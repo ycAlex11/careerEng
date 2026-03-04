@@ -1,0 +1,76 @@
+version: v3
+examples:
+  - input: "Name: Alex Lee\nCurrent City: Shanghai\nNationality: China"
+    patch:
+      basic:
+        name: "Alex Lee"
+        current_city: "Shanghai"
+        nationality: "China"
+
+  - input: "我在太原，国籍中国，会Python和Java"
+    patch:
+      basic:
+        current_city: "Taiyuan"
+        nationality: "China"
+      skills:
+        programming: ["Python", "Java"]
+
+  - input: "姓名：王磊\n语言：中文，English"
+    patch:
+      basic:
+        name: "王磊"
+        languages: ["中文", "English"]
+
+  - input: "我本科是计算机科学，硕士是软件工程"
+    patch:
+      education:
+        - degree: "BS"
+          major: "Computer Science"
+        - degree: "MS"
+          major: "Software Engineering"
+
+  - input: "Education: Bachelor of Computer Science, Tsinghua University"
+    patch:
+      education:
+        - degree: "BS"
+          major: "Computer Science"
+          school: "Tsinghua University"
+
+  - input: "过去3年在Ant做后端工程师，负责交易链路"
+    patch:
+      experience:
+        - company: "Ant Group"
+          role: "Backend Engineer"
+          years: 3
+
+  - input: "做过招聘平台项目，负责职位检索和推荐"
+    patch:
+      projects:
+        - name: "Recruitment Platform"
+          scope: "Job search and recommendation"
+
+  - input: "我常用FastAPI、Django和Spring Boot"
+    patch:
+      skills:
+        frameworks: ["FastAPI", "Django", "Spring Boot"]
+
+  - input: "日常工具是Docker、Kubernetes、GitHub Actions"
+    patch:
+      skills:
+        tools: ["Docker", "Kubernetes", "GitHub Actions"]
+
+  - input: "我在工作中会用LangChain和RAG流程"
+    patch:
+      skills:
+        ai: ["LangChain", "RAG"]
+
+  - input: "我的工作风格是结果导向，偏好异步协作"
+    patch:
+      summary:
+        work_style: "Result-oriented and async collaboration"
+
+  - input: "我目前签证是none，工作许可是china"
+    patch:
+      constraints:
+        visa: "none"
+        work_auth: "china"

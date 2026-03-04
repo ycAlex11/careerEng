@@ -1,0 +1,56 @@
+version: v3
+examples:
+  - input: "我想要远程全职后端岗位"
+    patch:
+      work_mode: "remote"
+      employment_type: "fulltime"
+      target_roles: ["backend"]
+
+  - input: "只看中国岗位，城市不限"
+    patch:
+      target_locations: ["China"]
+      location_note: "Any city in China is acceptable"
+
+  - input: "希望职位年包40-60万，至少35k月薪"
+    patch:
+      must_have: ["salary >= 35k monthly", "annual package 400k-600k CNY"]
+
+  - input: "我想做分布式系统和高并发架构方向"
+    patch:
+      target_roles: ["backend", "platform engineer"]
+      nice_to_have: ["distributed systems", "high concurrency"]
+
+  - input: "优先医疗AI和金融科技行业"
+    patch:
+      industry_preferences: ["Healthcare AI", "FinTech"]
+
+  - input: "岗位发布时间最好在2026-02-01之后"
+    patch:
+      date_posted_after: "2026-02-01"
+
+  - input: "不考虑实习，只接受正式全职"
+    patch:
+      employment_type: "fulltime"
+      must_have: ["no internship"]
+
+  - input: "我接受hybrid，也可以onsite"
+    patch:
+      work_mode: "hybrid"
+      nice_to_have: ["onsite optional"]
+
+  - input: "我想投递数据工程师或AI Engineer职位"
+    patch:
+      target_roles: ["data engineer", "ai engineer"]
+
+  - input: "必须有五险一金和年终奖，最好有股票"
+    patch:
+      must_have: ["social insurance and housing fund", "year-end bonus"]
+      nice_to_have: ["equity"]
+
+  - input: "我偏好外企，不考虑百人以下的小公司"
+    patch:
+      company_preferences: ["外企", "非百人公司"]
+
+  - input: "优先大厂和成熟平台团队"
+    patch:
+      company_preferences: ["大厂", "成熟平台团队"]

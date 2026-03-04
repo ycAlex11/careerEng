@@ -1,0 +1,32 @@
+# Secrets / local-only config
+auth.json
+config.toml
+.env
+.env.*
+
+# Runtime workspace data
+workspace/
+
+# Python environment and build artifacts
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editor / OS files
+.DS_Store
+.vscode/
+.idea/
+
+# Temporary choice for initial push
+tests/

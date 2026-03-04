@@ -1,0 +1,106 @@
+version: v4
+examples:
+  - message: "我有5年Python和Java后端经验，做过支付项目"
+    is_profile_related: true
+    is_intent_related: false
+    reason: "Shares technical background and experience"
+
+  - message: "我想找remote fulltime的后端岗位"
+    is_profile_related: false
+    is_intent_related: true
+    reason: "Defines role preference and work mode"
+
+  - message: "这个职位年包希望在40-60万之间"
+    is_profile_related: false
+    is_intent_related: true
+    reason: "Compensation expectation for target jobs"
+
+  - message: "我现在城市在太原，目标城市是上海或深圳"
+    is_profile_related: true
+    is_intent_related: true
+    reason: "Contains both current profile city and target locations"
+
+  - message: "我在上个项目负责微服务拆分和Kafka消息链路，Java经验4年"
+    is_profile_related: true
+    is_intent_related: false
+    reason: "Describes architecture work and personal experience"
+
+  - message: "我想投递AI医疗行业的数据平台岗位"
+    is_profile_related: false
+    is_intent_related: true
+    reason: "Expresses business-domain targeting intent"
+
+  - message: "我是中国国籍，目前work auth在china，签证是none"
+    is_profile_related: true
+    is_intent_related: false
+    reason: "Provides profile constraints and authorization facts"
+
+  - message: "优先remote，不考虑intern，只看fulltime"
+    is_profile_related: false
+    is_intent_related: true
+    reason: "States employment type and mode constraints"
+
+  - message: "我在电商业务做过2年推荐系统，接下来想找金融风控岗位"
+    is_profile_related: true
+    is_intent_related: true
+    reason: "Includes past background plus future target direction"
+
+  - message: "我偏好外企和大厂，不考虑百人以下团队"
+    is_profile_related: false
+    is_intent_related: true
+    reason: "Company preference update for intent"
+
+  - message: "帮我查今天NBA比分"
+    is_profile_related: false
+    is_intent_related: false
+    reason: "Unrelated to profile or job-search intent"
+
+  - message: "你好呀，今天过得怎么样？"
+    is_profile_related: false
+    is_intent_related: false
+    reason: "Greeting only"
+
+  - message: "早上好，辛苦啦"
+    is_profile_related: false
+    is_intent_related: false
+    reason: "Greeting only"
+
+  - message: "晚安，明天见"
+    is_profile_related: false
+    is_intent_related: false
+    reason: "Greeting and closing only"
+
+  - message: "帮我把‘我稍后回复你’翻译成英文"
+    is_profile_related: false
+    is_intent_related: false
+    reason: "Translation task only"
+
+  - message: "把这句英文翻译成中文：Please call me later"
+    is_profile_related: false
+    is_intent_related: false
+    reason: "Translation task only"
+
+  - message: "请翻译这句话：我想找后端岗位"
+    is_profile_related: false
+    is_intent_related: false
+    reason: "Translation intent, not user preference update"
+
+  - message: "今天天气怎么样，要不要带伞？"
+    is_profile_related: false
+    is_intent_related: false
+    reason: "Daily life question"
+
+  - message: "晚饭有什么清淡一点的推荐？"
+    is_profile_related: false
+    is_intent_related: false
+    reason: "Daily life question"
+
+  - message: "周末去哪里放松比较好？"
+    is_profile_related: false
+    is_intent_related: false
+    reason: "Daily life question"
+
+  - message: "我家路由器老掉线，怎么排查？"
+    is_profile_related: false
+    is_intent_related: false
+    reason: "General tech support, not job profile/intent"

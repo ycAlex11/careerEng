@@ -1,0 +1,16 @@
+{"message": "我有5年Python和Java经验", "is_profile_related": true, "is_intent_related": false}
+{"message": "请帮我找remote fulltime后端岗位", "is_profile_related": false, "is_intent_related": true}
+{"message": "我现在城市在太原，目标城市北京", "is_profile_related": true, "is_intent_related": true}
+{"message": "我想投递上海的数据工程师职位", "is_profile_related": false, "is_intent_related": true}
+{"message": "我的国籍是中国，有后端项目经验", "is_profile_related": true, "is_intent_related": false}
+{"message": "可以推荐onsite岗位吗", "is_profile_related": false, "is_intent_related": true}
+{"message": "我有C++经验，也做过分布式项目", "is_profile_related": true, "is_intent_related": false}
+{"message": "想申请intern职位，地点在深圳", "is_profile_related": false, "is_intent_related": true}
+{"message": "education 是计算机硕士", "is_profile_related": true, "is_intent_related": false}
+{"message": "experience includes 3 years in fintech", "is_profile_related": true, "is_intent_related": false}
+{"message": "这个岗位薪资要30k以上", "is_profile_related": false, "is_intent_related": true}
+{"message": "我偏好外企和大厂", "is_profile_related": false, "is_intent_related": true}
+{"message": "请翻译这句话：我想找后端岗位", "is_profile_related": false, "is_intent_related": false}
+{"message": "你好呀，今天过得怎么样", "is_profile_related": false, "is_intent_related": false}
+{"message": "帮我查今天NBA赛程", "is_profile_related": false, "is_intent_related": false}
+{"message": "晚饭吃什么清淡一些", "is_profile_related": false, "is_intent_related": false}

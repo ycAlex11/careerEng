@@ -1,0 +1,26 @@
+[project]
+name = "careereng"
+version = "0.1.0"
+description = "Lightweight LLM assistant for automated job search and application"
+requires-python = ">=3.11"
+authors = [{name = "careereng contributors"}]
+dependencies = [
+  "typer>=0.12.0",
+  "httpx>=0.27.0",
+  "pyyaml>=6.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+careereng = "careereng.cli.app:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["careereng"]
