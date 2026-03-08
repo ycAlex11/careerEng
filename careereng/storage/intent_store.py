@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from careereng.storage.domain_store import DomainStore
+
+
+def _default_date_posted_after(days: int = 30) -> str:
+    return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
 
 DEFAULT_INTENT = {
@@ -17,7 +22,7 @@ DEFAULT_INTENT = {
     "employment_type": "",
     "company_preferences": [],
     "industry_preferences": [],
-    "date_posted_after": "",
+    "date_posted_after": _default_date_posted_after(),
     "must_have": [],
     "nice_to_have": [],
 }

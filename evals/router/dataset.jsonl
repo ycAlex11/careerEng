@@ -1,0 +1,10 @@
+{"message":"请帮我搜索后端岗位","expected_route":"search"}
+{"message":"找一份中国远程软件工程师工作","expected_route":"search"}
+{"message":"find machine learning engineer jobs in singapore","expected_route":"search"}
+{"message":"仕事を探したい ソフトウェアエンジニア","expected_route":"search"}
+{"message":"帮我投递微软公司","expected_route":"site","expected_apply_requested":true,"expected_company_contains":"微软"}
+{"message":"apply to https://careers.microsoft.com","expected_route":"site","expected_apply_requested":true,"expected_base_url_prefix":"https://careers.microsoft.com"}
+{"message":"帮我看一下这个网站 https://jobs.lever.co/example","expected_route":"site","expected_base_url_prefix":"https://jobs.lever.co/example"}
+{"message":"你好","expected_route":"chat"}
+{"message":"请翻译下面这段英文","expected_route":"chat"}
+{"message":"今天天气怎么样","expected_route":"chat"}

@@ -21,53 +21,38 @@ class SiteTools:
         apply_requested: bool,
         session_id: str,
         turn_id: str,
+        source_type: str = "manual",
     ) -> dict[str, Any]:
-        site = self.site_store.register(site_name, base_url=base_url)
+        site = self.site_store.register(site_name, base_url=base_url, source_type=source_type)
         site_id = str(site["site_id"])
-        target_url = base_url or str(site.get("base_url") or f"https://{site_id}.com")
-
-        search_result = self.playwright.discover_jobs(target_url, max_items=20)
-        jobs = search_result.get("items", []) if isinstance(search_result, dict) else []
-        if not isinstance(jobs, list):
-            jobs = []
-
-        normalized_jobs = []
-        for job in jobs:
-            if not isinstance(job, dict):
-                continue
-            normalized_jobs.append(
-                {
-                    "title": str(job.get("title") or ""),
-                    "url": str(job.get("url") or ""),
-                    "company": site_name,
-                }
-            )
-
-        self.site_store.append_jobs(site_id, normalized_jobs, session_id=session_id, turn_id=turn_id)
+        target_url = str(site.get("base_url") or "")
+        skill_path, skill_template_created = self.site_store.ensure_skill_template(site_id)
         self.site_store.append_event(
             site_id,
-            "jobs.search",
+            "site.registered",
             {
-                "target_url": target_url,
-                "jobs_count": len(normalized_jobs),
-                "search_ok": bool(search_result.get("ok")) if isinstance(search_result, dict) else False,
-                "search_error": str(search_result.get("error") or "") if isinstance(search_result, dict) else "",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "site_name": site_name,
+                "base_url": target_url,
+                "apply_requested": bool(apply_requested),
+                "source_type": source_type,
+                "skill_template_created": skill_template_created,
             },
         )
-
-        has_skill = self.site_store.has_skill(site_id)
         return {
             "site_id": site_id,
-            "site_name": site_name,
-            "target_url": target_url,
-            "jobs": normalized_jobs,
-            "jobs_count": len(normalized_jobs),
-            "has_skill": has_skill,
+            "site_name": str(site.get("canonical_company") or site_name),
+            "raw_name": str(site.get("raw_name") or site_name),
+            "base_url": target_url,
+            "has_skill": self.site_store.has_skill(site_id),
+            "skill_path": str(skill_path.relative_to(self.site_store.workspace)),
+            "skill_template_created": skill_template_created,
             "apply_requested": apply_requested,
-            "search_ok": bool(search_result.get("ok")) if isinstance(search_result, dict) else False,
-            "search_error": str(search_result.get("error") or "") if isinstance(search_result, dict) else "",
-            "await_apply_confirmation": bool(apply_requested and has_skill),
-            "search_only_no_skill": bool(apply_requested and not has_skill),
+            "status": str(site.get("status") or "active"),
+            "registry_id": str(site.get("registry_id") or ""),
+            "source_type": source_type,
+            "registration_only": True,
         }
 
     def apply_now(self, site_id: str, jobs: list[dict[str, Any]], session_id: str, turn_id: str) -> dict[str, Any]:
@@ -85,6 +70,11 @@ class SiteTools:
                     "site_id": site_id,
                     "title": str(job.get("title") or ""),
                     "url": url,
+                    "job_id": str(job.get("job_id") or ""),
+                    "canonical_job_id": str(job.get("canonical_job_id") or ""),
+                    "employer": str(job.get("employer") or job.get("company") or ""),
+                    "discovery_site": str(job.get("discovery_site") or ""),
+                    "submission_site": site_id,
                     "submitted": bool(result.get("ok") and result.get("clicked")),
                     "detail": result,
                 }

@@ -17,24 +17,28 @@ def create_provider(config: AppConfig, auth: AuthConfig) -> tuple[str, LLMProvid
         return "openai", OpenAICompatibleProvider(
             api_key=auth.openai_api_key,
             api_base=openai_base,
+            structured_output_mode=config.providers.openai.structured_output_mode,
         )
 
     if name == "openrouter" and auth.openrouter_api_key:
         return "openrouter", OpenRouterProvider(
             api_key=auth.openrouter_api_key,
             api_base=openrouter_base,
+            structured_output_mode=config.providers.openrouter.structured_output_mode,
         )
 
     if auth.openrouter_api_key:
         return "openrouter", OpenRouterProvider(
             api_key=auth.openrouter_api_key,
             api_base=openrouter_base,
+            structured_output_mode=config.providers.openrouter.structured_output_mode,
         )
 
     if auth.openai_api_key:
         return "openai", OpenAICompatibleProvider(
             api_key=auth.openai_api_key,
             api_base=openai_base,
+            structured_output_mode=config.providers.openai.structured_output_mode,
         )
 
     raise ProviderError("No available provider key in auth.json")

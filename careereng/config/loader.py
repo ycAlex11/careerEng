@@ -31,16 +31,23 @@ default_model = "openai/gpt-4o-mini"
 max_history_messages = 50
 related_history_k = 6
 relatedness_threshold = 0.7
+site_parallelism = 2
+router_confidence_threshold = 0.75
+router_log_enabled = true
+search_company_top_k = 10
 
 [browser]
-headless = true
+headless = false
 timeout_ms = 45000
+slow_mo_ms = 0
 
 [providers.openrouter]
 api_base = "https://openrouter.ai/api/v1"
+structured_output_mode = "auto"
 
 [providers.openai]
 api_base = "https://api.openai.com/v1"
+structured_output_mode = "auto"
 """
 
 
@@ -125,8 +132,8 @@ def load_config(project_root: Path) -> AppConfig:
         "browser": BrowserConfig().__dict__.copy(),
         "paths": PathsConfig().__dict__.copy(),
         "providers": {
-            "openai": ProviderConfig(api_base="https://api.openai.com/v1").__dict__.copy(),
-            "openrouter": ProviderConfig(api_base="https://openrouter.ai/api/v1").__dict__.copy(),
+            "openai": ProviderConfig(api_base="https://api.openai.com/v1", structured_output_mode="auto").__dict__.copy(),
+            "openrouter": ProviderConfig(api_base="https://openrouter.ai/api/v1", structured_output_mode="auto").__dict__.copy(),
         },
     }
     try:

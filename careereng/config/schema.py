@@ -13,12 +13,17 @@ class AgentConfig:
     max_history_messages: int = 50
     related_history_k: int = 6
     relatedness_threshold: float = 0.7
+    site_parallelism: int = 2
+    router_confidence_threshold: float = 0.75
+    router_log_enabled: bool = True
+    search_company_top_k: int = 10
 
 
 @dataclass
 class BrowserConfig:
-    headless: bool = True
+    headless: bool = False
     timeout_ms: int = 45000
+    slow_mo_ms: int = 0
 
 
 @dataclass
@@ -35,6 +40,7 @@ class PathsConfig:
 @dataclass
 class ProviderConfig:
     api_base: str = ""
+    structured_output_mode: str = "auto"
 
 
 @dataclass
