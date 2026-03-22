@@ -10,19 +10,20 @@ scope: search
 
 ## Routing Rule
 
-If the current request is about finding companies for job search, always apply this core skill together with `./jobs/SKILL.md`.
-If the user has already selected companies and the system is locating where to apply, also continue using `./jobs/SKILL.md`.
-If a workspace user job preference skill is available, load it as an additional overlay for personal preferences.
+This file defines search-wide behavior shared across search domains.
+If the current request belongs to job search, apply this core skill together with `./jobs/SKILL.md`.
+If the current request belongs to people search, apply this core skill together with `./people/SKILL.md`.
+If a workspace skill exists for the active search domain, load it as an overlay on top of the project search skills.
 
 ## Search Tools
 
-Use Playwright for browser actions.
-Use Google as the search engine when web search is needed.
+Use Playwright as the default browser execution tool.
+Use Google as the default search engine when web search is needed.
+If a trustworthy entry URL is already known, open it directly before starting a new web search.
 
-## Search Context
+## Search Principles
 
-For company-finding and company-follow-up search, reason over the current user message first.
-Then apply the workspace user job preference skill if present.
-Then apply the project search job skill.
-Use `intent.md` as a structured fallback state, not as the highest-priority preference source.
-Use `persona.md` mainly when evaluating whether concrete jobs are a good fit for the user.
+Prefer first-party or official sources when the current task allows it.
+Keep enough evidence to justify the result or next action.
+Stop searching once the current stage objective has been satisfied.
+Do not jump ahead into later-stage decisions when the current task is only discovery or navigation.

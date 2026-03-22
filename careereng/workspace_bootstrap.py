@@ -101,6 +101,10 @@ def bootstrap_workspace(workspace: Path) -> list[WorkspaceEntry]:
     _ensure_text_file(workspace / "profile" / "persona.md", dump_front_matter(DEFAULT_PERSONA), rows, workspace)
     _ensure_empty_file(workspace / "profile" / "profile_events.jsonl", rows, workspace)
 
+    _ensure_dir(workspace / "cv", rows, workspace)
+    _ensure_dir(workspace / "cv" / "current", rows, workspace)
+    _ensure_dir(workspace / "cv" / "history", rows, workspace)
+
     _ensure_dir(workspace / "intent", rows, workspace)
     _ensure_dir(workspace / "intent" / "history", rows, workspace)
     _ensure_dir(workspace / "intent" / "reports", rows, workspace)
@@ -126,6 +130,10 @@ def bootstrap_workspace(workspace: Path) -> list[WorkspaceEntry]:
     _ensure_dir(workspace / "applications", rows, workspace)
     _ensure_empty_file(workspace / "applications" / "all.jsonl", rows, workspace)
     _ensure_empty_file(workspace / "applications" / "events.jsonl", rows, workspace)
+
+    _ensure_dir(workspace / "jobs", rows, workspace)
+    _ensure_dir(workspace / "jobs" / "batches", rows, workspace)
+    _ensure_empty_file(workspace / "jobs" / "events.jsonl", rows, workspace)
 
     _ensure_dir(workspace / "router", rows, workspace)
     _ensure_empty_file(workspace / "router" / "events.jsonl", rows, workspace)

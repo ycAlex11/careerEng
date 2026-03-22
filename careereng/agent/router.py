@@ -52,6 +52,62 @@ def detect_site_request(text: str) -> dict:
     }
 
 
+def detect_jobs_batch_request(text: str) -> dict:
+    raw = text.strip()
+    lowered = raw.lower()
+    apply_requested = ("投递" in raw) or ("apply" in lowered) or ("submit" in lowered)
+    retrieve_terms = ("检索", "查", "看看", "找", "search", "retrieve")
+    registered_terms = ("已注册", "注册的", "registered")
+    company_terms = ("公司", "站点", "sites", "site")
+    explicit_phrases = (
+        "开始检索并投递已注册的公司",
+        "投递已注册的公司",
+        "检索已注册的公司",
+        "检查已注册公司的岗位",
+        "开始投递已注册的公司",
+    )
+    if any(phrase in raw or phrase in lowered for phrase in explicit_phrases):
+        return {"is_jobs_batch_flow": True, "apply_requested": apply_requested}
+    if any(term in raw for term in registered_terms) and any(term in raw or term in lowered for term in company_terms):
+        if apply_requested or any(term in raw or term in lowered for term in retrieve_terms):
+            return {"is_jobs_batch_flow": True, "apply_requested": apply_requested}
+    if "相关的公司" in raw and apply_requested:
+        return {"is_jobs_batch_flow": True, "apply_requested": True}
+    if "registered" in lowered and ("company" in lowered or "site" in lowered) and (
+        apply_requested or any(term in lowered for term in retrieve_terms)
+    ):
+        return {"is_jobs_batch_flow": True, "apply_requested": apply_requested}
+    return {"is_jobs_batch_flow": False, "apply_requested": False}
+
+
+def detect_jobs_batch_request(text: str) -> dict:
+    raw = text.strip()
+    lowered = raw.lower()
+    apply_requested = ("投递" in raw) or ("apply" in lowered) or ("submit" in lowered)
+    retrieve_terms = ("检索", "查", "看看", "找", "search", "retrieve")
+    registered_terms = ("已注册", "注册的", "registered")
+    company_terms = ("公司", "站点", "sites", "site")
+    explicit_phrases = (
+        "开始检索并投递已注册的公司",
+        "投递已注册的公司",
+        "检索已注册的公司",
+        "检查已注册公司的岗位",
+        "开始投递已注册的公司",
+    )
+    if any(phrase in raw or phrase in lowered for phrase in explicit_phrases):
+        return {"is_jobs_batch_flow": True, "apply_requested": apply_requested}
+    if any(term in raw for term in registered_terms) and any(term in raw or term in lowered for term in company_terms):
+        if apply_requested or any(term in raw or term in lowered for term in retrieve_terms):
+            return {"is_jobs_batch_flow": True, "apply_requested": apply_requested}
+    if "相关的公司" in raw and apply_requested:
+        return {"is_jobs_batch_flow": True, "apply_requested": True}
+    if "registered" in lowered and ("company" in lowered or "site" in lowered) and (
+        apply_requested or any(term in lowered for term in retrieve_terms)
+    ):
+        return {"is_jobs_batch_flow": True, "apply_requested": apply_requested}
+    return {"is_jobs_batch_flow": False, "apply_requested": False}
+
+
 def detect_search_request(text: str) -> dict:
     raw = text.strip()
     lowered = raw.lower()

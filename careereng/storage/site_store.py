@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from careereng.storage.jsonl import JSONLStore
-from careereng.utils import ensure_dir, make_id, now_iso, read_json, safe_file_stem, today_str, write_json
+from careereng.utils import dump_front_matter, ensure_dir, make_id, now_iso, parse_front_matter, read_json, safe_file_stem, today_str, write_json
 
 
 class SiteStore:
@@ -37,8 +37,116 @@ class SiteStore:
         ensure_dir(root / "applications")
         ensure_dir(root / "events")
         ensure_dir(root / "skills")
+        ensure_dir(root / "browser")
+        ensure_dir(root / "browser" / "user_data")
         JSONLStore(root / "jobs" / "catalog.jsonl")
         JSONLStore(root / "events" / "all.jsonl")
+
+    def _default_site_skill_text(self, site_id: str) -> str:
+        body = (
+            "# Site Skill\n\n"
+            "Use this file to describe how this site should be handled.\n\n"
+            "## Session Preparation\n\n"
+            "### Authentication\n\n"
+            "- Describe whether manual login is needed and where the login flow begins.\n"
+            "- Describe what account type should be used and any safe takeover points.\n\n"
+            "### Ready Signal\n\n"
+            "- Describe what the logged-in ready state looks like before discovery continues.\n\n"
+            "## Channel Discovery\n\n"
+            "### Navigation\n\n"
+            "- Describe how to reach the real jobs surface from the entry URL.\n"
+            "- Describe any known redirects, new tabs, ATS handoffs, or site-specific stop conditions.\n\n"
+            "### Success Signal\n\n"
+            "- Describe what should count as a real jobs list or reliable application entry.\n\n"
+            "## Apply Workflow\n\n"
+            "- Describe how to find relevant jobs and which pages are safe to skip.\n"
+            "- Describe when the agent should stop and ask the user to take over.\n"
+        )
+        return dump_front_matter(
+            {
+                "id": f"site-{site_id}",
+                "name": f"{site_id} Site Skill",
+                "version": "v1",
+                "updated_at": now_iso()[:10],
+                "scope": "site",
+                "site_key": site_id,
+                "status": "draft",
+                "apply_enabled": False,
+            },
+            body,
+        )
+
+    def _default_browser_session(self, site_id: str) -> dict[str, Any]:
+        profile_dir = self.site_dir(site_id) / "browser" / "user_data"
+        return {
+            "site_key": site_id,
+            "profile_dir": str(profile_dir),
+            "login_required": True,
+            "session_ready": False,
+            "last_manual_login_at": "",
+            "last_validated_at": "",
+            "last_validation_result": "unknown",
+            "active_run_id": "",
+            "last_browser_pid": 0,
+            "browser_status": "stopped",
+            "last_browser_opened_at": "",
+            "resume_phase": "idle",
+            "pending_action": "",
+            "last_known_url": "",
+            "current_job_id": "",
+            "current_job_url": "",
+            "visible_mode": "headless",
+        }
+
+    def browser_profile_dir(self, site_id: str) -> Path:
+        root = self.site_dir(site_id)
+        self._ensure_site_tree(root)
+        return root / "browser" / "user_data"
+
+    def browser_session_path(self, site_id: str) -> Path:
+        root = self.site_dir(site_id)
+        self._ensure_site_tree(root)
+        return root / "browser" / "session.json"
+
+    def ensure_browser_session(self, site_id: str) -> dict[str, Any]:
+        root = self.site_dir(site_id)
+        self._ensure_site_tree(root)
+        session_path = self.browser_session_path(site_id)
+        current = read_json(session_path)
+        payload = self._default_browser_session(site_id)
+        if isinstance(current, dict):
+            payload.update({k: v for k, v in current.items() if v not in (None,)})
+        payload["site_key"] = site_id
+        payload["profile_dir"] = str(self.browser_profile_dir(site_id))
+        write_json(session_path, payload)
+        return payload
+
+    def load_browser_session(self, site_id: str) -> dict[str, Any]:
+        session = read_json(self.browser_session_path(site_id))
+        if session:
+            return self.ensure_browser_session(site_id)
+        return self.ensure_browser_session(site_id)
+
+    def save_browser_session(self, site_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        current = self.ensure_browser_session(site_id)
+        current.update(payload or {})
+        current["site_key"] = site_id
+        current["profile_dir"] = str(self.browser_profile_dir(site_id))
+        write_json(self.browser_session_path(site_id), current)
+        return current
+
+    def load_skill(self, site_id: str) -> dict[str, Any]:
+        skill_path = self.site_dir(site_id) / "skills" / "SKILL.md"
+        if not skill_path.exists():
+            return {"path": skill_path, "exists": False, "front_matter": {}, "body": ""}
+        text = skill_path.read_text(encoding="utf-8")
+        front_matter, body = parse_front_matter(text)
+        return {
+            "path": skill_path,
+            "exists": True,
+            "front_matter": front_matter if isinstance(front_matter, dict) else {},
+            "body": body,
+        }
 
     def _normalize_company_name(self, value: str) -> str:
         raw = re.sub(r"\s+", " ", str(value or "").replace("_", " ").strip())
@@ -139,7 +247,9 @@ class SiteStore:
 
     def _migrate_existing_sites(self) -> None:
         rows = self._read_registry_rows()
+        synced_rows: list[dict[str, Any]] = []
         registry_changed = False
+        seen_site_keys: set[str] = set()
 
         for path in self._site_dirs():
             original_root = path
@@ -159,9 +269,21 @@ class SiteStore:
             current = read_json(root / "site.json")
             had_catalog_data, legacy_dirty = self._cleanup_legacy_job_data(root)
             site_key = root.name
+            seen_site_keys.add(site_key)
+            idx = self._find_registry_row_index(
+                rows,
+                raw_name=raw_name,
+                canonical_company=canonical_company,
+                site_key=site_key,
+            )
+            existing_row = rows[idx] if idx is not None else {}
+            registry_id = str(existing_row.get("registry_id") or current.get("registry_id") or make_id("site"))
+            registered_at = str(existing_row.get("registered_at") or current.get("created_at") or now_iso())
+            created_at = str(current.get("created_at") or original.get("created_at") or registered_at)
             desired_payload = dict(current)
             desired_payload.update(
                 {
+                    "registry_id": registry_id,
                     "site_id": site_key,
                     "site_key": site_key,
                     "display_name": canonical_company,
@@ -170,7 +292,7 @@ class SiteStore:
                     "base_url": self._normalize_url(str(current.get("base_url") or original.get("base_url") or "")),
                     "status": str(current.get("status") or original.get("status") or "active"),
                     "source_type": str(current.get("source_type") or original.get("source_type") or "migrated"),
-                    "created_at": str(current.get("created_at") or original.get("created_at") or now_iso()),
+                    "created_at": created_at,
                 }
             )
             if legacy_dirty or bool(current.get("legacy_discoveries_dirty")):
@@ -188,6 +310,7 @@ class SiteStore:
                 "source_type",
                 "created_at",
                 "legacy_discoveries_dirty",
+                "registry_id",
             ):
                 if desired_payload.get(key) != current.get(key):
                     payload_changed = True
@@ -196,23 +319,16 @@ class SiteStore:
             if payload_changed:
                 write_json(root / "site.json", desired_payload)
 
-            idx = self._find_registry_row_index(
-                rows,
-                raw_name=raw_name,
-                canonical_company=canonical_company,
-                site_key=site_key,
-            )
-            existing_row = rows[idx] if idx is not None else {}
             desired_row = {
-                "registry_id": str(existing_row.get("registry_id") or make_id("site")),
-                "canonical_company": canonical_company,
+                "registry_id": registry_id,
+                "canonical_company": str(desired_payload.get("canonical_company") or canonical_company),
                 "site_key": site_key,
-                "raw_name": raw_name,
-                "status": str(existing_row.get("status") or desired_payload.get("status") or "active"),
-                "base_url": str(existing_row.get("base_url") or desired_payload.get("base_url") or ""),
-                "source_type": str(existing_row.get("source_type") or desired_payload.get("source_type") or "migrated"),
-                "registered_at": str(existing_row.get("registered_at") or desired_payload.get("created_at") or now_iso()),
-                "updated_at": str(existing_row.get("updated_at") or desired_payload.get("updated_at") or now_iso()),
+                "raw_name": str(desired_payload.get("raw_name") or raw_name),
+                "status": str(desired_payload.get("status") or "active"),
+                "base_url": self._normalize_url(str(desired_payload.get("base_url") or "")),
+                "source_type": str(desired_payload.get("source_type") or "migrated"),
+                "registered_at": registered_at,
+                "updated_at": str(desired_payload.get("updated_at") or now_iso()),
             }
             row_changed = idx is None
             if idx is not None:
@@ -228,16 +344,20 @@ class SiteStore:
                     if desired_row.get(key) != existing_row.get(key):
                         row_changed = True
                         break
+            synced_rows.append(desired_row)
+            self.ensure_skill_template(site_key)
+            self.ensure_browser_session(site_key)
             if row_changed:
                 desired_row["updated_at"] = now_iso()
-                if idx is None:
-                    rows.append(desired_row)
-                else:
-                    rows[idx] = desired_row
                 registry_changed = True
 
+        if len(synced_rows) != len(rows):
+            registry_changed = True
+        elif any(safe_file_stem(str(row.get("site_key") or "")) not in seen_site_keys for row in rows):
+            registry_changed = True
+
         if registry_changed:
-            self._write_registry_rows(rows)
+            self._write_registry_rows(synced_rows)
 
     def _build_site_payload(
         self,
@@ -290,12 +410,11 @@ class SiteStore:
         registered_at = str(existing_row.get("registered_at") or now)
         site_key = safe_file_stem(str(existing_row.get("site_key") or site_key))
         canonical_company = self._normalize_company_name(str(existing_row.get("canonical_company") or canonical_company))
-        resolved_base_url = self._normalize_url(base_url) or self._normalize_url(str(existing_row.get("base_url") or ""))
-        resolved_source_type = str(source_type or existing_row.get("source_type") or "manual")
-
         root = self.site_dir(site_key)
         self._ensure_site_tree(root)
         current = read_json(root / "site.json")
+        resolved_base_url = self._normalize_url(base_url) or self._normalize_url(str(current.get("base_url") or existing_row.get("base_url") or ""))
+        resolved_source_type = str(source_type or current.get("source_type") or existing_row.get("source_type") or "manual")
         created_at = str(current.get("created_at") or registered_at or now)
         payload = self._build_site_payload(
             site_key=site_key,
@@ -310,6 +429,8 @@ class SiteStore:
             existing=current,
         )
         write_json(root / "site.json", payload)
+        self.ensure_skill_template(site_key)
+        self.ensure_browser_session(site_key)
 
         row = {
             "registry_id": registry_id,
@@ -379,6 +500,8 @@ class SiteStore:
             existing=current,
         )
         write_json(root / "site.json", payload)
+        self.ensure_skill_template(str(row.get("site_key") or site_key))
+        self.ensure_browser_session(str(row.get("site_key") or site_key))
         return row
 
     def activate(self, name: str, *, base_url: str = "") -> dict[str, Any]:
@@ -395,13 +518,7 @@ class SiteStore:
         skill = self.site_dir(site_id) / "skills" / "SKILL.md"
         existed = skill.exists()
         if not existed:
-            skill.write_text(
-                "# Site Skill\n\n"
-                "- Define how to navigate this site.\n"
-                "- Define login requirements and apply steps.\n"
-                "- Define skip rules (duplicate/captcha/risky forms).\n",
-                encoding="utf-8",
-            )
+            skill.write_text(self._default_site_skill_text(site_id), encoding="utf-8")
         return skill, not existed
 
     def _normalize_url(self, url: str) -> str:
@@ -485,7 +602,11 @@ class SiteStore:
                 "url": url,
                 "location": str(job.get("location") or ""),
                 "posted_at": str(job.get("posted_at") or ""),
+                "posted_label": str(job.get("posted_label") or ""),
                 "employment_type": str(job.get("employment_type") or ""),
+                "match_label": str(job.get("match_label") or ""),
+                "apply_state": str(job.get("apply_state") or ""),
+                "card_text": str(job.get("card_text") or "")[:2000],
                 "description_ref": description_ref,
             }
             discovery_store.append(snapshot)
@@ -512,17 +633,76 @@ class SiteStore:
                         "employer": employer or str(existing.get("employer") or ""),
                         "location": str(job.get("location") or existing.get("location") or ""),
                         "posted_at": str(job.get("posted_at") or existing.get("posted_at") or ""),
+                        "posted_label": str(job.get("posted_label") or existing.get("posted_label") or ""),
                         "employment_type": str(job.get("employment_type") or existing.get("employment_type") or ""),
+                        "match_label": str(job.get("match_label") or existing.get("match_label") or ""),
+                        "apply_state": str(job.get("apply_state") or existing.get("apply_state") or ""),
                     }
                 )
                 if description_ref:
                     existing["description_ref"] = description_ref
+                card_text = str(job.get("card_text") or "")
+                if card_text:
+                    existing["card_text"] = card_text[:2000]
             updated_ids.append(job_id)
 
         catalog_rows = list(index.values())
         catalog_rows.sort(key=lambda r: str(r.get("first_seen_at") or ""))
         catalog_store.write_all(catalog_rows)
         return [index[jid] for jid in updated_ids if jid in index]
+
+    def update_job_decisions(self, site_id: str, jobs: list[dict[str, Any]]) -> None:
+        catalog_store = JSONLStore(self.site_dir(site_id) / "jobs" / "catalog.jsonl")
+        rows = catalog_store.read_all()
+        index = {str(row.get("job_id") or ""): row for row in rows if str(row.get("job_id") or "")}
+        changed = False
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            job_id = str(job.get("job_id") or "")
+            current = index.get(job_id)
+            if not current:
+                continue
+            if "fit_apply" not in job and "fit_reason" not in job:
+                continue
+            current["fit_apply"] = bool(job.get("fit_apply"))
+            try:
+                current["fit_confidence"] = float(job.get("fit_confidence") or 0.0)
+            except Exception:
+                current["fit_confidence"] = 0.0
+            current["fit_reason"] = str(job.get("fit_reason") or "")
+            current["fit_source"] = str(job.get("fit_source") or "")
+            current["decision_status"] = str(
+                job.get("decision_status") or ("recommended_apply" if current["fit_apply"] else "filtered_out")
+            )
+            current["decision_updated_at"] = now_iso()
+            changed = True
+        if changed:
+            catalog_store.write_all(rows)
+
+    def update_job_application_outcomes(self, site_id: str, applications: list[dict[str, Any]]) -> None:
+        catalog_store = JSONLStore(self.site_dir(site_id) / "jobs" / "catalog.jsonl")
+        rows = catalog_store.read_all()
+        index = {str(row.get("job_id") or ""): row for row in rows if str(row.get("job_id") or "")}
+        changed = False
+        for app in applications:
+            if not isinstance(app, dict):
+                continue
+            job_id = str(app.get("job_id") or "")
+            current = index.get(job_id)
+            if not current:
+                continue
+            status = str(app.get("status") or ("submitted" if app.get("submitted") else "apply_failed"))
+            current["application_status"] = status
+            current["application_updated_at"] = now_iso()
+            current["last_apply_error"] = str(
+                app.get("detail", {}).get("error") if isinstance(app.get("detail"), dict) else ""
+            )
+            if status == "submitted":
+                current["last_submitted_at"] = now_iso()
+            changed = True
+        if changed:
+            catalog_store.write_all(rows)
 
     def append_applications(self, site_id: str, applications: list[dict[str, Any]], session_id: str, turn_id: str) -> None:
         store = JSONLStore(self.site_dir(site_id) / "applications" / f"{today_str()}.jsonl")

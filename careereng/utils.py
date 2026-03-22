@@ -65,6 +65,32 @@ def dump_front_matter(data: dict[str, Any], body: str = "") -> str:
     return f"---\n{head}\n---\n{body}"
 
 
+def extract_markdown_section(text: str, heading: str, *, level: int = 2) -> str:
+    if not text:
+        return ""
+    target = f"{'#' * max(1, int(level))} {str(heading or '').strip()}"
+    if not str(heading or "").strip():
+        return ""
+
+    lines = text.splitlines()
+    start: int | None = None
+    for idx, line in enumerate(lines):
+        if line.strip() == target:
+            start = idx
+            break
+    if start is None:
+        return ""
+
+    end = len(lines)
+    boundary = re.compile(rf"^#{{1,{max(1, int(level))}}}\s+")
+    for idx in range(start + 1, len(lines)):
+        if boundary.match(lines[idx]):
+            end = idx
+            break
+    chunk = "\n".join(lines[start:end]).strip()
+    return chunk + ("\n" if chunk else "")
+
+
 def deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     for key, value in patch.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):

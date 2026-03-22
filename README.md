@@ -21,7 +21,8 @@ CareerEng is a lightweight CLI assistant for automated job search and applicatio
   - LLM recommends company candidates (Top-N)
   - User selects companies by index (`1 3 5`)
   - Google/Playwright resolves each selected company's entry URL
-  - Registration stage only writes the site registry + site metadata; job discovery stays for the next phase
+  - Registration stage writes the site registry + site metadata + site runtime scaffold
+  - Registered-site retrieve/apply batch runs through `run -m`, with blocked-login recovery by `site_key y/n`
 - Site registry commands: `careereng site add/list/activate/deactivate`
 
 ## Install
@@ -113,6 +114,8 @@ careereng site add "Microsoft"
 careereng site list --status active
 careereng site deactivate microsoft
 careereng site activate microsoft --url https://careers.microsoft.com
+careereng run -m "开始检索并投递已注册的公司"
+careereng run -m "microsoft y"
 ```
 
 Search conversation example (all through `run -m`):
@@ -121,6 +124,11 @@ Search conversation example (all through `run -m`):
 careereng run -m "请帮我搜索后端岗位，偏外企"
 # assistant returns company list -> reply: 1 3 5
 # assistant registers those companies, resolves entry URLs, and creates site skill templates
+
+careereng run -m "开始检索并投递已注册的公司"
+# ready sites continue automatically
+# blocked sites ask for manual login recovery
+# reply: microsoft y
 ```
 
 ## Repository Layout
@@ -191,6 +199,9 @@ workspace/
 ├─ applications/
 │  ├─ all.jsonl
 │  └─ events.jsonl
+├─ jobs/
+│  ├─ batches/<batch_id>.json
+│  └─ events.jsonl
 ├─ router/
 │  ├─ events.jsonl
 │  └─ feedback.jsonl
@@ -198,6 +209,9 @@ workspace/
 │  ├─ registry.jsonl
 │  └─ <site_id>/
 │     ├─ site.json
+│     ├─ browser/
+│     │  ├─ session.json
+│     │  └─ user_data/
 │     ├─ jobs/discoveries/YYYY-MM-DD.jsonl
 │     ├─ jobs/catalog.jsonl
 │     ├─ jobs/descriptions/<hash>.md
@@ -250,17 +264,40 @@ When user selects companies for registration:
 - Resolve an entry URL (official careers first, Google fallback)
 - Register/update `workspace/sites/registry.jsonl`
 - Create or reuse `workspace/sites/<site_id>/site.json`
-- Create `workspace/sites/<site_id>/skills/SKILL.md` if missing
+- Create or reuse `workspace/sites/<site_id>/skills/SKILL.md` with YAML front matter:
+  - `status: draft|ready`
+  - `apply_enabled: true|false`
+- Create or reuse `workspace/sites/<site_id>/browser/session.json`
+- Create or reuse `workspace/sites/<site_id>/browser/user_data/`
 - Do not write `jobs/catalog.jsonl` or `jobs/discoveries/*` during registration
+
+## Registered-Site Retrieve/Apply (V1.1)
+
+- Batch trigger stays in chat: `careereng run -m "开始检索并投递已注册的公司"`
+- The system only auto-applies when the site skill is both:
+  - `status: ready`
+  - `apply_enabled: true`
+- Preflight checks before a site can apply:
+  - site is `active`
+  - `entry_url` exists
+  - site skill exists and is `ready`
+  - browser session is ready
+- If `apply_enabled: false`, the site still runs retrieval only.
+- If session is not ready, the site becomes `blocked_login` and the batch keeps going for other ready sites.
+- Recovery flow:
+  - reply `site_key y` to continue that site
+  - if login browser is opened, finish login, close the site window, then reply `site_key y` again
+  - reply `site_key n` to skip that blocked site
+- First version keeps Chromium visible by default (`[browser].headless = false`) for easier debugging.
 
 ## V1.1 Search + Storage Strategy
 
 - Conflict priority: `current message > search skills > intent.md > defaults`
 - Routing strategy:
-  - LLM route decision first (`chat/search/site` + confidence + params)
-  - If confidence below threshold or parse fails, fallback to deterministic route detector
+  - LLM route decision first (`chat/search/site/jobs_batch` + confidence + params)
+  - High confidence executes directly; medium confidence asks `y/n`; low confidence falls back to normal chat or deterministic detector
   - Every route decision is logged in `workspace/router/events.jsonl`
-  - Optional user/tool review is logged in `workspace/router/feedback.jsonl`
+  - User confirmation / rejection is logged in `workspace/router/feedback.jsonl`
 - Search pipeline:
   - `Extract`: build structured query spec
   - `Reason`: LLM generates company shortlist from persona + intent + jobs skill
@@ -276,7 +313,10 @@ When user selects companies for registration:
   - Legacy `catalog.jsonl` is cleared during migration from older runs
   - Legacy discoveries are marked with `site.json.legacy_discoveries_dirty = true`
 - Job storage policy:
-  - `jobs/catalog.jsonl` and `jobs/discoveries/*.jsonl` are reserved for the later discovery phase, not initial registration
+  - Registration does not write `jobs/catalog.jsonl` or `jobs/discoveries/*.jsonl`
+  - Retrieve/apply batch state lives in `workspace/jobs/batches/<batch_id>.json`
+  - Batch event history lives in `workspace/jobs/events.jsonl`
+  - If retrieval succeeds but apply fails, discovered jobs are kept and the batch/site result is marked as "retrieved but not applied"
 
 ## Skill Placement Rules
 

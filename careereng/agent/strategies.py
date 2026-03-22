@@ -566,16 +566,25 @@ class SearchStrategyEngine:
         jobs: list[dict[str, Any]],
         persona: dict[str, Any],
         intent: dict[str, Any],
+        cv_text: str = "",
+        project_job_skill_text: str = "",
+        site_job_skill_text: str = "",
     ) -> list[dict[str, Any]]:
         if not jobs:
             return []
         prompt = (
             "Evaluate job fit for automatic application.\n"
+            "Priority order for conflicts: site job skill > project jobs skill > intent.\n"
+            "Use persona and current CV as factual background.\n"
             "Return JSON only: {\"decisions\":[{\"job_id\",\"apply\",\"confidence\",\"reason\"}]}.\n"
             "If confidence < 0.65, set apply=false."
         )
-        messages = [
-            {"role": "system", "content": prompt},
+        messages = [{"role": "system", "content": prompt}]
+        if project_job_skill_text.strip():
+            messages.append({"role": "system", "content": "Project jobs skill:\n" + project_job_skill_text})
+        if site_job_skill_text.strip():
+            messages.append({"role": "system", "content": "Site job skill (highest priority):\n" + site_job_skill_text})
+        messages.append(
             {
                 "role": "user",
                 "content": json.dumps(
@@ -583,12 +592,13 @@ class SearchStrategyEngine:
                         "site_name": site_name,
                         "persona": persona,
                         "intent": intent,
+                        "current_cv": cv_text[:24000],
                         "jobs": jobs[:20],
                     },
                     ensure_ascii=False,
                 ),
             },
-        ]
+        )
         parsed = self._llm_json(
             messages,
             schema=APPLY_DECISIONS_SCHEMA,
@@ -615,7 +625,23 @@ class SearchStrategyEngine:
                 conf = float(confidence)
             except Exception:
                 conf = 0.0
-            apply = bool(dec.get("apply")) and conf >= 0.65
+            apply_state = str(job.get("apply_state") or "").lower()
+            if "view application" in apply_state:
+                apply = False
+                conf = 1.0
+                reason = "site already marks this role as applied"
+                source = "site_signal"
+                decision_status = "already_applied"
+            else:
+                apply = bool(dec.get("apply")) and conf >= 0.65
+                reason = str(dec.get("reason") or "")
+                source = "llm"
+                decision_status = "recommended_apply" if apply else "filtered_out"
+            job["fit_apply"] = apply
+            job["fit_confidence"] = conf
+            job["fit_reason"] = reason
+            job["fit_source"] = source
+            job["decision_status"] = decision_status
             if apply:
                 chosen.append(job)
 
@@ -629,7 +655,33 @@ class SearchStrategyEngine:
         for job in jobs:
             title = str(job.get("title") or "").lower()
             if any(term in title for term in role_terms):
+                job["fit_apply"] = True
+                job["fit_confidence"] = 0.65
+                job["fit_reason"] = "fallback title match"
+                job["fit_source"] = "fallback"
+                job["decision_status"] = "recommended_apply"
                 fallback.append(job)
+            elif isinstance(job, dict):
+                job["fit_apply"] = False
+                job["fit_confidence"] = 0.0
+                job["fit_reason"] = "fallback filtered out"
+                job["fit_source"] = "fallback"
+                job["decision_status"] = "filtered_out"
         if fallback:
             return fallback[:2]
+        if jobs:
+            first = jobs[0]
+            if isinstance(first, dict):
+                first["fit_apply"] = True
+                first["fit_confidence"] = 0.55
+                first["fit_reason"] = "fallback single candidate"
+                first["fit_source"] = "fallback"
+                first["decision_status"] = "recommended_apply"
+            for job in jobs[1:]:
+                if isinstance(job, dict):
+                    job["fit_apply"] = False
+                    job["fit_confidence"] = 0.0
+                    job["fit_reason"] = "fallback filtered out"
+                    job["fit_source"] = "fallback"
+                    job["decision_status"] = "filtered_out"
         return jobs[:1]

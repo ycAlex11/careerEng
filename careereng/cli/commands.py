@@ -8,19 +8,15 @@ from typing import Any
 import typer
 import yaml
 
-from careereng.agent.channel_locator import ChannelLocator
-from careereng.agent.loop import AgentLoop
-from careereng.config.loader import load_auth, load_config
-from careereng.providers import create_provider
-from careereng.providers.base import ProviderError, StructuredOutputResult
 from careereng.storage.intent_store import IntentStore
 from careereng.storage.profile_store import ProfileStore
 from careereng.storage.router_store import RouterStore
-from careereng.storage.search_store import SearchStore
-from careereng.storage.site_store import SiteStore
-from careereng.tools.playwright_tools import PlaywrightTools
-from careereng.tools.site_tools import SiteTools
+from careereng.runtime import build_loop as runtime_build_loop
+from careereng.runtime import build_site_services as runtime_build_site_services
+from careereng.runtime import project_root_from_cwd, workspace_path as runtime_workspace_path
+from careereng.site_worker import serve_site_worker
 from careereng.utils import make_id
+from careereng.workspace_manager import dispatch_manager_message, serve_workspace_manager
 from careereng.workspace_bootstrap import bootstrap_workspace
 
 app = typer.Typer(help="CareerEng CLI")
@@ -34,90 +30,24 @@ app.add_typer(route_app, name="route")
 app.add_typer(site_app, name="site")
 
 
-class _FallbackProvider:
-    def __init__(self, error: str):
-        self.error = error
-
-    def chat(self, messages, *, model):
-        return f"Provider not configured: {self.error}"
-
-    def chat_json(self, messages, *, model, schema=None, schema_name="response", json_mode="auto"):
-        return StructuredOutputResult(
-            data={},
-            raw=f"Provider not configured: {self.error}",
-            mode="error",
-            used_fallback=True,
-        )
-
-
 def _project_root() -> Path:
-    cwd = Path.cwd()
-    if (cwd / "pyproject.toml").exists() and (cwd / "careereng").exists():
-        return cwd
-    return Path(__file__).resolve().parents[2]
+    return project_root_from_cwd()
 
 
 def _workspace_path() -> Path:
-    config = load_config(_project_root())
-    path = config.paths.workspace_path(_project_root())
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return runtime_workspace_path(_project_root())
 
 
-def _build_site_services() -> tuple[Path, Path, Any, SearchStore, SiteStore, SiteTools, ChannelLocator]:
+def _build_site_services() -> tuple[Path, Path, Any, Any, Any, Any, Any]:
     root = _project_root()
-    config = load_config(root)
-    workspace = config.paths.workspace_path(root)
-    workspace.mkdir(parents=True, exist_ok=True)
-    site_store = SiteStore(workspace)
-    search_store = SearchStore(workspace)
-    site_tools = SiteTools(
-        site_store,
-        PlaywrightTools(
-            headless=config.browser.headless,
-            timeout_ms=config.browser.timeout_ms,
-            slow_mo_ms=config.browser.slow_mo_ms,
-        ),
-    )
-    locator = ChannelLocator(site_tools=site_tools, search_store=search_store)
-    return root, workspace, config, search_store, site_store, site_tools, locator
+    workspace = _workspace_path()
+    return runtime_build_site_services(project_root=root, workspace=workspace)
 
 
-def _build_loop() -> tuple[AgentLoop, Any]:
+def _build_loop() -> tuple[Any, Any]:
     root = _project_root()
-    config = load_config(root)
-    auth = load_auth(root)
-    try:
-        _, provider = create_provider(config, auth)
-    except ProviderError as exc:
-        provider = _FallbackProvider(str(exc))
-
-    workspace = config.paths.workspace_path(root)
-    workspace.mkdir(parents=True, exist_ok=True)
-    site_store = SiteStore(workspace)
-    site_tools = SiteTools(
-        site_store,
-        PlaywrightTools(
-            headless=config.browser.headless,
-            timeout_ms=config.browser.timeout_ms,
-            slow_mo_ms=config.browser.slow_mo_ms,
-        ),
-    )
-    loop = AgentLoop(
-        project_root=root,
-        workspace=workspace,
-        provider=provider,
-        model=config.agent.default_model,
-        max_history_messages=config.agent.max_history_messages,
-        related_history_k=config.agent.related_history_k,
-        relatedness_threshold=config.agent.relatedness_threshold,
-        router_confidence_threshold=config.agent.router_confidence_threshold,
-        router_log_enabled=config.agent.router_log_enabled,
-        search_company_top_k=config.agent.search_company_top_k,
-        site_parallelism=config.agent.site_parallelism,
-        site_tools=site_tools,
-    )
-    return loop, config
+    workspace = _workspace_path()
+    return runtime_build_loop(project_root=root, workspace=workspace)
 
 
 @app.command()
@@ -141,9 +71,40 @@ def run(
     session: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
 ):
     """Run one chat turn."""
-    loop, _ = _build_loop()
-    reply = loop.process_message(session, message)
+    root = _project_root()
+    workspace = _workspace_path()
+    reply = dispatch_manager_message(project_root=root, workspace=workspace, session_id=session, message=message)
     typer.echo(reply)
+
+
+@app.command("manager-serve", hidden=True)
+def manager_serve(
+    project_root: str = typer.Option(..., "--project-root", help="Project root"),
+    workspace: str = typer.Option(..., "--workspace", help="Workspace path"),
+    socket_path: str = typer.Option(..., "--socket-path", help="Unix socket path"),
+):
+    """Run the hidden workspace manager server."""
+    serve_workspace_manager(
+        project_root=Path(project_root).expanduser().resolve(),
+        workspace=Path(workspace).expanduser().resolve(),
+        socket_path=Path(socket_path).expanduser(),
+    )
+
+
+@app.command("site-worker-serve", hidden=True)
+def site_worker_serve(
+    project_root: str = typer.Option(..., "--project-root", help="Project root"),
+    workspace: str = typer.Option(..., "--workspace", help="Workspace path"),
+    site_key: str = typer.Option(..., "--site-key", help="Site key"),
+    socket_path: str = typer.Option(..., "--socket-path", help="Unix socket path"),
+):
+    """Run the hidden per-site browser worker."""
+    serve_site_worker(
+        project_root=Path(project_root).expanduser().resolve(),
+        workspace=Path(workspace).expanduser().resolve(),
+        site_key=site_key.strip(),
+        socket_path=Path(socket_path).expanduser(),
+    )
 
 
 @site_app.command("add")

@@ -22,6 +22,7 @@ class AgentConfig:
 @dataclass
 class BrowserConfig:
     headless: bool = False
+    keep_open: bool = False
     timeout_ms: int = 45000
     slow_mo_ms: int = 0
 

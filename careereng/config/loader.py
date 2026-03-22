@@ -38,6 +38,7 @@ search_company_top_k = 10
 
 [browser]
 headless = false
+keep_open = false
 timeout_ms = 45000
 slow_mo_ms = 0
 

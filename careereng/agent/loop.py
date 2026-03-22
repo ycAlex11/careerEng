@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -11,22 +12,25 @@ from careereng.agent.channel_locator import ChannelLocator
 from careereng.agent.context import ContextBuilder
 from careereng.agent.extractor import CandidateExtractor
 from careereng.agent.fallbacks import default_search_spec, minimal_intent_candidate_from_persona
+from careereng.agent.job_flow import JobFlow
 from careereng.agent.profile_pipeline import ProfilePipeline
 from careereng.agent.relatedness import RelatednessEvaluator
-from careereng.agent.route_decider import RouteDecider
 from careereng.agent.response_templates import (
     format_company_index_pick_prompt,
     format_company_pick_prompt,
     format_site_result_text,
 )
+from careereng.agent.route_decider import RouteDecider
+from careereng.agent.router import detect_search_request, is_no, is_yes, parse_yes_no_reason
 from careereng.agent.search_flow import SearchFlow
 from careereng.agent.strategies import SearchStrategyEngine
-from careereng.agent.router import detect_search_request, is_no, is_yes, parse_yes_no_reason
 from careereng.providers.base import LLMProvider, ProviderError
 from careereng.session.manager import SessionManager
 from careereng.storage.application_store import ApplicationStore
 from careereng.storage.chat_store import ChatStore
+from careereng.storage.cv_store import CVStore
 from careereng.storage.intent_store import IntentStore
+from careereng.storage.job_store import JobStore
 from careereng.storage.profile_store import ProfileStore
 from careereng.storage.router_store import RouterStore
 from careereng.storage.run_store import RunStore
@@ -65,16 +69,16 @@ class AgentLoop:
         self.session_manager = SessionManager(workspace)
         self.chat_store = ChatStore(workspace)
         self.profile_store = ProfileStore(workspace)
+        self.cv_store = CVStore(workspace)
         self.intent_store = IntentStore(workspace)
         self.run_store = RunStore(workspace)
         self.router_store = RouterStore(workspace)
         self.search_store = SearchStore(workspace)
         self.application_store = ApplicationStore(workspace)
+        self.job_store = JobStore(workspace)
         self.site_tools = site_tools
-        self.channel_locator = ChannelLocator(
-            site_tools=self.site_tools,
-            search_store=self.search_store,
-        )
+        setattr(self.site_tools, "project_root", self.project_root)
+        self.channel_locator = ChannelLocator(site_tools=self.site_tools, search_store=self.search_store)
         self.search_flow = SearchFlow(
             site_tools=self.site_tools,
             save_state_fn=self._save_session_state,
@@ -105,6 +109,20 @@ class AgentLoop:
             profile_store=self.profile_store,
             intent_store=self.intent_store,
         )
+        self.job_flow = JobFlow(
+            project_root=self.project_root,
+            job_store=self.job_store,
+            application_store=self.application_store,
+            site_tools=self.site_tools,
+            search_strategy=self.search_strategy,
+            profile_store=self.profile_store,
+            cv_store=self.cv_store,
+            intent_store=self.intent_store,
+            site_parallelism=self.site_parallelism,
+        )
+
+    def close(self) -> None:
+        self.job_flow.close()
 
     def _provider_chat(self, messages: list[dict[str, Any]]) -> str:
         try:
@@ -125,10 +143,7 @@ class AgentLoop:
         root = self.project_root / "skills" / "search"
         if not root.exists():
             return ""
-        selected = [
-            root / "SKILL.md",
-            root / search_kind / "SKILL.md",
-        ]
+        selected = [root / "SKILL.md", root / search_kind / "SKILL.md"]
         parts: list[str] = []
         for path in selected:
             if not path.exists():
@@ -169,9 +184,6 @@ class AgentLoop:
         else:
             self.session_manager.clear_state(session_id)
 
-    def _default_search_spec(self, user_message: str, persona: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any]:
-        return default_search_spec(user_message, persona, intent)
-
     def _extract_search_spec(
         self,
         *,
@@ -187,22 +199,6 @@ class AgentLoop:
             search_skill_text=search_skill_text,
             default_builder=default_search_spec,
         )
-
-    def _summarize_google_company_candidates(
-        self,
-        *,
-        query_id: str,
-        search_spec: dict[str, Any],
-        all_web_items: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        return self.search_strategy.summarize_google_company_candidates(
-            query_id=query_id,
-            search_spec=search_spec,
-            all_web_items=all_web_items,
-        )
-
-    def _format_company_pick_prompt(self, pending: dict[str, Any]) -> str:
-        return format_company_pick_prompt(pending)
 
     def _run_site_searches_parallel(
         self,
@@ -231,48 +227,100 @@ class AgentLoop:
         results: list[dict[str, Any]] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(_job, row) for row in selected_companies]
-            for fu in concurrent.futures.as_completed(futures):
+            for future in concurrent.futures.as_completed(futures):
                 try:
-                    results.append(fu.result())
+                    results.append(future.result())
                 except Exception:
                     continue
-        results.sort(key=lambda r: str(r.get("company") or ""))
+        results.sort(key=lambda row: str(row.get("company") or ""))
         return results
 
     def _minimal_intent_candidate_from_persona(self, persona: dict[str, Any]) -> dict[str, Any]:
         return minimal_intent_candidate_from_persona(persona)
 
-    def _evaluate_jobs_for_apply(
-        self,
-        *,
-        site_name: str,
-        jobs: list[dict[str, Any]],
-        persona: dict[str, Any],
-        intent: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        chosen = self.search_strategy.evaluate_jobs_for_apply(
-            site_name=site_name,
-            jobs=jobs,
-            persona=persona,
-            intent=intent,
+    @staticmethod
+    def _parse_explicit_company_register_command(message: str) -> list[int] | None:
+        matched = re.fullmatch(
+            r"\s*(?:(?:请|麻烦请)\s*)?(?:帮我\s*)?注册公司\s*[:：]?\s*((?:\d+(?:[\s,，]+)?)+)\s*",
+            str(message or ""),
         )
-        chosen_ids = {str(j.get("job_id") or "") for j in chosen if isinstance(j, dict)}
-        for job in jobs:
-            if not isinstance(job, dict):
+        if not matched:
+            return None
+        return [int(item) for item in re.findall(r"\d+", matched.group(1))]
+
+    @staticmethod
+    def _is_naked_company_index_message(message: str) -> bool:
+        return bool(re.fullmatch(r"\s*\d+(?:[\s,，]+\d+)*\s*", str(message or "")))
+
+    def _handle_explicit_company_register_command(self, session_id: str, message: str, turn_id: str) -> str | None:
+        requested = self._parse_explicit_company_register_command(message)
+        if requested is None:
+            return None
+
+        snapshot = self.search_store.load_latest_company_snapshot(session_id)
+        candidates = self.search_store.load_company_snapshot_candidates(session_id)
+        if not candidates:
+            return "当前会话里没有最近一次的公司候选。请先重新搜索公司，再使用“注册公司 7”。"
+
+        max_idx = len(candidates)
+        picked: list[int] = []
+        invalid: list[int] = []
+        seen: set[int] = set()
+        for idx in requested:
+            if idx in seen:
                 continue
-            job_id = str(job.get("job_id") or "")
-            self.application_store.append_event(
-                "fit.evaluated",
-                {
-                    "site_name": site_name,
-                    "job_id": job_id,
-                    "title": job.get("title"),
-                    "confidence": 0.0,
-                    "apply": job_id in chosen_ids,
-                    "reason": "strategy_engine",
-                },
+            seen.add(idx)
+            if 1 <= idx <= max_idx:
+                picked.append(idx)
+            else:
+                invalid.append(idx)
+
+        if not picked:
+            return f"最近一次公司候选里没有这些序号。当前可用范围是 1-{max_idx}。"
+
+        candidate_map: dict[int, dict[str, Any]] = {}
+        for fallback_idx, row in enumerate(candidates, 1):
+            candidate_index = int(row.get("candidate_index") or fallback_idx)
+            candidate_map[candidate_index] = row
+
+        query_id = str(snapshot.get("query_id") or "")
+        selected_companies: list[dict[str, Any]] = []
+        for idx in picked:
+            row = candidate_map.get(idx)
+            if not isinstance(row, dict):
+                continue
+            selected_companies.append(row)
+            company = str(row.get("company") or "")
+            site_id = str(row.get("site_id") or safe_file_stem(company))
+            self.search_store.append_company_decision(
+                query_id=query_id,
+                session_id=session_id,
+                company=company,
+                site_id=site_id,
+                decision="yes",
+                reason_tag="explicit_register_command",
+                metadata={"candidate_index": idx},
             )
-        return chosen
+
+        if not selected_companies:
+            return f"最近一次公司候选里没有这些序号。当前可用范围是 1-{max_idx}。"
+
+        state = self.session_manager.get_state(session_id)
+        if not isinstance(state, dict):
+            state = {}
+        state.pop("pending_company_selection", None)
+        reply = self.search_flow.finalize_company_selection(
+            session_id=session_id,
+            turn_id=turn_id,
+            query_id=query_id,
+            selected_companies=selected_companies,
+            state=state,
+            run_site_searches_parallel=self._run_site_searches_parallel,
+        )
+        if invalid:
+            ignored = " ".join(str(item) for item in invalid)
+            return f"已忽略无效序号: {ignored}\n{reply}"
+        return reply
 
     def _handle_pending_company_selection(self, session_id: str, message: str, turn_id: str) -> str | None:
         state = self.session_manager.get_state(session_id)
@@ -280,7 +328,7 @@ class AgentLoop:
         if not isinstance(pending, dict):
             return None
         candidates = pending.get("candidates") if isinstance(pending.get("candidates"), list) else []
-        mode = str(pending.get("mode") or "sequential")
+        mode = str(pending.get("mode") or "indices")
         if mode == "indices":
             query_id = str(pending.get("query_id") or "")
             picked = self.search_flow.parse_company_indices(message, len(candidates))
@@ -356,180 +404,23 @@ class AgentLoop:
         if int(pending["index"]) < len(candidates):
             state["pending_company_selection"] = pending
             self._save_session_state(session_id, state)
-            return self._format_company_pick_prompt(pending)
+            return format_company_pick_prompt(pending)
 
-        # Finalize selection and run site searches.
         state.pop("pending_company_selection", None)
-        selected_companies = selected
         return self.search_flow.finalize_company_selection(
             session_id=session_id,
             turn_id=turn_id,
             query_id=str(pending.get("query_id") or ""),
-            selected_companies=selected_companies,
+            selected_companies=selected,
             state=state,
             run_site_searches_parallel=self._run_site_searches_parallel,
         )
-
-    def _handle_pending_company_apply(self, session_id: str, message: str, turn_id: str) -> str | None:
-        state = self.session_manager.get_state(session_id)
-        pending = state.get("pending_company_apply") if isinstance(state, dict) else None
-        if not isinstance(pending, dict):
-            return None
-        sites = pending.get("sites") if isinstance(pending.get("sites"), list) else []
-        idx = int(pending.get("index") or 0)
-        if idx >= len(sites):
-            state.pop("pending_company_apply", None)
-            self._save_session_state(session_id, state)
-            return None
-
-        decision, reason_text = parse_yes_no_reason(message)
-        if decision == "unknown":
-            return "请回复 y 或 n（公司级确认）。"
-
-        current = sites[idx]
-        company = str(current.get("company") or "")
-        site_id = str(current.get("site_id") or "")
-        jobs = current.get("jobs") if isinstance(current.get("jobs"), list) else []
-
-        applied_count = 0
-        skipped_count = 0
-        if decision == "yes":
-            if not bool(current.get("has_skill")):
-                reason = "missing_site_skill"
-                skipped_count = len(jobs)
-                self.application_store.append_event(
-                    "apply.batch_skipped",
-                    {"company": company, "site_id": site_id, "reason": reason},
-                )
-            else:
-                persona = self.profile_store.load_doc()
-                intent = self.intent_store.load_doc()
-                chosen = self._evaluate_jobs_for_apply(
-                    site_name=company or site_id,
-                    jobs=jobs,
-                    persona=persona,
-                    intent=intent,
-                )
-                chosen_ids = {str(j.get("job_id") or "") for j in chosen}
-                skipped_count = max(0, len(jobs) - len(chosen_ids))
-                result = self.site_tools.apply_now(site_id, chosen, session_id=session_id, turn_id=turn_id)
-                applied_rows = result.get("applied") if isinstance(result.get("applied"), list) else []
-                for row in applied_rows:
-                    submitted = bool(row.get("submitted"))
-                    if submitted:
-                        applied_count += 1
-                    payload = {
-                        "job_id": row.get("job_id") or "",
-                        "canonical_job_id": row.get("canonical_job_id") or "",
-                        "title": row.get("title") or "",
-                        "employer": row.get("employer") or company,
-                        "site_id": site_id,
-                        "discovery_site": row.get("discovery_site") or site_id,
-                        "submission_site": row.get("submission_site") or site_id,
-                        "decision_scope": "company",
-                        "auto_decision": "apply",
-                        "submitted": submitted,
-                        "submitted_at": row.get("ts") or "",
-                        "stage": "applied" if submitted else "apply_failed",
-                        "stage_updated_at": row.get("ts") or "",
-                        "error": row.get("detail", {}).get("error") if isinstance(row.get("detail"), dict) else "",
-                    }
-                    self.application_store.append_application(payload)
-                self.application_store.append_event(
-                    "apply.batch_finished",
-                    {
-                        "company": company,
-                        "site_id": site_id,
-                        "attempted_jobs": len(chosen),
-                        "submitted_jobs": applied_count,
-                        "skipped_jobs": skipped_count,
-                    },
-                )
-        else:
-            self.application_store.append_event(
-                "apply.batch_user_skipped",
-                {
-                    "company": company,
-                    "site_id": site_id,
-                    "reason": reason_text,
-                },
-            )
-            skipped_count = len(jobs)
-
-        pending["index"] = idx + 1
-        if int(pending["index"]) < len(sites):
-            state["pending_company_apply"] = pending
-            self._save_session_state(session_id, state)
-            nxt = sites[int(pending["index"])]
-            return (
-                f"{company} 处理完成：submitted={applied_count}, skipped={skipped_count}。\n"
-                f"是否对 {nxt.get('company')} 执行自动投递？（公司级）请回复 y/n。"
-            )
-
-        state.pop("pending_company_apply", None)
-        self._save_session_state(session_id, state)
-        return f"{company} 处理完成：submitted={applied_count}, skipped={skipped_count}。全部公司处理完毕。"
-
-    def _handle_pending_apply(self, session_id: str, message: str) -> str | None:
-        state = self.session_manager.get_state(session_id)
-        pending = state.get("pending_apply") if isinstance(state, dict) else None
-        if not isinstance(pending, dict):
-            return None
-
-        if is_yes(message):
-            site_id = str(pending.get("site_id") or "")
-            jobs = pending.get("jobs") or []
-            persona = self.profile_store.load_doc()
-            intent = self.intent_store.load_doc()
-            chosen = self._evaluate_jobs_for_apply(
-                site_name=site_id,
-                jobs=[j for j in jobs if isinstance(j, dict)],
-                persona=persona,
-                intent=intent,
-            )
-            result = self.site_tools.apply_now(site_id, chosen, session_id=session_id, turn_id=make_id("turn"))
-            applied_rows = result.get("applied") if isinstance(result.get("applied"), list) else []
-            submitted = 0
-            for row in applied_rows:
-                ok = bool(row.get("submitted"))
-                if ok:
-                    submitted += 1
-                self.application_store.append_application(
-                    {
-                        "job_id": row.get("job_id") or "",
-                        "canonical_job_id": row.get("canonical_job_id") or "",
-                        "title": row.get("title") or "",
-                        "employer": row.get("employer") or "",
-                        "site_id": site_id,
-                        "discovery_site": row.get("discovery_site") or site_id,
-                        "submission_site": row.get("submission_site") or site_id,
-                        "decision_scope": "company",
-                        "auto_decision": "apply",
-                        "submitted": ok,
-                        "stage": "applied" if ok else "apply_failed",
-                        "stage_updated_at": row.get("ts") or "",
-                        "error": row.get("detail", {}).get("error") if isinstance(row.get("detail"), dict) else "",
-                    }
-                )
-            state.pop("pending_apply", None)
-            self._save_session_state(session_id, state)
-            if result.get("ok"):
-                return f"已执行投递流程，尝试 {len(applied_rows)} 条，成功提交 {submitted} 条。"
-            return f"投递失败：{result.get('error') or 'unknown'}"
-
-        if is_no(message):
-            state.pop("pending_apply", None)
-            self._save_session_state(session_id, state)
-            return "已取消本次投递。"
-
-        return None
 
     def _handle_pending_intent_confirmation(self, session_id: str, message: str) -> str | None:
         state = self.session_manager.get_state(session_id)
         pending = state.get("pending_intent_patch") if isinstance(state, dict) else None
         if not isinstance(pending, dict):
             return None
-
         patch = pending.get("patch")
         if not isinstance(patch, dict) or not patch:
             state.pop("pending_intent_patch", None)
@@ -553,6 +444,52 @@ class AgentLoop:
             return "已保留 intent 候选，不写入文档。"
 
         return None
+
+    def _handle_pending_route_confirmation(self, session_id: str, message: str, turn_id: str) -> str | None:
+        state = self.session_manager.get_state(session_id)
+        pending = state.get("pending_route_confirmation") if isinstance(state, dict) else None
+        if not isinstance(pending, dict):
+            return None
+        route_event_id = str(pending.get("route_event_id") or "")
+
+        if is_yes(message):
+            if route_event_id:
+                self.router_store.append_feedback(
+                    {
+                        "route_event_id": route_event_id,
+                        "session_id": session_id,
+                        "decision": "yes",
+                        "message": message,
+                    }
+                )
+            route = str(pending.get("route") or "chat")
+            params = pending.get("params") if isinstance(pending.get("params"), dict) else {}
+            original_message = str(pending.get("original_message") or message)
+            state.pop("pending_route_confirmation", None)
+            self._save_session_state(session_id, state)
+            return self._execute_route(
+                session_id=session_id,
+                turn_id=turn_id,
+                route=route,
+                params=params,
+                original_message=original_message,
+            )
+
+        if is_no(message):
+            if route_event_id:
+                self.router_store.append_feedback(
+                    {
+                        "route_event_id": route_event_id,
+                        "session_id": session_id,
+                        "decision": "no",
+                        "message": message,
+                    }
+                )
+            state.pop("pending_route_confirmation", None)
+            self._save_session_state(session_id, state)
+            return "已取消这次自动执行。"
+
+        return "请回复 y/n 来确认是否执行这条链路。"
 
     def _record_turn(
         self,
@@ -594,11 +531,12 @@ class AgentLoop:
         intent = self.intent_store.load_doc()
         search_skill_text = self._load_search_skill_text()
         user_job_skill_text = self._load_user_job_skill_text()
+        merged_skill = (search_skill_text + "\n\n" + user_job_skill_text).strip()
         spec = self._extract_search_spec(
             user_message=message,
             persona=persona,
             intent=intent,
-            search_skill_text=(search_skill_text + "\n\n" + user_job_skill_text).strip(),
+            search_skill_text=merged_skill,
         )
         query = self.search_store.start_query(
             session_id=session_id,
@@ -610,7 +548,7 @@ class AgentLoop:
         candidates = self.search_strategy.generate_company_candidates(
             user_message=message,
             intent=intent,
-            job_skill_text=(search_skill_text + "\n\n" + user_job_skill_text).strip(),
+            job_skill_text=merged_skill,
             top_k=self.search_company_top_k,
             query_id=query_id,
         )
@@ -618,46 +556,81 @@ class AgentLoop:
         if not candidates:
             return "未生成具体公司候选。请补充岗位方向或调整 job skill 后重试。"
 
+        snapshot = self.search_store.save_company_snapshot(
+            session_id=session_id,
+            query_id=query_id,
+            turn_id=turn_id,
+            user_message=message,
+            candidates=candidates,
+        )
+        snapshot_candidates = snapshot.get("candidates") if isinstance(snapshot.get("candidates"), list) else candidates
         state = self.session_manager.get_state(session_id)
         state["pending_company_selection"] = {
             "query_id": query_id,
-            "candidates": candidates,
+            "candidates": snapshot_candidates,
             "mode": "indices",
         }
         self._save_session_state(session_id, state)
         lines = [
-            f"已生成 {len(candidates)} 个公司候选（基于 intent + search skill + job skill）。",
-            format_company_index_pick_prompt(candidates),
+            f"已生成 {len(snapshot_candidates)} 个公司候选（基于 intent + search skill + job skill）。",
+            format_company_index_pick_prompt(snapshot_candidates),
         ]
         return "\n".join(lines)
+
+    def _handle_jobs_batch_request(self, session_id: str, message: str, turn_id: str, apply_requested: bool) -> str:
+        return self.job_flow.start_batch(
+            session_id=session_id,
+            turn_id=turn_id,
+            user_message=message,
+            apply_requested=apply_requested,
+        )
 
     def _interrupt_search_pending_if_needed(self, session_id: str, message: str) -> None:
         state = self.session_manager.get_state(session_id)
         if not isinstance(state, dict) or not state:
             return
-        has_search_pending = any(key in state for key in ("pending_company_selection", "pending_company_apply", "pending_apply"))
-        if not has_search_pending:
+        if "pending_company_selection" not in state:
             return
         if not bool(detect_search_request(message).get("is_search_flow")):
             return
-        changed = False
-        for key in ("pending_company_selection", "pending_company_apply", "pending_apply"):
-            if key in state:
-                state.pop(key, None)
-                changed = True
-        if changed:
-            self._save_session_state(session_id, state)
+        state.pop("pending_company_selection", None)
+        self._save_session_state(session_id, state)
+
+    def _execute_route(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        route: str,
+        params: dict[str, Any],
+        original_message: str,
+    ) -> str:
+        if route == "search":
+            return self._handle_search_request(session_id, original_message, turn_id)
+        if route == "jobs_batch":
+            return self._handle_jobs_batch_request(
+                session_id,
+                original_message,
+                turn_id,
+                apply_requested=bool(params.get("apply_requested")),
+            )
+        return ""
 
     def process_message(self, session_id: str, message: str) -> str:
         turn_id = make_id("turn")
         self._interrupt_search_pending_if_needed(session_id, message)
-        pending_reply = self._handle_pending_apply(session_id, message)
+
+        pending_reply = self._handle_pending_route_confirmation(session_id, message, turn_id)
+        if pending_reply is None:
+            pending_reply = self.job_flow.handle_resume_message(session_id=session_id, message=message, turn_id=turn_id)
         if pending_reply is None:
             pending_reply = self._handle_pending_intent_confirmation(session_id, message)
         if pending_reply is None:
             pending_reply = self._handle_pending_company_selection(session_id, message, turn_id)
         if pending_reply is None:
-            pending_reply = self._handle_pending_company_apply(session_id, message, turn_id)
+            pending_reply = self._handle_explicit_company_register_command(session_id, message, turn_id)
+        if pending_reply is None and self._is_naked_company_index_message(message):
+            pending_reply = "当前没有待选择的公司候选。请先重新搜索公司，或使用“注册公司 7”。"
         if pending_reply is not None:
             self._record_turn(
                 session_id=session_id,
@@ -688,16 +661,30 @@ class AgentLoop:
                     "fallback_params": route_decision.get("fallback", {}).get("params", {}),
                     "fallback_used": bool(route_decision.get("fallback_used")),
                     "threshold": route_decision.get("threshold", 0.0),
+                    "confirm_threshold": route_decision.get("confirm_threshold", 0.0),
                     "decision_source": route_decision.get("decision_source", ""),
                     "final_route": route_decision.get("final_route", ""),
                     "final_params": route_decision.get("final_params", {}),
+                    "final_confidence": route_decision.get("final_confidence", 0.0),
+                    "confidence_band": route_decision.get("confidence_band", "low"),
+                    "requires_confirmation": bool(route_decision.get("requires_confirmation")),
                 }
             )
             route_event_id = str(event.get("route_event_id") or "")
 
         final_route = str(route_decision.get("final_route") or "chat")
-        if final_route == "search":
-            reply = self._handle_search_request(session_id, message, turn_id)
+        final_params = route_decision.get("final_params") if isinstance(route_decision.get("final_params"), dict) else {}
+
+        if bool(route_decision.get("requires_confirmation")) and final_route != "chat":
+            state = self.session_manager.get_state(session_id)
+            state["pending_route_confirmation"] = {
+                "route": final_route,
+                "params": final_params,
+                "original_message": message,
+                "route_event_id": route_event_id,
+            }
+            self._save_session_state(session_id, state)
+            reply = f"我判断你想走 `{final_route}` 链路，但当前置信度中等。是否执行？请回复 y/n。"
             self._record_turn(
                 session_id=session_id,
                 turn_id=turn_id,
@@ -705,11 +692,36 @@ class AgentLoop:
                 assistant_message=reply,
                 relatedness=None,
                 extra_run={
-                    "search_flow": True,
                     "route_event_id": route_event_id,
                     "route_source": route_decision.get("decision_source", ""),
-                    "route_confidence": route_decision.get("llm", {}).get("confidence", 0.0),
+                    "route_confidence": route_decision.get("final_confidence", 0.0),
                     "route_fallback_used": bool(route_decision.get("fallback_used")),
+                    "requires_confirmation": True,
+                    "final_route": final_route,
+                },
+            )
+            return reply
+
+        if final_route in {"search", "jobs_batch"}:
+            reply = self._execute_route(
+                session_id=session_id,
+                turn_id=turn_id,
+                route=final_route,
+                params=final_params,
+                original_message=message,
+            )
+            self._record_turn(
+                session_id=session_id,
+                turn_id=turn_id,
+                user_message=message,
+                assistant_message=reply,
+                relatedness=None,
+                extra_run={
+                    "route_event_id": route_event_id,
+                    "route_source": route_decision.get("decision_source", ""),
+                    "route_confidence": route_decision.get("final_confidence", 0.0),
+                    "route_fallback_used": bool(route_decision.get("fallback_used")),
+                    "final_route": final_route,
                 },
             )
             return reply
@@ -721,7 +733,6 @@ class AgentLoop:
             persona=persona,
             intent=intent,
         )
-
         session_history = self.session_manager.get_recent_messages(session_id, limit=self.max_history_messages)
         profile_hist = self.chat_store.recent_related(session_id, "profile", self.related_history_k)
         intent_hist = self.chat_store.recent_related(session_id, "intent", self.related_history_k)
@@ -744,12 +755,11 @@ class AgentLoop:
             "apply_requested": False,
         }
         if final_route == "site":
-            params = route_decision.get("final_params") if isinstance(route_decision.get("final_params"), dict) else {}
             req = {
                 "is_site_flow": True,
-                "company": str(params.get("company") or "target-site"),
-                "base_url": str(params.get("base_url") or ""),
-                "apply_requested": bool(params.get("apply_requested")),
+                "company": str(final_params.get("company") or "target-site"),
+                "base_url": str(final_params.get("base_url") or ""),
+                "apply_requested": bool(final_params.get("apply_requested")),
             }
             site_result = self.site_tools.handle_site_request(
                 site_name=str(req.get("company") or "target-site"),
@@ -759,7 +769,7 @@ class AgentLoop:
                 turn_id=turn_id,
                 source_type="site_request",
             )
-            site_hint = self._format_site_result(site_result, session_id)
+            site_hint = self._format_site_result(site_result)
 
         message_id = make_id("msg")
         pipeline_info = self.pipeline.process_message(
@@ -775,8 +785,9 @@ class AgentLoop:
 
         reports = pipeline_info.get("new_reports") or []
         if reports:
-            ids = ", ".join(str(r.get("id")) for r in reports)
+            ids = ", ".join(str(row.get("id")) for row in reports)
             final_reply += f"\n\n检测到新报告已生成：{ids}。请运行 `careereng report review --id <report_id>` 进行审核。"
+
         self._record_turn(
             session_id=session_id,
             turn_id=turn_id,
@@ -787,17 +798,18 @@ class AgentLoop:
                 "site_flow": bool(req.get("is_site_flow")),
                 "route_event_id": route_event_id,
                 "route_source": route_decision.get("decision_source", ""),
-                "route_confidence": route_decision.get("llm", {}).get("confidence", 0.0),
+                "route_confidence": route_decision.get("final_confidence", 0.0),
                 "route_fallback_used": bool(route_decision.get("fallback_used")),
                 "final_route": final_route,
             },
         )
         return final_reply
 
-    def _format_site_result(self, site_result: dict[str, Any], session_id: str) -> str:
+    def _format_site_result(self, site_result: dict[str, Any]) -> str:
         return format_site_result_text(site_result)
 
     def process_resume_upload(self, session_id: str, text: str, source_name: str) -> str:
+        cv_sync = self.cv_store.save_upload(text, source_name)
         skill_text = self._load_resume_skill_text()
         profile_patch = self.extractor.extract_profile_patch(
             self.provider,
@@ -885,6 +897,7 @@ class AgentLoop:
             return "未从简历中提取到可更新字段。"
 
         lines: list[str] = []
+        lines.append(f"已同步当前简历到 {cv_sync.get('current_path')}。")
         if skill_text.strip():
             lines.append("已加载 skills/resume-sync/SKILL.md 进行简历解析。")
         if profile_patch:
