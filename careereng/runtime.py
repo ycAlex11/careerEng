@@ -12,7 +12,6 @@ from careereng.providers import create_provider
 from careereng.providers.base import ProviderError, StructuredOutputResult
 from careereng.storage.search_store import SearchStore
 from careereng.storage.site_store import SiteStore
-from careereng.tools.playwright_tools import PlaywrightTools
 from careereng.tools.site_tools import SiteTools
 
 
@@ -56,15 +55,7 @@ def build_site_services(
     resolved_workspace.mkdir(parents=True, exist_ok=True)
     site_store = SiteStore(resolved_workspace)
     search_store = SearchStore(resolved_workspace)
-    site_tools = SiteTools(
-        site_store,
-        PlaywrightTools(
-            headless=config.browser.headless,
-            keep_open=config.browser.keep_open,
-            timeout_ms=config.browser.timeout_ms,
-            slow_mo_ms=config.browser.slow_mo_ms,
-        ),
-    )
+    site_tools = SiteTools(site_store)
     site_tools.project_root = project_root
     locator = ChannelLocator(site_tools=site_tools, search_store=search_store)
     return project_root, resolved_workspace, config, search_store, site_store, site_tools, locator
@@ -81,15 +72,7 @@ def build_loop(*, project_root: Path, workspace: Path | None = None) -> tuple[Ag
     resolved_workspace = workspace or config.paths.workspace_path(project_root)
     resolved_workspace.mkdir(parents=True, exist_ok=True)
     site_store = SiteStore(resolved_workspace)
-    site_tools = SiteTools(
-        site_store,
-        PlaywrightTools(
-            headless=config.browser.headless,
-            keep_open=config.browser.keep_open,
-            timeout_ms=config.browser.timeout_ms,
-            slow_mo_ms=config.browser.slow_mo_ms,
-        ),
-    )
+    site_tools = SiteTools(site_store)
     site_tools.project_root = project_root
     loop = AgentLoop(
         project_root=project_root,

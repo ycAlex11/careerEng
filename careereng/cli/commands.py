@@ -14,7 +14,6 @@ from careereng.storage.router_store import RouterStore
 from careereng.runtime import build_loop as runtime_build_loop
 from careereng.runtime import build_site_services as runtime_build_site_services
 from careereng.runtime import project_root_from_cwd, workspace_path as runtime_workspace_path
-from careereng.site_worker import serve_site_worker
 from careereng.utils import make_id
 from careereng.workspace_manager import dispatch_manager_message, serve_workspace_manager
 from careereng.workspace_bootstrap import bootstrap_workspace
@@ -87,22 +86,6 @@ def manager_serve(
     serve_workspace_manager(
         project_root=Path(project_root).expanduser().resolve(),
         workspace=Path(workspace).expanduser().resolve(),
-        socket_path=Path(socket_path).expanduser(),
-    )
-
-
-@app.command("site-worker-serve", hidden=True)
-def site_worker_serve(
-    project_root: str = typer.Option(..., "--project-root", help="Project root"),
-    workspace: str = typer.Option(..., "--workspace", help="Workspace path"),
-    site_key: str = typer.Option(..., "--site-key", help="Site key"),
-    socket_path: str = typer.Option(..., "--socket-path", help="Unix socket path"),
-):
-    """Run the hidden per-site browser worker."""
-    serve_site_worker(
-        project_root=Path(project_root).expanduser().resolve(),
-        workspace=Path(workspace).expanduser().resolve(),
-        site_key=site_key.strip(),
         socket_path=Path(socket_path).expanduser(),
     )
 
