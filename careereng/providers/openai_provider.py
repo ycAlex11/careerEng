@@ -10,6 +10,9 @@ import httpx
 from careereng.providers.base import LLMProvider, ProviderError, StructuredOutputResult
 
 
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 180.0
+
+
 class OpenAICompatibleProvider(LLMProvider):
     def __init__(self, *, api_key: str, api_base: str, structured_output_mode: str = "auto"):
         self.api_key = api_key
@@ -31,7 +34,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 f"{self.api_base}/chat/completions",
                 json=payload,
                 headers=self._headers(),
-                timeout=60,
+                timeout=DEFAULT_PROVIDER_TIMEOUT_SECONDS,
             )
         except Exception as exc:
             raise ProviderError(f"provider request failed: {exc}") from exc

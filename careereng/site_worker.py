@@ -18,6 +18,9 @@ from careereng.storage.site_store import SiteStore
 from careereng.tools.playwright_tools import PlaywrightSessionOpenError, PlaywrightTools
 
 
+DEFAULT_SITE_WORKER_REQUEST_TIMEOUT_SECONDS = 600.0
+
+
 def site_worker_socket_path(workspace: Path, site_key: str) -> Path:
     digest = hashlib.sha1(f"{workspace.resolve()}::{site_key}".encode("utf-8")).hexdigest()[:16]
     return Path(tempfile.gettempdir()) / f"careereng-site-worker-{digest}.sock"
@@ -266,7 +269,7 @@ class RemoteRunSession:
     def __init__(self, *, socket_path: Path):
         self.socket_path = Path(socket_path)
 
-    def _request(self, payload: dict[str, Any], *, timeout: float = 120.0) -> dict[str, Any]:
+    def _request(self, payload: dict[str, Any], *, timeout: float = DEFAULT_SITE_WORKER_REQUEST_TIMEOUT_SECONDS) -> dict[str, Any]:
         return _send_request(self.socket_path, payload, timeout=timeout)
 
     def is_alive(self) -> bool:
@@ -327,7 +330,7 @@ def open_remote_site_session(
             "target_url": str(target_url or ""),
             "headless": headless,
         },
-        timeout=120.0,
+        timeout=DEFAULT_SITE_WORKER_REQUEST_TIMEOUT_SECONDS,
     )
     if not bool(response.get("ok")):
         return {

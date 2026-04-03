@@ -159,9 +159,12 @@ class RouteDecider:
 
         site = detect_site_request(message)
         if site.get("is_site_flow"):
+            site_confidence = 0.62
+            if bool(site.get("explicit_site")):
+                site_confidence = 0.84
             return {
                 "route": "site",
-                "confidence": 0.84,
+                "confidence": site_confidence,
                 "reason_tag": "fallback.site_keyword",
                 "params": {
                     "company": str(site.get("company") or ""),

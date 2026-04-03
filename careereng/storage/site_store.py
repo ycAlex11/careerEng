@@ -96,6 +96,12 @@ class SiteStore:
             "current_job_id": "",
             "current_job_url": "",
             "visible_mode": "headless",
+            "current_step_id": "",
+            "current_step_attempt": 0,
+            "current_step_status": "",
+            "expected_outcome": "",
+            "last_step_error": "",
+            "current_trace_ref": "",
         }
 
     def browser_profile_dir(self, site_id: str) -> Path:
@@ -185,6 +191,34 @@ class SiteStore:
         needle = {value for value in needle if value}
         for idx, row in enumerate(rows):
             if self._registry_row_key_set(row) & needle:
+                return idx
+        return None
+
+    def _url_host_key(self, url: str) -> str:
+        normalized = self._normalize_url(url)
+        if not normalized:
+            return ""
+        try:
+            parsed = urlparse(normalized)
+        except Exception:
+            return ""
+        host = (parsed.netloc or "").strip().lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+
+    def _find_registry_row_index_by_base_url(self, rows: list[dict[str, Any]], base_url: str) -> int | None:
+        normalized_target = self._normalize_url(base_url)
+        if not normalized_target:
+            return None
+        target_host = self._url_host_key(normalized_target)
+        for idx, row in enumerate(rows):
+            row_url = self._normalize_url(str(row.get("base_url") or ""))
+            if not row_url:
+                continue
+            if row_url == normalized_target:
+                return idx
+            if target_host and self._url_host_key(row_url) == target_host:
                 return idx
         return None
 
@@ -398,6 +432,7 @@ class SiteStore:
         raw_name = self._normalize_company_name(site)
         canonical_company = raw_name
         site_key = safe_file_stem(canonical_company)
+        normalized_base_url = self._normalize_url(base_url)
         now = now_iso()
         idx = self._find_registry_row_index(
             rows,
@@ -405,6 +440,8 @@ class SiteStore:
             canonical_company=canonical_company,
             site_key=site_key,
         )
+        if idx is None and normalized_base_url:
+            idx = self._find_registry_row_index_by_base_url(rows, normalized_base_url)
         existing_row = rows[idx] if idx is not None else {}
         registry_id = str(existing_row.get("registry_id") or make_id("site"))
         registered_at = str(existing_row.get("registered_at") or now)
@@ -413,7 +450,7 @@ class SiteStore:
         root = self.site_dir(site_key)
         self._ensure_site_tree(root)
         current = read_json(root / "site.json")
-        resolved_base_url = self._normalize_url(base_url) or self._normalize_url(str(current.get("base_url") or existing_row.get("base_url") or ""))
+        resolved_base_url = normalized_base_url or self._normalize_url(str(current.get("base_url") or existing_row.get("base_url") or ""))
         resolved_source_type = str(source_type or current.get("source_type") or existing_row.get("source_type") or "manual")
         created_at = str(current.get("created_at") or registered_at or now)
         payload = self._build_site_payload(
@@ -556,6 +593,13 @@ class SiteStore:
                 "payload": payload,
             }
         )
+
+    def append_step_trace(self, site_id: str, turn_id: str, payload: dict[str, Any]) -> str:
+        trace_dir = self.site_dir(site_id) / "events" / "traces"
+        ensure_dir(trace_dir)
+        trace_path = trace_dir / f"{turn_id}.jsonl"
+        JSONLStore(trace_path).append({"ts": now_iso(), **(payload or {})})
+        return str(trace_path.relative_to(self.workspace))
 
     def append_jobs(self, site_id: str, jobs: list[dict[str, Any]], session_id: str, turn_id: str) -> list[dict[str, Any]]:
         root = self.site_dir(site_id)

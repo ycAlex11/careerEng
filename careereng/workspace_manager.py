@@ -18,6 +18,9 @@ from typing import Any
 from careereng.runtime import build_loop
 
 
+DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS = 600.0
+
+
 def manager_socket_path(workspace: Path) -> Path:
     digest = hashlib.sha1(str(workspace.resolve()).encode("utf-8")).hexdigest()[:16]
     return Path(tempfile.gettempdir()) / f"careereng-manager-{digest}.sock"
@@ -172,7 +175,7 @@ def dispatch_manager_message(*, project_root: Path, workspace: Path, session_id:
             "session_id": session_id,
             "message": message,
         },
-        timeout=120.0,
+        timeout=DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS,
     )
     if not bool(response.get("ok")):
         raise RuntimeError(str(response.get("error") or "workspace manager request failed"))

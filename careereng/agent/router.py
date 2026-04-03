@@ -20,20 +20,33 @@ def detect_site_request(text: str) -> dict:
     lowered = raw.lower()
     has_url = bool(re.search(r"https?://[^\s]+", raw))
     apply_requested = ("投递" in raw) or ("apply" in lowered)
+    generic_company_search_patterns = (
+        r"适合.*公司",
+        r"推荐.*公司",
+        r"搜索.*公司",
+        r"检索.*公司",
+        r"找.*公司",
+        r"top\s*-?\s*10.*公司",
+        r"罗列.*公司",
+        r"列出.*公司",
+    )
+    if any(re.search(pattern, raw, flags=re.I) for pattern in generic_company_search_patterns):
+        return {"is_site_flow": False, "apply_requested": False, "company": "", "base_url": "", "explicit_site": False}
 
-    site_keywords = ["公司", "官网", "网站", "career", "careers", "workday", "linkedin", "greenhouse", "lever"]
-    trigger = apply_requested or has_url or any(k in raw or k in lowered for k in site_keywords)
+    site_keywords = ["官网", "网站", "career", "careers", "workday", "linkedin", "greenhouse", "lever"]
+    explicit_site = has_url or apply_requested or any(k in raw or k in lowered for k in site_keywords)
+    trigger = explicit_site
     if not trigger:
-        return {"is_site_flow": False, "apply_requested": False, "company": "", "base_url": ""}
+        return {"is_site_flow": False, "apply_requested": False, "company": "", "base_url": "", "explicit_site": False}
 
-    m = re.search(r"(?:检索投递|投递|检索)\s*([\w一-鿿\- ]+?)(?:公司|官网|网站|careers?|jobs?|$)", raw, flags=re.I)
+    m = re.search(r"(?:检索投递|投递|申请|apply(?:\s+to)?)\s*([\w一-鿿&/.\- ]+?)(?:公司|官网|网站|careers?|jobs?|岗位|职位|$)", raw, flags=re.I)
     company = m.group(1).strip() if m else ""
 
     if not company:
-        m2 = re.search(r"([\w一-鿿\- ]+?)\s*(?:公司|careers|jobs)", raw, flags=re.I)
+        m2 = re.search(r"([\w一-鿿&/.\- ]+?)\s*(?:官网|网站|careers?|career page|workday|greenhouse|lever|linkedin(?:\s+jobs?)?)", raw, flags=re.I)
         company = m2.group(1).strip() if m2 else ""
 
-    if not company and (apply_requested or has_url):
+    if not company and has_url:
         company = "target-site"
 
     base_url = ""
@@ -42,13 +55,14 @@ def detect_site_request(text: str) -> dict:
         base_url = url_match.group(0)
 
     if not company and not base_url:
-        return {"is_site_flow": False, "apply_requested": False, "company": "", "base_url": ""}
+        return {"is_site_flow": False, "apply_requested": False, "company": "", "base_url": "", "explicit_site": False}
 
     return {
         "is_site_flow": True,
         "apply_requested": apply_requested,
         "company": company,
         "base_url": base_url,
+        "explicit_site": explicit_site,
     }
 
 
@@ -125,6 +139,13 @@ def detect_search_request(text: str) -> dict:
         "求职",
         "推荐一些公司",
         "推荐公司",
+        "适合我的公司",
+        "搜索公司",
+        "检索公司",
+        "找公司",
+        "公司推荐",
+        "罗列公司",
+        "列出公司",
         "适合我的岗位",
         "适合我的工作",
     ]
@@ -136,7 +157,19 @@ def detect_search_request(text: str) -> dict:
     if any(v in raw for v in zh_search_verbs) and any(t in raw for t in zh_job_terms):
         return {"is_search_flow": True, "query": raw}
 
+    if any(v in raw for v in zh_search_verbs) and "公司" in raw:
+        return {"is_search_flow": True, "query": raw}
+
     if "推荐" in raw and "公司" in raw:
+        return {"is_search_flow": True, "query": raw}
+
+    if "适合" in raw and "公司" in raw:
+        return {"is_search_flow": True, "query": raw}
+
+    if any(term in lowered for term in ("top 10", "top10", "top-10")) and "公司" in raw:
+        return {"is_search_flow": True, "query": raw}
+
+    if any(term in raw for term in ("罗列", "列出")) and "公司" in raw:
         return {"is_search_flow": True, "query": raw}
 
     if "适合" in raw and any(t in raw for t in zh_job_terms):

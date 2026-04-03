@@ -614,6 +614,16 @@ class AgentLoop:
                 turn_id,
                 apply_requested=bool(params.get("apply_requested")),
             )
+        if route == "site":
+            site_result = self.site_tools.handle_site_request(
+                site_name=str(params.get("company") or "target-site"),
+                base_url=str(params.get("base_url") or ""),
+                apply_requested=bool(params.get("apply_requested")),
+                session_id=session_id,
+                turn_id=turn_id,
+                source_type="site_request",
+            )
+            return self._format_site_result(site_result)
         return ""
 
     def process_message(self, session_id: str, message: str) -> str:
@@ -675,7 +685,7 @@ class AgentLoop:
         final_route = str(route_decision.get("final_route") or "chat")
         final_params = route_decision.get("final_params") if isinstance(route_decision.get("final_params"), dict) else {}
 
-        if bool(route_decision.get("requires_confirmation")) and final_route != "chat":
+        if final_route == "site" or (bool(route_decision.get("requires_confirmation")) and final_route != "chat"):
             state = self.session_manager.get_state(session_id)
             state["pending_route_confirmation"] = {
                 "route": final_route,
@@ -684,7 +694,11 @@ class AgentLoop:
                 "route_event_id": route_event_id,
             }
             self._save_session_state(session_id, state)
-            reply = f"我判断你想走 `{final_route}` 链路，但当前置信度中等。是否执行？请回复 y/n。"
+            if final_route == "site":
+                target = str(final_params.get("company") or final_params.get("base_url") or "target-site")
+                reply = f"我识别到你可能想把 `{target}` 当作站点处理。确认后才会写入 sites。是否继续？请回复 y/n。"
+            else:
+                reply = f"我判断你想走 `{final_route}` 链路，但当前置信度中等。是否执行？请回复 y/n。"
             self._record_turn(
                 session_id=session_id,
                 turn_id=turn_id,
