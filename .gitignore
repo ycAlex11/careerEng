@@ -30,3 +30,4 @@ htmlcov/
 
 # Temporary choice for initial push
 tests/
+teststh.py

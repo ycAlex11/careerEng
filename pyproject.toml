@@ -7,6 +7,7 @@ authors = [{name = "careereng contributors"}]
 dependencies = [
   "typer>=0.12.0",
   "httpx>=0.27.0",
+  "mcp>=1.27.0",
   "pyyaml>=6.0.1",
 ]
 

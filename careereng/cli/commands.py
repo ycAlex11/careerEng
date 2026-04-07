@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
 import typer
 import yaml
-
+from careereng.storage.job_store import JobStore
+from careereng.storage.jsonl import JSONLStore
 from careereng.storage.intent_store import IntentStore
 from careereng.storage.profile_store import ProfileStore
 from careereng.storage.router_store import RouterStore
 from careereng.runtime import build_loop as runtime_build_loop
 from careereng.runtime import build_site_services as runtime_build_site_services
 from careereng.runtime import project_root_from_cwd, workspace_path as runtime_workspace_path
-from careereng.utils import make_id
+from careereng.utils import make_id, safe_file_stem
 from careereng.workspace_manager import dispatch_manager_message, serve_workspace_manager
 from careereng.workspace_bootstrap import bootstrap_workspace
 
@@ -49,6 +51,87 @@ def _build_loop() -> tuple[Any, Any]:
     return runtime_build_loop(project_root=root, workspace=workspace)
 
 
+def _job_store() -> JobStore:
+    return JobStore(_workspace_path())
+
+
+_PHASE_EVENT_LABELS = {
+    "browser.phase.done": "done",
+    "browser.phase.blocked": "blocked",
+    "browser.phase.failed": "failed",
+}
+
+
+def _site_events_path(workspace: Path, site_key: str) -> Path:
+    return workspace / "sites" / safe_file_stem(site_key) / "events" / "all.jsonl"
+
+
+def _format_phase_progress_line(site_key: str, event: dict[str, Any]) -> str:
+    name = str(event.get("name") or "")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    status = _PHASE_EVENT_LABELS.get(name, name)
+    phase = str(payload.get("phase") or "").strip()
+    line = f"{site_key} {status}"
+    if phase:
+        line += f" {phase}"
+    return line
+
+
+def _emit_phase_progress(
+    *,
+    workspace: Path,
+    session_id: str,
+    baseline_batch_ids: set[str],
+    state: dict[str, Any],
+) -> None:
+    job_store = JobStore(workspace)
+    batch_id = str(state.get("batch_id") or "")
+    if not batch_id:
+        for row in job_store.list_batches(session_id=session_id, include_terminal=True):
+            candidate = str(row.get("batch_id") or "")
+            if candidate and candidate not in baseline_batch_ids:
+                state["batch_id"] = candidate
+                state["turn_id"] = str(row.get("turn_id") or "")
+                batch_id = candidate
+                break
+    if not batch_id:
+        return
+    batch = job_store.load_batch(batch_id)
+    turn_id = str(state.get("turn_id") or batch.get("turn_id") or "")
+    if turn_id:
+        state["turn_id"] = turn_id
+    sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+    seen = state.setdefault("seen_phase_events", set())
+    pending: list[tuple[str, str, tuple[str, str, str, str, str]]] = []
+    for site_key in sorted(sites.keys()):
+        events_path = _site_events_path(workspace, site_key)
+        if not events_path.exists():
+            continue
+        for event in JSONLStore(events_path).read_all():
+            if not isinstance(event, dict):
+                continue
+            name = str(event.get("name") or "")
+            if name not in _PHASE_EVENT_LABELS:
+                continue
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if turn_id and str(payload.get("turn_id") or "") != turn_id:
+                continue
+            key = (
+                site_key,
+                str(event.get("ts") or ""),
+                name,
+                str(payload.get("phase") or ""),
+                str(payload.get("summary") or ""),
+            )
+            if key in seen:
+                continue
+            pending.append((str(event.get("ts") or ""), _format_phase_progress_line(site_key, event), key))
+    pending.sort(key=lambda row: row[0])
+    for _, line, key in pending:
+        seen.add(key)
+        typer.echo(line)
+
+
 @app.command()
 def onboard():
     """Create the editable workspace scaffold."""
@@ -72,8 +155,79 @@ def run(
     """Run one chat turn."""
     root = _project_root()
     workspace = _workspace_path()
-    reply = dispatch_manager_message(project_root=root, workspace=workspace, session_id=session, message=message)
+    baseline_batch_ids = {
+        str(row.get("batch_id") or "")
+        for row in JobStore(workspace).list_batches(session_id=session, include_terminal=True)
+        if str(row.get("batch_id") or "")
+    }
+    progress_state: dict[str, Any] = {}
+    result: dict[str, Any] = {"reply": "", "error": None}
+
+    def _worker() -> None:
+        try:
+            result["reply"] = dispatch_manager_message(
+                project_root=root,
+                workspace=workspace,
+                session_id=session,
+                message=message,
+            )
+        except BaseException as exc:  # pragma: no cover - exercised via CLI behavior
+            result["error"] = exc
+
+    worker = threading.Thread(target=_worker, name="careereng-cli-run", daemon=True)
+    worker.start()
+    while worker.is_alive():
+        _emit_phase_progress(
+            workspace=workspace,
+            session_id=session,
+            baseline_batch_ids=baseline_batch_ids,
+            state=progress_state,
+        )
+        worker.join(timeout=0.75)
+    _emit_phase_progress(
+        workspace=workspace,
+        session_id=session,
+        baseline_batch_ids=baseline_batch_ids,
+        state=progress_state,
+    )
+    error = result.get("error")
+    if isinstance(error, BaseException):
+        raise error
+    reply = str(result.get("reply") or "")
     typer.echo(reply)
+
+
+@app.command("batch-list")
+def batch_list(
+    session: str = typer.Option("", "--session", "-s", help="Optional session ID filter"),
+):
+    """List open job batches."""
+    store = _job_store()
+    rows = store.list_batches(session_id=session or None, include_terminal=False)
+    if not rows:
+        typer.echo("No open batches found.")
+        return
+    for row in rows:
+        batch_id = str(row.get("batch_id") or "")
+        status = str(row.get("status") or "")
+        session_id = str(row.get("session_id") or "")
+        updated_at = str(row.get("updated_at") or row.get("created_at") or "")
+        typer.echo(f"{batch_id}\t{status}\t{session_id}\t{updated_at}")
+
+
+@app.command("batch-clear")
+def batch_clear(
+    session: str = typer.Option("", "--session", "-s", help="Optional session ID filter"),
+):
+    """Clear all open job batches by marking them cancelled."""
+    store = _job_store()
+    rows = store.clear_open_batches(session_id=session or None)
+    if not rows:
+        typer.echo("No open batches to clear.")
+        return
+    typer.echo(f"cleared={len(rows)}")
+    for row in rows:
+        typer.echo(f"{row.get('batch_id')}\t{row.get('session_id')}\t{row.get('status')}")
 
 
 @app.command("manager-serve", hidden=True)
@@ -88,7 +242,6 @@ def manager_serve(
         workspace=Path(workspace).expanduser().resolve(),
         socket_path=Path(socket_path).expanduser(),
     )
-
 
 @site_app.command("add")
 def site_add(

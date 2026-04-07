@@ -55,6 +55,7 @@ class AgentLoop:
         search_company_top_k: int = 10,
         site_parallelism: int = 2,
         site_tools: SiteTools,
+        browser_runner: Any | None = None,
     ):
         self.workspace = workspace
         self.project_root = project_root
@@ -114,6 +115,7 @@ class AgentLoop:
             job_store=self.job_store,
             application_store=self.application_store,
             site_tools=self.site_tools,
+            browser_runner=browser_runner,
             search_strategy=self.search_strategy,
             profile_store=self.profile_store,
             cv_store=self.cv_store,

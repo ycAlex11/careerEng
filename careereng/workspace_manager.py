@@ -18,7 +18,7 @@ from typing import Any
 from careereng.runtime import build_loop
 
 
-DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS = 600.0
+DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS = 1800.0
 
 
 def manager_socket_path(workspace: Path) -> Path:

@@ -212,8 +212,8 @@ workspace/
 │     ├─ browser/
 │     │  ├─ session.json
 │     │  └─ user_data/
-│     ├─ jobs/discoveries/YYYY-MM-DD.jsonl
-│     ├─ jobs/catalog.jsonl
+│     ├─ jobs/runs/<batch_id>.jsonl
+│     ├─ jobs/history_jobs.json
 │     ├─ jobs/descriptions/<hash>.md
 │     ├─ jobs/features.jsonl
 │     ├─ applications/YYYY-MM-DD.jsonl
@@ -310,10 +310,12 @@ When user selects companies for registration:
 - Registration storage policy:
   - Source of truth: `workspace/sites/registry.jsonl`
   - Per-site metadata: `workspace/sites/<site_id>/site.json`
-  - Legacy `catalog.jsonl` is cleared during migration from older runs
+  - Legacy `catalog.jsonl` is seeded into `jobs/history_jobs.json` when history is still empty
   - Legacy discoveries are marked with `site.json.legacy_discoveries_dirty = true`
 - Job storage policy:
-  - Registration does not write `jobs/catalog.jsonl` or `jobs/discoveries/*.jsonl`
+  - Registration does not write site job results
+  - Each successful retrieval run writes per-site run data to `workspace/sites/<site_id>/jobs/runs/<batch_id>.jsonl`
+  - After `job_retrieval` finishes successfully, that run is merged into `workspace/sites/<site_id>/jobs/history_jobs.json`
   - Retrieve/apply batch state lives in `workspace/jobs/batches/<batch_id>.json`
   - Batch event history lives in `workspace/jobs/events.jsonl`
   - If retrieval succeeds but apply fails, discovered jobs are kept and the batch/site result is marked as "retrieved but not applied"

@@ -82,19 +82,43 @@ class JobStore:
         )
 
     def latest_open_batch(self, session_id: str) -> dict[str, Any] | None:
+        rows = self.list_batches(session_id=session_id)
+        for row in rows:
+            if str(row.get("status") or "") not in TERMINAL_BATCH_STATUSES:
+                return row
+        return rows[0] if rows else None
+
+    def list_batches(self, *, session_id: str | None = None, include_terminal: bool = True) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for path in sorted(self.batches_dir.glob("*.json")):
             row = read_json(path)
             if not row:
                 continue
-            if str(row.get("session_id") or "") != session_id:
+            if session_id and str(row.get("session_id") or "") != session_id:
+                continue
+            if not include_terminal and str(row.get("status") or "") in TERMINAL_BATCH_STATUSES:
                 continue
             rows.append(row)
         rows.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
-        for row in rows:
-            if str(row.get("status") or "") not in TERMINAL_BATCH_STATUSES:
-                return row
-        return rows[0] if rows else None
+        return rows
+
+    def clear_open_batches(self, *, session_id: str | None = None, status: str = "cancelled") -> list[dict[str, Any]]:
+        cleared: list[dict[str, Any]] = []
+        for row in self.list_batches(session_id=session_id, include_terminal=False):
+            payload = dict(row)
+            payload["status"] = status
+            payload["closed_at"] = now_iso()
+            saved = self.save_batch(payload)
+            self.append_event(
+                "batch.cleared",
+                {
+                    "batch_id": str(saved.get("batch_id") or ""),
+                    "session_id": str(saved.get("session_id") or ""),
+                    "new_status": status,
+                },
+            )
+            cleared.append(saved)
+        return cleared
 
     def update_site(self, batch: dict[str, Any], site_key: str, patch: dict[str, Any]) -> dict[str, Any]:
         batch = dict(batch or {})

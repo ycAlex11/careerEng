@@ -41,6 +41,15 @@ headless = false
 keep_open = false
 timeout_ms = 45000
 slow_mo_ms = 0
+api_base = "https://api.openai.com/v1"
+model = "gpt-5"
+reasoning_effort = "high"
+site_parallelism = 2
+phase_timeout_seconds = 180
+step_timeout_seconds = 30
+max_step_retries = 1
+max_phase_steps = 24
+browser_name = "chrome"
 
 [providers.openrouter]
 api_base = "https://openrouter.ai/api/v1"
@@ -150,7 +159,9 @@ def load_config(project_root: Path) -> AppConfig:
         for section in ("agent", "browser"):
             sec = loaded.get(section)
             if isinstance(sec, dict):
-                payload[section].update(sec)
+                for key, value in sec.items():
+                    if key in payload[section]:
+                        payload[section][key] = value
 
         workspace = loaded.get("workspace")
         if isinstance(workspace, dict) and isinstance(workspace.get("path"), str):
@@ -166,7 +177,9 @@ def load_config(project_root: Path) -> AppConfig:
             for name in ("openai", "openrouter"):
                 sec = providers.get(name)
                 if isinstance(sec, dict):
-                    payload["providers"][name].update(sec)
+                    for key, value in sec.items():
+                        if key in payload["providers"][name]:
+                            payload["providers"][name][key] = value
 
     return AppConfig(
         agent=AgentConfig(**payload["agent"]),

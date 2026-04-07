@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,10 @@ class SiteStore:
 
     def _ensure_site_tree(self, root: Path) -> None:
         ensure_dir(root / "jobs")
+        ensure_dir(root / "jobs" / "runs")
+        history_path = root / "jobs" / "history_jobs.json"
+        if not history_path.exists():
+            history_path.write_text("[]\n", encoding="utf-8")
         ensure_dir(root / "jobs" / "discoveries")
         ensure_dir(root / "jobs" / "descriptions")
         ensure_dir(root / "applications")
@@ -102,7 +107,11 @@ class SiteStore:
             "expected_outcome": "",
             "last_step_error": "",
             "current_trace_ref": "",
+            "mcp_log_path": "",
         }
+
+    def _site_json_path(self, site_id: str) -> Path:
+        return self.site_dir(site_id) / "site.json"
 
     def browser_profile_dir(self, site_id: str) -> Path:
         root = self.site_dir(site_id)
@@ -119,11 +128,16 @@ class SiteStore:
         self._ensure_site_tree(root)
         session_path = self.browser_session_path(site_id)
         current = read_json(session_path)
+        site_payload = read_json(root / "site.json")
         payload = self._default_browser_session(site_id)
         if isinstance(current, dict):
             payload.update({k: v for k, v in current.items() if v not in (None,)})
         payload["site_key"] = site_id
         payload["profile_dir"] = str(self.browser_profile_dir(site_id))
+        payload.pop("mcp_port", None)
+        payload.pop("mcp_endpoint", None)
+        if isinstance(site_payload, dict):
+            site_payload.pop("mcp_port", None)
         write_json(session_path, payload)
         return payload
 
@@ -138,6 +152,8 @@ class SiteStore:
         current.update(payload or {})
         current["site_key"] = site_id
         current["profile_dir"] = str(self.browser_profile_dir(site_id))
+        current.pop("mcp_port", None)
+        current.pop("mcp_endpoint", None)
         write_json(self.browser_session_path(site_id), current)
         return current
 
@@ -264,12 +280,43 @@ class SiteStore:
         )
         self.registry.write_all(ordered)
 
-    def _cleanup_legacy_job_data(self, root: Path) -> tuple[bool, bool]:
+    def _history_jobs_path(self, site_id: str) -> Path:
+        root = self.site_dir(site_id)
+        self._ensure_site_tree(root)
+        return root / "jobs" / "history_jobs.json"
+
+    def _job_runs_dir(self, site_id: str) -> Path:
+        root = self.site_dir(site_id)
+        self._ensure_site_tree(root)
+        return root / "jobs" / "runs"
+
+    def _job_run_path(self, site_id: str, batch_id: str) -> Path:
+        batch_key = safe_file_stem(batch_id or "adhoc_run")
+        return self._job_runs_dir(site_id) / f"{batch_key}.jsonl"
+
+    def _load_history_jobs(self, site_id: str) -> list[dict[str, Any]]:
+        path = self._history_jobs_path(site_id)
+        if not path.exists():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict)]
+
+    def _write_history_jobs(self, site_id: str, rows: list[dict[str, Any]]) -> None:
+        path = self._history_jobs_path(site_id)
+        ensure_dir(path.parent)
+        path.write_text(
+            json.dumps([row for row in rows if isinstance(row, dict)], ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _inspect_legacy_job_data(self, root: Path) -> tuple[bool, bool]:
         catalog = root / "jobs" / "catalog.jsonl"
         had_catalog_data = bool(catalog.exists() and catalog.read_text(encoding="utf-8").strip())
-        if had_catalog_data:
-            catalog.write_text("", encoding="utf-8")
-
         discoveries_dir = root / "jobs" / "discoveries"
         had_discovery_data = False
         if discoveries_dir.exists():
@@ -301,9 +348,18 @@ class SiteStore:
 
             self._ensure_site_tree(root)
             current = read_json(root / "site.json")
-            had_catalog_data, legacy_dirty = self._cleanup_legacy_job_data(root)
+            had_catalog_data, legacy_dirty = self._inspect_legacy_job_data(root)
             site_key = root.name
             seen_site_keys.add(site_key)
+            history_path = self._history_jobs_path(site_key)
+            history_rows = self._load_history_jobs(site_key)
+            if not history_rows:
+                legacy_catalog_rows = JSONLStore(root / "jobs" / "catalog.jsonl").read_all()
+                if legacy_catalog_rows:
+                    history_path.write_text(
+                        json.dumps(legacy_catalog_rows, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
             idx = self._find_registry_row_index(
                 rows,
                 raw_name=raw_name,
@@ -329,10 +385,17 @@ class SiteStore:
                     "created_at": created_at,
                 }
             )
+            desired_payload.pop("mcp_port", None)
             if legacy_dirty or bool(current.get("legacy_discoveries_dirty")):
                 desired_payload["legacy_discoveries_dirty"] = True
 
-            payload_changed = had_catalog_data or original_root != root or not (root / "site.json").exists()
+            payload_changed = (
+                had_catalog_data
+                or original_root != root
+                or not (root / "site.json").exists()
+                or "mcp_port" in current
+                or "mcp_endpoint" in current
+            )
             for key in (
                 "site_id",
                 "site_key",
@@ -408,6 +471,7 @@ class SiteStore:
         existing: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = dict(existing or {})
+        payload.pop("mcp_port", None)
         payload.update(
             {
                 "registry_id": registry_id,
@@ -491,7 +555,7 @@ class SiteStore:
         rows = self._read_registry_rows()
         if status:
             rows = [row for row in rows if str(row.get("status") or "") == status]
-        return rows
+        return [dict(row) for row in rows]
 
     def find_site(self, name: str, *, include_inactive: bool = True) -> dict[str, Any] | None:
         rows = self._read_registry_rows()
@@ -601,13 +665,26 @@ class SiteStore:
         JSONLStore(trace_path).append({"ts": now_iso(), **(payload or {})})
         return str(trace_path.relative_to(self.workspace))
 
-    def append_jobs(self, site_id: str, jobs: list[dict[str, Any]], session_id: str, turn_id: str) -> list[dict[str, Any]]:
+    def list_jobs(self, site_id: str) -> list[dict[str, Any]]:
+        return self._load_history_jobs(site_id)
+
+    def list_run_jobs(self, site_id: str, batch_id: str) -> list[dict[str, Any]]:
+        rows = JSONLStore(self._job_run_path(site_id, batch_id)).read_all()
+        return [row for row in rows if isinstance(row, dict)]
+
+    def append_jobs(
+        self,
+        site_id: str,
+        jobs: list[dict[str, Any]],
+        session_id: str,
+        turn_id: str,
+        batch_id: str = "",
+    ) -> list[dict[str, Any]]:
         root = self.site_dir(site_id)
-        ensure_dir(root / "jobs" / "discoveries")
+        ensure_dir(root / "jobs" / "runs")
         ensure_dir(root / "jobs" / "descriptions")
-        catalog_store = JSONLStore(root / "jobs" / "catalog.jsonl")
-        discovery_store = JSONLStore(root / "jobs" / "discoveries" / f"{today_str()}.jsonl")
-        rows = catalog_store.read_all()
+        run_store = JSONLStore(self._job_run_path(site_id, batch_id))
+        rows = run_store.read_all()
         index: dict[str, dict[str, Any]] = {}
         for row in rows:
             jid = str(row.get("job_id") or "")
@@ -636,6 +713,7 @@ class SiteStore:
 
             snapshot = {
                 "ts": now,
+                "batch_id": str(batch_id or ""),
                 "session_id": session_id,
                 "turn_id": turn_id,
                 "job_id": job_id,
@@ -652,35 +730,26 @@ class SiteStore:
                 "apply_state": str(job.get("apply_state") or ""),
                 "card_text": str(job.get("card_text") or "")[:2000],
                 "description_ref": description_ref,
+                "posted_label_raw": str(job.get("posted_label") or ""),
             }
-            discovery_store.append(snapshot)
-
             existing = index.get(job_id)
             if existing is None:
-                existing = {
-                    **snapshot,
-                    "first_seen_at": now,
-                    "last_seen_at": now,
-                    "seen_count": 1,
-                    "is_active": True,
-                    "features_ref": str(job.get("features_ref") or ""),
-                }
+                existing = dict(snapshot)
                 index[job_id] = existing
             else:
                 existing.update(
                     {
-                        "last_seen_at": now,
-                        "seen_count": int(existing.get("seen_count", 1) or 1) + 1,
-                        "is_active": True,
                         "title": title or str(existing.get("title") or ""),
                         "url": url or str(existing.get("url") or ""),
                         "employer": employer or str(existing.get("employer") or ""),
                         "location": str(job.get("location") or existing.get("location") or ""),
                         "posted_at": str(job.get("posted_at") or existing.get("posted_at") or ""),
                         "posted_label": str(job.get("posted_label") or existing.get("posted_label") or ""),
+                        "posted_label_raw": str(job.get("posted_label") or existing.get("posted_label_raw") or ""),
                         "employment_type": str(job.get("employment_type") or existing.get("employment_type") or ""),
                         "match_label": str(job.get("match_label") or existing.get("match_label") or ""),
                         "apply_state": str(job.get("apply_state") or existing.get("apply_state") or ""),
+                        "ts": now,
                     }
                 )
                 if description_ref:
@@ -690,14 +759,72 @@ class SiteStore:
                     existing["card_text"] = card_text[:2000]
             updated_ids.append(job_id)
 
-        catalog_rows = list(index.values())
-        catalog_rows.sort(key=lambda r: str(r.get("first_seen_at") or ""))
-        catalog_store.write_all(catalog_rows)
+        run_rows = list(index.values())
+        run_rows.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("job_id") or "")))
+        run_store.write_all(run_rows)
         return [index[jid] for jid in updated_ids if jid in index]
 
+    def promote_run_jobs_to_history(self, site_id: str, batch_id: str) -> list[dict[str, Any]]:
+        history_rows = self._load_history_jobs(site_id)
+        history_index = {
+            str(row.get("job_id") or ""): dict(row)
+            for row in history_rows
+            if isinstance(row, dict) and str(row.get("job_id") or "")
+        }
+        run_rows = self.list_run_jobs(site_id, batch_id)
+        if not run_rows:
+            return []
+
+        promoted_ids: list[str] = []
+        for row in run_rows:
+            job_id = str(row.get("job_id") or "").strip()
+            if not job_id:
+                continue
+            now = str(row.get("ts") or now_iso())
+            current = history_index.get(job_id)
+            if current is None:
+                current = dict(row)
+                current["first_seen_at"] = now
+                current["last_seen_at"] = now
+                current["seen_count"] = 1
+                current["is_active"] = True
+                current["features_ref"] = str(current.get("features_ref") or "")
+                history_index[job_id] = current
+            else:
+                current.update(
+                    {
+                        "ts": now,
+                        "batch_id": str(row.get("batch_id") or current.get("batch_id") or ""),
+                        "session_id": str(row.get("session_id") or current.get("session_id") or ""),
+                        "turn_id": str(row.get("turn_id") or current.get("turn_id") or ""),
+                        "canonical_job_id": str(row.get("canonical_job_id") or current.get("canonical_job_id") or ""),
+                        "site_id": str(row.get("site_id") or current.get("site_id") or site_id),
+                        "employer": str(row.get("employer") or current.get("employer") or site_id),
+                        "title": str(row.get("title") or current.get("title") or ""),
+                        "url": str(row.get("url") or current.get("url") or ""),
+                        "location": str(row.get("location") or current.get("location") or ""),
+                        "posted_at": str(row.get("posted_at") or current.get("posted_at") or ""),
+                        "posted_label": str(row.get("posted_label") or current.get("posted_label") or ""),
+                        "posted_label_raw": str(row.get("posted_label_raw") or current.get("posted_label_raw") or ""),
+                        "employment_type": str(row.get("employment_type") or current.get("employment_type") or ""),
+                        "match_label": str(row.get("match_label") or current.get("match_label") or ""),
+                        "apply_state": str(row.get("apply_state") or current.get("apply_state") or ""),
+                        "card_text": str(row.get("card_text") or current.get("card_text") or "")[:2000],
+                        "description_ref": str(row.get("description_ref") or current.get("description_ref") or ""),
+                        "last_seen_at": now,
+                        "seen_count": int(current.get("seen_count") or 0) + 1,
+                        "is_active": True,
+                    }
+                )
+            promoted_ids.append(job_id)
+
+        merged_rows = list(history_index.values())
+        merged_rows.sort(key=lambda r: (str(r.get("first_seen_at") or ""), str(r.get("job_id") or "")))
+        self._write_history_jobs(site_id, merged_rows)
+        return [history_index[job_id] for job_id in promoted_ids if job_id in history_index]
+
     def update_job_decisions(self, site_id: str, jobs: list[dict[str, Any]]) -> None:
-        catalog_store = JSONLStore(self.site_dir(site_id) / "jobs" / "catalog.jsonl")
-        rows = catalog_store.read_all()
+        rows = self._load_history_jobs(site_id)
         index = {str(row.get("job_id") or ""): row for row in rows if str(row.get("job_id") or "")}
         changed = False
         for job in jobs:
@@ -722,11 +849,10 @@ class SiteStore:
             current["decision_updated_at"] = now_iso()
             changed = True
         if changed:
-            catalog_store.write_all(rows)
+            self._write_history_jobs(site_id, rows)
 
     def update_job_application_outcomes(self, site_id: str, applications: list[dict[str, Any]]) -> None:
-        catalog_store = JSONLStore(self.site_dir(site_id) / "jobs" / "catalog.jsonl")
-        rows = catalog_store.read_all()
+        rows = self._load_history_jobs(site_id)
         index = {str(row.get("job_id") or ""): row for row in rows if str(row.get("job_id") or "")}
         changed = False
         for app in applications:
@@ -746,7 +872,7 @@ class SiteStore:
                 current["last_submitted_at"] = now_iso()
             changed = True
         if changed:
-            catalog_store.write_all(rows)
+            self._write_history_jobs(site_id, rows)
 
     def append_applications(self, site_id: str, applications: list[dict[str, Any]], session_id: str, turn_id: str) -> None:
         store = JSONLStore(self.site_dir(site_id) / "applications" / f"{today_str()}.jsonl")

@@ -25,6 +25,15 @@ class BrowserConfig:
     keep_open: bool = False
     timeout_ms: int = 45000
     slow_mo_ms: int = 0
+    api_base: str = "https://api.openai.com/v1"
+    model: str = "gpt-5"
+    reasoning_effort: str = "high"
+    site_parallelism: int = 2
+    phase_timeout_seconds: int = 180
+    step_timeout_seconds: int = 30
+    max_step_retries: int = 1
+    max_phase_steps: int = 24
+    browser_name: str = "chrome"
 
 
 @dataclass
