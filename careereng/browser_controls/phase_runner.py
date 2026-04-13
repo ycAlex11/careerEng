@@ -22,6 +22,7 @@ from careereng.utils import now_iso
 SUPPORTED_PHASES = {"session_preparation", "channel_discovery", "job_filtering", "job_retrieval"}
 GLOBAL_BLOCKED_TOOL_NAMES = {"browser_run_code"}
 SESSION_PREPARATION_BLOCKED_TOOL_NAMES = {"browser_resize"}
+JOB_RETRIEVAL_BLOCKED_TOOL_NAMES = {"browser_navigate"}
 JOB_FILTERING_PHASE_TIMEOUT_SECONDS = 420
 JOB_RETRIEVAL_PHASE_TIMEOUT_SECONDS = 900
 JOB_RETRIEVAL_MAX_PHASE_STEPS = 96
@@ -40,6 +41,8 @@ class BrowserAutomationResult:
     step_count: int = 0
     retrieved_count: int = 0
     new_job_count: int = 0
+    authenticated_ready: bool = False
+    jobs_surface_ready: bool = False
 
 
 @dataclass
@@ -80,18 +83,17 @@ class BrowserAutomationService:
         self.max_phase_steps = int(max_phase_steps or 24)
         self._lock = threading.Lock()
         self._active: dict[str, ActiveSiteRuntime] = {}
-        self.phase_runtime = BrowserPhaseRuntime(
-            BrowserRuntimeConfig(
-                api_base=api_base,
-                api_key=api_key,
-                model=model,
-                reasoning_effort=reasoning_effort,
-                phase_timeout_seconds=self.phase_timeout_seconds,
-                step_timeout_seconds=step_timeout_seconds,
-                max_step_retries=max_step_retries,
-                max_phase_steps=self.max_phase_steps,
-            )
+        self._phase_runtime_config = BrowserRuntimeConfig(
+            api_base=api_base,
+            api_key=api_key,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            phase_timeout_seconds=self.phase_timeout_seconds,
+            step_timeout_seconds=step_timeout_seconds,
+            max_step_retries=max_step_retries,
+            max_phase_steps=self.max_phase_steps,
         )
+        self.phase_runtime: BrowserPhaseRuntime | Any | None = None
 
     def close(self) -> None:
         with self._lock:
@@ -115,15 +117,28 @@ class BrowserAutomationService:
         )
 
     @staticmethod
-    def _ready_message_for_phase(phase_slug: str) -> str:
+    def _phase_has_jobs_surface(phase_slug: str) -> bool:
+        return str(phase_slug or "").strip() in {"channel_discovery", "job_filtering", "job_retrieval"}
+
+    @classmethod
+    def _ready_message_for_phase(cls, phase_slug: str, *, authenticated_ready: bool, jobs_surface_ready: bool) -> str:
         normalized = str(phase_slug or "").strip()
-        if normalized == "job_retrieval":
-            return "登录已就绪，岗位检索已完成，等待后续投递。"
-        if normalized == "job_filtering":
-            return "登录已就绪，岗位筛选已完成，等待后续岗位检索。"
-        if normalized == "channel_discovery":
-            return "登录已就绪，岗位入口已定位，等待后续岗位检索。"
-        return "登录已就绪，等待后续岗位检索。"
+        if authenticated_ready:
+            if normalized == "job_retrieval":
+                return "登录已就绪，岗位检索已完成，等待后续投递。"
+            if normalized == "job_filtering":
+                return "登录已就绪，岗位筛选已完成，等待后续岗位检索。"
+            if normalized == "channel_discovery":
+                return "登录已就绪，岗位入口已定位，等待后续岗位检索。"
+            return "登录已就绪，等待后续岗位检索。"
+        if jobs_surface_ready:
+            if normalized == "job_retrieval":
+                return "岗位检索已完成，当前 jobs 页面可继续，等待后续投递。"
+            if normalized == "job_filtering":
+                return "岗位筛选已完成，当前 jobs 页面可继续，等待后续岗位检索。"
+            if normalized == "channel_discovery":
+                return "岗位入口已定位，当前 jobs 页面可继续，等待后续岗位检索。"
+        return "当前 jobs 页面可继续，等待后续岗位检索。"
 
     @staticmethod
     def _tool_allowed_for_phase(tool_name: str, phase_slug: str) -> bool:
@@ -133,6 +148,8 @@ class BrowserAutomationService:
         if normalized in GLOBAL_BLOCKED_TOOL_NAMES:
             return False
         if phase_slug == "session_preparation" and normalized in SESSION_PREPARATION_BLOCKED_TOOL_NAMES:
+            return False
+        if phase_slug == "job_retrieval" and normalized in JOB_RETRIEVAL_BLOCKED_TOOL_NAMES:
             return False
         return True
 
@@ -167,6 +184,12 @@ class BrowserAutomationService:
             response_tools.append(schema)
             tool_names.add(str(schema.get("name") or "record_jobs"))
         return response_tools, tool_names
+
+    def _create_phase_runtime(self) -> BrowserPhaseRuntime | Any:
+        override = self.phase_runtime
+        if override is not None:
+            return override
+        return BrowserPhaseRuntime(self._phase_runtime_config)
 
     def _reserve_runtime(self, site_key: str, entry_url: str) -> tuple[ActiveSiteRuntime, bool]:
         with self._lock:
@@ -213,6 +236,7 @@ class BrowserAutomationService:
         resume: bool,
     ) -> BrowserAutomationResult:
         active, reused_runtime = self._reserve_runtime(site_key, entry_url)
+        phase_runtime = self._create_phase_runtime()
         wait_for_process(active.runtime)
         self.site_store.save_browser_session(
             site_key,
@@ -333,7 +357,7 @@ class BrowserAutomationService:
                         for phase in phases:
                             response_tools, tool_names = self._response_tools_for_phase(tools, phase.slug)
                             self.site_store.append_event(site_key, "browser.phase.started", {"turn_id": turn_id, "phase": phase.slug})
-                            phase_result = await self.phase_runtime.run_phase(
+                            phase_result = await phase_runtime.run_phase(
                                 site_key=site_key,
                                 site_name=site_name,
                                 entry_url=entry_url or active.entry_url,
@@ -385,6 +409,12 @@ class BrowserAutomationService:
                                             )
                                             break
                                 phase_handoff = f"{phase.title} completed. {phase_result.summary.strip()[:300]}".strip()
+                                authenticated_ready = bool(session_state.get("authenticated_ready") or session_state.get("session_ready"))
+                                jobs_surface_ready = bool(session_state.get("jobs_surface_ready"))
+                                if phase.slug == "session_preparation":
+                                    authenticated_ready = True
+                                if self._phase_has_jobs_surface(phase.slug):
+                                    jobs_surface_ready = True
                                 self.site_store.save_browser_session(
                                     site_key,
                                     {
@@ -393,7 +423,9 @@ class BrowserAutomationService:
                                         "last_phase_summary": phase_result.summary[:500],
                                         "resume_phase": "",
                                         "pending_action": "",
-                                        "session_ready": phase.slug == "session_preparation" or bool(session_state.get("session_ready")),
+                                        "session_ready": authenticated_ready,
+                                        "authenticated_ready": authenticated_ready,
+                                        "jobs_surface_ready": jobs_surface_ready,
                                         "last_known_url": current_url,
                                         "current_trace_ref": phase_result.trace_ref,
                                     },
@@ -416,6 +448,8 @@ class BrowserAutomationService:
                                         "resume_phase": phase.slug,
                                         "pending_action": "waiting_user",
                                         "session_ready": False,
+                                        "authenticated_ready": False,
+                                        "jobs_surface_ready": bool(session_state.get("jobs_surface_ready")),
                                         "last_known_url": current_url,
                                         "current_trace_ref": phase_result.trace_ref,
                                         "browser_status": "waiting_user",
@@ -472,13 +506,19 @@ class BrowserAutomationService:
                             )
                         else:
                             keep_runtime = self.keep_open
+                            authenticated_ready = bool(session_state.get("authenticated_ready") or session_state.get("session_ready"))
+                            jobs_surface_ready = bool(session_state.get("jobs_surface_ready")) or self._phase_has_jobs_surface(
+                                phases[-1].slug if phases else ""
+                            )
                             self.site_store.save_browser_session(
                                 site_key,
                                 {
                                     "browser_status": "ready" if keep_runtime else "running",
                                     "pending_action": "",
                                     "resume_phase": "",
-                                    "session_ready": True,
+                                    "session_ready": authenticated_ready,
+                                    "authenticated_ready": authenticated_ready,
+                                    "jobs_surface_ready": jobs_surface_ready,
                                     "last_known_url": str(last_result.current_url or current_url or target_url),
                                     "current_trace_ref": last_result.trace_ref,
                                 },
@@ -488,13 +528,19 @@ class BrowserAutomationService:
                                 site_name=site_name,
                                 status="ready",
                                 reason_tag="ready",
-                                message=self._ready_message_for_phase(phases[-1].slug if phases else ""),
+                                message=self._ready_message_for_phase(
+                                    phases[-1].slug if phases else "",
+                                    authenticated_ready=authenticated_ready,
+                                    jobs_surface_ready=jobs_surface_ready,
+                                ),
                                 current_phase=phases[-1].slug if phases else "",
                                 current_url=str(last_result.current_url or current_url or target_url),
                                 trace_ref=last_result.trace_ref,
                                 step_count=last_result.step_count,
                                 retrieved_count=last_result.recorded_count,
                                 new_job_count=last_result.new_count,
+                                authenticated_ready=authenticated_ready,
+                                jobs_surface_ready=jobs_surface_ready,
                             )
 
         if result is None:

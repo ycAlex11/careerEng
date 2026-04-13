@@ -185,13 +185,18 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 ### Recording Rules
 
 - Record the full current visible jobs page before deciding whether to stop or paginate.
-- Use `record_jobs` for the current page after extracting the visible job cards into structured data.
-- Record only the current visible results cards from the live jobs surface. Do not scan the broader page for every `/job/` link outside the active results list or results region.
-- Keep the extraction anchored to the real live results container. Do not treat a broad page section, full `main`, page header, side rail, or mixed detail panel as the jobs source when a narrower results list is visible.
-- If one extraction step already produced the current page jobs, call `record_jobs` immediately before any more observation or pagination.
-- If the live page clearly shows result signals such as a jobs count, pagination, or visible result cards but the current extraction returns zero jobs, do not conclude that the page is empty yet. Capture a fresh snapshot, re-identify the active results container, and then extract the current visible cards again.
-- In that recovery step, keep the extraction anchored to the actual live results list or results region. Do not switch to broad page text, navigation sections, or unrelated content blocks.
-- If the extraction output clearly looks like collapsed whole-page text instead of per-card records, do not treat it as a valid page extraction. Capture a fresh snapshot, re-identify the active results list, and extract the current visible cards again before paginating.
+- Use `record_jobs` for the current page as soon as the current visible jobs page can be formed into structured current-page records.
+- Use the attached current live snapshot first. If the current visible jobs are already readable there, form the records directly from that current page instead of starting with extra extraction.
+- On split-view or mixed-panel job pages, first form the current visible results set for this page.
+- If some fields or URLs are still missing, you may inspect additional candidate sources on that same page more broadly, but only keep per-role data that aligns back to the current visible results set.
+- Do not accept or reject a same-page candidate source only because of its layout position, panel placement, or region label.
+- Do not indiscriminately import every `/job/` link visible somewhere on the page. Keep only the links that can be matched back to the current visible results set for this page.
+- The current results-page address is not a per-job link. Do not reuse the same results page address as the job link for multiple visible roles.
+- Do not open a single job detail before the current visible results page has been recorded.
+- If one attempt already produced the current page jobs, call `record_jobs` immediately before any more observation or pagination.
+- If one or more current-page list fields are still missing after reading the current live snapshot, use one focused supplemental read on the same current page, then call `record_jobs`.
+- If any visible role on the current page still does not have its own concrete role link, stay on that same page, complete the missing links, and only then record or paginate.
+- If the live page clearly still shows jobs, pagination, or a jobs count but the current attempt returned zero jobs, capture a fresh snapshot, use that live snapshot first, and try the same current visible jobs page once more before paginating.
 - In this phase, record lightweight list-level fields only: title, url, location, posted label, employment type, match label, apply state, and card text when visible.
 - Do not open each job detail page just to capture long descriptions in this phase.
 - Do not apply in this phase.

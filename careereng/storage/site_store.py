@@ -88,6 +88,8 @@ class SiteStore:
             "profile_dir": str(profile_dir),
             "login_required": True,
             "session_ready": False,
+            "authenticated_ready": False,
+            "jobs_surface_ready": False,
             "last_manual_login_at": "",
             "last_validated_at": "",
             "last_validation_result": "unknown",
@@ -649,6 +651,139 @@ class SiteStore:
         job_id = "job_" + hashlib.sha1(scoped_source.encode("utf-8")).hexdigest()[:16]
         return job_id, canonical_job_id
 
+    @staticmethod
+    def _normalize_job_text(value: str) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+    def _job_source_ref(self, row: dict[str, Any]) -> str:
+        if not isinstance(row, dict):
+            return ""
+        explicit_fields = (
+            "source_job_ref",
+            "source_job_id",
+            "job_number",
+            "job_number_raw",
+            "requisition_id",
+            "requisition_number",
+            "pid",
+        )
+        for field in explicit_fields:
+            value = self._normalize_job_text(str(row.get(field) or ""))
+            if value:
+                return f"{field}:{value}"
+
+        url = self._normalize_url(str(row.get("url") or ""))
+        if not url:
+            return ""
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return ""
+        query = {k.lower(): v for k, v in parse_qsl(parsed.query, keep_blank_values=False)}
+        for field in ("pid", "jobid", "job_id", "jobnumber", "job_number", "requisitionid", "reqid"):
+            value = self._normalize_job_text(query.get(field, ""))
+            if value:
+                return f"{field}:{value}"
+        match = re.search(r"/job[s]?/([^/?#]+)", parsed.path, flags=re.IGNORECASE)
+        if match:
+            return f"path-job:{self._normalize_job_text(match.group(1))}"
+        return ""
+
+    def _history_match_keys(self, site_id: str, row: dict[str, Any]) -> list[str]:
+        if not isinstance(row, dict):
+            return []
+        site = safe_file_stem(site_id)
+        keys: list[str] = []
+
+        url = self._normalize_url(str(row.get("url") or ""))
+        if url:
+            keys.append(f"url|{site}|{url}")
+
+        source_ref = self._job_source_ref(row)
+        if source_ref:
+            keys.append(f"source|{site}|{source_ref}")
+
+        title = self._normalize_job_text(str(row.get("title") or ""))
+        location = self._normalize_job_text(str(row.get("location") or ""))
+        posted = self._normalize_job_text(str(row.get("posted_label_raw") or row.get("posted_label") or ""))
+        if title and location and posted:
+            keys.append(f"fallback|{site}|{title}|{location}|{posted}")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for key in keys:
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(key)
+        return deduped
+
+    def _history_identity_seed(self, site_id: str, row: dict[str, Any]) -> str:
+        keys = self._history_match_keys(site_id, row)
+        if keys:
+            return keys[0]
+        site = safe_file_stem(site_id)
+        title = self._normalize_job_text(str(row.get("title") or ""))
+        location = self._normalize_job_text(str(row.get("location") or ""))
+        posted = self._normalize_job_text(str(row.get("posted_label_raw") or row.get("posted_label") or ""))
+        card_text = self._normalize_job_text(str(row.get("card_text") or ""))
+        return f"opaque|{site}|{title}|{location}|{posted}|{card_text}"
+
+    def _history_ids(self, site_id: str, row: dict[str, Any]) -> tuple[str, str]:
+        seed = self._history_identity_seed(site_id, row)
+        canonical_job_id = "cj_" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+        job_id = "job_" + hashlib.sha1(f"{site_id}|{seed}".encode("utf-8")).hexdigest()[:16]
+        return job_id, canonical_job_id
+
+    @staticmethod
+    def _merge_job_row(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(base)
+        for field in (
+            "batch_id",
+            "session_id",
+            "turn_id",
+            "canonical_job_id",
+            "site_id",
+            "employer",
+            "title",
+            "url",
+            "location",
+            "posted_at",
+            "posted_label",
+            "posted_label_raw",
+            "employment_type",
+            "match_label",
+            "apply_state",
+            "description_ref",
+        ):
+            value = str(incoming.get(field) or "").strip()
+            if value:
+                merged[field] = value
+        card_text = str(incoming.get("card_text") or "").strip()
+        if card_text:
+            merged["card_text"] = card_text[:2000]
+        ts = str(incoming.get("ts") or "").strip()
+        if ts:
+            merged["ts"] = ts
+        return merged
+
+    def preview_history_new_flags(self, site_id: str, jobs: list[dict[str, Any]]) -> list[bool]:
+        history_rows = self._load_history_jobs(site_id)
+        lookup: dict[str, str] = {}
+        for row in history_rows:
+            if not isinstance(row, dict):
+                continue
+            job_id = str(row.get("job_id") or "").strip()
+            if not job_id:
+                continue
+            for key in self._history_match_keys(site_id, row):
+                lookup.setdefault(key, job_id)
+
+        flags: list[bool] = []
+        for job in jobs:
+            keys = self._history_match_keys(site_id, job if isinstance(job, dict) else {})
+            flags.append(not any(key in lookup for key in keys))
+        return flags
+
     def append_event(self, site_id: str, name: str, payload: dict[str, Any]) -> None:
         JSONLStore(self.site_dir(site_id) / "events" / "all.jsonl").append(
             {
@@ -685,13 +820,8 @@ class SiteStore:
         ensure_dir(root / "jobs" / "descriptions")
         run_store = JSONLStore(self._job_run_path(site_id, batch_id))
         rows = run_store.read_all()
-        index: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            jid = str(row.get("job_id") or "")
-            if jid:
-                index[jid] = row
 
-        updated_ids: list[str] = []
+        appended_rows: list[dict[str, Any]] = []
         for job in jobs:
             if not isinstance(job, dict):
                 continue
@@ -712,6 +842,7 @@ class SiteStore:
                 description_ref = str(desc_path.relative_to(self.workspace))
 
             snapshot = {
+                "observation_id": make_id("obs"),
                 "ts": now,
                 "batch_id": str(batch_id or ""),
                 "session_id": session_id,
@@ -732,90 +863,91 @@ class SiteStore:
                 "description_ref": description_ref,
                 "posted_label_raw": str(job.get("posted_label") or ""),
             }
-            existing = index.get(job_id)
-            if existing is None:
-                existing = dict(snapshot)
-                index[job_id] = existing
-            else:
-                existing.update(
-                    {
-                        "title": title or str(existing.get("title") or ""),
-                        "url": url or str(existing.get("url") or ""),
-                        "employer": employer or str(existing.get("employer") or ""),
-                        "location": str(job.get("location") or existing.get("location") or ""),
-                        "posted_at": str(job.get("posted_at") or existing.get("posted_at") or ""),
-                        "posted_label": str(job.get("posted_label") or existing.get("posted_label") or ""),
-                        "posted_label_raw": str(job.get("posted_label") or existing.get("posted_label_raw") or ""),
-                        "employment_type": str(job.get("employment_type") or existing.get("employment_type") or ""),
-                        "match_label": str(job.get("match_label") or existing.get("match_label") or ""),
-                        "apply_state": str(job.get("apply_state") or existing.get("apply_state") or ""),
-                        "ts": now,
-                    }
-                )
-                if description_ref:
-                    existing["description_ref"] = description_ref
-                card_text = str(job.get("card_text") or "")
-                if card_text:
-                    existing["card_text"] = card_text[:2000]
-            updated_ids.append(job_id)
+            rows.append(snapshot)
+            appended_rows.append(snapshot)
 
-        run_rows = list(index.values())
-        run_rows.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("job_id") or "")))
+        run_rows = [row for row in rows if isinstance(row, dict)]
+        run_rows.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("observation_id") or ""), str(r.get("job_id") or "")))
         run_store.write_all(run_rows)
-        return [index[jid] for jid in updated_ids if jid in index]
+        return appended_rows
 
     def promote_run_jobs_to_history(self, site_id: str, batch_id: str) -> list[dict[str, Any]]:
         history_rows = self._load_history_jobs(site_id)
-        history_index = {
+        history_index: dict[str, dict[str, Any]] = {
             str(row.get("job_id") or ""): dict(row)
             for row in history_rows
             if isinstance(row, dict) and str(row.get("job_id") or "")
         }
+        history_lookup: dict[str, str] = {}
+        for job_id, row in history_index.items():
+            for key in self._history_match_keys(site_id, row):
+                history_lookup.setdefault(key, job_id)
+
         run_rows = self.list_run_jobs(site_id, batch_id)
         if not run_rows:
             return []
 
-        promoted_ids: list[str] = []
+        aggregated_rows: dict[str, dict[str, Any]] = {}
+        ordered_targets: list[str] = []
         for row in run_rows:
-            job_id = str(row.get("job_id") or "").strip()
-            if not job_id:
+            if not isinstance(row, dict):
                 continue
-            now = str(row.get("ts") or now_iso())
-            current = history_index.get(job_id)
+            match_keys = self._history_match_keys(site_id, row)
+            target = ""
+            for key in match_keys:
+                existing_target = history_lookup.get(key, "")
+                if existing_target:
+                    target = existing_target
+                    break
+            if not target:
+                target = "new:" + self._history_identity_seed(site_id, row)
+            current = aggregated_rows.get(target)
             if current is None:
-                current = dict(row)
-                current["first_seen_at"] = now
-                current["last_seen_at"] = now
-                current["seen_count"] = 1
-                current["is_active"] = True
-                current["features_ref"] = str(current.get("features_ref") or "")
-                history_index[job_id] = current
+                aggregated_rows[target] = dict(row)
+                ordered_targets.append(target)
             else:
-                current.update(
-                    {
-                        "ts": now,
-                        "batch_id": str(row.get("batch_id") or current.get("batch_id") or ""),
-                        "session_id": str(row.get("session_id") or current.get("session_id") or ""),
-                        "turn_id": str(row.get("turn_id") or current.get("turn_id") or ""),
-                        "canonical_job_id": str(row.get("canonical_job_id") or current.get("canonical_job_id") or ""),
-                        "site_id": str(row.get("site_id") or current.get("site_id") or site_id),
-                        "employer": str(row.get("employer") or current.get("employer") or site_id),
-                        "title": str(row.get("title") or current.get("title") or ""),
-                        "url": str(row.get("url") or current.get("url") or ""),
-                        "location": str(row.get("location") or current.get("location") or ""),
-                        "posted_at": str(row.get("posted_at") or current.get("posted_at") or ""),
-                        "posted_label": str(row.get("posted_label") or current.get("posted_label") or ""),
-                        "posted_label_raw": str(row.get("posted_label_raw") or current.get("posted_label_raw") or ""),
-                        "employment_type": str(row.get("employment_type") or current.get("employment_type") or ""),
-                        "match_label": str(row.get("match_label") or current.get("match_label") or ""),
-                        "apply_state": str(row.get("apply_state") or current.get("apply_state") or ""),
-                        "card_text": str(row.get("card_text") or current.get("card_text") or "")[:2000],
-                        "description_ref": str(row.get("description_ref") or current.get("description_ref") or ""),
-                        "last_seen_at": now,
-                        "seen_count": int(current.get("seen_count") or 0) + 1,
-                        "is_active": True,
-                    }
-                )
+                aggregated_rows[target] = self._merge_job_row(current, row)
+            for key in match_keys:
+                history_lookup[key] = target
+
+        promoted_ids: list[str] = []
+        for target in ordered_targets:
+            row = aggregated_rows[target]
+            now = str(row.get("ts") or now_iso())
+            if target.startswith("new:"):
+                job_id, canonical_job_id = self._history_ids(site_id, row)
+                current = history_index.get(job_id)
+                if current is None:
+                    current = dict(row)
+                    current["job_id"] = job_id
+                    current["canonical_job_id"] = canonical_job_id
+                    current["first_seen_at"] = now
+                    current["last_seen_at"] = now
+                    current["seen_count"] = 1
+                    current["is_active"] = True
+                    current["features_ref"] = str(current.get("features_ref") or "")
+                    history_index[job_id] = current
+                else:
+                    current = self._merge_job_row(current, row)
+                    current["job_id"] = job_id
+                    current["canonical_job_id"] = canonical_job_id
+                    current["last_seen_at"] = now
+                    current["seen_count"] = int(current.get("seen_count") or 0) + 1
+                    current["is_active"] = True
+                    history_index[job_id] = current
+            else:
+                job_id = target
+                current = history_index.get(job_id)
+            if current is None:
+                continue
+            if not target.startswith("new:"):
+                current = self._merge_job_row(current, row)
+                current["last_seen_at"] = now
+                current["seen_count"] = int(current.get("seen_count") or 0) + 1
+                current["is_active"] = True
+                history_index[job_id] = current
+            for key in self._history_match_keys(site_id, current):
+                history_lookup[key] = job_id
             promoted_ids.append(job_id)
 
         merged_rows = list(history_index.values())

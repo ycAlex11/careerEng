@@ -81,7 +81,14 @@ class JobFlow:
                 return f"- {site_name} [{site_key}]: {message}"
             return f"- {site_name} [{site_key}]: 浏览器自动化已禁用。"
         if status == "ready":
-            message = str(row.get("message") or self._ready_message_for_phase(str(row.get("current_phase") or "")))
+            message = str(
+                row.get("message")
+                or self._ready_message_for_phase(
+                    str(row.get("current_phase") or ""),
+                    authenticated_ready=bool(row.get("authenticated_ready") or row.get("session_ready")),
+                    jobs_surface_ready=bool(row.get("jobs_surface_ready")),
+                )
+            )
             return f"- {site_name} [{site_key}]: {message}"
         if str(retrieve.get("status") or "") == "failed":
             return f"- {site_name} [{site_key}]: 岗位检索失败（{reason or 'retrieve_failed'}）。"
@@ -94,16 +101,25 @@ class JobFlow:
             return f"- {site_name} [{site_key}]: 已检索 {retrieve_count} 个岗位，尝试投递 {attempted} 个，成功 {submitted} 个{suffix}。"
         return f"- {site_name} [{site_key}]: 已检索 {retrieve_count} 个岗位，未执行投递。"
 
-    @staticmethod
-    def _ready_message_for_phase(phase_slug: str) -> str:
+    @classmethod
+    def _ready_message_for_phase(cls, phase_slug: str, *, authenticated_ready: bool, jobs_surface_ready: bool) -> str:
         normalized = str(phase_slug or "").strip()
-        if normalized == "job_retrieval":
-            return "登录已就绪，岗位检索已完成，等待后续投递。"
-        if normalized == "job_filtering":
-            return "登录已就绪，岗位筛选已完成，等待后续岗位检索。"
-        if normalized == "channel_discovery":
-            return "登录已就绪，岗位入口已定位，等待后续岗位检索。"
-        return "登录已就绪，等待后续岗位检索。"
+        if authenticated_ready:
+            if normalized == "job_retrieval":
+                return "登录已就绪，岗位检索已完成，等待后续投递。"
+            if normalized == "job_filtering":
+                return "登录已就绪，岗位筛选已完成，等待后续岗位检索。"
+            if normalized == "channel_discovery":
+                return "登录已就绪，岗位入口已定位，等待后续岗位检索。"
+            return "登录已就绪，等待后续岗位检索。"
+        if jobs_surface_ready:
+            if normalized == "job_retrieval":
+                return "岗位检索已完成，当前 jobs 页面可继续，等待后续投递。"
+            if normalized == "job_filtering":
+                return "岗位筛选已完成，当前 jobs 页面可继续，等待后续岗位检索。"
+            if normalized == "channel_discovery":
+                return "岗位入口已定位，当前 jobs 页面可继续，等待后续岗位检索。"
+        return "当前 jobs 页面可继续，等待后续岗位检索。"
 
     def _format_batch_summary(self, batch: dict[str, Any]) -> str:
         status = str(batch.get("status") or "unknown")
@@ -183,6 +199,8 @@ class JobFlow:
         trace_ref = str(getattr(result, "trace_ref", "") or "")
         step_count = int(getattr(result, "step_count", 0) or 0)
         retrieved_count = int(getattr(result, "retrieved_count", 0) or 0)
+        authenticated_ready = bool(getattr(result, "authenticated_ready", False))
+        jobs_surface_ready = bool(getattr(result, "jobs_surface_ready", False))
 
         if status == "ready":
             if current_phase == "job_retrieval":
@@ -191,13 +209,21 @@ class JobFlow:
                     "site_name": site_name,
                     "status": "completed",
                     "reason_tag": reason_tag,
-                    "message": message or self._ready_message_for_phase(current_phase),
+                    "message": message
+                    or self._ready_message_for_phase(
+                        current_phase,
+                        authenticated_ready=authenticated_ready,
+                        jobs_surface_ready=jobs_surface_ready,
+                    ),
                     "entry_url": entry_url,
                     "current_phase": current_phase,
                     "current_url": current_url,
                     "trace_ref": trace_ref,
                     "step_count": step_count,
                     "skill_path": skill_path,
+                    "authenticated_ready": authenticated_ready,
+                    "jobs_surface_ready": jobs_surface_ready,
+                    "session_ready": authenticated_ready,
                     "retrieve": {"status": "done", "count": retrieved_count},
                     "apply": {
                         "status": "pending" if allow_apply else "skipped",
@@ -210,13 +236,21 @@ class JobFlow:
                 "site_name": site_name,
                 "status": "ready",
                 "reason_tag": reason_tag,
-                "message": message or self._ready_message_for_phase(current_phase),
+                "message": message
+                or self._ready_message_for_phase(
+                    current_phase,
+                    authenticated_ready=authenticated_ready,
+                    jobs_surface_ready=jobs_surface_ready,
+                ),
                 "entry_url": entry_url,
                 "current_phase": current_phase,
                 "current_url": current_url,
                 "trace_ref": trace_ref,
                 "step_count": step_count,
                 "skill_path": skill_path,
+                "authenticated_ready": authenticated_ready,
+                "jobs_surface_ready": jobs_surface_ready,
+                "session_ready": authenticated_ready,
                 "retrieve": {"status": "pending", "count": retrieved_count},
                 "apply": {
                     "status": "pending" if allow_apply else "skipped",

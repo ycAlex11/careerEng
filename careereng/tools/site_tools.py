@@ -153,6 +153,8 @@ class SiteTools:
             "entry_url": entry_url,
             "skill_path": skill_path,
             "session_ready": bool(session.get("session_ready")),
+            "authenticated_ready": bool(session.get("authenticated_ready") or session.get("session_ready")),
+            "jobs_surface_ready": bool(session.get("jobs_surface_ready")),
             "apply_enabled": apply_enabled,
             "allow_apply": allow_apply,
         }
