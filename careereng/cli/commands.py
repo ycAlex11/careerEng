@@ -8,17 +8,19 @@ from typing import Any
 
 import typer
 import yaml
+from careereng.config.loader import ensure_files
+from careereng.core.runtime import build_loop as runtime_build_loop
+from careereng.core.runtime import build_site_services as runtime_build_site_services
+from careereng.core.runtime import project_root_from_cwd, workspace_path as runtime_workspace_path
+from careereng.core.workspace_bootstrap import bootstrap_workspace
+from careereng.core.workspace_manager import dispatch_manager_message, serve_workspace_manager
+from careereng.resume.export import ResumeExportError, export_resume_pdf as export_resume_pdf_file
 from careereng.storage.job_store import JobStore
 from careereng.storage.jsonl import JSONLStore
 from careereng.storage.intent_store import IntentStore
 from careereng.storage.profile_store import ProfileStore
 from careereng.storage.router_store import RouterStore
-from careereng.runtime import build_loop as runtime_build_loop
-from careereng.runtime import build_site_services as runtime_build_site_services
-from careereng.runtime import project_root_from_cwd, workspace_path as runtime_workspace_path
 from careereng.utils import make_id, safe_file_stem
-from careereng.workspace_manager import dispatch_manager_message, serve_workspace_manager
-from careereng.workspace_bootstrap import bootstrap_workspace
 
 app = typer.Typer(help="CareerEng CLI")
 report_app = typer.Typer(help="Report review commands")
@@ -37,6 +39,26 @@ def _project_root() -> Path:
 
 def _workspace_path() -> Path:
     return runtime_workspace_path(_project_root())
+
+
+def _ensure_project_templates(project_root: Path) -> list[dict[str, str]]:
+    config_path = project_root / "config.toml"
+    auth_path = project_root / "auth.json"
+    config_existed = config_path.exists()
+    auth_existed = auth_path.exists()
+    ensure_files(project_root)
+    return [
+        {
+            "path": config_path.name,
+            "kind": "file",
+            "status": "existing" if config_existed else "created",
+        },
+        {
+            "path": auth_path.name,
+            "kind": "file",
+            "status": "existing" if auth_existed else "created",
+        },
+    ]
 
 
 def _build_site_services() -> tuple[Path, Path, Any, Any, Any, Any, Any]:
@@ -135,11 +157,21 @@ def _emit_phase_progress(
 @app.command()
 def onboard():
     """Create the editable workspace scaffold."""
-    workspace = _workspace_path()
+    project_root = _project_root()
+    project_rows = _ensure_project_templates(project_root)
+    workspace = runtime_workspace_path(project_root)
     rows = bootstrap_workspace(workspace)
+    project_created = sum(1 for row in project_rows if row.get("status") == "created")
+    project_existing = len(project_rows) - project_created
     created = sum(1 for row in rows if row.get("status") == "created")
     existing = len(rows) - created
 
+    typer.echo(f"Project templates ready at {project_root}")
+    typer.echo(f"created={project_created} existing={project_existing}")
+    for row in project_rows:
+        marker = "+" if row.get("status") == "created" else "="
+        typer.echo(f"{marker} {row.get('path')}")
+    typer.echo("auth.json contains template fields only; add your own provider API keys.")
     typer.echo(f"Workspace initialized at {workspace}")
     typer.echo(f"created={created} existing={existing}")
     for row in rows:
@@ -353,6 +385,30 @@ def resume_upload(
         pass
 
     typer.echo(reply)
+
+
+@resume_app.command("export-pdf")
+def resume_export_pdf(
+    file: str = typer.Option(..., "--file", help="Markdown resume source path"),
+    output: str = typer.Option("", "--output", "-o", help="Optional output PDF path"),
+    template: str = typer.Option("", "--template", help="Optional Typst template path"),
+):
+    """Export one Markdown resume file to PDF through Typst."""
+    workspace = _workspace_path()
+    try:
+        result = export_resume_pdf_file(
+            workspace=workspace,
+            markdown_path=Path(file),
+            output_path=Path(output) if output.strip() else None,
+            template=template,
+        )
+    except ResumeExportError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(f"template: {result.template_path}")
+    typer.echo(f"typst_source: {result.typ_path}")
+    typer.echo(f"pdf: {result.pdf_path}")
 
 
 def _stores() -> tuple[ProfileStore, IntentStore]:

@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from careereng.runtime import build_loop
+from careereng.core.runtime import build_loop
 
 
 DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS = 1800.0

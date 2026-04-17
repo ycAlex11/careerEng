@@ -187,12 +187,14 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - Record the full current visible jobs page before deciding whether to stop or paginate.
 - Use `record_jobs` for the current page as soon as the current visible jobs page can be formed into structured current-page records.
 - Use the attached current live snapshot first. If the current visible jobs are already readable there, form the records directly from that current page instead of starting with extra extraction.
+- If the fresh live snapshot clearly enumerates the current page's repeated visible job items, use that current-page visible count as the completeness check for this page.
+- Do not paginate or finish while the current page records still contain fewer roles than that clearly visible current-page count.
 - On split-view or mixed-panel job pages, first form the current visible results set for this page.
 - If some fields or URLs are still missing, you may inspect additional candidate sources on that same page more broadly, but only keep per-role data that aligns back to the current visible results set.
 - Do not accept or reject a same-page candidate source only because of its layout position, panel placement, or region label.
 - Do not indiscriminately import every `/job/` link visible somewhere on the page. Keep only the links that can be matched back to the current visible results set for this page.
 - The current results-page address is not a per-job link. Do not reuse the same results page address as the job link for multiple visible roles.
-- Do not open a single job detail before the current visible results page has been recorded.
+- Do not leave the current results page to open a separate job detail page before the current visible results page has been recorded.
 - If one attempt already produced the current page jobs, call `record_jobs` immediately before any more observation or pagination.
 - If one or more current-page list fields are still missing after reading the current live snapshot, use one focused supplemental read on the same current page, then call `record_jobs`.
 - If any visible role on the current page still does not have its own concrete role link, stay on that same page, complete the missing links, and only then record or paginate.
@@ -216,18 +218,63 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - Do not treat the current page as final when the live page still indicates a larger total results set or additional numbered pages that have not yet been confirmed and recorded.
 - Never stop before recording the full current visible page.
 
-## Apply Decision
+## Apply
 
-### Default Matching Rule
+### Workflow
 
-Use these as the default application-decision rules when a site skill does not provide a stronger site-native signal.
+- Work from the current batch's saved jobs, one job at a time.
+- Open each saved job URL, sync the current page's JD and application state, then decide what to do for that specific role.
+- For every job, end in one terminal run-state before moving on: `recommended_apply`, `filtered_out`, `already_applied`, `submitted`, or `blocked`.
+- Submit only the jobs that are judged `recommended_apply`.
+- Record JD sync, decision, and application progress as you go so the current batch always reflects the latest state.
+- Treat apply as a page-by-page workflow on the current live page.
+- At the start of each apply page, read the current live page first before taking the next action.
+- On the current page, first handle explicit validation errors, required empty fields, required selections, or missing uploaded files.
+- If the current page needs a resume or file upload, first use that page's own upload entry such as `Upload new`, `Upload`, or `Select files`.
+- Call `browser_file_upload` only after the live page has actually entered file-chooser state for that current page.
+- After any upload attempt, re-read the fresh current live page and confirm the page accepted the staged PDF before continuing.
+- After any successful upload, `Next`, `Continue`, `Review`, `Save and continue`, `Submit`, or `Submit application` action, capture a fresh live snapshot and use that new page state as the source of truth.
+- Use the current page's safe forward action when one is clearly available, such as `Next`, `Continue`, `Review`, or `Save and continue`.
+- If the current apply flow returns to a sign-in page but still shows a visible one-click continuation such as a provider button, remembered account, or direct sign-in continuation, continue through that visible login recovery path instead of stopping immediately.
+- If the current apply flow has reached password entry, email entry, MFA, verification code, CAPTCHA, or another explicit human-only challenge with no visible one-click continuation left, finish that job with `blocked`.
+- Use the final irreversible action such as `Submit` or `Submit application` only when the current page is clearly the final confirmation page for the current job.
+- Do not keep retrying upload, forward, or submit blindly on the same unchanged page. If an action did not advance, re-read the current page and resolve the visible blocking reason first.
 
-- Score the job description against `persona.md` first.
-- If the match score is between 70 and 100, apply directly.
-- If the match score is below 40, do not apply.
-- If the match score is between 40 and 70, review the full CV before making a final decision.
-- After the full CV review, apply only if the updated score is above 50.
+### Matching
 
-### Persona Usage
+- If the site skill defines a stronger site-native matching rule, use that site rule first.
+- Otherwise use this common rule:
+- Score the JD against `persona.md` first.
+- If the score is between 70 and 100, treat it as `recommended_apply`.
+- If the score is below 40, treat it as `filtered_out`.
+- If the score is between 40 and 70, review the full CV before making the final decision.
+- After the full CV review, use `recommended_apply` only if the updated score is above 50; otherwise use `filtered_out`.
+- Use `persona.md` and the current CV as the decision basis. Do not invent unsupported experience.
 
-Use `persona.md` and the current CV here, when judging whether a concrete role is a realistic fit for the user.
+### Resume Source
+
+- The resume source for apply is the run-local staged PDF path provided in the current apply context.
+- When the site asks for a resume upload, use that provided run-local PDF path.
+- The apply context also provides the staged resume basename. If the current live page already shows that same file name as the selected or active resume for this apply page, treat the resume step as already satisfied and do not upload again.
+- A successful file-upload tool call only means the local file was attached to the page control. It does not by itself prove the site accepted the resume.
+- If the current live page already confirms that same staged PDF is uploaded or selected for this apply page, do not upload it again on that same page.
+- If a stale file chooser reappears on an unchanged apply page after an upload attempt, return to the live page state first instead of blindly uploading again.
+- Do not switch to an older site-saved application or a different local file unless the site skill explicitly requires a user takeover.
+
+### Form Filling
+
+- Fill only required fields in apply.
+- If a required field already has a visible current value, selected option, checked state, or uploaded file, leave it as-is and move on.
+- Do not spend time rewriting or re-answering fields that are already filled.
+- Skip optional fields unless the active site skill explicitly requires them.
+
+### Submission Success
+
+- Treat a job as successfully submitted only after the site shows an explicit final success confirmation on the live page.
+- If the site clearly shows that the user already applied, record `already_applied` instead of submitting again.
+- If submission is ambiguous after the final action, do not guess success. Record the blocking state and stop for that job.
+
+### Completion
+
+- Finish `Apply` only after every saved job for the current site and batch has reached a terminal state.
+- Do not leave jobs in an in-between state just because one role was submitted successfully.

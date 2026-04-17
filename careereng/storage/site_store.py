@@ -14,6 +14,43 @@ from careereng.utils import dump_front_matter, ensure_dir, make_id, now_iso, par
 
 
 class SiteStore:
+    RUN_JOB_STRING_FIELDS = (
+        "batch_id",
+        "session_id",
+        "turn_id",
+        "canonical_job_id",
+        "site_id",
+        "employer",
+        "title",
+        "url",
+        "location",
+        "posted_at",
+        "posted_label",
+        "posted_label_raw",
+        "employment_type",
+        "match_label",
+        "apply_state",
+        "card_text",
+        "description_ref",
+        "jd_sync_status",
+        "decision_status",
+        "decision_rule_source",
+        "decision_rule_name",
+        "site_match_signal_raw",
+        "match_reason_initial",
+        "match_reason_final",
+        "fit_reason",
+        "fit_source",
+        "application_status",
+        "last_apply_error",
+    )
+    RUN_JOB_NUMERIC_FIELDS = (
+        "match_score_initial",
+        "match_score_final",
+        "fit_confidence",
+    )
+    RUN_JOB_BOOL_FIELDS = ("fit_apply",)
+
     def __init__(self, workspace: Path):
         self.workspace = workspace
         self.sites_dir = ensure_dir(workspace / "sites")
@@ -63,8 +100,14 @@ class SiteStore:
             "- Describe any known redirects, new tabs, ATS handoffs, or site-specific stop conditions.\n\n"
             "### Success Signal\n\n"
             "- Describe what should count as a real jobs list or reliable application entry.\n\n"
-            "## Apply Workflow\n\n"
-            "- Describe how to find relevant jobs and which pages are safe to skip.\n"
+            "## Apply\n\n"
+            "### Matching Override\n\n"
+            "- Describe any site-native matching or already-applied signals that should override the project default.\n\n"
+            "### Form Filling\n\n"
+            "- Describe site-specific form answers, safe defaults, and fields that require user takeover.\n\n"
+            "### Site Signals\n\n"
+            "- Describe what counts as already applied, submitted successfully, or clearly blocked on this site.\n\n"
+            "### Escalation\n\n"
             "- Describe when the agent should stop and ask the user to take over.\n"
         )
         return dump_front_matter(
@@ -766,6 +809,71 @@ class SiteStore:
             merged["ts"] = ts
         return merged
 
+    def _persist_description_ref(self, *, root: Path, job_id: str, description: str) -> str:
+        text = str(description or "").strip()
+        if not text:
+            return ""
+        ensure_dir(root / "jobs" / "descriptions")
+        doc_id = hashlib.sha1((job_id + "|" + text).encode("utf-8")).hexdigest()[:16]
+        desc_path = root / "jobs" / "descriptions" / f"{doc_id}.md"
+        if not desc_path.exists():
+            desc_path.write_text(text, encoding="utf-8")
+        return str(desc_path.relative_to(self.workspace))
+
+    def _merge_run_job_row(
+        self,
+        *,
+        base: dict[str, Any],
+        incoming: dict[str, Any],
+        root: Path,
+        job_id: str,
+        session_id: str,
+        turn_id: str,
+        batch_id: str,
+    ) -> dict[str, Any]:
+        merged = dict(base)
+        merged["job_id"] = job_id
+        merged["ts"] = now_iso()
+        if batch_id:
+            merged["batch_id"] = batch_id
+        if session_id:
+            merged["session_id"] = session_id
+        if turn_id:
+            merged["turn_id"] = turn_id
+
+        for field in self.RUN_JOB_STRING_FIELDS:
+            value = incoming.get(field)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                if field == "url":
+                    merged[field] = self._normalize_url(text)
+                elif field == "card_text":
+                    merged[field] = text[:2000]
+                else:
+                    merged[field] = text
+        for field in self.RUN_JOB_NUMERIC_FIELDS:
+            value = incoming.get(field)
+            if value in (None, ""):
+                continue
+            try:
+                merged[field] = float(value)
+            except Exception:
+                continue
+        for field in self.RUN_JOB_BOOL_FIELDS:
+            if field in incoming:
+                merged[field] = bool(incoming.get(field))
+
+        description = str(incoming.get("description") or "").strip()
+        if description:
+            merged["description_ref"] = self._persist_description_ref(
+                root=root,
+                job_id=job_id,
+                description=description,
+            )
+        return merged
+
     def preview_history_new_flags(self, site_id: str, jobs: list[dict[str, Any]]) -> list[bool]:
         history_rows = self._load_history_jobs(site_id)
         lookup: dict[str, str] = {}
@@ -832,14 +940,11 @@ class SiteStore:
                 continue
             job_id, canonical_job_id = self._job_ids(site_id, title, employer, url)
             now = now_iso()
-            description = str(job.get("description") or "").strip()
-            description_ref = ""
-            if description:
-                doc_id = hashlib.sha1((job_id + "|" + description).encode("utf-8")).hexdigest()[:16]
-                desc_path = root / "jobs" / "descriptions" / f"{doc_id}.md"
-                if not desc_path.exists():
-                    desc_path.write_text(description, encoding="utf-8")
-                description_ref = str(desc_path.relative_to(self.workspace))
+            description_ref = self._persist_description_ref(
+                root=root,
+                job_id=job_id,
+                description=str(job.get("description") or ""),
+            )
 
             snapshot = {
                 "observation_id": make_id("obs"),
@@ -870,6 +975,47 @@ class SiteStore:
         run_rows.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("observation_id") or ""), str(r.get("job_id") or "")))
         run_store.write_all(run_rows)
         return appended_rows
+
+    def update_run_jobs(
+        self,
+        site_id: str,
+        jobs: list[dict[str, Any]],
+        session_id: str,
+        turn_id: str,
+        batch_id: str = "",
+    ) -> list[dict[str, Any]]:
+        root = self.site_dir(site_id)
+        run_store = JSONLStore(self._job_run_path(site_id, batch_id))
+        rows = [row for row in run_store.read_all() if isinstance(row, dict)]
+        index = {str(row.get("job_id") or ""): idx for idx, row in enumerate(rows) if str(row.get("job_id") or "")}
+
+        updated_rows: list[dict[str, Any]] = []
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            job_id = str(job.get("job_id") or "").strip()
+            if not job_id:
+                continue
+            base = rows[index[job_id]] if job_id in index else {"job_id": job_id}
+            merged = self._merge_run_job_row(
+                base=base,
+                incoming=job,
+                root=root,
+                job_id=job_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                batch_id=str(batch_id or ""),
+            )
+            if job_id in index:
+                rows[index[job_id]] = merged
+            else:
+                index[job_id] = len(rows)
+                rows.append(merged)
+            updated_rows.append(merged)
+
+        rows.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("observation_id") or ""), str(r.get("job_id") or "")))
+        run_store.write_all(rows)
+        return updated_rows
 
     def promote_run_jobs_to_history(self, site_id: str, batch_id: str) -> list[dict[str, Any]]:
         history_rows = self._load_history_jobs(site_id)

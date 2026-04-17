@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from careereng.resume.export import default_resume_template_text
 from careereng.storage.intent_store import DEFAULT_INTENT
 from careereng.storage.profile_store import DEFAULT_PERSONA
 from careereng.utils import dump_front_matter, ensure_dir, now_iso
@@ -104,6 +105,15 @@ def bootstrap_workspace(workspace: Path) -> list[WorkspaceEntry]:
     _ensure_dir(workspace / "cv", rows, workspace)
     _ensure_dir(workspace / "cv" / "current", rows, workspace)
     _ensure_dir(workspace / "cv" / "history", rows, workspace)
+    _ensure_dir(workspace / "cv" / "templates", rows, workspace)
+    _ensure_dir(workspace / "cv" / "exports", rows, workspace)
+    _ensure_dir(workspace / "cv" / "variants", rows, workspace)
+    _ensure_text_file(
+        workspace / "cv" / "templates" / "default.typ",
+        default_resume_template_text(),
+        rows,
+        workspace,
+    )
 
     _ensure_dir(workspace / "intent", rows, workspace)
     _ensure_dir(workspace / "intent" / "history", rows, workspace)

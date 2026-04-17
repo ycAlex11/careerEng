@@ -1,29 +1,22 @@
 # CareerEng (V1.1)
 
-CareerEng is a lightweight CLI assistant for automated job search and application workflows.
+CareerEng is a local CLI assistant for job search, site registration, job retrieval, and browser-driven application workflows.
 
-## Scope
+## Current Capabilities
 
-- Single chat entry: `careereng run -m "..."`
-- Resume upload: `careereng resume upload --file <path>`
-- Report review flow:
-  - `careereng report list`
-  - `careereng report review --id <report_id>`
-- Provider support: OpenAI/OpenRouter (`config.toml` + `auth.json`)
-- Session isolation (`workspace/sessions/<session_id>.jsonl`)
-- Relatedness-first context routing for chat turns
-- Candidate events + auto report (every 20 related events)
-- Resume sync flow:
-  - Apply `persona.md` patch automatically
-  - Generate `intent.md` candidate patch and require `y/n` confirmation
-- V1.1 search/apply flow:
-  - Extract constraints from `message + intent + project search skills + workspace job skill`
-  - LLM recommends company candidates (Top-N)
-  - User selects companies by index (`1 3 5`)
-  - Google/Playwright resolves each selected company's entry URL
-  - Registration stage writes the site registry + site metadata + site runtime scaffold
-  - Registered-site retrieve/apply batch runs through `run -m`, with blocked-login recovery by `site_key y/n`
-- Site registry commands: `careereng site add/list/activate/deactivate`
+- Single chat entry through `careereng run -m "..."`
+- Resume upload through `careereng resume upload --file <path>`
+- Resume PDF export through `careereng resume export-pdf --file <path>`
+- Automatic `persona.md` update from resume content
+- Conservative `intent.md` candidate generation with explicit `y/n` confirmation
+- Company search based on `message + intent + project search skills + workspace job skill`
+- Company registration with entry URL resolution and per-site runtime scaffold creation
+- Registered-site retrieval batches that write per-run job data and history
+- Apply continuation on sites whose site skill is `ready` and `apply_enabled: true`
+- Blocked-login recovery through `site_key y` / `site_key n`
+- Report review flow through `careereng report list` and `careereng report review --id <report_id>`
+- Site registry management through `careereng site add/list/activate/deactivate`
+- Batch state inspection and cleanup through `careereng batch-list` and `careereng batch-clear`
 
 ## Install
 
@@ -31,14 +24,27 @@ CareerEng is a lightweight CLI assistant for automated job search and applicatio
 pip install -e .
 pip install playwright
 python -m playwright install chromium
+typst --version  # ensure Typst is installed and on PATH
 careereng onboard
 ```
 
-`careereng onboard` ensures the editable runtime scaffold exists before first use, including:
+Install Typst separately before using PDF export. Example on macOS:
+
+```bash
+brew install typst
+```
+
+## First-Time Setup
+
+Run `careereng onboard` once after install.
+
+It creates or reuses:
 
 - `config.toml`
 - `auth.json`
 - `workspace/...`
+
+`careereng onboard` only creates templates. It does not write any real provider API key.
 
 ## Configuration
 
@@ -54,8 +60,8 @@ Set provider config in `config.toml`:
 path = "./workspace"
 
 [agent]
-default_provider = "openai"
-default_model = "gpt-4o-mini"
+default_provider = "openrouter"
+default_model = "openai/gpt-4o-mini"
 max_history_messages = 50
 related_history_k = 6
 relatedness_threshold = 0.7
@@ -66,8 +72,18 @@ search_company_top_k = 10
 
 [browser]
 headless = false
+keep_open = false
 timeout_ms = 45000
 slow_mo_ms = 0
+api_base = "https://api.openai.com/v1"
+model = "gpt-5"
+reasoning_effort = "high"
+site_parallelism = 2
+phase_timeout_seconds = 180
+step_timeout_seconds = 30
+max_step_retries = 1
+max_phase_steps = 24
+browser_name = "chrome"
 
 [providers.openrouter]
 api_base = "https://openrouter.ai/api/v1"
@@ -91,45 +107,116 @@ Set provider keys in `auth.json`:
 ```json
 {
   "providers": {
-    "openrouter": {
+    "openai": {
       "api_key": ""
     },
-    "openai": {
-      "api_key": "sk-..."
+    "openrouter": {
+      "api_key": ""
     }
   }
 }
 ```
 
-## Commands
+## Quick Start
 
 ```bash
 careereng onboard
-careereng run -m "我想找中国后端岗位" --session cli:default
 careereng resume upload --file ./cv.md --session cli:default
+careereng resume export-pdf --file ./cv.md
+careereng run -m "请帮我搜索后端岗位，偏外企" --session cli:default
+# assistant returns company list -> reply: 1 3 5
+careereng run -m "开始检索并投递已注册的公司" --session cli:default
+# if a site blocks for login recovery -> reply: microsoft y
+```
+
+## Resume, Persona, Intent
+
+- Do not manually copy a CV into `workspace/` as the main flow. Use `careereng resume upload --file <path>`.
+- After upload:
+  - the current normalized resume snapshot is stored under `workspace/cv/current/`
+  - previous current versions are archived under `workspace/cv/history/`
+  - a raw source snapshot is also saved under `workspace/profile/sources/`
+- PDF export uses:
+  - `workspace/cv/templates/default.typ` as the default editable Typst template
+  - `workspace/cv/exports/` as the default output directory for `.pdf` and generated `.typ`
+- Your current persona lives at `workspace/profile/persona.md`
+- Your current intent lives at `workspace/intent/intent.md`
+- Your user-owned job preference overlay lives at `workspace/skills/jobs/SKILL.md`
+
+## Company Search, Registration, Retrieval
+
+Company search:
+
+- Trigger through `careereng run -m "..."`
+- The system builds candidates from the current message, `intent.md`, project search skills, and `workspace/skills/jobs/SKILL.md`
+- Search artifacts are written under:
+  - `workspace/search/queries.jsonl`
+  - `workspace/search/web_results.jsonl`
+  - `workspace/search/company_candidates.jsonl`
+  - `workspace/search/company_decisions.jsonl`
+
+Company registration:
+
+- After you reply with company indices such as `1 3 5`, CareerEng resolves each entry URL and registers the site
+- Registration writes:
+  - `workspace/sites/registry.jsonl`
+  - `workspace/sites/<site_id>/site.json`
+  - `workspace/sites/<site_id>/skills/SKILL.md`
+  - `workspace/sites/<site_id>/browser/session.json`
+  - `workspace/sites/<site_id>/browser/user_data/`
+
+Registered-site retrieval and apply:
+
+- Trigger through `careereng run -m "开始检索并投递已注册的公司"`
+- Each successful retrieval run writes:
+  - `workspace/sites/<site_id>/jobs/runs/<batch_id>.jsonl`
+  - `workspace/sites/<site_id>/jobs/history_jobs.json`
+  - `workspace/jobs/batches/<batch_id>.json`
+  - `workspace/jobs/events.jsonl`
+- If a site is blocked for login, reply with `site_key y` after recovery, or `site_key n` to skip it
+
+## CLI Commands
+
+Core commands:
+
+```bash
+careereng onboard
+careereng run -m "..." --session cli:default
+careereng batch-list --session cli:default
+careereng batch-clear --session cli:default
+careereng viewreport --id profile_report_xxx
+```
+
+Resume commands:
+
+```bash
+careereng resume upload --file ./cv.md --session cli:default
+careereng resume export-pdf --file ./cv.md
+```
+
+Report commands:
+
+```bash
 careereng report list
 careereng report review --id profile_report_xxx
+```
+
+Route review commands:
+
+```bash
 careereng route feedback --event-id route_evt_xxx --correct no --expected-route search --comment "should be search"
+```
+
+Site registry commands:
+
+```bash
 careereng site add "Microsoft"
 careereng site list --status active
 careereng site deactivate microsoft
 careereng site activate microsoft --url https://careers.microsoft.com
-careereng run -m "开始检索并投递已注册的公司"
-careereng run -m "microsoft y"
 ```
 
-Search conversation example (all through `run -m`):
-
-```bash
-careereng run -m "请帮我搜索后端岗位，偏外企"
-# assistant returns company list -> reply: 1 3 5
-# assistant registers those companies, resolves entry URLs, and creates site skill templates
-
-careereng run -m "开始检索并投递已注册的公司"
-# ready sites continue automatically
-# blocked sites ask for manual login recovery
-# reply: microsoft y
-```
+`careereng batch-clear` clears open batch state by marking unfinished batches as cancelled. It does not kill OS processes.
 
 ## Repository Layout
 
@@ -184,6 +271,13 @@ workspace/
 │  ├─ profile_events.jsonl
 │  ├─ reports/
 │  └─ sources/
+├─ cv/
+│  ├─ current/
+│  ├─ history/
+│  ├─ templates/
+│  │  └─ default.typ
+│  ├─ exports/
+│  └─ variants/
 ├─ intent/
 │  ├─ intent.md
 │  ├─ history/

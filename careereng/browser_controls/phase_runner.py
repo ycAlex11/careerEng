@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
+import shutil
 import threading
 from typing import Any
 import anyio
@@ -16,16 +18,20 @@ from careereng.browser_controls.backends.playwright_mcp import (
 from careereng.browser_controls.bridge import MCPToolBridge
 from careereng.browser_controls.prompting import build_phase_prompts, load_text
 from careereng.browser_controls.runtime import BrowserPhaseResult, BrowserPhaseRuntime, BrowserRuntimeConfig
+from careereng.resume.export import default_apply_resume_pdf_path
 from careereng.utils import now_iso
 
 
-SUPPORTED_PHASES = {"session_preparation", "channel_discovery", "job_filtering", "job_retrieval"}
+SUPPORTED_PHASES = {"session_preparation", "channel_discovery", "job_filtering", "job_retrieval", "apply"}
+DEFAULT_RUN_PHASES = ("session_preparation", "channel_discovery", "job_filtering", "job_retrieval")
 GLOBAL_BLOCKED_TOOL_NAMES = {"browser_run_code"}
 SESSION_PREPARATION_BLOCKED_TOOL_NAMES = {"browser_resize"}
 JOB_RETRIEVAL_BLOCKED_TOOL_NAMES = {"browser_navigate"}
 JOB_FILTERING_PHASE_TIMEOUT_SECONDS = 420
 JOB_RETRIEVAL_PHASE_TIMEOUT_SECONDS = 900
 JOB_RETRIEVAL_MAX_PHASE_STEPS = 96
+APPLY_PHASE_TIMEOUT_SECONDS = 3600
+APPLY_PHASE_MAX_PHASE_STEPS = 240
 
 
 @dataclass(frozen=True)
@@ -41,6 +47,9 @@ class BrowserAutomationResult:
     step_count: int = 0
     retrieved_count: int = 0
     new_job_count: int = 0
+    applied_count: int = 0
+    submitted_count: int = 0
+    already_applied_count: int = 0
     authenticated_ready: bool = False
     jobs_surface_ready: bool = False
 
@@ -109,11 +118,11 @@ class BrowserAutomationService:
     def _site_skill_path(self, site_key: str) -> Path:
         return self.site_store.site_dir(site_key) / "skills" / "SKILL.md"
 
-    def _phase_prompts(self, site_key: str):
+    def _phase_prompts(self, site_key: str, *, allowed_slugs: set[str]):
         return build_phase_prompts(
             load_text(self._project_skill_path()),
             load_text(self._site_skill_path(site_key)),
-            allowed_slugs=SUPPORTED_PHASES,
+            allowed_slugs=allowed_slugs,
         )
 
     @staticmethod
@@ -124,6 +133,8 @@ class BrowserAutomationService:
     def _ready_message_for_phase(cls, phase_slug: str, *, authenticated_ready: bool, jobs_surface_ready: bool) -> str:
         normalized = str(phase_slug or "").strip()
         if authenticated_ready:
+            if normalized == "apply":
+                return "登录已就绪，岗位投递已完成。"
             if normalized == "job_retrieval":
                 return "登录已就绪，岗位检索已完成，等待后续投递。"
             if normalized == "job_filtering":
@@ -132,6 +143,8 @@ class BrowserAutomationService:
                 return "登录已就绪，岗位入口已定位，等待后续岗位检索。"
             return "登录已就绪，等待后续岗位检索。"
         if jobs_surface_ready:
+            if normalized == "apply":
+                return "岗位投递已完成。"
             if normalized == "job_retrieval":
                 return "岗位检索已完成，当前 jobs 页面可继续，等待后续投递。"
             if normalized == "job_filtering":
@@ -157,6 +170,8 @@ class BrowserAutomationService:
         base = int(self.phase_timeout_seconds or 180)
         if str(phase_slug or "").strip() == "job_retrieval":
             return max(base, JOB_RETRIEVAL_PHASE_TIMEOUT_SECONDS)
+        if str(phase_slug or "").strip() == "apply":
+            return max(base, APPLY_PHASE_TIMEOUT_SECONDS)
         if str(phase_slug or "").strip() == "job_filtering":
             return max(base, JOB_FILTERING_PHASE_TIMEOUT_SECONDS)
         return base
@@ -165,6 +180,8 @@ class BrowserAutomationService:
         base = int(self.max_phase_steps or 24)
         if str(phase_slug or "").strip() == "job_retrieval":
             return max(base, JOB_RETRIEVAL_MAX_PHASE_STEPS)
+        if str(phase_slug or "").strip() == "apply":
+            return max(base, APPLY_PHASE_MAX_PHASE_STEPS)
         return base
 
     def _response_tools_for_phase(self, tools: list[Any], phase_slug: str) -> tuple[list[dict[str, Any]], set[str]]:
@@ -183,7 +200,137 @@ class BrowserAutomationService:
             schema = BrowserPhaseRuntime.record_jobs_tool()
             response_tools.append(schema)
             tool_names.add(str(schema.get("name") or "record_jobs"))
+        if phase_slug == "apply":
+            schema = BrowserPhaseRuntime.update_jobs_tool()
+            response_tools.append(schema)
+            tool_names.add(str(schema.get("name") or "update_jobs"))
         return response_tools, tool_names
+
+    def _apply_context_items(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        target_job_ids: tuple[str, ...] | None = None,
+        staged_resume_pdf_path: str = "",
+    ) -> list[dict[str, str]]:
+        items: list[dict[str, str]] = []
+        target_ids = {str(job_id or "").strip() for job_id in (target_job_ids or ()) if str(job_id or "").strip()}
+        list_run_jobs = getattr(self.site_store, "list_run_jobs", None)
+        if callable(list_run_jobs):
+            try:
+                run_rows = list_run_jobs(site_key, batch_id)
+            except Exception:
+                run_rows = []
+        else:
+            run_rows = []
+        terminal_decisions = {"filtered_out", "already_applied"}
+        terminal_applications = {"already_applied", "submitted", "apply_failed", "blocked"}
+        pending_rows: list[dict[str, Any]] = []
+        for row in run_rows:
+            if not isinstance(row, dict):
+                continue
+            job_id = str(row.get("job_id") or "").strip()
+            if target_ids and job_id not in target_ids:
+                continue
+            decision_status = str(row.get("decision_status") or "").strip().lower()
+            application_status = str(row.get("application_status") or "").strip().lower()
+            if decision_status in terminal_decisions or application_status in terminal_applications:
+                continue
+            pending_rows.append(
+                {
+                    "job_id": job_id,
+                    "title": str(row.get("title") or ""),
+                    "url": str(row.get("url") or ""),
+                    "location": str(row.get("location") or ""),
+                    "posted_label": str(row.get("posted_label") or ""),
+                    "employment_type": str(row.get("employment_type") or ""),
+                    "match_label": str(row.get("match_label") or ""),
+                    "apply_state": str(row.get("apply_state") or ""),
+                    "decision_status": str(row.get("decision_status") or ""),
+                    "application_status": str(row.get("application_status") or ""),
+                }
+            )
+        items.append(
+            {
+                "role": "user",
+                "content": (
+                    (
+                        "Current apply target for this site and batch. Work only on this job:\n"
+                        if len(target_ids) == 1
+                        else "Current apply targets for this site and batch:\n"
+                    )
+                    + json.dumps(pending_rows, ensure_ascii=False)
+                ),
+            }
+        )
+        resume_pdf_path = str(staged_resume_pdf_path or "").strip() or str(default_apply_resume_pdf_path(self.workspace))
+        items.append(
+            {
+                "role": "user",
+                "content": (
+                    "Run-local staged resume PDF for this apply phase "
+                    f"(use this exact local path if upload is needed): {resume_pdf_path}"
+                ),
+            }
+        )
+        resume_file_name = Path(resume_pdf_path).name.strip()
+        if resume_file_name:
+            items.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Current staged resume filename for this apply phase "
+                        f"(compare the live page's selected resume name against this basename): {resume_file_name}"
+                    ),
+                }
+            )
+        persona_path = self.workspace / "profile" / "persona.md"
+        persona_text = load_text(persona_path).strip()
+        if persona_text:
+            items.append({"role": "user", "content": f"Current persona.md:\n{persona_text[:24000]}"})
+        current_dir = self.workspace / "cv" / "current"
+        cv_text = ""
+        if current_dir.exists():
+            for path in sorted(current_dir.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
+                if not path.is_file() or path.name == "metadata.json":
+                    continue
+                cv_text = load_text(path).strip()
+                if cv_text:
+                    break
+        if cv_text:
+            items.append({"role": "user", "content": f"Current CV text:\n{cv_text[:24000]}"})
+        return items
+
+    def _phase_context_items(
+        self,
+        *,
+        site_key: str,
+        phase_slug: str,
+        batch_id: str,
+        target_job_ids: tuple[str, ...] | None = None,
+        staged_resume_pdf_path: str = "",
+    ) -> list[dict[str, str]]:
+        if phase_slug == "apply":
+            return self._apply_context_items(
+                site_key=site_key,
+                batch_id=batch_id,
+                target_job_ids=target_job_ids,
+                staged_resume_pdf_path=staged_resume_pdf_path,
+            )
+        return []
+
+    def _stage_apply_resume_pdf(self, *, runtime_output_dir: Path) -> Path:
+        source_path = default_apply_resume_pdf_path(self.workspace)
+        if not source_path.is_file():
+            raise FileNotFoundError(f"resume source not found: {source_path}")
+        runtime_output_dir.mkdir(parents=True, exist_ok=True)
+        staged_path = runtime_output_dir / source_path.name
+        if source_path.resolve() != staged_path.resolve():
+            shutil.copy2(source_path, staged_path)
+        elif not staged_path.exists():
+            shutil.copy2(source_path, staged_path)
+        return staged_path
 
     def _create_phase_runtime(self) -> BrowserPhaseRuntime | Any:
         override = self.phase_runtime
@@ -191,11 +338,16 @@ class BrowserAutomationService:
             return override
         return BrowserPhaseRuntime(self._phase_runtime_config)
 
-    def _reserve_runtime(self, site_key: str, entry_url: str) -> tuple[ActiveSiteRuntime, bool]:
+    def _reserve_runtime(self, site_key: str, entry_url: str, timeout_ms: int | None = None) -> tuple[ActiveSiteRuntime, bool]:
+        effective_timeout_ms = int(timeout_ms or self.timeout_ms or 45000)
         with self._lock:
             current = self._active.get(site_key)
             if current and current.runtime.is_running():
                 current.entry_url = entry_url or current.entry_url
+                current.runtime.command_timeout_seconds = max(
+                    float(getattr(current.runtime, "command_timeout_seconds", 0.0) or 0.0),
+                    max(45.0, float(effective_timeout_ms) / 1000.0 + 30.0),
+                )
                 return current, True
             if current:
                 current.runtime.stop()
@@ -209,7 +361,7 @@ class BrowserAutomationService:
                     headless=self.headless,
                     profile_dir=self.site_store.browser_profile_dir(site_key),
                     output_dir=output_dir,
-                    timeout_ms=self.timeout_ms,
+                    timeout_ms=effective_timeout_ms,
                 )
             except Exception:
                 raise
@@ -234,8 +386,12 @@ class BrowserAutomationService:
         turn_id: str,
         batch_id: str,
         resume: bool,
+        phase_slugs: tuple[str, ...] | None,
+        apply_target_job_ids: tuple[str, ...] | None = None,
+        phase_timeout_seconds_override: int | None = None,
+        timeout_ms_override: int | None = None,
     ) -> BrowserAutomationResult:
-        active, reused_runtime = self._reserve_runtime(site_key, entry_url)
+        active, reused_runtime = self._reserve_runtime(site_key, entry_url, timeout_ms=timeout_ms_override)
         phase_runtime = self._create_phase_runtime()
         wait_for_process(active.runtime)
         self.site_store.save_browser_session(
@@ -267,10 +423,12 @@ class BrowserAutomationService:
             },
         )
 
-        bridge = MCPToolBridge(active.runtime, timeout_seconds=max(30.0, self.timeout_ms / 1000.0))
+        effective_timeout_ms = int(timeout_ms_override or self.timeout_ms or 45000)
+        bridge = MCPToolBridge(active.runtime, timeout_seconds=max(30.0, effective_timeout_ms / 1000.0))
         keep_runtime = False
         result: BrowserAutomationResult | None = None
-        phases = self._phase_prompts(site_key)
+        allowed_slugs = set(phase_slugs or DEFAULT_RUN_PHASES)
+        phases = self._phase_prompts(site_key, allowed_slugs=allowed_slugs)
         if not phases:
             result = BrowserAutomationResult(
                 site_key=site_key,
@@ -282,7 +440,7 @@ class BrowserAutomationService:
         else:
             try:
                 await bridge.wait_until_ready(
-                    seconds=max(5.0, min(30.0, float(self.timeout_ms or 45000) / 1000.0)),
+                    seconds=max(5.0, min(30.0, float(effective_timeout_ms) / 1000.0)),
                     poll_interval=0.25,
                 )
             except Exception as exc:
@@ -295,6 +453,24 @@ class BrowserAutomationService:
                 )
             else:
                 session_state = self.site_store.ensure_browser_session(site_key)
+                apply_staged_resume_pdf_path = ""
+                if result is None and any(phase.slug == "apply" for phase in phases):
+                    try:
+                        staged_resume_pdf = self._stage_apply_resume_pdf(runtime_output_dir=active.runtime.output_dir)
+                    except Exception as exc:
+                        result = BrowserAutomationResult(
+                            site_key=site_key,
+                            site_name=site_name,
+                            status="failed",
+                            reason_tag="resume_pdf_unavailable",
+                            message=str(exc),
+                        )
+                    else:
+                        apply_staged_resume_pdf_path = str(staged_resume_pdf)
+                        self.site_store.save_browser_session(
+                            site_key,
+                            {"staged_resume_pdf_path": apply_staged_resume_pdf_path},
+                        )
                 resume_phase = str(session_state.get("resume_phase") or "").strip()
                 start_index = 0
                 if resume and resume_phase:
@@ -371,43 +547,24 @@ class BrowserAutomationService:
                                 response_tools=response_tools,
                                 tool_names=tool_names,
                                 phase_handoff=phase_handoff,
-                                phase_timeout_seconds=self._phase_timeout_seconds(phase.slug),
+                                phase_timeout_seconds=(
+                                    max(self._phase_timeout_seconds(phase.slug), int(phase_timeout_seconds_override or 0))
+                                    if phase.slug == "apply"
+                                    else self._phase_timeout_seconds(phase.slug)
+                                ),
                                 max_phase_steps=self._phase_max_steps(phase.slug),
+                                extra_context_items=self._phase_context_items(
+                                    site_key=site_key,
+                                    phase_slug=phase.slug,
+                                    batch_id=batch_id,
+                                    target_job_ids=apply_target_job_ids,
+                                    staged_resume_pdf_path=apply_staged_resume_pdf_path,
+                                ),
+                                apply_staged_resume_pdf_path=apply_staged_resume_pdf_path,
                             )
                             last_result = phase_result
                             current_url = str(phase_result.current_url or current_url or target_url)
                             if phase_result.status == "done":
-                                if phase.slug == "job_retrieval":
-                                    promote_run_jobs = getattr(self.site_store, "promote_run_jobs_to_history", None)
-                                    if callable(promote_run_jobs):
-                                        try:
-                                            promote_run_jobs(site_key, batch_id)
-                                        except Exception as exc:
-                                            message = MCPToolBridge._format_exception(exc) or str(exc)
-                                            self.site_store.append_event(
-                                                site_key,
-                                                "browser.phase.failed",
-                                                {
-                                                    "turn_id": turn_id,
-                                                    "phase": phase.slug,
-                                                    "summary": message,
-                                                    "reason_tag": "history_promote_failed",
-                                                },
-                                            )
-                                            result = BrowserAutomationResult(
-                                                site_key=site_key,
-                                                site_name=site_name,
-                                                status="failed",
-                                                reason_tag="history_promote_failed",
-                                                message=message,
-                                                current_phase=phase.slug,
-                                                current_url=current_url,
-                                                trace_ref=phase_result.trace_ref,
-                                                step_count=phase_result.step_count,
-                                                retrieved_count=phase_result.recorded_count,
-                                                new_job_count=phase_result.new_count,
-                                            )
-                                            break
                                 phase_handoff = f"{phase.title} completed. {phase_result.summary.strip()[:300]}".strip()
                                 authenticated_ready = bool(session_state.get("authenticated_ready") or session_state.get("session_ready"))
                                 jobs_surface_ready = bool(session_state.get("jobs_surface_ready"))
@@ -559,6 +716,10 @@ class BrowserAutomationService:
         turn_id: str,
         batch_id: str,
         resume: bool = False,
+        phase_slugs: tuple[str, ...] | None = None,
+        apply_target_job_ids: tuple[str, ...] | None = None,
+        phase_timeout_seconds_override: int | None = None,
+        timeout_ms_override: int | None = None,
     ) -> BrowserAutomationResult:
         try:
             async def _runner() -> BrowserAutomationResult:
@@ -570,6 +731,10 @@ class BrowserAutomationService:
                     turn_id=turn_id,
                     batch_id=batch_id,
                     resume=resume,
+                    phase_slugs=phase_slugs,
+                    apply_target_job_ids=apply_target_job_ids,
+                    phase_timeout_seconds_override=phase_timeout_seconds_override,
+                    timeout_ms_override=timeout_ms_override,
                 )
 
             return anyio.run(_runner)

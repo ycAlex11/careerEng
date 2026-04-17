@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from careereng.resume.export import ensure_default_resume_pdf
 from careereng.storage.site_store import SiteStore
 
 
@@ -19,6 +20,12 @@ class SiteTools:
 
     def keep_browser_open(self) -> bool:
         return False
+
+    def default_resume_pdf_path(self) -> Path:
+        return (self.site_store.workspace / "cv" / "exports" / "cv.pdf").resolve()
+
+    def ensure_default_resume_pdf(self) -> Path:
+        return ensure_default_resume_pdf(self.site_store.workspace)
 
     def _site_skill_state(self, site_id: str) -> dict[str, Any]:
         skill = self.site_store.load_skill(site_id)

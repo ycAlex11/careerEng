@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import inspect
 import json
+from pathlib import Path
 import re
 import time
 from typing import Any
@@ -48,11 +49,21 @@ class ResponsesClient:
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.timeout_seconds = max(30.0, float(timeout_seconds or 30.0))
-        self.client = AsyncOpenAI(
+        self.client = self._build_client(timeout_seconds=self.timeout_seconds)
+
+    def _build_client(self, *, timeout_seconds: float) -> AsyncOpenAI:
+        return AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.api_base,
-            timeout=self.timeout_seconds,
+            timeout=max(30.0, float(timeout_seconds or 30.0)),
         )
+
+    def ensure_timeout(self, timeout_seconds: float) -> None:
+        desired = max(30.0, float(timeout_seconds or 30.0))
+        if desired <= self.timeout_seconds:
+            return
+        self.timeout_seconds = desired
+        self.client = self._build_client(timeout_seconds=self.timeout_seconds)
 
     @staticmethod
     def _normalize_stream_input(input_value: Any) -> list[dict[str, Any]]:
@@ -262,6 +273,91 @@ class BrowserPhaseRuntime:
         return normalized in {"browser_snapshot", "browser_console_messages", "browser_tabs"}
 
     @staticmethod
+    def _apply_file_upload_use_staged_path_message(*, current_url: str, staged_path: str, attempted_paths: list[str]) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        attempted = ", ".join(attempted_paths[:3]) if attempted_paths else "(none)"
+        return (
+            "The last browser_file_upload call used a local path that is not allowed for this active browser run.\n"
+            f"{url_line}"
+            f"Use only this run-local staged PDF path for upload: {staged_path}\n"
+            f"Do not retry the old source path(s): {attempted}\n"
+            "If upload is still needed, call browser_file_upload again with exactly that staged path."
+        )
+
+    @staticmethod
+    def _apply_file_upload_empty_paths_message(*, current_url: str, staged_path: str) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        staged_line = f"Use this run-local staged PDF path if upload is needed: {staged_path}\n" if staged_path else ""
+        return (
+            "The last browser_file_upload call provided no file paths.\n"
+            f"{url_line}"
+            f"{staged_line}"
+            "Do not call browser_file_upload with an empty paths list."
+        )
+
+    @staticmethod
+    def _apply_file_upload_observe_message(*, current_url: str, staged_path: str) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        staged_line = f"Uploaded file path: {staged_path}\n" if staged_path else ""
+        return (
+            "The browser file upload tool already succeeded for the current apply page.\n"
+            f"{url_line}"
+            f"{staged_line}"
+            "Before any more upload, click, next, continue, or submit actions, first capture a fresh browser_snapshot and inspect the current page. "
+            "Only continue after reading what the page now shows."
+        )
+
+    @staticmethod
+    def _apply_file_upload_confirmed_message(*, current_url: str, staged_path: str) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        staged_line = f"Confirmed uploaded file path: {staged_path}\n" if staged_path else ""
+        return (
+            "The current apply page now confirms the staged file is uploaded.\n"
+            f"{url_line}"
+            f"{staged_line}"
+            "Do not upload the same file again on this page. Continue with the next visible required form step, "
+            "such as Continue, Next, Save and continue, Review, or the next required field."
+        )
+
+    @staticmethod
+    def _apply_file_upload_repeat_message(*, current_url: str, staged_path: str) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        staged_line = f"Already uploaded file path: {staged_path}\n" if staged_path else ""
+        return (
+            "This same apply page already completed a browser_file_upload call with the run-local staged PDF.\n"
+            f"{url_line}"
+            f"{staged_line}"
+            "Do not call browser_file_upload again for the same page and file. If a stale file chooser is still open, "
+            "recover back to the form page, inspect the current page state, and continue the apply workflow."
+        )
+
+    @staticmethod
+    def _apply_file_upload_requires_chooser_message(*, current_url: str, staged_path: str) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        staged_line = f"Use this run-local staged PDF path when upload is ready: {staged_path}\n" if staged_path else ""
+        return (
+            "The current live page does not show an active file chooser yet.\n"
+            f"{url_line}"
+            f"{staged_line}"
+            "Do not call browser_file_upload yet. First use the page's own upload control so the live page enters file-chooser state, "
+            "then call browser_file_upload."
+        )
+
+    @staticmethod
+    def _apply_file_upload_modal_unresolved_message(*, current_url: str, staged_path: str, chooser_count: int) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        staged_line = f"Last staged PDF path: {staged_path}\n" if staged_path else ""
+        chooser_line = f"Active file choosers still visible: {max(1, int(chooser_count or 0))}\n"
+        return (
+            "The last upload attempt did not return to a normal form page.\n"
+            f"{url_line}"
+            f"{staged_line}"
+            f"{chooser_line}"
+            "The current live page still shows unresolved file chooser modal state. Do not click Continue, Next, Save and continue, Submit, "
+            "or call browser_file_upload again. End this job with phase_result status=blocked and explain that the upload modal did not resolve."
+        )
+
+    @staticmethod
     def _observation_guard_message(*, phase: PhasePrompt, current_url: str) -> str:
         url_line = f"Current page URL: {current_url}\n" if current_url else ""
         phase_tail = ""
@@ -307,6 +403,32 @@ class BrowserPhaseRuntime:
         if 'button "' not in lowered and 'link "' not in lowered:
             return False
         return any(phrase in lowered for phrase in cls.SESSION_PREPARATION_AUTH_PHRASES)
+
+    @classmethod
+    def _apply_recovery_page_key(
+        cls,
+        *,
+        current_url: str,
+        payload: dict[str, Any] | None,
+    ) -> str:
+        url_key = cls._canonicalize_runtime_url(current_url)
+        title = ""
+        if isinstance(payload, dict):
+            title = str(MCPToolBridge.extract_page_title(payload) or "").strip().lower()
+        if not url_key and not title:
+            return ""
+        return json.dumps({"url": url_key, "title": title}, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _apply_auth_recovery_message(*, current_url: str) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        return (
+            "The current apply flow is on an authentication step with a visible sign-in continuation.\n"
+            f"{url_line}"
+            "Do not keep calling update_jobs from this same sign-in page. "
+            "If a visible sign-in continuation, provider option, or remembered-account step is available, click it directly now. "
+            "If the page instead requires password entry, email entry, MFA, verification code, CAPTCHA, or another human-only challenge with no one-click continuation left, finish this job with phase_result status=blocked."
+        )
 
     @classmethod
     def _is_blocked_session_navigation_target(cls, target_url: str) -> bool:
@@ -425,6 +547,59 @@ class BrowserPhaseRuntime:
         }
 
     @staticmethod
+    def update_jobs_tool() -> dict[str, Any]:
+        job_properties = {
+            "job_id": {"type": "string"},
+            "title": {"type": "string"},
+            "url": {"type": "string"},
+            "location": {"type": "string"},
+            "posted_label": {"type": "string"},
+            "employment_type": {"type": "string"},
+            "match_label": {"type": "string"},
+            "apply_state": {"type": "string"},
+            "card_text": {"type": "string"},
+            "posted_at": {"type": "string"},
+            "description": {"type": "string"},
+            "jd_sync_status": {"type": "string"},
+            "decision_status": {"type": "string"},
+            "decision_rule_source": {"type": "string"},
+            "decision_rule_name": {"type": "string"},
+            "site_match_signal_raw": {"type": "string"},
+            "match_score_initial": {"type": "number"},
+            "match_reason_initial": {"type": "string"},
+            "match_score_final": {"type": "number"},
+            "match_reason_final": {"type": "string"},
+            "fit_apply": {"type": "boolean"},
+            "fit_confidence": {"type": "number"},
+            "fit_reason": {"type": "string"},
+            "fit_source": {"type": "string"},
+            "application_status": {"type": "string"},
+            "last_apply_error": {"type": "string"},
+        }
+        return {
+            "type": "function",
+            "name": "update_jobs",
+            "description": "Persist current per-job JD, decision, and application state for the active batch run.",
+            "strict": False,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "jobs": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": job_properties,
+                            "required": ["job_id"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["jobs"],
+                "additionalProperties": False,
+            },
+        }
+
+    @staticmethod
     def _extract_output_items(response: dict[str, Any]) -> list[dict[str, Any]]:
         output = response.get("output")
         if not isinstance(output, list):
@@ -509,6 +684,14 @@ class BrowserPhaseRuntime:
                 "If one broad same-page read still leaves current-page role links missing, one current-page result may be selected to expose current-page links, then re-read that same page and record it. "
                 "After the current page is recorded, use only a real visible next-page, numbered page, or load-more control. "
                 "Do not guess pagination URLs."
+            )
+        elif phase.slug == "apply":
+            prompt += (
+                " During Apply, work from the active batch run jobs and process them one by one. "
+                "Before making the final apply decision for a job, sync the current page JD, apply state, and any site-native match signal for that job. "
+                "Use update_jobs whenever a job gains new JD, decision, or application state. "
+                "Only move to irreversible submission when the current job is clearly marked recommended_apply by the active site or project rules. "
+                "Do not finish the phase until every target job for this site has reached a terminal state or the site skill explicitly requires human takeover."
             )
         return prompt
 
@@ -762,6 +945,180 @@ class BrowserPhaseRuntime:
         return missing
 
     @staticmethod
+    def _record_jobs_payload_count(arguments: dict[str, Any] | None) -> int:
+        if not isinstance(arguments, dict):
+            return 0
+        jobs = arguments.get("jobs")
+        return len(jobs) if isinstance(jobs, list) else 0
+
+    @classmethod
+    def _current_visible_result_control_count(cls, payload: dict[str, Any] | None) -> int:
+        if not isinstance(payload, dict):
+            return 0
+        live_page = MCPToolBridge.live_page_text(payload)
+        if not live_page:
+            return 0
+        count = 0
+        seen_refs: set[str] = set()
+        for line in live_page.splitlines():
+            if not re.search(r"""^\s*-\s+'?button\s+"View job:""", line):
+                continue
+            ref_match = re.search(r"\[ref=([^\]]+)\]", line)
+            ref = ref_match.group(1) if ref_match else ""
+            if ref and ref in seen_refs:
+                continue
+            if ref:
+                seen_refs.add(ref)
+            count += 1
+        return count
+
+    @staticmethod
+    def _is_apply_terminal_job_state(row: dict[str, Any] | None) -> bool:
+        if not isinstance(row, dict):
+            return False
+        decision_status = str(row.get("decision_status") or "").strip().lower()
+        application_status = str(row.get("application_status") or "").strip().lower()
+        apply_state = str(row.get("apply_state") or "").strip().lower()
+        return decision_status in {"filtered_out", "already_applied"} or application_status in {
+            "already_applied",
+            "submitted",
+            "apply_failed",
+            "blocked",
+        } or apply_state in {
+            "already_applied",
+            "submitted",
+            "apply_failed",
+            "blocked",
+        }
+
+    @classmethod
+    def _terminal_job_ids_from_update_payload(cls, payload: dict[str, Any] | None) -> list[str]:
+        if not isinstance(payload, dict):
+            return []
+        structured = payload.get("structuredContent")
+        if not isinstance(structured, dict):
+            return []
+        terminal_ids = structured.get("terminal_job_ids")
+        if not isinstance(terminal_ids, list):
+            return []
+        return [str(job_id).strip() for job_id in terminal_ids if str(job_id).strip()]
+
+    @classmethod
+    def _recordable_extracted_jobs(cls, payload: dict[str, Any] | None, *, current_url: str) -> list[dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+        extracted = cls._extract_job_records(payload)
+        if not extracted:
+            return []
+        jobs: list[dict[str, Any]] = []
+        for job in extracted:
+            if not isinstance(job, dict):
+                continue
+            normalized = cls._normalize_record_job(job)
+            if normalized:
+                jobs.append(normalized)
+        if not jobs:
+            return []
+        if cls._record_jobs_missing_url_count({"jobs": jobs}, current_url=current_url):
+            return []
+        return jobs
+
+    @staticmethod
+    def _normalize_file_upload_paths(arguments: dict[str, Any] | None) -> list[str]:
+        if not isinstance(arguments, dict):
+            return []
+        raw_paths = arguments.get("paths")
+        if isinstance(raw_paths, list):
+            return [str(path).strip() for path in raw_paths if str(path).strip()]
+        raw_path = str(arguments.get("path") or "").strip()
+        return [raw_path] if raw_path else []
+
+    @staticmethod
+    def _canonicalize_local_path(path_text: str) -> str:
+        raw = str(path_text or "").strip()
+        if not raw:
+            return ""
+        try:
+            return str(Path(raw).expanduser().resolve())
+        except Exception:
+            return raw
+
+    @classmethod
+    def _apply_upload_attempt_key(cls, *, current_url: str, upload_paths: list[str]) -> tuple[str, str] | tuple[()]:
+        if not current_url or not upload_paths:
+            return ()
+        page_key = cls._canonicalize_runtime_url(current_url)
+        if not page_key:
+            return ()
+        normalized_paths = sorted(
+            cls._canonicalize_local_path(path)
+            for path in upload_paths
+            if str(path or "").strip()
+        )
+        normalized_paths = [path for path in normalized_paths if path]
+        if not normalized_paths:
+            return ()
+        return (json.dumps(page_key, ensure_ascii=False, sort_keys=True), "|".join(normalized_paths))
+
+    @classmethod
+    def _payload_confirms_staged_file_upload(cls, payload: dict[str, Any] | None, *, staged_path: str) -> bool:
+        if not isinstance(payload, dict) or not staged_path:
+            return False
+        file_name = Path(staged_path).name.strip().lower()
+        if not file_name:
+            return False
+        text = "\n".join(
+            part
+            for part in (
+                MCPToolBridge.live_page_text(payload),
+                MCPToolBridge.summarize_tool_output(payload),
+            )
+            if part
+        ).lower()
+        if file_name not in text:
+            return False
+        return bool(re.search(r"\b(successfully uploaded|uploaded|attached|selected)\b", text))
+
+    @classmethod
+    def _matches_staged_upload_path(cls, candidate_path: str, staged_path: str) -> bool:
+        left = cls._canonicalize_local_path(candidate_path)
+        right = cls._canonicalize_local_path(staged_path)
+        return bool(left and right and left == right)
+
+    @staticmethod
+    def _payload_upload_state_text(payload: dict[str, Any] | None) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        parts: list[str] = []
+        for key in ("modalState", "page", "inlineSnapshot"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+        live_page = MCPToolBridge.live_page_text(payload)
+        if live_page:
+            parts.append(live_page)
+        summary = MCPToolBridge.summarize_tool_output(payload)
+        if summary:
+            parts.append(summary)
+        merged = "\n".join(part for part in parts if part).strip()
+        return merged
+
+    @classmethod
+    def _payload_file_chooser_count(cls, payload: dict[str, Any] | None) -> int:
+        text = cls._payload_upload_state_text(payload)
+        if not text:
+            return 0
+        explicit = len(re.findall(r"\[\s*file chooser\s*\]", text, flags=re.IGNORECASE))
+        if explicit > 0:
+            return explicit
+        generic = len(re.findall(r"\bfile chooser\b", text, flags=re.IGNORECASE))
+        return generic
+
+    @classmethod
+    def _payload_has_file_chooser(cls, payload: dict[str, Any] | None) -> bool:
+        return cls._payload_file_chooser_count(payload) > 0
+
+    @staticmethod
     def _payload_has_extracted_jobs(payload: dict[str, Any]) -> bool:
         jobs = BrowserPhaseRuntime._extract_job_records(payload)
         if jobs is not None:
@@ -989,6 +1346,11 @@ class BrowserPhaseRuntime:
             )
         ):
             return True
+        if re.search(
+            r"(^|\n)-\s*(?:generic|status|alert|paragraph|text|section|region)\b[^\n]{0,120}:\s*loading(?:\.\.\.)?(?:\s|$)",
+            lowered,
+        ):
+            return True
         return bool(
             re.search(r"\bloading\b", lowered)
             and re.search(r"\b(page\s+\d+\s+of\s+\d+|\d+\s+jobs|next|previous)\b", lowered)
@@ -998,6 +1360,18 @@ class BrowserPhaseRuntime:
     def _is_page_settle_action(cls, name: str) -> bool:
         normalized = str(name or "").strip().lower()
         return normalized in cls.PAGE_SETTLE_ACTION_TOOLS
+
+    @classmethod
+    def _page_action_signature(cls, name: str, arguments: dict[str, Any] | None) -> str:
+        if not cls._is_page_settle_action(name):
+            return ""
+        if not isinstance(arguments, dict):
+            return str(name or "").strip().lower()
+        try:
+            normalized_arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            normalized_arguments = str(arguments)
+        return f"{str(name or '').strip().lower()}::{normalized_arguments}"
 
     @classmethod
     def _looks_like_pagination_action(cls, name: str, arguments: dict[str, Any] | None) -> bool:
@@ -1025,7 +1399,7 @@ class BrowserPhaseRuntime:
             "Use the attached live snapshot first. "
             "If you use browser_evaluate again, run it page-wide with ref='' and a no-argument function against the current page. "
             "First form the current visible results set, then inspect the same page broadly for any aligned per-role link sources. "
-            "Do not open a single current-page role just to recover this page. "
+            "If one same-page result selection is needed to expose aligned current-page role links, select one visible current-page result card and then re-read this same page page-wide. "
             "Do not paginate away from this page until the current visible roles are concretely formed."
         )
 
@@ -1049,6 +1423,20 @@ class BrowserPhaseRuntime:
             f"Phase: {phase.title}\n"
             "Do not take another page-changing or result-changing action yet. "
             "Wait for a fresh settled snapshot of the current page before continuing."
+        )
+
+    @staticmethod
+    def _page_action_failure_recovery_message(*, current_url: str, tool_name: str) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        tool_line = f"Failed page action: {tool_name}\n" if tool_name else ""
+        return (
+            "The previous page action failed.\n"
+            f"{url_line}"
+            f"{tool_line}"
+            "A fresh live browser snapshot of the current page is already attached separately. "
+            "Treat the failed action arguments, old ref, and pre-failure trajectory only as stale history. "
+            "Re-read the current live page and resolve the next action from that fresh page state. "
+            "Do not repeat the same failed page action or keep updating state from the stale pre-failure page."
         )
 
     @staticmethod
@@ -1109,8 +1497,29 @@ class BrowserPhaseRuntime:
             "Do not assume the snapshot's role labels imply literal DOM tag names. "
             "Do not reject a same-page candidate only because it appears in another panel or section of the same page. "
             "Keep only the per-role links that align back to the current visible results set. "
-            "Do not open a single current-page role just to fill the missing URLs. "
+            "If one same-page result selection is needed to expose still-missing aligned role links, select one visible current-page result card and then re-read this same page page-wide. "
             "After supplementing the current-page URLs, call record_jobs immediately."
+        )
+
+    @staticmethod
+    def _job_retrieval_incomplete_page_message(
+        *,
+        current_url: str,
+        page_label: str,
+        expected_count: int,
+        actual_count: int,
+    ) -> str:
+        page_line = f"Current page label: {page_label}\n" if page_label else ""
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        return (
+            "The attached live snapshot already shows the current page's visible results count, but the current page records are still incomplete.\n"
+            f"{url_line}"
+            f"{page_line}"
+            f"Current visible result controls seen in the fresh snapshot: {max(0, int(expected_count or 0))}\n"
+            f"Current jobs in this payload: {max(0, int(actual_count or 0))}\n"
+            "Stay on this same visible results page. Do not paginate or finish yet. "
+            "Use the fresh live snapshot as the primary source of truth, fully form the current visible results set for this page, "
+            "then fill any remaining current-page links or list fields from aligned same-page sources before calling record_jobs."
         )
 
     @staticmethod
@@ -1138,7 +1547,7 @@ class BrowserPhaseRuntime:
             "Stay on this same visible results page. "
             "Select one visible current-page result card only if that same-page selection is needed to expose current-page role links or list details. "
             "Then run one more page-wide browser_evaluate with ref='' and a no-argument function against document or main. "
-            "Re-read only the current visible results page, gather same-page per-role data broadly, keep only what aligns back to the current visible results set, then call record_jobs immediately. "
+            "Re-read only the current visible results page, inspect same-page clickable job items and href-bearing job elements broadly, keep only what aligns back to the current visible results set, then call record_jobs immediately. "
             "Do not paginate away from this page."
         )
 
@@ -1155,6 +1564,20 @@ class BrowserPhaseRuntime:
             "Select one visible current-page result card only if that same-page selection is needed to expose current-page role links for this page. "
             "Then run one more page-wide browser_evaluate with ref='' and a no-argument function against document or main, gather same-page per-role data broadly, keep only the still-missing URLs that align back to the current visible results set, and call record_jobs immediately. "
             "Do not paginate away from this page while those URLs remain unresolved."
+        )
+
+    @staticmethod
+    def _job_retrieval_post_click_pagewide_message(*, current_url: str, page_label: str) -> str:
+        page_line = f"Current page label: {page_label}\n" if page_label else ""
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        return (
+            "A visible current-page result card was just selected on this same results page.\n"
+            f"{url_line}"
+            f"{page_line}"
+            "Stay on this same visible results page. "
+            "Now run one page-wide browser_evaluate with ref='' and a direct no-argument function against document or main. "
+            "Re-read only the current visible results page, inspect same-page clickable job items and href-bearing job elements broadly, keep only what aligns back to the current visible results set, then call record_jobs immediately. "
+            "Do not paginate away from this page."
         )
 
     @staticmethod
@@ -1268,6 +1691,37 @@ class BrowserPhaseRuntime:
             "content": [{"type": "text", "text": summary}],
         }
 
+    def _update_jobs_payload(
+        self,
+        *,
+        site_store: Any,
+        site_key: str,
+        session_id: str,
+        turn_id: str,
+        batch_id: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_jobs = arguments.get("jobs")
+        jobs = [dict(job) for job in raw_jobs if isinstance(job, dict)] if isinstance(raw_jobs, list) else []
+        saved_rows = site_store.update_run_jobs(site_key, jobs, session_id or "", turn_id, batch_id)
+        updated_ids = [str(row.get("job_id") or "").strip() for row in saved_rows if str(row.get("job_id") or "").strip()]
+        terminal_ids = [
+            str(row.get("job_id") or "").strip()
+            for row in saved_rows
+            if self._is_apply_terminal_job_state(row) and str(row.get("job_id") or "").strip()
+        ]
+        summary = f"Updated {len(updated_ids)} jobs in the current batch run."
+        return {
+            "isError": False,
+            "structuredContent": {
+                "updated_count": len(updated_ids),
+                "job_ids": updated_ids,
+                "terminal_count": len(terminal_ids),
+                "terminal_job_ids": terminal_ids,
+            },
+            "content": [{"type": "text", "text": summary}],
+        }
+
     async def run_phase(
         self,
         *,
@@ -1286,6 +1740,8 @@ class BrowserPhaseRuntime:
         phase_handoff: str = "",
         phase_timeout_seconds: int | None = None,
         max_phase_steps: int | None = None,
+        extra_context_items: list[dict[str, Any]] | None = None,
+        apply_staged_resume_pdf_path: str = "",
     ) -> BrowserPhaseResult:
         history_items: list[dict[str, Any]] = []
         tools = list(response_tools) + [self.phase_result_tool()]
@@ -1293,6 +1749,9 @@ class BrowserPhaseRuntime:
         step_count = 0
         effective_phase_timeout = int(phase_timeout_seconds or self.config.phase_timeout_seconds or 180)
         effective_max_phase_steps = int(max_phase_steps or self.config.max_phase_steps or 24)
+        ensure_timeout = getattr(self.responses, "ensure_timeout", None)
+        if callable(ensure_timeout):
+            ensure_timeout(max(effective_phase_timeout, int(self.config.step_timeout_seconds or 30)) + 30.0)
         deadline = time.monotonic() + max(5.0, float(effective_phase_timeout))
         current_url = str(entry_url or "")
         observation_streak = 0
@@ -1304,6 +1763,7 @@ class BrowserPhaseRuntime:
         primary_read_page_key = ""
         pagewide_retry_page_key = ""
         click_recovery_page_key = ""
+        forced_pagewide_after_click_page_key = ""
         latest_snapshot_payload = await self._capture_snapshot_payload(
             bridge=bridge,
             session=session,
@@ -1319,6 +1779,13 @@ class BrowserPhaseRuntime:
             else None
         )
         recent_steps: list[dict[str, str]] = []
+        staged_resume_pdf_path = str(apply_staged_resume_pdf_path or "").strip()
+        apply_upload_requires_observation = False
+        apply_upload_modal_unresolved = False
+        apply_completed_upload_keys: set[tuple[str, str]] = set()
+        apply_auth_recovery_page_key = ""
+        failed_page_action_signature = ""
+        failed_page_action_name = ""
 
         while time.monotonic() < deadline and step_count < max(1, effective_max_phase_steps):
             loop_context_items = list(history_items)
@@ -1349,7 +1816,10 @@ class BrowserPhaseRuntime:
                     ),
                 },
             ]
-            response = await self._create_response_with_retry(self._payload(input_items=base_items + loop_context_items, tools=tools))
+            static_context_items = list(extra_context_items or [])
+            response = await self._create_response_with_retry(
+                self._payload(input_items=base_items + static_context_items + loop_context_items, tools=tools)
+            )
             output_items = self._extract_output_items(response)
             output_text = self._extract_output_text(response)
             fallback_result = self._maybe_parse_phase_result_text(output_text)
@@ -1401,6 +1871,14 @@ class BrowserPhaseRuntime:
                 is_observation_tool = self._is_observation_tool(name)
                 current_page_key = ""
                 current_page_label = ""
+                current_signal_payload = (
+                    latest_snapshot_payload
+                    if isinstance(latest_snapshot_payload, dict)
+                    else last_payload
+                    if isinstance(last_payload, dict)
+                    else None
+                )
+                current_visible_result_count = 0
                 if phase.slug == "job_retrieval":
                     current_page_key = self._job_retrieval_page_fingerprint(
                         current_url=current_url,
@@ -1408,6 +1886,33 @@ class BrowserPhaseRuntime:
                         last_payload=last_payload if isinstance(last_payload, dict) else None,
                     )
                     current_page_label = self._extract_page_label(latest_snapshot_payload) or self._extract_page_label(last_payload)
+                    current_visible_result_count = self._current_visible_result_control_count(current_signal_payload)
+
+                if phase.slug == "apply" and apply_upload_requires_observation and name == "phase_result":
+                    history_items = [
+                        self._context_item(
+                            self._apply_file_upload_observe_message(
+                                current_url=current_url,
+                                staged_path=staged_resume_pdf_path,
+                            )
+                        )
+                    ]
+                    retry_requested = True
+                    break
+
+                if phase.slug == "apply" and apply_upload_modal_unresolved and name == "phase_result":
+                    if str(arguments.get("status") or "").strip().lower() != "blocked":
+                        history_items = [
+                            self._context_item(
+                                self._apply_file_upload_modal_unresolved_message(
+                                    current_url=current_url,
+                                    staged_path=staged_resume_pdf_path,
+                                    chooser_count=self._payload_file_chooser_count(current_signal_payload),
+                                )
+                            )
+                        ]
+                        retry_requested = True
+                        break
 
                 if name == "phase_result":
                     if (
@@ -1421,6 +1926,24 @@ class BrowserPhaseRuntime:
                                 self._job_retrieval_extracted_page_message(
                                     current_url=current_url,
                                     page_label=current_page_label,
+                                )
+                            )
+                        ]
+                        retry_requested = True
+                        break
+                    if (
+                        phase.slug == "job_retrieval"
+                        and current_visible_result_count > 0
+                        and current_page_key
+                        and current_page_key not in recorded_page_fingerprints
+                    ):
+                        history_items = [
+                            self._context_item(
+                                self._job_retrieval_incomplete_page_message(
+                                    current_url=current_url,
+                                    page_label=current_page_label,
+                                    expected_count=current_visible_result_count,
+                                    actual_count=0,
                                 )
                             )
                         ]
@@ -1451,6 +1974,130 @@ class BrowserPhaseRuntime:
                     retry_requested = True
                     break
 
+                if failed_page_action_signature:
+                    current_action_signature = self._page_action_signature(
+                        name,
+                        arguments if isinstance(arguments, dict) else None,
+                    )
+                    if current_action_signature and current_action_signature == failed_page_action_signature:
+                        history_items = [
+                            self._context_item(
+                                self._page_action_failure_recovery_message(
+                                    current_url=current_url,
+                                    tool_name=failed_page_action_name or name,
+                                )
+                            )
+                        ]
+                        retry_requested = True
+                        break
+                    if phase.slug == "apply" and name == "update_jobs":
+                        history_items = [
+                            self._context_item(
+                                self._page_action_failure_recovery_message(
+                                    current_url=current_url,
+                                    tool_name=failed_page_action_name,
+                                )
+                            )
+                        ]
+                        retry_requested = True
+                        break
+
+                if phase.slug == "apply" and apply_upload_modal_unresolved:
+                    history_items = [
+                        self._context_item(
+                            self._apply_file_upload_modal_unresolved_message(
+                                current_url=current_url,
+                                staged_path=staged_resume_pdf_path,
+                                chooser_count=self._payload_file_chooser_count(current_signal_payload),
+                            )
+                        )
+                    ]
+                    retry_requested = True
+                    break
+
+                if phase.slug == "apply" and apply_auth_recovery_page_key and name == "update_jobs":
+                    current_apply_recovery_page_key = self._apply_recovery_page_key(
+                        current_url=current_url,
+                        payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else last_payload,
+                    )
+                    if not current_apply_recovery_page_key or current_apply_recovery_page_key == apply_auth_recovery_page_key:
+                        history_items = [
+                            self._context_item(self._live_snapshot_primary_message()),
+                            self._context_item(
+                                self._apply_auth_recovery_message(
+                                    current_url=current_url,
+                                )
+                            ),
+                        ]
+                        retry_requested = True
+                        break
+
+                if phase.slug == "apply" and apply_upload_requires_observation and not is_observation_tool:
+                    history_items = [
+                        self._context_item(
+                            self._apply_file_upload_observe_message(
+                                current_url=current_url,
+                                staged_path=staged_resume_pdf_path,
+                            )
+                        )
+                    ]
+                    retry_requested = True
+                    break
+
+                if phase.slug == "apply" and name == "browser_file_upload":
+                    upload_paths = self._normalize_file_upload_paths(arguments if isinstance(arguments, dict) else None)
+                    if not upload_paths:
+                        history_items = [
+                            self._context_item(
+                                self._apply_file_upload_empty_paths_message(
+                                    current_url=current_url,
+                                    staged_path=staged_resume_pdf_path,
+                                )
+                            )
+                        ]
+                        retry_requested = True
+                        break
+                    if staged_resume_pdf_path and any(
+                        not self._matches_staged_upload_path(path, staged_resume_pdf_path) for path in upload_paths
+                    ):
+                        history_items = [
+                            self._context_item(
+                                self._apply_file_upload_use_staged_path_message(
+                                    current_url=current_url,
+                                    staged_path=staged_resume_pdf_path,
+                                    attempted_paths=upload_paths,
+                                )
+                            )
+                        ]
+                        retry_requested = True
+                        break
+                    upload_attempt_key = self._apply_upload_attempt_key(
+                        current_url=current_url,
+                        upload_paths=upload_paths,
+                    )
+                    if upload_attempt_key and upload_attempt_key in apply_completed_upload_keys:
+                        history_items = [
+                            self._context_item(
+                                self._apply_file_upload_repeat_message(
+                                    current_url=current_url,
+                                    staged_path=staged_resume_pdf_path or upload_paths[0],
+                                )
+                            )
+                        ]
+                        retry_requested = True
+                        break
+                    if not self._payload_has_file_chooser(current_signal_payload):
+                        history_items = [
+                            self._context_item(
+                                self._apply_file_upload_requires_chooser_message(
+                                    current_url=current_url,
+                                    staged_path=staged_resume_pdf_path or upload_paths[0],
+                                )
+                            )
+                        ]
+                        retry_requested = True
+                        break
+
                 if (
                     phase.slug != "job_retrieval"
                     and self._is_page_settle_action(name)
@@ -1463,6 +2110,25 @@ class BrowserPhaseRuntime:
                             self._page_still_loading_message(
                                 phase=phase,
                                 current_url=current_url,
+                            )
+                        )
+                    ]
+                    retry_requested = True
+                    break
+                if (
+                    phase.slug == "job_retrieval"
+                    and current_visible_result_count > 0
+                    and current_page_key
+                    and current_page_key not in recorded_page_fingerprints
+                    and self._looks_like_pagination_action(name, arguments if isinstance(arguments, dict) else None)
+                ):
+                    history_items = [
+                        self._context_item(
+                            self._job_retrieval_incomplete_page_message(
+                                current_url=current_url,
+                                page_label=current_page_label,
+                                expected_count=current_visible_result_count,
+                                actual_count=0,
                             )
                         )
                     ]
@@ -1493,11 +2159,28 @@ class BrowserPhaseRuntime:
                     phase.slug == "job_retrieval"
                     and current_page_key
                     and current_page_key in recorded_page_fingerprints
-                    and (is_observation_tool or name == "browser_evaluate")
+                    and (is_observation_tool or name in {"browser_evaluate", "record_jobs"})
                 ):
                     history_items = [
                         self._context_item(
                             self._job_retrieval_page_recorded_message(
+                                current_url=current_url,
+                                page_label=current_page_label,
+                            )
+                        )
+                    ]
+                    retry_requested = True
+                    break
+                if (
+                    phase.slug == "job_retrieval"
+                    and forced_pagewide_after_click_page_key
+                    and current_page_key
+                    and current_page_key == forced_pagewide_after_click_page_key
+                    and name != "browser_evaluate"
+                ):
+                    history_items = [
+                        self._context_item(
+                            self._job_retrieval_post_click_pagewide_message(
                                 current_url=current_url,
                                 page_label=current_page_label,
                             )
@@ -1531,6 +2214,49 @@ class BrowserPhaseRuntime:
                         if isinstance(last_payload, dict)
                         else None
                     )
+                    expected_visible_count = self._current_visible_result_control_count(signal_payload)
+                    actual_record_count = self._record_jobs_payload_count(arguments if isinstance(arguments, dict) else None)
+                    if expected_visible_count and actual_record_count < expected_visible_count:
+                        page_label = self._extract_page_label(signal_payload)
+                        page_key = self._job_retrieval_page_fingerprint(
+                            current_url=current_url,
+                            latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
+                            last_payload=last_payload if isinstance(last_payload, dict) else None,
+                        )
+                        history_items = [
+                            self._context_item(
+                                self._job_retrieval_incomplete_page_message(
+                                    current_url=current_url,
+                                    page_label=page_label,
+                                    expected_count=expected_visible_count,
+                                    actual_count=actual_record_count,
+                                )
+                            )
+                        ]
+                        if "browser_evaluate" in tool_names:
+                            if page_key and page_key == pagewide_retry_page_key and page_key != click_recovery_page_key and "browser_click" in tool_names:
+                                click_recovery_page_key = page_key
+                                history_items.append(
+                                    self._context_item(
+                                        self._job_retrieval_click_then_pagewide_message(
+                                            current_url=current_url,
+                                            page_label=page_label,
+                                        )
+                                    )
+                                )
+                            else:
+                                if page_key:
+                                    pagewide_retry_page_key = page_key
+                                history_items.append(
+                                    self._context_item(
+                                        self._job_retrieval_pagewide_evaluate_message(
+                                            current_url=current_url,
+                                            page_label=page_label,
+                                        )
+                                    )
+                                )
+                        retry_requested = True
+                        break
                     missing_url_count = self._record_jobs_missing_url_count(
                         arguments if isinstance(arguments, dict) else None,
                         current_url=current_url,
@@ -1642,6 +2368,15 @@ class BrowserPhaseRuntime:
                                 current_url=current_url,
                                 arguments=arguments if isinstance(arguments, dict) else {},
                             )
+                        elif name == "update_jobs":
+                            payload = self._update_jobs_payload(
+                                site_store=site_store,
+                                site_key=site_key,
+                                session_id=session_id,
+                                turn_id=turn_id,
+                                batch_id=batch_id,
+                                arguments=arguments if isinstance(arguments, dict) else {},
+                            )
                         else:
                             payload = await bridge.call_tool(session, name, arguments if isinstance(arguments, dict) else {})
                     except Exception as exc:
@@ -1704,6 +2439,24 @@ class BrowserPhaseRuntime:
                         current_url=current_url,
                         payload=payload,
                     )
+                    terminal_job_ids: list[str] = []
+                    if phase.slug == "apply" and name == "update_jobs" and not error_text:
+                        terminal_job_ids = self._terminal_job_ids_from_update_payload(payload)
+                        if terminal_job_ids:
+                            terminal_text = ", ".join(terminal_job_ids[:3])
+                            if len(terminal_job_ids) > 3:
+                                terminal_text = f"{terminal_text}, ..."
+                            return BrowserPhaseResult(
+                                status="done",
+                                reason_tag="apply_terminal_update",
+                                summary=f"Current apply target reached terminal state via update_jobs: {terminal_text}",
+                                current_url=current_url,
+                                step_count=step_count,
+                                trace_ref=trace_ref,
+                                raw_text=output_text,
+                                recorded_count=len(recorded_job_ids),
+                                new_count=len(new_job_ids),
+                            )
                     tool_feedback = self._context_item(
                         MCPToolBridge.build_tool_feedback(
                             name,
@@ -1711,6 +2464,37 @@ class BrowserPhaseRuntime:
                             ignore_phrases=phase.ignore_phrases,
                         )
                     )
+                    if phase.slug == "apply" and name == "update_jobs" and not error_text and not terminal_job_ids:
+                        auth_recovery_payload = (
+                            latest_snapshot_payload
+                            if isinstance(latest_snapshot_payload, dict)
+                            else current_signal_payload
+                            if isinstance(current_signal_payload, dict)
+                            else payload
+                            if isinstance(payload, dict)
+                            else None
+                        )
+                        if isinstance(auth_recovery_payload, dict) and self._payload_has_visible_auth_action(
+                            auth_recovery_payload,
+                            phase=phase,
+                        ):
+                            apply_auth_recovery_page_key = self._apply_recovery_page_key(
+                                current_url=current_url,
+                                payload=auth_recovery_payload,
+                            )
+                            history_items = [tool_feedback]
+                            history_items.append(self._context_item(self._live_snapshot_primary_message()))
+                            history_items.append(
+                                self._context_item(
+                                    self._apply_auth_recovery_message(
+                                        current_url=current_url,
+                                    )
+                                )
+                            )
+                            last_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
+                            retry_requested = True
+                            break
+                    post_tool_context_items: list[dict[str, Any]] = []
                     fresh_snapshot_captured = False
                     if name == "browser_snapshot":
                         if not bool(payload.get("isError")):
@@ -1747,6 +2531,121 @@ class BrowserPhaseRuntime:
                             latest_snapshot_payload = settled_payload
                         if settled_url:
                             current_url = settled_url
+                    if phase.slug == "apply" and not error_text:
+                        auth_signal_payload = (
+                            latest_snapshot_payload
+                            if isinstance(latest_snapshot_payload, dict)
+                            else payload
+                            if isinstance(payload, dict)
+                            else None
+                        )
+                        latest_apply_recovery_page_key = self._apply_recovery_page_key(
+                            current_url=current_url,
+                            payload=auth_signal_payload,
+                        )
+                        if (
+                            apply_auth_recovery_page_key
+                            and latest_apply_recovery_page_key
+                            and latest_apply_recovery_page_key != apply_auth_recovery_page_key
+                        ):
+                            apply_auth_recovery_page_key = ""
+                        elif apply_auth_recovery_page_key and (
+                            not isinstance(auth_signal_payload, dict)
+                            or not self._payload_has_visible_auth_action(auth_signal_payload, phase=phase)
+                        ):
+                            apply_auth_recovery_page_key = ""
+                    if phase.slug == "apply":
+                        if name == "browser_file_upload" and not error_text:
+                            upload_paths = self._normalize_file_upload_paths(arguments if isinstance(arguments, dict) else None)
+                            upload_attempt_key = self._apply_upload_attempt_key(
+                                current_url=current_url,
+                                upload_paths=upload_paths,
+                            )
+                            if upload_attempt_key:
+                                apply_completed_upload_keys.add(upload_attempt_key)
+                            upload_signal_payload = (
+                                latest_snapshot_payload
+                                if isinstance(latest_snapshot_payload, dict)
+                                else payload
+                            )
+                            upload_chooser_count = self._payload_file_chooser_count(upload_signal_payload)
+                            if self._payload_confirms_staged_file_upload(
+                                upload_signal_payload,
+                                staged_path=staged_resume_pdf_path,
+                            ):
+                                apply_upload_requires_observation = False
+                                apply_upload_modal_unresolved = False
+                                history_items = [
+                                    tool_feedback,
+                                    self._context_item(
+                                        self._apply_file_upload_confirmed_message(
+                                            current_url=current_url,
+                                            staged_path=staged_resume_pdf_path,
+                                        )
+                                    ),
+                                ]
+                            elif upload_chooser_count > 0:
+                                apply_upload_requires_observation = False
+                                apply_upload_modal_unresolved = True
+                                history_items = [
+                                    tool_feedback,
+                                    self._context_item(
+                                        self._apply_file_upload_modal_unresolved_message(
+                                            current_url=current_url,
+                                            staged_path=staged_resume_pdf_path or (upload_paths[0] if upload_paths else ""),
+                                            chooser_count=upload_chooser_count,
+                                        )
+                                    ),
+                                ]
+                            else:
+                                apply_upload_requires_observation = True
+                                apply_upload_modal_unresolved = False
+                                history_items = [
+                                    tool_feedback,
+                                    self._context_item(
+                                        self._apply_file_upload_observe_message(
+                                            current_url=current_url,
+                                            staged_path=staged_resume_pdf_path,
+                                        )
+                                    ),
+                                ]
+                            last_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
+                            retry_requested = True
+                            break
+                        if apply_upload_requires_observation and is_observation_tool and not error_text:
+                            if self._payload_confirms_staged_file_upload(
+                                payload,
+                                staged_path=staged_resume_pdf_path,
+                            ):
+                                apply_upload_requires_observation = False
+                                apply_upload_modal_unresolved = False
+                                post_tool_context_items.append(
+                                    self._context_item(
+                                        self._apply_file_upload_confirmed_message(
+                                            current_url=current_url,
+                                            staged_path=staged_resume_pdf_path,
+                                        )
+                                    )
+                                )
+                            elif self._payload_has_file_chooser(payload):
+                                apply_upload_requires_observation = False
+                                apply_upload_modal_unresolved = True
+                                history_items = [
+                                    tool_feedback,
+                                    self._context_item(
+                                        self._apply_file_upload_modal_unresolved_message(
+                                            current_url=current_url,
+                                            staged_path=staged_resume_pdf_path,
+                                            chooser_count=self._payload_file_chooser_count(payload),
+                                        )
+                                    ),
+                                ]
+                                last_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
+                                retry_requested = True
+                                break
+                            else:
+                                apply_upload_requires_observation = False
+                                apply_upload_modal_unresolved = False
                     if is_observation_tool:
                         if observation_streak > 0 and (
                             not last_observation_url or current_url == last_observation_url
@@ -1759,17 +2658,26 @@ class BrowserPhaseRuntime:
                         observation_streak = 0
                         last_observation_url = ""
                     latest_page_key = ""
+                    is_click_recovery_action = False
                     if phase.slug == "job_retrieval":
                         latest_page_key = self._job_retrieval_page_fingerprint(
                             current_url=current_url,
                             latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
                             last_payload=last_payload if isinstance(last_payload, dict) else None,
                         )
+                        is_click_recovery_action = (
+                            not error_text
+                            and name == "browser_click"
+                            and bool(click_recovery_page_key)
+                            and bool(current_page_key)
+                            and current_page_key == click_recovery_page_key
+                        )
                         if name == "record_jobs" and not error_text:
                             extracted_page_key = ""
                             primary_read_page_key = ""
                             pagewide_retry_page_key = ""
                             click_recovery_page_key = ""
+                            forced_pagewide_after_click_page_key = ""
                         elif (
                             name == "browser_evaluate"
                             and not error_text
@@ -1779,6 +2687,7 @@ class BrowserPhaseRuntime:
                             primary_read_page_key = ""
                             pagewide_retry_page_key = ""
                             click_recovery_page_key = ""
+                            forced_pagewide_after_click_page_key = ""
                         elif (
                             name == "browser_evaluate"
                             and not error_text
@@ -1802,6 +2711,14 @@ class BrowserPhaseRuntime:
                         ):
                             primary_read_page_key = ""
                         if (
+                            forced_pagewide_after_click_page_key
+                            and name == "browser_evaluate"
+                            and not error_text
+                            and latest_page_key
+                            and latest_page_key == forced_pagewide_after_click_page_key
+                        ):
+                            forced_pagewide_after_click_page_key = ""
+                        if (
                             pagewide_retry_page_key
                             and latest_page_key
                             and latest_page_key != pagewide_retry_page_key
@@ -1815,6 +2732,13 @@ class BrowserPhaseRuntime:
                             and not error_text
                         ):
                             click_recovery_page_key = ""
+                        if (
+                            forced_pagewide_after_click_page_key
+                            and latest_page_key
+                            and latest_page_key != forced_pagewide_after_click_page_key
+                            and not error_text
+                        ):
+                            forced_pagewide_after_click_page_key = ""
                     page_label = self._extract_page_label(latest_snapshot_payload) or self._extract_page_label(last_payload)
                     signal_payload = (
                         latest_snapshot_payload
@@ -1823,6 +2747,121 @@ class BrowserPhaseRuntime:
                         if isinstance(last_payload, dict)
                         else payload
                     )
+                    auto_record_payload: dict[str, Any] | None = None
+                    if (
+                        phase.slug == "job_retrieval"
+                        and name == "browser_evaluate"
+                        and not error_text
+                    ):
+                        auto_record_jobs = self._recordable_extracted_jobs(payload, current_url=current_url)
+                        if auto_record_jobs:
+                            expected_visible_count = self._current_visible_result_control_count(signal_payload)
+                            if expected_visible_count and len(auto_record_jobs) < expected_visible_count:
+                                page_key = latest_page_key or current_page_key
+                                history_items = [tool_feedback]
+                                history_items.append(
+                                    self._context_item(
+                                        self._job_retrieval_incomplete_page_message(
+                                            current_url=current_url,
+                                            page_label=page_label,
+                                            expected_count=expected_visible_count,
+                                            actual_count=len(auto_record_jobs),
+                                        )
+                                    )
+                                )
+                                if "browser_evaluate" in tool_names:
+                                    if page_key and page_key != pagewide_retry_page_key:
+                                        pagewide_retry_page_key = page_key
+                                        history_items.append(
+                                            self._context_item(
+                                                self._job_retrieval_pagewide_evaluate_message(
+                                                    current_url=current_url,
+                                                    page_label=page_label,
+                                                )
+                                            )
+                                        )
+                                    elif page_key and page_key != click_recovery_page_key and "browser_click" in tool_names:
+                                        click_recovery_page_key = page_key
+                                        history_items.append(
+                                            self._context_item(
+                                                self._job_retrieval_click_then_pagewide_message(
+                                                    current_url=current_url,
+                                                    page_label=page_label,
+                                                )
+                                            )
+                                        )
+                                    else:
+                                        history_items.append(
+                                            self._context_item(
+                                                self._job_retrieval_empty_extraction_message(
+                                                    current_url=current_url,
+                                                    page_label=page_label,
+                                                )
+                                            )
+                                        )
+                                last_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
+                                retry_requested = True
+                                break
+                            auto_record_payload = self._record_jobs_payload(
+                                site_store=site_store,
+                                site_key=site_key,
+                                session_id=session_id,
+                                turn_id=turn_id,
+                                batch_id=batch_id,
+                                current_url=current_url,
+                                arguments={"jobs": auto_record_jobs},
+                            )
+                            auto_record_trace_ref = site_store.append_step_trace(
+                                site_key,
+                                turn_id,
+                                {
+                                    "phase": phase.slug,
+                                    "step_id": f"{phase.slug}:record_jobs",
+                                    "attempt": 1,
+                                    "tool_name": "record_jobs",
+                                    "arguments": {"jobs": auto_record_jobs},
+                                    "result": "ok",
+                                    "output": MCPToolBridge.summarize_tool_output(
+                                        auto_record_payload,
+                                        ignore_phrases=phase.ignore_phrases,
+                                    ),
+                                },
+                            )
+                            site_store.save_browser_session(
+                                site_key,
+                                {
+                                    "current_step_id": f"{phase.slug}:record_jobs",
+                                    "current_step_attempt": 1,
+                                    "current_step_status": "done",
+                                    "last_step_error": "",
+                                    "current_trace_ref": auto_record_trace_ref,
+                                    "last_known_url": current_url,
+                                },
+                            )
+                            self._append_recent_step(
+                                recent_steps,
+                                tool_name="record_jobs",
+                                arguments={"jobs": auto_record_jobs},
+                                error_text="",
+                                current_url=current_url,
+                                payload=auto_record_payload,
+                            )
+                            recorded_page_key = latest_page_key or current_page_key
+                            if recorded_page_key:
+                                recorded_page_fingerprints.add(recorded_page_key)
+                            auto_structured = auto_record_payload.get("structuredContent")
+                            if isinstance(auto_structured, dict):
+                                for job_id in auto_structured.get("job_ids") or []:
+                                    if isinstance(job_id, str) and job_id.strip():
+                                        recorded_job_ids.add(job_id.strip())
+                                for job_id in auto_structured.get("new_job_ids") or []:
+                                    if isinstance(job_id, str) and job_id.strip():
+                                        new_job_ids.add(job_id.strip())
+                            extracted_page_key = ""
+                            primary_read_page_key = ""
+                            pagewide_retry_page_key = ""
+                            click_recovery_page_key = ""
+                            forced_pagewide_after_click_page_key = ""
                     if (
                         phase.slug == "job_retrieval"
                         and name == "browser_evaluate"
@@ -1922,18 +2961,33 @@ class BrowserPhaseRuntime:
                     ):
                         extracted_page_key = ""
                         primary_read_page_key = latest_page_key or current_page_key
-                        pagewide_retry_page_key = ""
-                        click_recovery_page_key = ""
                         recent_steps.clear()
                         history_items = [tool_feedback]
                         if fresh_snapshot_captured and name != "browser_snapshot":
                             history_items.append(self._context_item(self._live_snapshot_primary_message()))
-                        history_items.append(
-                            self._context_item(
-                                self._job_retrieval_page_action_completed_message(tool_name=name)
+                        if is_click_recovery_action:
+                            recovery_page_key = latest_page_key or current_page_key
+                            pagewide_retry_page_key = recovery_page_key
+                            click_recovery_page_key = recovery_page_key
+                            forced_pagewide_after_click_page_key = recovery_page_key
+                            history_items.append(
+                                self._context_item(
+                                    self._job_retrieval_post_click_pagewide_message(
+                                        current_url=current_url,
+                                        page_label=self._extract_page_label(latest_snapshot_payload) or self._extract_page_label(last_payload),
+                                    )
+                                )
                             )
-                        )
-                        if primary_read_page_key:
+                        else:
+                            pagewide_retry_page_key = ""
+                            click_recovery_page_key = ""
+                            forced_pagewide_after_click_page_key = ""
+                            history_items.append(
+                                self._context_item(
+                                    self._job_retrieval_page_action_completed_message(tool_name=name)
+                                )
+                            )
+                        if primary_read_page_key and not is_click_recovery_action:
                             history_items.append(
                                 self._context_item(
                                     self._job_retrieval_snapshot_first_message(
@@ -1945,7 +2999,26 @@ class BrowserPhaseRuntime:
                         last_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
                     else:
                         history_items = [tool_feedback]
-                        if fresh_snapshot_captured and name != "browser_snapshot":
+                        history_items.extend(post_tool_context_items)
+                        if auto_record_payload is not None:
+                            history_items.append(
+                                self._context_item(
+                                    MCPToolBridge.build_tool_feedback(
+                                        "record_jobs",
+                                        auto_record_payload,
+                                        ignore_phrases=phase.ignore_phrases,
+                                    )
+                                )
+                            )
+                            history_items.append(
+                                self._context_item(
+                                    self._job_retrieval_page_recorded_message(
+                                        current_url=current_url,
+                                        page_label=self._extract_page_label(latest_snapshot_payload) or self._extract_page_label(last_payload),
+                                    )
+                                )
+                            )
+                        elif fresh_snapshot_captured and name != "browser_snapshot":
                             history_items.append(self._context_item(self._live_snapshot_primary_message()))
                         if (
                             phase.slug == "job_retrieval"
@@ -1978,6 +3051,15 @@ class BrowserPhaseRuntime:
                             recorded_count=len(recorded_job_ids),
                             new_count=len(new_job_ids),
                         )
+                    page_action_failed = bool(error_text) and self._is_page_settle_action(name)
+                    if page_action_failed:
+                        failed_page_action_signature = self._page_action_signature(
+                            name,
+                            arguments if isinstance(arguments, dict) else None,
+                        )
+                        failed_page_action_name = str(name or "").strip()
+                        if recent_steps:
+                            recent_steps[:] = recent_steps[-1:]
                     await self._sleep(min(2.0, max(0.25, float(self.config.step_timeout_seconds or 1) / 10.0)))
                     snapshot_payload = await self._capture_snapshot_payload(
                         bridge=bridge,
@@ -1997,11 +3079,16 @@ class BrowserPhaseRuntime:
                     history_items = [
                         tool_feedback,
                         self._context_item(
-                            (
+                            self._page_action_failure_recovery_message(
+                                current_url=current_url,
+                                tool_name=failed_page_action_name or name,
+                            )
+                            if page_action_failed
+                            else (
                                 f"The previous tool call {name} failed with: {error_text}. "
                                 "Wait briefly if needed, then continue from the current page state with the official tools."
                             )
-                        ),
+                        )
                     ]
                     if (
                         isinstance(snapshot_payload, dict)
@@ -2011,6 +3098,9 @@ class BrowserPhaseRuntime:
                         history_items.append(self._context_item(self._live_snapshot_primary_message()))
                     retry_requested = True
                     break
+                if not error_text and self._is_page_settle_action(name):
+                    failed_page_action_signature = ""
+                    failed_page_action_name = ""
                 if retry_requested:
                     break
             if retry_requested:

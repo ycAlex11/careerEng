@@ -13,6 +13,10 @@ from careereng.tools.site_tools import SiteTools
 
 
 class JobFlow:
+    ENABLE_BROWSER_APPLY_PHASE = True
+    APPLY_JOB_PHASE_TIMEOUT_SECONDS = 3600
+    APPLY_JOB_TIMEOUT_MS = 180000
+
     def __init__(
         self,
         *,
@@ -97,8 +101,24 @@ class JobFlow:
             submitted = int(apply.get("submitted") or 0)
             attempted = int(apply.get("attempted") or 0)
             already_applied = int(apply.get("already_applied") or 0)
-            suffix = f"，已存在申请 {already_applied} 个" if already_applied else ""
+            filtered_out = int(apply.get("filtered_out") or 0)
+            failed = int(apply.get("failed") or 0)
+            blocked = int(apply.get("blocked") or 0)
+            suffix_parts: list[str] = []
+            if already_applied:
+                suffix_parts.append(f"已存在申请 {already_applied} 个")
+            if filtered_out:
+                suffix_parts.append(f"不匹配 {filtered_out} 个")
+            if failed:
+                suffix_parts.append(f"失败 {failed} 个")
+            if blocked:
+                suffix_parts.append(f"阻塞 {blocked} 个")
+            suffix = f"，{'，'.join(suffix_parts)}" if suffix_parts else ""
             return f"- {site_name} [{site_key}]: 已检索 {retrieve_count} 个岗位，尝试投递 {attempted} 个，成功 {submitted} 个{suffix}。"
+        if str(apply.get("status") or "") == "failed":
+            return f"- {site_name} [{site_key}]: 已检索 {retrieve_count} 个岗位，投递阶段失败（{reason or 'apply_failed'}）。"
+        if str(apply.get("status") or "") == "blocked":
+            return f"- {site_name} [{site_key}]: 已检索 {retrieve_count} 个岗位，投递阶段阻塞（{reason or 'apply_blocked'}）。"
         return f"- {site_name} [{site_key}]: 已检索 {retrieve_count} 个岗位，未执行投递。"
 
     @classmethod
@@ -299,16 +319,339 @@ class JobFlow:
             },
         }
 
+    def _run_job_rows(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
+        list_run_jobs = getattr(self.site_tools.site_store, "list_run_jobs", None)
+        if not callable(list_run_jobs):
+            return []
+        rows = list_run_jobs(site_key, batch_id)
+        return [row for row in rows if isinstance(row, dict)]
+
+    def _apply_counters_from_run(self, site_key: str, batch_id: str) -> dict[str, int]:
+        rows = self._run_job_rows(site_key, batch_id)
+        counts = {
+            "retrieved": len(rows),
+            "attempted": 0,
+            "submitted": 0,
+            "already_applied": 0,
+            "filtered_out": 0,
+            "failed": 0,
+            "blocked": 0,
+        }
+        for row in rows:
+            decision_status = str(row.get("decision_status") or "").strip().lower()
+            application_status = str(row.get("application_status") or "").strip().lower()
+            if decision_status == "already_applied" or application_status == "already_applied":
+                counts["already_applied"] += 1
+            if decision_status == "filtered_out":
+                counts["filtered_out"] += 1
+            if application_status in {"submitted", "apply_failed", "blocked"}:
+                counts["attempted"] += 1
+            if application_status == "submitted":
+                counts["submitted"] += 1
+            elif application_status == "apply_failed":
+                counts["failed"] += 1
+            elif application_status == "blocked":
+                counts["blocked"] += 1
+        return counts
+
+    @staticmethod
+    def _is_apply_row_terminal(row: dict[str, Any]) -> bool:
+        decision_status = str(row.get("decision_status") or "").strip().lower()
+        application_status = str(row.get("application_status") or "").strip().lower()
+        return decision_status in {"filtered_out", "already_applied"} or application_status in {
+            "already_applied",
+            "submitted",
+            "apply_failed",
+            "blocked",
+        }
+
+    def _pending_apply_rows(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
+        return [row for row in self._run_job_rows(site_key, batch_id) if not self._is_apply_row_terminal(row)]
+
+    def _seal_apply_row_terminal(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        session_id: str,
+        turn_id: str,
+        job_id: str,
+        status: str,
+        error_text: str = "",
+    ) -> None:
+        self.site_tools.site_store.update_run_jobs(
+            site_key,
+            [
+                {
+                    "job_id": str(job_id or ""),
+                    "application_status": status,
+                    "last_apply_error": str(error_text or ""),
+                }
+            ],
+            session_id,
+            turn_id,
+            batch_id,
+        )
+
+    def _finalize_apply_site_row(
+        self,
+        *,
+        site_key: str,
+        existing: dict[str, Any],
+        batch_id: str,
+        last_result: Any | None,
+        message: str = "",
+    ) -> dict[str, Any]:
+        retrieve = dict(existing.get("retrieve") or {})
+        apply = dict(existing.get("apply") or {})
+        counters = self._apply_counters_from_run(site_key, batch_id)
+        apply.update(
+            {
+                "status": "done",
+                "attempted": counters["attempted"],
+                "submitted": counters["submitted"],
+                "already_applied": counters["already_applied"],
+                "filtered_out": counters["filtered_out"],
+                "failed": counters["failed"],
+                "blocked": counters["blocked"],
+            }
+        )
+        retrieve["count"] = max(int(retrieve.get("count") or 0), counters["retrieved"])
+        current_url = str(
+            getattr(last_result, "current_url", "") or existing.get("current_url") or existing.get("entry_url") or ""
+        )
+        trace_ref = str(getattr(last_result, "trace_ref", "") or existing.get("trace_ref") or "")
+        step_count = int(getattr(last_result, "step_count", 0) or existing.get("step_count") or 0)
+        result_message = str(getattr(last_result, "message", "") or "").strip()
+        return {
+            **existing,
+            "status": "completed",
+            "reason_tag": "ready",
+            "message": message or result_message or "岗位投递已完成。",
+            "current_phase": "apply",
+            "current_url": current_url,
+            "trace_ref": trace_ref,
+            "step_count": step_count,
+            "retrieve": retrieve,
+            "apply": apply,
+        }
+
+    def _apply_site_jobs(
+        self,
+        *,
+        site_key: str,
+        current: dict[str, Any],
+        batch_id: str,
+        session_id: str,
+        turn_id: str,
+    ) -> dict[str, Any]:
+        try:
+            self.site_tools.ensure_default_resume_pdf()
+        except Exception as exc:
+            updated = dict(current)
+            updated["reason_tag"] = "resume_pdf_unavailable"
+            updated["message"] = str(exc)
+            updated["apply"] = {
+                **dict(current.get("apply") or {}),
+                "status": "failed",
+                "attempted": 0,
+                "submitted": 0,
+            }
+            return updated
+
+        last_result: Any | None = None
+        while True:
+            pending_rows = self._pending_apply_rows(site_key, batch_id)
+            if not pending_rows:
+                break
+            target = pending_rows[0]
+            job_id = str(target.get("job_id") or "").strip()
+            job_url = str(target.get("url") or "").strip()
+            if not job_id:
+                break
+            if not job_url:
+                self._seal_apply_row_terminal(
+                    site_key=site_key,
+                    batch_id=batch_id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    job_id=job_id,
+                    status="blocked",
+                    error_text="missing job url",
+                )
+                continue
+
+            last_result = self.browser_runner.run_site(
+                site_key=site_key,
+                site_name=str(current.get("site_name") or site_key),
+                entry_url=job_url,
+                session_id=session_id,
+                turn_id=turn_id,
+                batch_id=batch_id,
+                resume=False,
+                phase_slugs=("apply",),
+                apply_target_job_ids=(job_id,),
+                phase_timeout_seconds_override=self.APPLY_JOB_PHASE_TIMEOUT_SECONDS,
+                timeout_ms_override=self.APPLY_JOB_TIMEOUT_MS,
+            )
+
+            latest_rows = {str(row.get("job_id") or ""): row for row in self._run_job_rows(site_key, batch_id)}
+            latest_row = latest_rows.get(job_id) or {}
+            if self._is_apply_row_terminal(latest_row):
+                continue
+            status = "blocked" if str(getattr(last_result, "status", "") or "") == "blocked" else "apply_failed"
+            error_text = str(getattr(last_result, "message", "") or "").strip() or "apply phase ended without terminal job update"
+            self._seal_apply_row_terminal(
+                site_key=site_key,
+                batch_id=batch_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                job_id=job_id,
+                status=status,
+                error_text=error_text,
+            )
+
+        if not self._pending_apply_rows(site_key, batch_id):
+            self._promote_apply_run_to_history(
+                site_key=site_key,
+                batch_id=batch_id,
+                session_id=session_id,
+                turn_id=turn_id,
+            )
+        return self._finalize_apply_site_row(
+            site_key=site_key,
+            existing=current,
+            batch_id=batch_id,
+            last_result=last_result,
+        )
+
+    def _promote_apply_run_to_history(self, *, site_key: str, batch_id: str, session_id: str, turn_id: str) -> None:
+        site_store = self.site_tools.site_store
+        promote = getattr(site_store, "promote_run_jobs_to_history", None)
+        if callable(promote):
+            promote(site_key, batch_id)
+        run_rows = self._run_job_rows(site_key, batch_id)
+        update_decisions = getattr(site_store, "update_job_decisions", None)
+        if callable(update_decisions):
+            update_decisions(site_key, run_rows)
+
+        applications: list[dict[str, Any]] = []
+        for row in run_rows:
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("application_status") or "").strip()
+            if not status:
+                continue
+            detail: dict[str, Any] = {}
+            error_text = str(row.get("last_apply_error") or "").strip()
+            if error_text:
+                detail["error"] = error_text
+            applications.append(
+                {
+                    "job_id": str(row.get("job_id") or ""),
+                    "status": status,
+                    "submitted": status == "submitted",
+                    "site_id": site_key,
+                    "batch_id": batch_id,
+                    "title": str(row.get("title") or ""),
+                    "url": str(row.get("url") or ""),
+                    "detail": detail,
+                }
+            )
+        update_outcomes = getattr(site_store, "update_job_application_outcomes", None)
+        if callable(update_outcomes):
+            update_outcomes(site_key, applications)
+        append_site_apps = getattr(site_store, "append_applications", None)
+        if callable(append_site_apps):
+            append_site_apps(site_key, applications, session_id, turn_id)
+        for app in applications:
+            self.application_store.append_application(
+                {
+                    "site_id": site_key,
+                    "batch_id": batch_id,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    **app,
+                }
+            )
+
+    def _apply_result_to_site_row(
+        self,
+        *,
+        result: Any,
+        existing: dict[str, Any],
+        batch_id: str,
+    ) -> dict[str, Any]:
+        site_key = str(existing.get("site_key") or getattr(result, "site_key", ""))
+        site_name = str(existing.get("site_name") or getattr(result, "site_name", site_key))
+        current_url = str(getattr(result, "current_url", "") or existing.get("current_url") or existing.get("entry_url") or "")
+        trace_ref = str(getattr(result, "trace_ref", "") or "")
+        step_count = int(getattr(result, "step_count", 0) or 0)
+        reason_tag = str(getattr(result, "reason_tag", "") or "")
+        message = str(getattr(result, "message", "") or "")
+        current_phase = str(getattr(result, "current_phase", "") or "")
+        retrieve = dict(existing.get("retrieve") or {})
+        apply = dict(existing.get("apply") or {})
+        counters = self._apply_counters_from_run(site_key, batch_id)
+
+        if str(getattr(result, "status", "") or "") == "ready" and current_phase == "apply":
+            apply.update(
+                {
+                    "status": "done",
+                    "attempted": counters["attempted"],
+                    "submitted": counters["submitted"],
+                    "already_applied": counters["already_applied"],
+                    "filtered_out": counters["filtered_out"],
+                    "failed": counters["failed"],
+                    "blocked": counters["blocked"],
+                }
+            )
+            retrieve["count"] = max(int(retrieve.get("count") or 0), counters["retrieved"])
+            return {
+                **existing,
+                "status": "completed",
+                "reason_tag": reason_tag,
+                "message": message or "岗位投递已完成。",
+                "current_phase": "apply",
+                "current_url": current_url,
+                "trace_ref": trace_ref,
+                "step_count": step_count,
+                "retrieve": retrieve,
+                "apply": apply,
+            }
+
+        apply["status"] = "blocked" if str(getattr(result, "status", "") or "") == "blocked" else "failed"
+        apply["attempted"] = counters["attempted"]
+        apply["submitted"] = counters["submitted"]
+        apply["already_applied"] = counters["already_applied"]
+        apply["filtered_out"] = counters["filtered_out"]
+        apply["failed"] = counters["failed"]
+        apply["blocked"] = counters["blocked"]
+        retrieve["count"] = max(int(retrieve.get("count") or 0), counters["retrieved"])
+        return {
+            **existing,
+            "status": "completed" if counters["retrieved"] else "failed",
+            "reason_tag": reason_tag or ("apply_blocked" if apply["status"] == "blocked" else "apply_failed"),
+            "message": message,
+            "current_phase": current_phase or "apply",
+            "current_url": current_url,
+            "trace_ref": trace_ref,
+            "step_count": step_count,
+            "retrieve": retrieve,
+            "apply": apply,
+        }
+
     def start_batch(self, *, session_id: str, turn_id: str, user_message: str, apply_requested: bool) -> str:
         active_sites = self.site_tools.site_store.list_sites("active")
         if not active_sites:
             return "当前没有已注册的 active sites。请先完成公司注册。"
+        effective_apply_requested = bool(apply_requested and self.ENABLE_BROWSER_APPLY_PHASE)
 
         site_rows: list[dict[str, Any]] = []
         runnable_keys: list[str] = []
         for row in active_sites:
             site_key = str(row.get("site_key") or "")
-            preflight = self.site_tools.preflight_site(site_key, apply_requested=apply_requested)
+            preflight = self.site_tools.preflight_site(site_key, apply_requested=effective_apply_requested)
             site_name = str(preflight.get("site_name") or row.get("canonical_company") or site_key)
             skill_path = str(preflight.get("skill_path") or "")
             entry_url = str(preflight.get("entry_url") or row.get("base_url") or "")
@@ -343,7 +686,7 @@ class JobFlow:
             session_id=session_id,
             turn_id=turn_id,
             user_message=user_message,
-            apply_requested=apply_requested,
+            apply_requested=effective_apply_requested,
             sites=site_rows,
         )
         if not self.browser_runner:
@@ -365,16 +708,32 @@ class JobFlow:
 
         def _job(site_key: str, current: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             allow_apply = str((current.get("apply") or {}).get("status") or "") != "skipped"
+            batch_id = str(batch.get("batch_id") or "")
             result = self.browser_runner.run_site(
                 site_key=site_key,
                 site_name=str(current.get("site_name") or site_key),
                 entry_url=str(current.get("entry_url") or ""),
                 session_id=session_id,
                 turn_id=turn_id,
-                batch_id=str(batch.get("batch_id") or ""),
+                batch_id=batch_id,
                 resume=False,
+                phase_slugs=("session_preparation", "channel_discovery", "job_filtering", "job_retrieval"),
             )
-            return site_key, self._browser_result_to_site_row(result=result, existing=current, allow_apply=allow_apply)
+            updated = self._browser_result_to_site_row(result=result, existing=current, allow_apply=allow_apply)
+            if (
+                effective_apply_requested
+                and allow_apply
+                and str((updated.get("retrieve") or {}).get("status") or "") == "done"
+                and str((updated.get("apply") or {}).get("status") or "") == "pending"
+            ):
+                updated = self._apply_site_jobs(
+                    site_key=site_key,
+                    current=updated,
+                    batch_id=batch_id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                )
+            return site_key, updated
 
         runnable_rows = [
             (site_key, row)
@@ -390,6 +749,7 @@ class JobFlow:
                     batch = self.job_store.update_site(batch, site_key, updated)
                     batch["status"] = self._compute_batch_status(batch)
                     batch = self.job_store.save_batch(batch)
+
         batch["status"] = self._compute_batch_status(batch)
         batch = self.job_store.save_batch(batch)
         return self._format_batch_summary(batch)
@@ -438,6 +798,7 @@ class JobFlow:
                 turn_id=turn_id,
                 batch_id=str(batch.get("batch_id") or ""),
                 resume=True,
+                phase_slugs=("session_preparation", "channel_discovery", "job_filtering", "job_retrieval"),
             )
             replacement = self._browser_result_to_site_row(
                 result=result,
