@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 from pathlib import Path
 import shutil
 import threading
@@ -18,6 +17,7 @@ from careereng.browser_controls.backends.playwright_mcp import (
 from careereng.browser_controls.bridge import MCPToolBridge
 from careereng.browser_controls.prompting import build_phase_prompts, load_text
 from careereng.browser_controls.runtime import BrowserPhaseResult, BrowserPhaseRuntime, BrowserRuntimeConfig
+from careereng.browser_context import BrowserContextRegistry, BrowserContextSession, BrowserPhaseMemory
 from careereng.resume.export import default_apply_resume_pdf_path
 from careereng.utils import now_iso
 
@@ -92,6 +92,7 @@ class BrowserAutomationService:
         self.max_phase_steps = int(max_phase_steps or 24)
         self._lock = threading.Lock()
         self._active: dict[str, ActiveSiteRuntime] = {}
+        self._browser_context_registry = BrowserContextRegistry(self.workspace)
         self._phase_runtime_config = BrowserRuntimeConfig(
             api_base=api_base,
             api_key=api_key,
@@ -204,105 +205,12 @@ class BrowserAutomationService:
             schema = BrowserPhaseRuntime.update_jobs_tool()
             response_tools.append(schema)
             tool_names.add(str(schema.get("name") or "update_jobs"))
+            schema = BrowserPhaseRuntime.request_context_tool()
+            response_tools.append(schema)
+            tool_names.add(str(schema.get("name") or "request_context"))
         return response_tools, tool_names
 
-    def _apply_context_items(
-        self,
-        *,
-        site_key: str,
-        batch_id: str,
-        target_job_ids: tuple[str, ...] | None = None,
-        staged_resume_pdf_path: str = "",
-    ) -> list[dict[str, str]]:
-        items: list[dict[str, str]] = []
-        target_ids = {str(job_id or "").strip() for job_id in (target_job_ids or ()) if str(job_id or "").strip()}
-        list_run_jobs = getattr(self.site_store, "list_run_jobs", None)
-        if callable(list_run_jobs):
-            try:
-                run_rows = list_run_jobs(site_key, batch_id)
-            except Exception:
-                run_rows = []
-        else:
-            run_rows = []
-        terminal_decisions = {"filtered_out", "already_applied"}
-        terminal_applications = {"already_applied", "submitted", "apply_failed", "blocked"}
-        pending_rows: list[dict[str, Any]] = []
-        for row in run_rows:
-            if not isinstance(row, dict):
-                continue
-            job_id = str(row.get("job_id") or "").strip()
-            if target_ids and job_id not in target_ids:
-                continue
-            decision_status = str(row.get("decision_status") or "").strip().lower()
-            application_status = str(row.get("application_status") or "").strip().lower()
-            if decision_status in terminal_decisions or application_status in terminal_applications:
-                continue
-            pending_rows.append(
-                {
-                    "job_id": job_id,
-                    "title": str(row.get("title") or ""),
-                    "url": str(row.get("url") or ""),
-                    "location": str(row.get("location") or ""),
-                    "posted_label": str(row.get("posted_label") or ""),
-                    "employment_type": str(row.get("employment_type") or ""),
-                    "match_label": str(row.get("match_label") or ""),
-                    "apply_state": str(row.get("apply_state") or ""),
-                    "decision_status": str(row.get("decision_status") or ""),
-                    "application_status": str(row.get("application_status") or ""),
-                }
-            )
-        items.append(
-            {
-                "role": "user",
-                "content": (
-                    (
-                        "Current apply target for this site and batch. Work only on this job:\n"
-                        if len(target_ids) == 1
-                        else "Current apply targets for this site and batch:\n"
-                    )
-                    + json.dumps(pending_rows, ensure_ascii=False)
-                ),
-            }
-        )
-        resume_pdf_path = str(staged_resume_pdf_path or "").strip() or str(default_apply_resume_pdf_path(self.workspace))
-        items.append(
-            {
-                "role": "user",
-                "content": (
-                    "Run-local staged resume PDF for this apply phase "
-                    f"(use this exact local path if upload is needed): {resume_pdf_path}"
-                ),
-            }
-        )
-        resume_file_name = Path(resume_pdf_path).name.strip()
-        if resume_file_name:
-            items.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Current staged resume filename for this apply phase "
-                        f"(compare the live page's selected resume name against this basename): {resume_file_name}"
-                    ),
-                }
-            )
-        persona_path = self.workspace / "profile" / "persona.md"
-        persona_text = load_text(persona_path).strip()
-        if persona_text:
-            items.append({"role": "user", "content": f"Current persona.md:\n{persona_text[:24000]}"})
-        current_dir = self.workspace / "cv" / "current"
-        cv_text = ""
-        if current_dir.exists():
-            for path in sorted(current_dir.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
-                if not path.is_file() or path.name == "metadata.json":
-                    continue
-                cv_text = load_text(path).strip()
-                if cv_text:
-                    break
-        if cv_text:
-            items.append({"role": "user", "content": f"Current CV text:\n{cv_text[:24000]}"})
-        return items
-
-    def _phase_context_items(
+    def _phase_context_session(
         self,
         *,
         site_key: str,
@@ -310,15 +218,48 @@ class BrowserAutomationService:
         batch_id: str,
         target_job_ids: tuple[str, ...] | None = None,
         staged_resume_pdf_path: str = "",
-    ) -> list[dict[str, str]]:
+        phase_memory: BrowserPhaseMemory | None = None,
+    ) -> BrowserContextSession | None:
         if phase_slug == "apply":
-            return self._apply_context_items(
+            self._browser_context_registry.refresh()
+            return BrowserContextSession.for_apply(
+                registry=self._browser_context_registry,
+                workspace=self.workspace,
+                site_store=self.site_store,
                 site_key=site_key,
                 batch_id=batch_id,
                 target_job_ids=target_job_ids,
                 staged_resume_pdf_path=staged_resume_pdf_path,
+                phase_memory=phase_memory,
             )
-        return []
+        return BrowserContextSession.for_phase(phase_memory=phase_memory)
+
+    @staticmethod
+    def _resume_context_items(*, staged_resume_pdf_path: str = "") -> list[dict[str, str]]:
+        resume_pdf_path = str(staged_resume_pdf_path or "").strip()
+        if not resume_pdf_path:
+            return []
+        items: list[dict[str, str]] = [
+            {
+                "role": "user",
+                "content": (
+                    "Run-local staged resume PDF for this browser run "
+                    f"(use this exact local path if the live page needs a resume upload): {resume_pdf_path}"
+                ),
+            }
+        ]
+        resume_file_name = Path(resume_pdf_path).name.strip()
+        if resume_file_name:
+            items.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Current staged resume filename for this browser run "
+                        f"(compare the live page's selected resume name against this basename): {resume_file_name}"
+                    ),
+                }
+            )
+        return items
 
     def _stage_apply_resume_pdf(self, *, runtime_output_dir: Path) -> Path:
         source_path = default_apply_resume_pdf_path(self.workspace)
@@ -454,17 +395,18 @@ class BrowserAutomationService:
             else:
                 session_state = self.site_store.ensure_browser_session(site_key)
                 apply_staged_resume_pdf_path = ""
-                if result is None and any(phase.slug == "apply" for phase in phases):
+                if result is None:
                     try:
                         staged_resume_pdf = self._stage_apply_resume_pdf(runtime_output_dir=active.runtime.output_dir)
                     except Exception as exc:
-                        result = BrowserAutomationResult(
-                            site_key=site_key,
-                            site_name=site_name,
-                            status="failed",
-                            reason_tag="resume_pdf_unavailable",
-                            message=str(exc),
-                        )
+                        if any(phase.slug == "apply" for phase in phases):
+                            result = BrowserAutomationResult(
+                                site_key=site_key,
+                                site_name=site_name,
+                                status="failed",
+                                reason_tag="resume_pdf_unavailable",
+                                message=str(exc),
+                            )
                     else:
                         apply_staged_resume_pdf_path = str(staged_resume_pdf)
                         self.site_store.save_browser_session(
@@ -532,7 +474,13 @@ class BrowserAutomationService:
                     if result is None:
                         for phase in phases:
                             response_tools, tool_names = self._response_tools_for_phase(tools, phase.slug)
+                            phase_memory = BrowserPhaseMemory()
                             self.site_store.append_event(site_key, "browser.phase.started", {"turn_id": turn_id, "phase": phase.slug})
+                            extra_context_items = []
+                            if phase.slug != "apply":
+                                extra_context_items = self._resume_context_items(
+                                    staged_resume_pdf_path=apply_staged_resume_pdf_path,
+                                )
                             phase_result = await phase_runtime.run_phase(
                                 site_key=site_key,
                                 site_name=site_name,
@@ -553,12 +501,14 @@ class BrowserAutomationService:
                                     else self._phase_timeout_seconds(phase.slug)
                                 ),
                                 max_phase_steps=self._phase_max_steps(phase.slug),
-                                extra_context_items=self._phase_context_items(
+                                extra_context_items=extra_context_items,
+                                context_session=self._phase_context_session(
                                     site_key=site_key,
                                     phase_slug=phase.slug,
                                     batch_id=batch_id,
                                     target_job_ids=apply_target_job_ids,
                                     staged_resume_pdf_path=apply_staged_resume_pdf_path,
+                                    phase_memory=phase_memory,
                                 ),
                                 apply_staged_resume_pdf_path=apply_staged_resume_pdf_path,
                             )

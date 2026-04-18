@@ -15,6 +15,7 @@ import anyio
 import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
+from careereng.browser_context import BrowserPhaseMemory
 from careereng.browser_controls.bridge import MCPToolBridge
 from careereng.browser_controls.prompting import PhasePrompt
 
@@ -242,6 +243,10 @@ class BrowserPhaseRuntime:
         "browser_select_option",
         "browser_navigate",
     )
+    OBSERVATION_ONLY_TOOLS = (
+        "browser_snapshot",
+        "browser_console_messages",
+    )
     JOB_RETRIEVAL_PAGE_ACTION_WAIT_SECONDS = 5.0
     PAGE_SETTLE_MAX_SNAPSHOT_RETRIES = 2
     PAGE_SETTLE_SLEEP_SECONDS = 0.75
@@ -270,7 +275,39 @@ class BrowserPhaseRuntime:
     @staticmethod
     def _is_observation_tool(name: str) -> bool:
         normalized = str(name or "").strip().lower()
-        return normalized in {"browser_snapshot", "browser_console_messages", "browser_tabs"}
+        return normalized in BrowserPhaseRuntime.OBSERVATION_ONLY_TOOLS
+
+    @staticmethod
+    def _observation_guard_applies(
+        *,
+        phase: PhasePrompt,
+        observation_streak: int,
+        current_url: str,
+        last_observation_url: str,
+        apply_upload_requires_observation: bool,
+        apply_upload_modal_unresolved: bool,
+    ) -> bool:
+        if observation_streak < 2:
+            return False
+        if last_observation_url and current_url and current_url != last_observation_url:
+            return False
+        if phase.slug == "apply" and (apply_upload_requires_observation or apply_upload_modal_unresolved):
+            return False
+        return True
+
+    @classmethod
+    def _filter_tools_for_observation_guard(
+        cls, response_tools: list[dict[str, Any]], available_tool_names: set[str]
+    ) -> tuple[list[dict[str, Any]], set[str]]:
+        filtered_tools: list[dict[str, Any]] = []
+        filtered_names = set(available_tool_names)
+        for tool in response_tools:
+            tool_name = str(tool.get("name") or "").strip()
+            if cls._is_observation_tool(tool_name):
+                filtered_names.discard(tool_name)
+                continue
+            filtered_tools.append(tool)
+        return filtered_tools, filtered_names
 
     @staticmethod
     def _apply_file_upload_use_staged_path_message(*, current_url: str, staged_path: str, attempted_paths: list[str]) -> str:
@@ -473,6 +510,22 @@ class BrowserPhaseRuntime:
                     raise
                 await self._sleep(min(3.0, float(attempts)))
 
+    def _response_turn_timeout_seconds(self, *, deadline: float) -> float:
+        remaining = max(0.1, float(deadline - time.monotonic()))
+        step_timeout = max(1.0, float(self.config.step_timeout_seconds or 30))
+        return max(0.1, min(remaining, step_timeout))
+
+    @staticmethod
+    def _response_turn_timeout_message(*, current_url: str, timeout_seconds: float) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        return (
+            "The previous model response turn timed out before producing any tool call.\n"
+            f"{url_line}"
+            f"Turn timeout budget: {timeout_seconds:.1f}s\n"
+            "Continue from the current live page and issue the next concrete browser action or phase_result now. "
+            "Do not treat the timed-out turn as completion."
+        )
+
     @classmethod
     def _is_retryable_response_runtime_error(cls, exc: RuntimeError) -> bool:
         text = str(exc or "").strip().lower()
@@ -600,6 +653,27 @@ class BrowserPhaseRuntime:
         }
 
     @staticmethod
+    def request_context_tool() -> dict[str, Any]:
+        return {
+            "type": "function",
+            "name": "request_context",
+            "description": (
+                "Request an additional preloaded context bundle for the current apply phase when the live page, "
+                "site skill, and lightweight facts are insufficient. This does not operate the browser."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bundle": {"type": "string", "enum": ["apply_facts", "full_cv", "full_persona"]},
+                    "reason": {"type": "string"},
+                },
+                "required": ["bundle", "reason"],
+                "additionalProperties": False,
+            },
+        }
+
+    @staticmethod
     def _extract_output_items(response: dict[str, Any]) -> list[dict[str, Any]]:
         output = response.get("output")
         if not isinstance(output, list):
@@ -657,15 +731,14 @@ class BrowserPhaseRuntime:
             "Stay inside the active site workflow. "
             "Use the current live page as the primary source of truth. "
             "Use recent browser trajectory only to remember what was just attempted; do not let it override the current live page. "
-            "Once the current phase goal is satisfied, stop exploring and call phase_result with status=done. "
-            "When the current phase is complete, call phase_result with status=done. "
+            "Use the current live page together with the active site and project skills to decide the next step. "
             "When the page requires human-only action such as password entry, MFA, verification code, CAPTCHA, or email confirmation, call phase_result with status=blocked."
         )
         if phase.slug == "session_preparation":
             prompt += (
                 " During Session Preparation, prefer direct visible browser actions over extra inspection. "
                 "Do not write custom browser code. If a visible sign-in continuation, provider option, or remembered-account step is available, click it directly. "
-                "Do not continue speculative navigation after the session goal has already been satisfied."
+                "Prefer direct visible continuation inside the active flow over speculative navigation."
             )
         elif phase.slug == "job_retrieval":
             prompt += (
@@ -689,6 +762,7 @@ class BrowserPhaseRuntime:
             prompt += (
                 " During Apply, work from the active batch run jobs and process them one by one. "
                 "Before making the final apply decision for a job, sync the current page JD, apply state, and any site-native match signal for that job. "
+                "If the live page, site skill, and lightweight apply facts are insufficient for a match decision or required form answer, call request_context for the needed bundle instead of guessing. "
                 "Use update_jobs whenever a job gains new JD, decision, or application state. "
                 "Only move to irreversible submission when the current job is clearly marked recommended_apply by the active site or project rules. "
                 "Do not finish the phase until every target job for this site has reached a terminal state or the site skill explicitly requires human takeover."
@@ -729,26 +803,6 @@ class BrowserPhaseRuntime:
         return cls._cap_text(", ".join(parts), max_chars=cls.RECENT_TRAJECTORY_ARGUMENTS_MAX_CHARS)
 
     @classmethod
-    def _format_recent_trajectory(cls, recent_steps: list[dict[str, str]]) -> str:
-        lines: list[str] = []
-        for index, step in enumerate(recent_steps[-cls.RECENT_TRAJECTORY_LIMIT :], start=1):
-            tool = str(step.get("tool") or "").strip() or "unknown"
-            lines.append(f"Step {index}: {tool}")
-            action = str(step.get("action") or "").strip()
-            if action:
-                lines.append(f"Action: {action}")
-            result = str(step.get("result") or "").strip()
-            if result:
-                lines.append(f"Result: {result}")
-            url = str(step.get("url") or "").strip()
-            if url:
-                lines.append(f"URL: {url}")
-            title = str(step.get("title") or "").strip()
-            if title:
-                lines.append(f"Title: {title}")
-        return "\n".join(lines).strip()
-
-    @classmethod
     def _is_job_retrieval_page_action(cls, name: str) -> bool:
         normalized = str(name or "").strip().lower()
         return normalized in cls.JOB_RETRIEVAL_PAGE_ACTION_TOOLS
@@ -761,11 +815,13 @@ class BrowserPhaseRuntime:
         phase: PhasePrompt,
         phase_handoff: str = "",
         recent_trajectory: str = "",
+        phase_memory_summary: str = "",
     ) -> str:
         guidance = phase.combined_guidance or "No phase-specific guidance was found."
         entry_line = f"Entry URL: {entry_url}\n" if entry_url else ""
         handoff_line = f"Previous phase handoff: {phase_handoff.strip()}\n" if phase_handoff.strip() else ""
         trajectory_line = f"Recent browser trajectory:\n{recent_trajectory.strip()}\n\n" if recent_trajectory.strip() else ""
+        phase_memory_line = f"Current phase memory:\n{phase_memory_summary.strip()}\n\n" if phase_memory_summary.strip() else ""
         return (
             f"Site: {site_name}\n"
             f"Phase: {phase.title}\n"
@@ -773,34 +829,13 @@ class BrowserPhaseRuntime:
             f"{handoff_line}"
             "Use the current live page as the primary source of truth.\n"
             "Use recent browser trajectory only as lightweight action history; do not continue reasoning from the pre-action page once a fresh live snapshot is available.\n"
-            "If the current phase goal is already satisfied, stop exploring and call phase_result.\n\n"
+            "Use current phase memory as confirmed in-run progress and already-observed facts; do not repeat a completed sub-step just because the fresh page no longer shows the earlier evidence directly.\n"
+            "Use the active site and project skills together with the current live page to decide the next step or whether phase_result is appropriate.\n\n"
             f"{trajectory_line}"
+            f"{phase_memory_line}"
             f"{guidance}\n\n"
             "Return control only by calling phase_result."
         )
-
-    def _append_recent_step(
-        self,
-        recent_steps: list[dict[str, str]],
-        *,
-        tool_name: str,
-        arguments: dict[str, Any] | None,
-        error_text: str,
-        current_url: str,
-        payload: dict[str, Any],
-        include_page_state: bool = True,
-    ) -> None:
-        recent_steps.append(
-            {
-                "tool": str(tool_name or "").strip(),
-                "action": self._summarize_arguments(arguments),
-                "result": "error" if str(error_text or "").strip() else "ok",
-                "url": str(current_url or "").strip() if include_page_state else "",
-                "title": MCPToolBridge.extract_page_title(payload) if include_page_state else "",
-            }
-        )
-        if len(recent_steps) > self.RECENT_TRAJECTORY_LIMIT:
-            del recent_steps[:-self.RECENT_TRAJECTORY_LIMIT]
 
     @staticmethod
     def _live_snapshot_primary_message() -> str:
@@ -809,6 +844,126 @@ class BrowserPhaseRuntime:
             "Use that current live page as the primary source of truth. "
             "Use recent trajectory only to remember what was just attempted."
         )
+
+    @staticmethod
+    def _action_looks_like_close(arguments: dict[str, Any] | None) -> bool:
+        if not isinstance(arguments, dict):
+            return False
+        haystack = " ".join(
+            str(arguments.get(key) or "")
+            for key in ("element", "button", "text", "value", "action")
+        ).strip().lower()
+        if not haystack:
+            return False
+        return bool(re.search(r"\b(close|dismiss|cancel|done|x)\b", haystack))
+
+    def _tool_outcome_summary(
+        self,
+        *,
+        phase: PhasePrompt,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        error_text: str,
+        current_url: str,
+        payload: dict[str, Any] | None,
+        latest_snapshot_payload: dict[str, Any] | None,
+        staged_resume_pdf_path: str,
+    ) -> str:
+        if str(error_text or "").strip():
+            return self._cap_text(f"Failed: {error_text}", max_chars=180)
+        signal_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
+        if staged_resume_pdf_path and self._payload_confirms_staged_file_upload(signal_payload, staged_path=staged_resume_pdf_path):
+            file_name = Path(staged_resume_pdf_path).name.strip()
+            if file_name:
+                return f"Confirmed staged file `{file_name}` is visible."
+        if tool_name == "record_jobs" and isinstance(payload, dict):
+            structured = payload.get("structuredContent")
+            if isinstance(structured, dict):
+                count = len(structured.get("job_ids") or [])
+                if count:
+                    return f"Recorded {count} job(s) from the current results page."
+        if tool_name == "update_jobs" and isinstance(payload, dict):
+            structured = payload.get("structuredContent")
+            if isinstance(structured, dict):
+                count = len(structured.get("jobs") or [])
+                if count:
+                    return f"Updated {count} current job state record(s)."
+        if tool_name == "request_context" and isinstance(arguments, dict):
+            bundle = str(arguments.get("bundle") or "").strip()
+            if bundle:
+                return f"Attached additional context bundle `{bundle}`."
+        if tool_name == "browser_file_upload":
+            file_name = Path(staged_resume_pdf_path).name.strip()
+            if file_name:
+                return f"Submitted staged file `{file_name}` to the live page."
+        if tool_name == "browser_click" and self._action_looks_like_close(arguments):
+            return "Closed the currently visible dialog or overlay."
+        page_title = MCPToolBridge.extract_page_title(signal_payload) if isinstance(signal_payload, dict) else ""
+        if phase.slug == "session_preparation" and tool_name == "browser_click":
+            element = ""
+            if isinstance(arguments, dict):
+                element = str(arguments.get("element") or "").strip()
+            if element:
+                return self._cap_text(f"Completed click on `{element}`.", max_chars=180)
+        if page_title:
+            return self._cap_text(f"Reached live page titled `{page_title}`.", max_chars=180)
+        if current_url:
+            return self._cap_text(f"Continued on `{current_url}`.", max_chars=180)
+        return ""
+
+    def _update_phase_memory(
+        self,
+        *,
+        phase_memory: BrowserPhaseMemory | None,
+        phase: PhasePrompt,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        error_text: str,
+        current_url: str,
+        payload: dict[str, Any] | None,
+        latest_snapshot_payload: dict[str, Any] | None,
+        staged_resume_pdf_path: str,
+        include_page_state: bool = True,
+    ) -> None:
+        if phase_memory is None:
+            return
+        outcome = self._tool_outcome_summary(
+            phase=phase,
+            tool_name=tool_name,
+            arguments=arguments,
+            error_text=error_text,
+            current_url=current_url,
+            payload=payload,
+            latest_snapshot_payload=latest_snapshot_payload,
+            staged_resume_pdf_path=staged_resume_pdf_path,
+        )
+        phase_memory.record_action(
+            tool=str(tool_name or "").strip(),
+            action=self._summarize_arguments(arguments),
+            status="error" if str(error_text or "").strip() else "ok",
+            url=str(current_url or "").strip() if include_page_state else "",
+            title=MCPToolBridge.extract_page_title(payload) if include_page_state and isinstance(payload, dict) else "",
+            outcome=outcome,
+        )
+        signal_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
+        if staged_resume_pdf_path and self._payload_confirms_staged_file_upload(
+            signal_payload,
+            staged_path=staged_resume_pdf_path,
+        ):
+            file_name = Path(staged_resume_pdf_path).name.strip()
+            if file_name:
+                phase_memory.set_completed(
+                    key="staged_file_verification_complete",
+                    text=f"The staged file `{file_name}` has already been verified on the live page in this phase.",
+                )
+                phase_memory.set_confirmed(
+                    key="staged_file_visible",
+                    text=f"The staged file `{file_name}` was already confirmed visible earlier in this phase.",
+                )
+                phase_memory.set_do_not_repeat(
+                    key="staged_file_recheck",
+                    text=f"Do not reopen the same file-selection or resume-selection surface only to re-check `{file_name}` in this phase.",
+                )
 
     async def _capture_snapshot_payload(
         self,
@@ -839,7 +994,11 @@ class BrowserPhaseRuntime:
         payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None
         updated_url = str(current_url or "")
         retries = 0
-        while payload is not None and self._payload_has_loading_signal(payload) and retries < self.PAGE_SETTLE_MAX_SNAPSHOT_RETRIES:
+        while (
+            payload is not None
+            and self._payload_requires_page_settle_retry(payload)
+            and retries < self.PAGE_SETTLE_MAX_SNAPSHOT_RETRIES
+        ):
             retries += 1
             await self._sleep(self.PAGE_SETTLE_SLEEP_SECONDS)
             refreshed = await self._capture_snapshot_payload(
@@ -1325,36 +1484,45 @@ class BrowserPhaseRuntime:
         return False
 
     @staticmethod
-    def _payload_has_loading_signal(payload: dict[str, Any] | None) -> bool:
-        if not isinstance(payload, dict):
+    def _payload_has_empty_snapshot_signal(payload: dict[str, Any] | None) -> bool:
+        if not isinstance(payload, dict) or bool(payload.get("isError")):
             return False
-        live_page = MCPToolBridge.live_page_text(payload)
-        if not live_page:
+        content = payload.get("content")
+        if not isinstance(content, list):
             return False
-        lowered = live_page.lower()
-        if any(
-            phrase in lowered
-            for phrase in (
-                "loading jobs",
-                "loading job card",
-                "loading results",
-                'status "loading',
-                "aria-busy",
-                "progressbar",
-                "spinner",
-                "skeleton",
-            )
-        ):
-            return True
-        if re.search(
-            r"(^|\n)-\s*(?:generic|status|alert|paragraph|text|section|region)\b[^\n]{0,120}:\s*loading(?:\.\.\.)?(?:\s|$)",
-            lowered,
-        ):
-            return True
-        return bool(
-            re.search(r"\bloading\b", lowered)
-            and re.search(r"\b(page\s+\d+\s+of\s+\d+|\d+\s+jobs|next|previous)\b", lowered)
-        )
+        text_blocks: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                text_blocks.append(text)
+        if not text_blocks:
+            return False
+        merged = "\n".join(text_blocks)
+        match = re.search(r"### Snapshot\b(.*?)(?=\n### [A-Za-z]|\Z)", merged, flags=re.S)
+        if not match:
+            return False
+        snapshot_body = match.group(1)
+        cleaned_lines: list[str] = []
+        for raw_line in snapshot_body.splitlines():
+            stripped = str(raw_line or "").strip()
+            if not stripped or stripped.startswith("```"):
+                continue
+            if stripped.startswith("- [Screenshot") or stripped.startswith("- [Snapshot"):
+                continue
+            lowered = stripped.lower()
+            if "mimetype" in lowered or '"data":' in lowered or "base64," in lowered:
+                continue
+            compact = stripped.replace(" ", "")
+            if re.fullmatch(r"[A-Za-z0-9+/=]{1024,}", compact):
+                continue
+            cleaned_lines.append(stripped)
+        return not cleaned_lines
+
+    @classmethod
+    def _payload_requires_page_settle_retry(cls, payload: dict[str, Any] | None) -> bool:
+        return cls._payload_has_empty_snapshot_signal(payload)
 
     @classmethod
     def _is_page_settle_action(cls, name: str) -> bool:
@@ -1412,17 +1580,6 @@ class BrowserPhaseRuntime:
             f"{url_line}"
             f"{page_line}"
             "Record the current page first, then use only a real visible next-page, numbered page, or load-more control from the live page."
-        )
-
-    @staticmethod
-    def _page_still_loading_message(*, phase: PhasePrompt, current_url: str) -> str:
-        url_line = f"Current page URL: {current_url}\n" if current_url else ""
-        return (
-            "The live page still appears to be loading from the previous action.\n"
-            f"{url_line}"
-            f"Phase: {phase.title}\n"
-            "Do not take another page-changing or result-changing action yet. "
-            "Wait for a fresh settled snapshot of the current page before continuing."
         )
 
     @staticmethod
@@ -1722,6 +1879,36 @@ class BrowserPhaseRuntime:
             "content": [{"type": "text", "text": summary}],
         }
 
+    @staticmethod
+    def _request_context_payload(*, context_session: Any | None, arguments: dict[str, Any]) -> dict[str, Any]:
+        if context_session is None:
+            return {
+                "isError": False,
+                "structuredContent": {
+                    "bundle": str(arguments.get("bundle") or ""),
+                    "available": False,
+                    "status": "context_session_unavailable",
+                },
+                "content": [{"type": "text", "text": "### Result\n- No browser context session is available for this phase."}],
+            }
+        request_bundle = getattr(context_session, "request_bundle", None)
+        if not callable(request_bundle):
+            return {
+                "isError": False,
+                "structuredContent": {
+                    "bundle": str(arguments.get("bundle") or ""),
+                    "available": False,
+                    "status": "context_session_invalid",
+                },
+                "content": [{"type": "text", "text": "### Result\n- The current context session cannot serve bundles."}],
+            }
+        return dict(
+            request_bundle(
+                bundle=str(arguments.get("bundle") or ""),
+                reason=str(arguments.get("reason") or ""),
+            )
+        )
+
     async def run_phase(
         self,
         *,
@@ -1741,6 +1928,7 @@ class BrowserPhaseRuntime:
         phase_timeout_seconds: int | None = None,
         max_phase_steps: int | None = None,
         extra_context_items: list[dict[str, Any]] | None = None,
+        context_session: Any | None = None,
         apply_staged_resume_pdf_path: str = "",
     ) -> BrowserPhaseResult:
         history_items: list[dict[str, Any]] = []
@@ -1778,7 +1966,9 @@ class BrowserPhaseRuntime:
             if isinstance(latest_snapshot_payload, dict) and not bool(latest_snapshot_payload.get("isError"))
             else None
         )
-        recent_steps: list[dict[str, str]] = []
+        phase_memory = getattr(context_session, "phase_memory", None) if context_session is not None else None
+        if not isinstance(phase_memory, BrowserPhaseMemory):
+            phase_memory = BrowserPhaseMemory(recent_action_limit=self.RECENT_TRAJECTORY_LIMIT)
         staged_resume_pdf_path = str(apply_staged_resume_pdf_path or "").strip()
         apply_upload_requires_observation = False
         apply_upload_modal_unresolved = False
@@ -1786,6 +1976,8 @@ class BrowserPhaseRuntime:
         apply_auth_recovery_page_key = ""
         failed_page_action_signature = ""
         failed_page_action_name = ""
+        response_turn_timeout_count = 0
+        max_response_turn_timeouts = max(1, int(self.config.max_step_retries or 0)) + 1
 
         while time.monotonic() < deadline and step_count < max(1, effective_max_phase_steps):
             loop_context_items = list(history_items)
@@ -1803,6 +1995,19 @@ class BrowserPhaseRuntime:
                         )
                         )
                     )
+            active_tools = list(tools)
+            active_tool_names = set(tool_names)
+            observation_guard_active = self._observation_guard_applies(
+                phase=phase,
+                observation_streak=observation_streak,
+                current_url=current_url,
+                last_observation_url=last_observation_url,
+                apply_upload_requires_observation=apply_upload_requires_observation,
+                apply_upload_modal_unresolved=apply_upload_modal_unresolved,
+            )
+            if observation_guard_active:
+                active_tools, active_tool_names = self._filter_tools_for_observation_guard(active_tools, active_tool_names)
+                loop_context_items.append(self._context_item(self._observation_guard_message(phase=phase, current_url=current_url)))
             base_items: list[dict[str, Any]] = [
                 {"role": "system", "content": self._system_prompt(site_name=site_name, phase=phase)},
                 {
@@ -1812,14 +2017,67 @@ class BrowserPhaseRuntime:
                         entry_url=entry_url,
                         phase=phase,
                         phase_handoff=phase_handoff,
-                        recent_trajectory=self._format_recent_trajectory(recent_steps),
+                        recent_trajectory=phase_memory.recent_actions_text(),
+                        phase_memory_summary=phase_memory.phase_memory_text(),
                     ),
                 },
             ]
-            static_context_items = list(extra_context_items or [])
-            response = await self._create_response_with_retry(
-                self._payload(input_items=base_items + static_context_items + loop_context_items, tools=tools)
-            )
+            context_items = getattr(context_session, "items", None) if context_session is not None else None
+            static_context_items = list(context_items() if callable(context_items) else (extra_context_items or []))
+            turn_timeout_seconds = self._response_turn_timeout_seconds(deadline=deadline)
+            try:
+                with anyio.fail_after(turn_timeout_seconds):
+                    response = await self._create_response_with_retry(
+                        self._payload(input_items=base_items + static_context_items + loop_context_items, tools=active_tools)
+                    )
+            except TimeoutError:
+                response_turn_timeout_count += 1
+                snapshot_payload = await self._capture_snapshot_payload(
+                    bridge=bridge,
+                    session=session,
+                    tool_names=tool_names,
+                )
+                if (
+                    isinstance(snapshot_payload, dict)
+                    and snapshot_payload
+                    and not bool(snapshot_payload.get("isError"))
+                ):
+                    latest_snapshot_payload = snapshot_payload
+                    last_payload = snapshot_payload
+                    snapshot_url = MCPToolBridge.extract_current_url(snapshot_payload)
+                    if snapshot_url:
+                        current_url = snapshot_url
+                history_items = [
+                    self._context_item(
+                        self._response_turn_timeout_message(
+                            current_url=current_url,
+                            timeout_seconds=turn_timeout_seconds,
+                        )
+                    )
+                ]
+                if (
+                    isinstance(latest_snapshot_payload, dict)
+                    and latest_snapshot_payload
+                    and not bool(latest_snapshot_payload.get("isError"))
+                ):
+                    history_items.append(self._context_item(self._live_snapshot_primary_message()))
+                if response_turn_timeout_count >= max_response_turn_timeouts:
+                    return BrowserPhaseResult(
+                        status="failed",
+                        reason_tag="response_turn_timeout",
+                        summary=(
+                            f"model response turn timed out {response_turn_timeout_count} times "
+                            "without producing a tool call"
+                        ),
+                        current_url=current_url,
+                        step_count=step_count,
+                        trace_ref=trace_ref,
+                        recorded_count=len(recorded_job_ids),
+                        new_count=len(new_job_ids),
+                    )
+                await self._sleep(min(1.0, max(0.1, turn_timeout_seconds / 2.0)))
+                continue
+            response_turn_timeout_count = 0
             output_items = self._extract_output_items(response)
             output_text = self._extract_output_text(response)
             fallback_result = self._maybe_parse_phase_result_text(output_text)
@@ -1961,7 +2219,20 @@ class BrowserPhaseRuntime:
                         new_count=len(new_job_ids),
                     )
 
-                if name not in tool_names:
+                if observation_guard_active and is_observation_tool and name not in active_tool_names:
+                    return BrowserPhaseResult(
+                        status="failed",
+                        reason_tag="observation_limit",
+                        summary="repeated observation-only tool calls on the same page exceeded limits",
+                        current_url=current_url,
+                        step_count=step_count,
+                        trace_ref=trace_ref,
+                        raw_text=output_text,
+                        recorded_count=len(recorded_job_ids),
+                        new_count=len(new_job_ids),
+                    )
+
+                if name not in active_tool_names:
                     history_items = [
                         self._context_item(
                             self._tool_unavailable_message(
@@ -2098,23 +2369,6 @@ class BrowserPhaseRuntime:
                         retry_requested = True
                         break
 
-                if (
-                    phase.slug != "job_retrieval"
-                    and self._is_page_settle_action(name)
-                    and self._payload_has_loading_signal(
-                        latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None
-                    )
-                ):
-                    history_items = [
-                        self._context_item(
-                            self._page_still_loading_message(
-                                phase=phase,
-                                current_url=current_url,
-                            )
-                        )
-                    ]
-                    retry_requested = True
-                    break
                 if (
                     phase.slug == "job_retrieval"
                     and current_visible_result_count > 0
@@ -2319,15 +2573,6 @@ class BrowserPhaseRuntime:
                     ]
                     retry_requested = True
                     break
-                if is_observation_tool and observation_streak >= 2 and (
-                    not last_observation_url or current_url == last_observation_url
-                ):
-                    history_items = [
-                        self._context_item(self._observation_guard_message(phase=phase, current_url=current_url))
-                    ]
-                    retry_requested = True
-                    break
-
                 if (
                     phase.slug == "job_retrieval"
                     and name == "browser_evaluate"
@@ -2375,6 +2620,11 @@ class BrowserPhaseRuntime:
                                 session_id=session_id,
                                 turn_id=turn_id,
                                 batch_id=batch_id,
+                                arguments=arguments if isinstance(arguments, dict) else {},
+                            )
+                        elif name == "request_context":
+                            payload = self._request_context_payload(
+                                context_session=context_session,
                                 arguments=arguments if isinstance(arguments, dict) else {},
                             )
                         else:
@@ -2431,14 +2681,6 @@ class BrowserPhaseRuntime:
                             "last_known_url": current_url,
                         },
                     )
-                    self._append_recent_step(
-                        recent_steps,
-                        tool_name=name,
-                        arguments=arguments,
-                        error_text=error_text,
-                        current_url=current_url,
-                        payload=payload,
-                    )
                     terminal_job_ids: list[str] = []
                     if phase.slug == "apply" and name == "update_jobs" and not error_text:
                         terminal_job_ids = self._terminal_job_ids_from_update_payload(payload)
@@ -2464,6 +2706,21 @@ class BrowserPhaseRuntime:
                             ignore_phrases=phase.ignore_phrases,
                         )
                     )
+                    if name == "request_context" and not error_text:
+                        self._update_phase_memory(
+                            phase_memory=phase_memory,
+                            phase=phase,
+                            tool_name=name,
+                            arguments=arguments,
+                            error_text=error_text,
+                            current_url=current_url,
+                            payload=payload,
+                            latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
+                            staged_resume_pdf_path=staged_resume_pdf_path,
+                        )
+                        history_items = [tool_feedback]
+                        retry_requested = True
+                        break
                     if phase.slug == "apply" and name == "update_jobs" and not error_text and not terminal_job_ids:
                         auth_recovery_payload = (
                             latest_snapshot_payload
@@ -2518,7 +2775,7 @@ class BrowserPhaseRuntime:
                             if snapshot_url:
                                 current_url = snapshot_url
                             fresh_snapshot_captured = True
-                    if fresh_snapshot_captured and not error_text and phase.slug != "job_retrieval":
+                    if fresh_snapshot_captured and not error_text:
                         settled_payload, settled_url = await self._wait_for_page_settle(
                             tool_name=name,
                             latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
@@ -2646,6 +2903,17 @@ class BrowserPhaseRuntime:
                             else:
                                 apply_upload_requires_observation = False
                                 apply_upload_modal_unresolved = False
+                    self._update_phase_memory(
+                        phase_memory=phase_memory,
+                        phase=phase,
+                        tool_name=name,
+                        arguments=arguments,
+                        error_text=error_text,
+                        current_url=current_url,
+                        payload=payload,
+                        latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
+                        staged_resume_pdf_path=staged_resume_pdf_path,
+                    )
                     if is_observation_tool:
                         if observation_streak > 0 and (
                             not last_observation_url or current_url == last_observation_url
@@ -2838,13 +3106,16 @@ class BrowserPhaseRuntime:
                                     "last_known_url": current_url,
                                 },
                             )
-                            self._append_recent_step(
-                                recent_steps,
+                            self._update_phase_memory(
+                                phase_memory=phase_memory,
+                                phase=phase,
                                 tool_name="record_jobs",
                                 arguments={"jobs": auto_record_jobs},
                                 error_text="",
                                 current_url=current_url,
                                 payload=auto_record_payload,
+                                latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
+                                staged_resume_pdf_path=staged_resume_pdf_path,
                             )
                             recorded_page_key = latest_page_key or current_page_key
                             if recorded_page_key:
@@ -2874,26 +3145,6 @@ class BrowserPhaseRuntime:
                                 self._job_retrieval_serialization_error_message(
                                     current_url=current_url,
                                     page_label=page_label,
-                                )
-                            )
-                        )
-                        last_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
-                        retry_requested = True
-                        break
-                    if (
-                        phase.slug != "job_retrieval"
-                        and not error_text
-                        and self._is_job_retrieval_page_action(name)
-                        and self._payload_has_loading_signal(latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None)
-                    ):
-                        history_items = [tool_feedback]
-                        if fresh_snapshot_captured and name != "browser_snapshot":
-                            history_items.append(self._context_item(self._live_snapshot_primary_message()))
-                        history_items.append(
-                            self._context_item(
-                                self._page_still_loading_message(
-                                    phase=phase,
-                                    current_url=current_url,
                                 )
                             )
                         )
@@ -2961,7 +3212,7 @@ class BrowserPhaseRuntime:
                     ):
                         extracted_page_key = ""
                         primary_read_page_key = latest_page_key or current_page_key
-                        recent_steps.clear()
+                        phase_memory.clear_recent_actions()
                         history_items = [tool_feedback]
                         if fresh_snapshot_captured and name != "browser_snapshot":
                             history_items.append(self._context_item(self._live_snapshot_primary_message()))
@@ -3058,8 +3309,8 @@ class BrowserPhaseRuntime:
                             arguments if isinstance(arguments, dict) else None,
                         )
                         failed_page_action_name = str(name or "").strip()
-                        if recent_steps:
-                            recent_steps[:] = recent_steps[-1:]
+                        if phase_memory.has_recent_actions():
+                            phase_memory.keep_last_recent_action()
                     await self._sleep(min(2.0, max(0.25, float(self.config.step_timeout_seconds or 1) / 10.0)))
                     snapshot_payload = await self._capture_snapshot_payload(
                         bridge=bridge,

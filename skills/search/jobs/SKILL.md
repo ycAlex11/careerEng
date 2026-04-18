@@ -244,12 +244,14 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 
 - If the site skill defines a stronger site-native matching rule, use that site rule first.
 - Otherwise use this common rule:
-- Score the JD against `persona.md` first.
+- Start from the current live JD, site-native signals, and lightweight apply facts already attached to the apply context.
+- If those are not enough for the common rule, call `request_context` for `full_persona` before scoring.
+- Score the JD against the available persona evidence.
 - If the score is between 70 and 100, treat it as `recommended_apply`.
 - If the score is below 40, treat it as `filtered_out`.
-- If the score is between 40 and 70, review the full CV before making the final decision.
+- If the score is between 40 and 70, call `request_context` for `full_cv` before making the final decision.
 - After the full CV review, use `recommended_apply` only if the updated score is above 50; otherwise use `filtered_out`.
-- Use `persona.md` and the current CV as the decision basis. Do not invent unsupported experience.
+- Do not invent unsupported experience. If needed evidence is not attached yet, request the relevant context bundle instead of guessing.
 
 ### Resume Source
 
@@ -264,6 +266,8 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 ### Form Filling
 
 - Fill only required fields in apply.
+- Prefer site skill rules and lightweight apply facts for routine form filling.
+- If a required field cannot be answered from the live page, active site skill, or lightweight apply facts, call `request_context` for the smallest needed bundle, usually `full_cv` for detailed experience or `full_persona` for background constraints.
 - If a required field already has a visible current value, selected option, checked state, or uploaded file, leave it as-is and move on.
 - Do not spend time rewriting or re-answering fields that are already filled.
 - Skip optional fields unless the active site skill explicitly requires them.
