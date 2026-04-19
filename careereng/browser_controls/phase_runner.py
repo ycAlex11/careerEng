@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import shutil
 import threading
@@ -28,7 +28,10 @@ GLOBAL_BLOCKED_TOOL_NAMES = {"browser_run_code"}
 SESSION_PREPARATION_BLOCKED_TOOL_NAMES = {"browser_resize"}
 JOB_RETRIEVAL_BLOCKED_TOOL_NAMES = {"browser_navigate"}
 JOB_FILTERING_PHASE_TIMEOUT_SECONDS = 420
-JOB_RETRIEVAL_PHASE_TIMEOUT_SECONDS = 900
+JOB_RETRIEVAL_PHASE_TIMEOUT_SECONDS = 1500
+JOB_RETRIEVAL_TIMEOUT_SECONDS_PER_PAGE = 180
+JOB_RETRIEVAL_TIMEOUT_MAX_PAGES = 10
+JOB_RETRIEVAL_STEP_TIMEOUT_SECONDS = 90
 JOB_RETRIEVAL_MAX_PHASE_STEPS = 96
 APPLY_PHASE_TIMEOUT_SECONDS = 3600
 APPLY_PHASE_MAX_PHASE_STEPS = 240
@@ -167,10 +170,18 @@ class BrowserAutomationService:
             return False
         return True
 
-    def _phase_timeout_seconds(self, phase_slug: str) -> int:
+    def _phase_timeout_seconds(self, phase_slug: str, *, phase_memory: BrowserPhaseMemory | None = None) -> int:
         base = int(self.phase_timeout_seconds or 180)
         if str(phase_slug or "").strip() == "job_retrieval":
-            return max(base, JOB_RETRIEVAL_PHASE_TIMEOUT_SECONDS)
+            timeout = max(base, JOB_RETRIEVAL_PHASE_TIMEOUT_SECONDS)
+            if isinstance(phase_memory, BrowserPhaseMemory):
+                budget_pages = phase_memory.retrieval_budget_pages(
+                    default_page_size=10,
+                    max_pages=JOB_RETRIEVAL_TIMEOUT_MAX_PAGES,
+                )
+                if budget_pages:
+                    timeout = max(timeout, int(budget_pages) * JOB_RETRIEVAL_TIMEOUT_SECONDS_PER_PAGE)
+            return timeout
         if str(phase_slug or "").strip() == "apply":
             return max(base, APPLY_PHASE_TIMEOUT_SECONDS)
         if str(phase_slug or "").strip() == "job_filtering":
@@ -197,6 +208,9 @@ class BrowserAutomationService:
             name = str(schema.get("name", "") or "").strip()
             if name:
                 tool_names.add(name)
+        schema = BrowserPhaseRuntime.update_phase_memory_tool()
+        response_tools.append(schema)
+        tool_names.add(str(schema.get("name") or "update_phase_memory"))
         if phase_slug == "job_retrieval":
             schema = BrowserPhaseRuntime.record_jobs_tool()
             response_tools.append(schema)
@@ -234,33 +248,6 @@ class BrowserAutomationService:
             )
         return BrowserContextSession.for_phase(phase_memory=phase_memory)
 
-    @staticmethod
-    def _resume_context_items(*, staged_resume_pdf_path: str = "") -> list[dict[str, str]]:
-        resume_pdf_path = str(staged_resume_pdf_path or "").strip()
-        if not resume_pdf_path:
-            return []
-        items: list[dict[str, str]] = [
-            {
-                "role": "user",
-                "content": (
-                    "Run-local staged resume PDF for this browser run "
-                    f"(use this exact local path if the live page needs a resume upload): {resume_pdf_path}"
-                ),
-            }
-        ]
-        resume_file_name = Path(resume_pdf_path).name.strip()
-        if resume_file_name:
-            items.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Current staged resume filename for this browser run "
-                        f"(compare the live page's selected resume name against this basename): {resume_file_name}"
-                    ),
-                }
-            )
-        return items
-
     def _stage_apply_resume_pdf(self, *, runtime_output_dir: Path) -> Path:
         source_path = default_apply_resume_pdf_path(self.workspace)
         if not source_path.is_file():
@@ -273,11 +260,21 @@ class BrowserAutomationService:
             shutil.copy2(source_path, staged_path)
         return staged_path
 
-    def _create_phase_runtime(self) -> BrowserPhaseRuntime | Any:
+    def _phase_step_timeout_seconds(self, phase_slug: str) -> int:
+        base_timeout = int(self._phase_runtime_config.step_timeout_seconds or 30)
+        if str(phase_slug or "").strip() == "job_retrieval":
+            return max(base_timeout, JOB_RETRIEVAL_STEP_TIMEOUT_SECONDS)
+        return base_timeout
+
+    def _create_phase_runtime(self, phase_slug: str = "") -> BrowserPhaseRuntime | Any:
         override = self.phase_runtime
         if override is not None:
             return override
-        return BrowserPhaseRuntime(self._phase_runtime_config)
+        step_timeout_seconds = self._phase_step_timeout_seconds(phase_slug)
+        config = self._phase_runtime_config
+        if step_timeout_seconds != int(config.step_timeout_seconds or 30):
+            config = replace(config, step_timeout_seconds=step_timeout_seconds)
+        return BrowserPhaseRuntime(config)
 
     def _reserve_runtime(self, site_key: str, entry_url: str, timeout_ms: int | None = None) -> tuple[ActiveSiteRuntime, bool]:
         effective_timeout_ms = int(timeout_ms or self.timeout_ms or 45000)
@@ -333,7 +330,6 @@ class BrowserAutomationService:
         timeout_ms_override: int | None = None,
     ) -> BrowserAutomationResult:
         active, reused_runtime = self._reserve_runtime(site_key, entry_url, timeout_ms=timeout_ms_override)
-        phase_runtime = self._create_phase_runtime()
         wait_for_process(active.runtime)
         self.site_store.save_browser_session(
             site_key,
@@ -471,16 +467,16 @@ class BrowserAutomationService:
                     last_result: BrowserPhaseResult | None = None
                     current_url = str(session_state.get("last_known_url") or target_url)
                     phase_handoff = ""
+                    previous_phase_memory: BrowserPhaseMemory | None = None
                     if result is None:
                         for phase in phases:
+                            phase_runtime = self._create_phase_runtime(phase.slug)
                             response_tools, tool_names = self._response_tools_for_phase(tools, phase.slug)
                             phase_memory = BrowserPhaseMemory()
+                            timeout_memory = previous_phase_memory if phase.slug == "job_retrieval" else None
+                            phase_timeout_seconds = self._phase_timeout_seconds(phase.slug, phase_memory=timeout_memory)
                             self.site_store.append_event(site_key, "browser.phase.started", {"turn_id": turn_id, "phase": phase.slug})
                             extra_context_items = []
-                            if phase.slug != "apply":
-                                extra_context_items = self._resume_context_items(
-                                    staged_resume_pdf_path=apply_staged_resume_pdf_path,
-                                )
                             phase_result = await phase_runtime.run_phase(
                                 site_key=site_key,
                                 site_name=site_name,
@@ -496,9 +492,9 @@ class BrowserAutomationService:
                                 tool_names=tool_names,
                                 phase_handoff=phase_handoff,
                                 phase_timeout_seconds=(
-                                    max(self._phase_timeout_seconds(phase.slug), int(phase_timeout_seconds_override or 0))
+                                    max(phase_timeout_seconds, int(phase_timeout_seconds_override or 0))
                                     if phase.slug == "apply"
-                                    else self._phase_timeout_seconds(phase.slug)
+                                    else phase_timeout_seconds
                                 ),
                                 max_phase_steps=self._phase_max_steps(phase.slug),
                                 extra_context_items=extra_context_items,
@@ -515,6 +511,7 @@ class BrowserAutomationService:
                             last_result = phase_result
                             current_url = str(phase_result.current_url or current_url or target_url)
                             if phase_result.status == "done":
+                                previous_phase_memory = phase_memory
                                 phase_handoff = f"{phase.title} completed. {phase_result.summary.strip()[:300]}".strip()
                                 authenticated_ready = bool(session_state.get("authenticated_ready") or session_state.get("session_ready"))
                                 jobs_surface_ready = bool(session_state.get("jobs_surface_ready"))

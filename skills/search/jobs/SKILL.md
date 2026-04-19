@@ -18,6 +18,13 @@ Use stage-aware priority when multiple sources overlap.
 - Use recent browser trajectory only as lightweight action history so you remember what was just attempted.
 - Do not continue reasoning from the pre-action page once a fresh live snapshot is available.
 
+## Phase Memory
+
+- Use `update_phase_memory` to record durable in-phase state whenever a sub-step becomes clearly completed, clearly confirmed, still pending, or should not be repeated on the same unchanged page.
+- Use `completed` for finished sub-steps, `confirmed` for stable live-page facts, `pending` for unresolved next targets, and `do_not_repeat` for loops that should not be retried unchanged.
+- Clear stale phase-memory keys when the page state changes enough that an earlier pending or do-not-repeat item no longer applies.
+- Do not rely only on recent trajectory when the current phase already has a clear completed/pending split; write that split into phase memory first.
+
 ### General Order
 
 Use this default order unless the current stage says otherwise:
@@ -161,6 +168,9 @@ Apply the same default narrowing goal on every supported jobs surface unless the
 - If one applied filter already enforces a target dimension, do not reopen a second filter just to restate it. Example: if a direct remote toggle already excludes remote-only roles, do not also use `Work site` only to express the same exclusion.
 - If the page already shows active chips, checked options, or URL state that satisfy one target dimension, treat that dimension as done and move on.
 - Do not keep reopening filters after the main narrowing goal is already satisfied.
+- After a filter dimension is clearly satisfied, record that state in `update_phase_memory` before moving on to the next unresolved dimension.
+- When the live page exposes a narrowed total such as `Show 64 jobs`, `64 jobs`, or a page label such as `1 of 7`, include structured `metrics` in `update_phase_memory` with `results_count`, `total_pages`, and `page_size` when those values are visible.
+- If only the total jobs count is visible, record `metrics.results_count`; if only the pagination label is visible, record `metrics.total_pages`; if the current page's visible result count is clear, record `metrics.page_size`.
 
 ### Completion Rule
 
@@ -168,6 +178,7 @@ Apply the same default narrowing goal on every supported jobs surface unless the
 - Treat the phase as complete once the page has narrowed to China, full-time, software-engineering-oriented roles, and non-intern / non-new-grad roles to the extent the current site exposes those filters.
 - After each successful filter application, re-check the live page and stop immediately if the current surface is already narrowed enough for retrieval.
 - If remote-only exclusion is not available as a visible filter on the current page, do not keep searching for it forever; finish with the best available narrowing and hand off to retrieval.
+- If one target dimension remains pending while another is already completed, record that pending/completed split in `update_phase_memory` instead of reopening the completed filter group again.
 
 ### Don't
 
@@ -182,26 +193,67 @@ Apply the same default narrowing goal on every supported jobs surface unless the
 
 Record the reachable jobs from the current narrowed jobs surface so later decision and apply phases can work from stored job entries.
 
+### Results Surface Guidance
+
+- Treat the current live results page as the only source of truth for the current page.
+- Read the current page from the visible results-list surface where the live page shows one current visible result entry per job.
+- Prefer the current visible list or card region that corresponds to the current page's jobs. Treat that region as the current page's primary retrieval surface.
+- Treat side detail panes, selected-job previews, recommendation rails, sticky preview panels, filter chrome, account chrome, and pagination summaries as context only unless the active site skill explicitly says they are part of the current page's jobs source.
+- A page label such as `4 of 7`, a total-count badge, or another pagination signal only means additional results pages still exist. It does not mean the current visible page is already recorded.
+- The current page becomes recordable as soon as the current visible results surface yields concrete per-job `{title, url}` pairs for the current page.
+- Once the current page is already recordable, call `record_jobs` immediately or after at most one final same-page pass for lightweight optional fields.
+- Do not keep broadening or restarting observation on the same unchanged page once the current page is already recordable.
+
 ### Recording Rules
 
 - Record the full current visible jobs page before deciding whether to stop or paginate.
-- Use `record_jobs` for the current page as soon as the current visible jobs page can be formed into structured current-page records.
-- Use the attached current live snapshot first. If the current visible jobs are already readable there, form the records directly from that current page instead of starting with extra extraction.
-- If the fresh live snapshot clearly enumerates the current page's repeated visible job items, use that current-page visible count as the completeness check for this page.
-- Do not paginate or finish while the current page records still contain fewer roles than that clearly visible current-page count.
-- On split-view or mixed-panel job pages, first form the current visible results set for this page.
-- If some fields or URLs are still missing, you may inspect additional candidate sources on that same page more broadly, but only keep per-role data that aligns back to the current visible results set.
-- Do not accept or reject a same-page candidate source only because of its layout position, panel placement, or region label.
-- Do not indiscriminately import every `/job/` link visible somewhere on the page. Keep only the links that can be matched back to the current visible results set for this page.
+- Start from the attached current live snapshot for the current results page.
+- If the current visible jobs are already readable there, form the current-page records directly from that current page.
+- If the snapshot is not yet enough, stay on the same current results page and use the official browser tools to read that same page. Do not leave the current results page before it is recorded.
+- As soon as any same-page read already yields the current page's `{title, url}` set, treat that current page as ready to record.
+- After `{title, url}` is already available for the current visible jobs, you may do at most one more same-page read to fill lightweight optional list fields that are clearly visible on the current page.
+- Those optional fields are best-effort only. Do not keep observing the same page just to perfect location, posted label, employment type, match label, apply state, card text, or posted_at.
+- After that optional same-page pass, or immediately if it is not needed, call `record_jobs`.
+- Do not paginate or finish while the current visible page is still unrecorded.
 - The current results-page address is not a per-job link. Do not reuse the same results page address as the job link for multiple visible roles.
 - Do not leave the current results page to open a separate job detail page before the current visible results page has been recorded.
-- If one attempt already produced the current page jobs, call `record_jobs` immediately before any more observation or pagination.
-- If one or more current-page list fields are still missing after reading the current live snapshot, use one focused supplemental read on the same current page, then call `record_jobs`.
-- If any visible role on the current page still does not have its own concrete role link, stay on that same page, complete the missing links, and only then record or paginate.
-- If the live page clearly still shows jobs, pagination, or a jobs count but the current attempt returned zero jobs, capture a fresh snapshot, use that live snapshot first, and try the same current visible jobs page once more before paginating.
+- If one attempt already produced the current page jobs, call `record_jobs` before any more observation or pagination.
 - In this phase, record lightweight list-level fields only: title, url, location, posted label, employment type, match label, apply state, and card text when visible.
+- Use a single stable phase-memory key named `retrieval_carry_forward` for page-to-page retrieval guidance in this run.
+- Immediately after `record_jobs` succeeds for the current page, and before any pagination action or `phase_result`, use `update_phase_memory` to save a short carry-forward retrieval context for the next page in this same run.
+- Save that carry-forward retrieval context under `retrieval_carry_forward`.
+- Write `retrieval_carry_forward` in exactly these four labeled lines and in this order: `Inspect First:`, `Worked Shape:`, `Ignore:`, and `Ready To Record:`.
+- `Inspect First` must state the first same-page reading route to use on the next results page.
+- `Worked Shape` must capture the decisive DOM or page-shape facts from the current successful page, such as whether the visible job cards are anchors or buttons, whether real per-job URLs appear directly in card `href` values, whether `aria-label` follows a stable `View job:` pattern, whether card ids follow a stable `job-card-...-job-list` shape, or whether card text follows a stable field order.
+- `Ignore` must name the tempting but wrong current-page regions or URL sources that should not be reused on the next page.
+- `Ready To Record` must state the minimum condition that means the current page is already ready for `record_jobs`.
+- Keep that carry-forward retrieval context concise and reusable. Do not store raw selectors, raw refs, or raw browser-evaluate code in phase memory. Short DOM or page-shape cues are allowed.
+- Replace the existing `retrieval_carry_forward` note when a newer current-page reading route succeeds. Do not keep multiple competing retrieval carry-forward notes alive in the same run.
+- It is acceptable for that carry-forward retrieval context to be imperfect. Prefer carrying the best current working note forward over re-starting every later page from a blank search.
 - Do not open each job detail page just to capture long descriptions in this phase.
 - Do not apply in this phase.
+
+### Carry-Forward Usage
+
+- If current phase memory already contains `retrieval_carry_forward`, the next results page's first same-page read must start from that carried guidance instead of restarting from a blank search.
+- Treat `retrieval_carry_forward` as the default first route for the next page, not as optional background advice.
+- On the next page, use `Inspect First` and `Worked Shape` before trying a different control type, region, or extraction route.
+- If `Worked Shape` says the visible job cards are anchors, direct links, or another specific current-page shape, do not fall back to a different control-type route first unless the fresh current live page clearly disproves that shape.
+- Use `Ignore` to suppress the wrong routes that already failed on the previous successful page.
+- As soon as the current page satisfies `Ready To Record`, call `record_jobs` instead of continuing to explore.
+- Only abandon the carried guidance after the fresh current live page clearly disproves it, such as returning empty on the visible results page or showing a different results shape than the carried note expected.
+- If the carried guidance is disproved, switch to a new same-page reading route on that same live page and replace `retrieval_carry_forward` as soon as the current page becomes recordable.
+- If the carried guidance still fits the current live page, keep using it through the current page's recording step instead of drifting into unrelated observation routes.
+- Do not create a new retrieval carry-forward note before the current page is actually recorded.
+
+### Recovery Rules
+
+- If a same-page read returns zero jobs while the live page still shows jobs, result count, pagination, or another results signal, treat that read as a failed extraction route, not as an empty results page.
+- When a same-page extraction route fails on a live results page, keep the current page unrecorded and try another same-page reading route from the current live page or the carried retrieval working note.
+- If the current page already yielded a non-empty jobs extraction, do not restart broad observation on that same unchanged page. Use the extracted current-page jobs to call `record_jobs` unless the extracted records are missing concrete per-job URLs.
+- If current-page records are missing concrete per-job URLs, or if any visible role reuses the current results-page address as its job URL, resolve only those missing or invalid URLs from the same current visible page before calling `record_jobs`.
+- Do not paginate, finish, or open unrelated detail pages while the current visible page has yielded jobs that have not yet been recorded.
+- If the runtime reports that the current page fingerprint has already been recorded in this run, do not re-record or re-extract that same unchanged page. Move to the next real results page, load more results, or finish if the site stop condition is met.
 
 ### Pagination
 
@@ -209,6 +261,7 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - If no stop condition is triggered and a real next-page / next-results / load-more action is available, continue to the next results page and repeat.
 - Use only a real visible pagination control, next-page control, or load-more action from the live page. Do not guess or synthesize pagination URLs.
 - When paginating through numbered results, move sequentially page by page instead of jumping ahead from inferred totals or URL parameters.
+- After a page-changing action, start the new current page from the carried retrieval working note if one exists; do not reset to a blank exploration unless the fresh live page disproves that carried note.
 - If the live page shows a total jobs count, page label, or other pagination signal that implies more results than the current recorded page, do not finish just because a next-page control is not immediately visible after one scroll. Re-check the bottom pagination region or results footer on the live page before deciding that pagination is unavailable.
 - If the site exposes no further results page and no load-more action, finish the phase.
 
@@ -227,18 +280,32 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - For every job, end in one terminal run-state before moving on: `recommended_apply`, `filtered_out`, `already_applied`, `submitted`, or `blocked`.
 - Submit only the jobs that are judged `recommended_apply`.
 - Record JD sync, decision, and application progress as you go so the current batch always reflects the latest state.
+- Use `update_jobs` whenever the current job gains new JD data, decision state, apply state, submission result, or blocking reason.
 - Treat apply as a page-by-page workflow on the current live page.
 - At the start of each apply page, read the current live page first before taking the next action.
+- Before making the final apply decision for a job, sync the current live JD, apply state, and any site-native match signal that the current page exposes for that job.
 - On the current page, first handle explicit validation errors, required empty fields, required selections, or missing uploaded files.
 - If the current page needs a resume or file upload, first use that page's own upload entry such as `Upload new`, `Upload`, or `Select files`.
 - Call `browser_file_upload` only after the live page has actually entered file-chooser state for that current page.
 - After any upload attempt, re-read the fresh current live page and confirm the page accepted the staged PDF before continuing.
 - After any successful upload, `Next`, `Continue`, `Review`, `Save and continue`, `Submit`, or `Submit application` action, capture a fresh live snapshot and use that new page state as the source of truth.
+- When a current-page apply sub-step becomes clearly complete, record that in `update_phase_memory` before moving on so later turns do not repeat it on the same unchanged page.
 - Use the current page's safe forward action when one is clearly available, such as `Next`, `Continue`, `Review`, or `Save and continue`.
 - If the current apply flow returns to a sign-in page but still shows a visible one-click continuation such as a provider button, remembered account, or direct sign-in continuation, continue through that visible login recovery path instead of stopping immediately.
 - If the current apply flow has reached password entry, email entry, MFA, verification code, CAPTCHA, or another explicit human-only challenge with no visible one-click continuation left, finish that job with `blocked`.
+- If the live page, active site skill, and lightweight apply facts are insufficient for a match decision or a required form answer, call `request_context` for the smallest needed bundle instead of guessing.
 - Use the final irreversible action such as `Submit` or `Submit application` only when the current page is clearly the final confirmation page for the current job.
+- Move to an irreversible submit action only when the current job is already `recommended_apply` under the active site or project matching rules.
 - Do not keep retrying upload, forward, or submit blindly on the same unchanged page. If an action did not advance, re-read the current page and resolve the visible blocking reason first.
+
+### Recovery Rules
+
+- After any successful `browser_file_upload` call, treat the page as changed and re-read the fresh current live page before taking any other apply action.
+- If the fresh current live page confirms that the staged PDF is already uploaded or selected for this unchanged apply page, do not upload it again on that page. Continue from the next required form step, safe forward action, or final confirmation step that the live page shows.
+- If the same unchanged apply page already completed a `browser_file_upload` call with the staged PDF in this run, do not repeat that upload on the same page. Return to the current live page state and continue the apply workflow from there.
+- If the apply flow temporarily returns to a sign-in surface that still shows a visible sign-in continuation, do not treat that sign-in page as a normal job-state page. Continue through the visible login recovery path first, then resume the current job.
+- If the apply flow is on a sign-in or recovery page, do not write final JD or application state updates from that page unless the live page clearly shows the job returned to a normal apply state.
+- If an upload attempt leaves the page in an unresolved file-chooser or modal-only state and the normal form does not return, stop that job as `blocked`.
 
 ### Matching
 

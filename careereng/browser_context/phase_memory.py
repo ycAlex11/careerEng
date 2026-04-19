@@ -21,7 +21,9 @@ class BrowserPhaseMemory:
     recent_actions: list[PhaseActionRecord] = field(default_factory=list)
     completed: dict[str, str] = field(default_factory=dict)
     confirmed: dict[str, str] = field(default_factory=dict)
+    pending: dict[str, str] = field(default_factory=dict)
     do_not_repeat: dict[str, str] = field(default_factory=dict)
+    metrics: dict[str, int] = field(default_factory=dict)
 
     def record_action(
         self,
@@ -66,10 +68,40 @@ class BrowserPhaseMemory:
         if normalized and str(text or "").strip():
             self.confirmed[normalized] = str(text).strip()
 
+    def set_pending(self, *, key: str, text: str) -> None:
+        normalized = str(key or "").strip()
+        if normalized and str(text or "").strip():
+            self.pending[normalized] = str(text).strip()
+
     def set_do_not_repeat(self, *, key: str, text: str) -> None:
         normalized = str(key or "").strip()
         if normalized and str(text or "").strip():
             self.do_not_repeat[normalized] = str(text).strip()
+
+    def set_metric(self, *, key: str, value: int) -> None:
+        normalized = str(key or "").strip()
+        number = int(value or 0)
+        if normalized and number > 0:
+            self.metrics[normalized] = number
+
+    def get_metric(self, key: str) -> int | None:
+        normalized = str(key or "").strip()
+        value = self.metrics.get(normalized)
+        if isinstance(value, int) and value > 0:
+            return value
+        return None
+
+    def retrieval_budget_pages(self, *, default_page_size: int = 10, max_pages: int = 10) -> int | None:
+        total_pages = self.get_metric("total_pages")
+        if total_pages:
+            return min(total_pages, max(1, int(max_pages or 1)))
+
+        results_count = self.get_metric("results_count")
+        if not results_count:
+            return None
+        page_size = self.get_metric("page_size") or max(1, int(default_page_size or 1))
+        estimated_pages = (results_count + page_size - 1) // page_size
+        return min(max(1, estimated_pages), max(1, int(max_pages or 1)))
 
     def drop(self, *keys: str) -> None:
         for raw in keys:
@@ -78,7 +110,9 @@ class BrowserPhaseMemory:
                 continue
             self.completed.pop(normalized, None)
             self.confirmed.pop(normalized, None)
+            self.pending.pop(normalized, None)
             self.do_not_repeat.pop(normalized, None)
+            self.metrics.pop(normalized, None)
 
     def recent_actions_text(self) -> str:
         lines: list[str] = []
@@ -112,8 +146,16 @@ class BrowserPhaseMemory:
             lines.append("Confirmed:")
             for text in self.confirmed.values():
                 lines.append(f"- {text}")
+        if self.pending:
+            lines.append("Pending:")
+            for text in self.pending.values():
+                lines.append(f"- {text}")
         if self.do_not_repeat:
             lines.append("Do not repeat:")
             for text in self.do_not_repeat.values():
                 lines.append(f"- {text}")
+        if self.metrics:
+            lines.append("Metrics:")
+            for key, value in self.metrics.items():
+                lines.append(f"- {key}: {value}")
         return "\n".join(lines).strip()
