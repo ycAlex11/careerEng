@@ -27,6 +27,19 @@ class SiteTools:
     def ensure_default_resume_pdf(self) -> Path:
         return ensure_default_resume_pdf(self.site_store.workspace)
 
+    def _display_path(self, path: Path | str) -> str:
+        if not str(path or "").strip():
+            return ""
+        resolved = Path(path)
+        for base in (self.project_root, getattr(self.site_store, "project_root", None), self.site_store.workspace):
+            if not base:
+                continue
+            try:
+                return str(resolved.relative_to(Path(base)))
+            except ValueError:
+                continue
+        return str(resolved)
+
     def _site_skill_state(self, site_id: str) -> dict[str, Any]:
         skill = self.site_store.load_skill(site_id)
         meta = skill.get("front_matter") if isinstance(skill.get("front_matter"), dict) else {}
@@ -81,7 +94,7 @@ class SiteTools:
             "raw_name": str(site.get("raw_name") or site_name),
             "base_url": target_url,
             "has_skill": self.site_store.has_skill(site_id),
-            "skill_path": str(skill_path.relative_to(self.site_store.workspace)),
+            "skill_path": self._display_path(skill_path),
             "skill_template_created": skill_template_created,
             "apply_requested": apply_requested,
             "status": str(site.get("status") or "active"),
@@ -107,7 +120,7 @@ class SiteTools:
         status = str(row.get("status") or "active")
         skill = self._site_skill_state(site_id)
         session = self.site_store.ensure_browser_session(site_id)
-        skill_path = skill.get("path") or ""
+        skill_path = self._display_path(skill.get("path") or "")
         apply_enabled = bool(skill.get("apply_enabled"))
         allow_apply = bool(apply_requested and apply_enabled)
 

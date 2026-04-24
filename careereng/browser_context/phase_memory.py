@@ -114,6 +114,16 @@ class BrowserPhaseMemory:
             self.do_not_repeat.pop(normalized, None)
             self.metrics.pop(normalized, None)
 
+    def get_text(self, key: str) -> str:
+        normalized = str(key or "").strip()
+        if not normalized:
+            return ""
+        for bucket in (self.completed, self.confirmed, self.pending, self.do_not_repeat):
+            value = str(bucket.get(normalized) or "").strip()
+            if value:
+                return value
+        return ""
+
     def recent_actions_text(self) -> str:
         lines: list[str] = []
         for index, step in enumerate(self.recent_actions[-self.recent_action_limit :], start=1):

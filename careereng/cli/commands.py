@@ -15,11 +15,13 @@ from careereng.core.runtime import project_root_from_cwd, workspace_path as runt
 from careereng.core.workspace_bootstrap import bootstrap_workspace
 from careereng.core.workspace_manager import dispatch_manager_message, serve_workspace_manager
 from careereng.resume.export import ResumeExportError, export_resume_pdf as export_resume_pdf_file
+from careereng.reporting.job_report import generate_job_batch_report
 from careereng.storage.job_store import JobStore
 from careereng.storage.jsonl import JSONLStore
 from careereng.storage.intent_store import IntentStore
 from careereng.storage.profile_store import ProfileStore
 from careereng.storage.router_store import RouterStore
+from careereng.tools.batch_apply_debug import BatchApplyDebugRunner
 from careereng.utils import make_id, safe_file_stem
 
 app = typer.Typer(help="CareerEng CLI")
@@ -262,6 +264,64 @@ def batch_clear(
         typer.echo(f"{row.get('batch_id')}\t{row.get('session_id')}\t{row.get('status')}")
 
 
+@app.command("batch-apply")
+def batch_apply(
+    site: str = typer.Option(..., "--site", help="Site key to apply from"),
+    batch: str = typer.Option("latest", "--batch", help="Job batch ID, or latest"),
+    limit: int = typer.Option(3, "--limit", min=1, help="Number of jobs to apply from this site"),
+    session: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
+    apply_only: bool = typer.Option(False, "--apply-only", help="Skip session preparation and run apply directly"),
+):
+    """Apply the first N jobs from an existing batch without rerunning retrieval."""
+    loop, _ = _build_loop()
+    try:
+        try:
+            reply = BatchApplyDebugRunner(loop.job_flow).run(
+                batch_id=batch,
+                site_key=site,
+                limit=limit,
+                session_id=session,
+                turn_id=make_id("turn"),
+                apply_only=apply_only,
+            )
+        finally:
+            loop.close()
+    except (FileNotFoundError, KeyError, ValueError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(reply)
+
+
+@app.command("batch-debug-create")
+def batch_debug_create(
+    site: str = typer.Option(..., "--site", help="Site key to isolate from"),
+    batch: str = typer.Option("latest", "--batch", help="Source job batch ID, or latest"),
+    job_id: str = typer.Option("", "--job-id", help="Exact job_id to isolate"),
+    title: str = typer.Option("", "--title", help="Case-insensitive title substring to isolate"),
+    session: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
+):
+    """Create a one-job debug batch from an existing site batch."""
+    if bool(job_id.strip()) == bool(title.strip()):
+        raise typer.BadParameter("provide exactly one of --job-id or --title")
+    loop, _ = _build_loop()
+    try:
+        try:
+            debug_batch_id = BatchApplyDebugRunner(loop.job_flow).create_debug_batch(
+                batch_id=batch,
+                site_key=site,
+                session_id=session,
+                turn_id=make_id("turn"),
+                job_id=job_id,
+                title_contains=title,
+            )
+        finally:
+            loop.close()
+    except (FileNotFoundError, KeyError, ValueError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    normalized_site_key = safe_file_stem(site)
+    typer.echo(f"source_batch={batch} debug_batch={debug_batch_id} site={normalized_site_key}")
+    typer.echo(f"next: python -m careereng batch-apply --site {normalized_site_key} --batch {debug_batch_id} --limit 1")
+
+
 @app.command("manager-serve", hidden=True)
 def manager_serve(
     project_root: str = typer.Option(..., "--project-root", help="Project root"),
@@ -373,7 +433,10 @@ def resume_upload(
         text = path.read_bytes().decode("utf-8", errors="ignore")
 
     loop, _ = _build_loop()
-    reply = loop.process_resume_upload(session_id=session, text=text, source_name=path.name)
+    try:
+        reply = loop.process_resume_upload(session_id=session, text=text, source_name=path.name)
+    finally:
+        loop.close()
 
     workspace = _workspace_path()
     sources = workspace / "profile" / "sources"
@@ -438,6 +501,28 @@ def report_list():
         typer.echo(
             f"[{domain}] id={report.get('id')} status={report.get('status')} items={len(report.get('items') or [])}"
         )
+
+
+@report_app.command("jobs")
+def report_jobs(
+    batch: str = typer.Option("latest", "--batch", help="Job batch ID, or latest"),
+):
+    """Generate a simple job batch report."""
+    root = _project_root()
+    workspace = _workspace_path()
+    try:
+        report = generate_job_batch_report(workspace=workspace, project_root=root, batch_id=batch)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    totals = report.get("totals") if isinstance(report.get("totals"), dict) else {}
+    typer.echo(f"batch={report.get('batch_id')} status={report.get('status') or 'unknown'}")
+    typer.echo(
+        f"retrieved={int(totals.get('retrieved_count') or 0)} "
+        f"submitted={int(totals.get('submitted_count') or 0)} "
+        f"already_applied={int(totals.get('already_applied_count') or 0)}"
+    )
+    typer.echo(f"json: {report.get('json_path')}")
+    typer.echo(f"markdown: {report.get('markdown_path')}")
 
 
 def _find_report(report_id: str) -> tuple[str, dict[str, Any], Any] | None:

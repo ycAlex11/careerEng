@@ -62,7 +62,7 @@ def build_site_services(
     config = load_config(project_root)
     resolved_workspace = workspace or config.paths.workspace_path(project_root)
     resolved_workspace.mkdir(parents=True, exist_ok=True)
-    site_store = SiteStore(resolved_workspace)
+    site_store = SiteStore(resolved_workspace, project_root=project_root)
     search_store = SearchStore(resolved_workspace)
     site_tools = SiteTools(site_store)
     site_tools.project_root = project_root
@@ -80,7 +80,7 @@ def build_loop(*, project_root: Path, workspace: Path | None = None) -> tuple[Ag
 
     resolved_workspace = workspace or config.paths.workspace_path(project_root)
     resolved_workspace.mkdir(parents=True, exist_ok=True)
-    site_store = SiteStore(resolved_workspace)
+    site_store = SiteStore(resolved_workspace, project_root=project_root)
     site_tools = SiteTools(site_store)
     site_tools.project_root = project_root
     browser_runner = BrowserAutomationService(

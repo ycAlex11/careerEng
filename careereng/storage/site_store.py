@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -26,11 +27,9 @@ class SiteStore:
         "location",
         "posted_at",
         "posted_label",
-        "posted_label_raw",
         "employment_type",
         "match_label",
         "apply_state",
-        "card_text",
         "description_ref",
         "jd_sync_status",
         "decision_status",
@@ -51,14 +50,25 @@ class SiteStore:
     )
     RUN_JOB_BOOL_FIELDS = ("fit_apply",)
 
-    def __init__(self, workspace: Path):
-        self.workspace = workspace
-        self.sites_dir = ensure_dir(workspace / "sites")
+    def __init__(self, workspace: Path, project_root: Path | None = None):
+        self.workspace = Path(workspace)
+        self.project_root = Path(project_root) if project_root is not None else self.workspace.parent
+        self.site_skills_dir = ensure_dir(self.project_root / "skills" / "search" / "jobs" / "sites")
+        self.sites_dir = ensure_dir(self.workspace / "sites")
         self.registry = JSONLStore(self.sites_dir / "registry.jsonl")
         self._migrate_existing_sites()
 
     def site_dir(self, site_id: str) -> Path:
         return self.sites_dir / safe_file_stem(site_id)
+
+    def site_skill_path(self, site_id: str) -> Path:
+        return self.site_skills_dir / safe_file_stem(site_id) / "SKILL.md"
+
+    def legacy_project_site_skill_path(self, site_id: str) -> Path:
+        return self.project_root / "skills" / "sites" / safe_file_stem(site_id) / "SKILL.md"
+
+    def legacy_site_skill_path(self, site_id: str) -> Path:
+        return self.site_dir(site_id) / "skills" / "SKILL.md"
 
     def _site_dirs(self) -> list[Path]:
         rows: list[Path] = []
@@ -202,8 +212,30 @@ class SiteStore:
         write_json(self.browser_session_path(site_id), current)
         return current
 
+    def _migrate_legacy_site_skill(self, site_id: str) -> Path:
+        skill_path = self.site_skill_path(site_id)
+        legacy_paths = [
+            path
+            for path in (self.legacy_project_site_skill_path(site_id), self.legacy_site_skill_path(site_id))
+            if path != skill_path and path.exists()
+        ]
+        if skill_path.exists():
+            for legacy_path in sorted(legacy_paths, key=lambda path: path.stat().st_mtime, reverse=True):
+                try:
+                    if legacy_path.stat().st_mtime > skill_path.stat().st_mtime:
+                        shutil.copy2(legacy_path, skill_path)
+                    break
+                except OSError:
+                    continue
+            return skill_path
+        if legacy_paths:
+            legacy_path = sorted(legacy_paths, key=lambda path: path.stat().st_mtime, reverse=True)[0]
+            ensure_dir(skill_path.parent)
+            shutil.copy2(legacy_path, skill_path)
+        return skill_path
+
     def load_skill(self, site_id: str) -> dict[str, Any]:
-        skill_path = self.site_dir(site_id) / "skills" / "SKILL.md"
+        skill_path = self._migrate_legacy_site_skill(site_id)
         if not skill_path.exists():
             return {"path": skill_path, "exists": False, "front_matter": {}, "body": ""}
         text = skill_path.read_text(encoding="utf-8")
@@ -339,6 +371,23 @@ class SiteStore:
         batch_key = safe_file_stem(batch_id or "adhoc_run")
         return self._job_runs_dir(site_id) / f"{batch_key}.jsonl"
 
+    def _job_run_context_path(self, site_id: str, batch_id: str) -> Path:
+        batch_key = safe_file_stem(batch_id or "adhoc_run")
+        return self._job_runs_dir(site_id) / f"{batch_key}.context.json"
+
+    def load_run_context(self, site_id: str, batch_id: str) -> dict[str, Any]:
+        path = self._job_run_context_path(site_id, batch_id)
+        payload = read_json(path)
+        return payload if isinstance(payload, dict) else {}
+
+    def save_run_context(self, site_id: str, batch_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        current = self.load_run_context(site_id, batch_id)
+        current.update(payload or {})
+        path = self._job_run_context_path(site_id, batch_id)
+        ensure_dir(path.parent)
+        write_json(path, current)
+        return current
+
     def _load_history_jobs(self, site_id: str) -> list[dict[str, Any]]:
         path = self._history_jobs_path(site_id)
         if not path.exists():
@@ -405,6 +454,7 @@ class SiteStore:
                         json.dumps(legacy_catalog_rows, ensure_ascii=False, indent=2) + "\n",
                         encoding="utf-8",
                     )
+                    (root / "jobs" / "catalog.jsonl").write_text("", encoding="utf-8")
             idx = self._find_registry_row_index(
                 rows,
                 raw_name=raw_name,
@@ -657,15 +707,17 @@ class SiteStore:
         return self._set_status(name, status="inactive")
 
     def has_skill(self, site_id: str) -> bool:
-        skill = self.site_dir(site_id) / "skills" / "SKILL.md"
+        skill = self._migrate_legacy_site_skill(site_id)
         return skill.exists() and bool(skill.read_text(encoding="utf-8").strip())
 
     def ensure_skill_template(self, site_id: str) -> tuple[Path, bool]:
-        skill = self.site_dir(site_id) / "skills" / "SKILL.md"
-        existed = skill.exists()
-        if not existed:
+        skill = self._migrate_legacy_site_skill(site_id)
+        if skill.exists():
+            return skill, False
+        ensure_dir(skill.parent)
+        if not skill.exists():
             skill.write_text(self._default_site_skill_text(site_id), encoding="utf-8")
-        return skill, not existed
+        return skill, True
 
     def _normalize_url(self, url: str) -> str:
         raw = (url or "").strip()
@@ -748,7 +800,7 @@ class SiteStore:
 
         title = self._normalize_job_text(str(row.get("title") or ""))
         location = self._normalize_job_text(str(row.get("location") or ""))
-        posted = self._normalize_job_text(str(row.get("posted_label_raw") or row.get("posted_label") or ""))
+        posted = self._normalize_job_text(str(row.get("posted_label") or ""))
         if title and location and posted:
             keys.append(f"fallback|{site}|{title}|{location}|{posted}")
 
@@ -767,9 +819,8 @@ class SiteStore:
         site = safe_file_stem(site_id)
         title = self._normalize_job_text(str(row.get("title") or ""))
         location = self._normalize_job_text(str(row.get("location") or ""))
-        posted = self._normalize_job_text(str(row.get("posted_label_raw") or row.get("posted_label") or ""))
-        card_text = self._normalize_job_text(str(row.get("card_text") or ""))
-        return f"opaque|{site}|{title}|{location}|{posted}|{card_text}"
+        posted = self._normalize_job_text(str(row.get("posted_label") or ""))
+        return f"opaque|{site}|{title}|{location}|{posted}"
 
     def _history_ids(self, site_id: str, row: dict[str, Any]) -> tuple[str, str]:
         seed = self._history_identity_seed(site_id, row)
@@ -792,7 +843,6 @@ class SiteStore:
             "location",
             "posted_at",
             "posted_label",
-            "posted_label_raw",
             "employment_type",
             "match_label",
             "apply_state",
@@ -801,9 +851,6 @@ class SiteStore:
             value = str(incoming.get(field) or "").strip()
             if value:
                 merged[field] = value
-        card_text = str(incoming.get("card_text") or "").strip()
-        if card_text:
-            merged["card_text"] = card_text[:2000]
         ts = str(incoming.get("ts") or "").strip()
         if ts:
             merged["ts"] = ts
@@ -849,8 +896,6 @@ class SiteStore:
             if text:
                 if field == "url":
                     merged[field] = self._normalize_url(text)
-                elif field == "card_text":
-                    merged[field] = text[:2000]
                 else:
                     merged[field] = text
         for field in self.RUN_JOB_NUMERIC_FIELDS:
@@ -964,9 +1009,7 @@ class SiteStore:
                 "employment_type": str(job.get("employment_type") or ""),
                 "match_label": str(job.get("match_label") or ""),
                 "apply_state": str(job.get("apply_state") or ""),
-                "card_text": str(job.get("card_text") or "")[:2000],
                 "description_ref": description_ref,
-                "posted_label_raw": str(job.get("posted_label") or ""),
             }
             rows.append(snapshot)
             appended_rows.append(snapshot)

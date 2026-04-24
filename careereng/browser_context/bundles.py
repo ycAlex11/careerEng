@@ -143,6 +143,15 @@ class BrowserContextSession:
         phase_memory: BrowserPhaseMemory | None = None,
     ) -> "BrowserContextSession":
         bundle_texts = {name: registry.bundle_item_text(name) for name in registry.available_bundles()}
+        load_run_context = getattr(site_store, "load_run_context", None)
+        if callable(load_run_context):
+            try:
+                run_context = load_run_context(site_key, batch_id)
+            except Exception:
+                run_context = {}
+        else:
+            run_context = {}
+        apply_carry_forward = str(run_context.get("apply_carry_forward") or "").strip() if isinstance(run_context, dict) else ""
         pending_rows = _pending_apply_rows(
             site_store=site_store,
             site_key=site_key,
@@ -192,6 +201,16 @@ class BrowserContextSession:
         )
         if nvidia_batch_fact:
             items.append({"role": "user", "content": nvidia_batch_fact})
+        if apply_carry_forward:
+            items.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Current apply carry-forward from an earlier completed job in this same site batch:\n"
+                        f"{apply_carry_forward}"
+                    ),
+                }
+            )
         if "apply_facts" in bundle_texts:
             items.append({"role": "user", "content": bundle_texts["apply_facts"]})
         items.append({"role": "user", "content": registry.available_bundles_item_text()})

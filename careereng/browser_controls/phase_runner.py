@@ -33,6 +33,7 @@ JOB_RETRIEVAL_TIMEOUT_SECONDS_PER_PAGE = 180
 JOB_RETRIEVAL_TIMEOUT_MAX_PAGES = 10
 JOB_RETRIEVAL_STEP_TIMEOUT_SECONDS = 90
 JOB_RETRIEVAL_MAX_PHASE_STEPS = 96
+APPLY_STEP_TIMEOUT_SECONDS = 300
 APPLY_PHASE_TIMEOUT_SECONDS = 3600
 APPLY_PHASE_MAX_PHASE_STEPS = 240
 
@@ -108,6 +109,21 @@ class BrowserAutomationService:
         )
         self.phase_runtime: BrowserPhaseRuntime | Any | None = None
 
+    async def _aclose_phase_runtime(self, runtime: Any) -> None:
+        if runtime is None:
+            return
+        aclose = getattr(runtime, "aclose", None)
+        if callable(aclose):
+            result = aclose()
+            if hasattr(result, "__await__"):
+                await result
+            return
+        close = getattr(runtime, "close", None)
+        if callable(close):
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
     def close(self) -> None:
         with self._lock:
             active = list(self._active.values())
@@ -115,11 +131,24 @@ class BrowserAutomationService:
         for item in active:
             item.runtime.stop()
             self.site_store.save_browser_session(item.site_key, {"browser_status": "stopped", "active_run_id": ""})
+        shared_phase_runtime = self.phase_runtime
+        self.phase_runtime = None
+        if shared_phase_runtime is not None:
+            anyio.run(self._aclose_phase_runtime, shared_phase_runtime)
 
     def _project_skill_path(self) -> Path:
         return self.project_root / "skills" / "search" / "jobs" / "SKILL.md"
 
     def _site_skill_path(self, site_key: str) -> Path:
+        load_skill = getattr(self.site_store, "load_skill", None)
+        if callable(load_skill):
+            skill = load_skill(site_key)
+            path = skill.get("path") if isinstance(skill, dict) else None
+            if path:
+                return Path(path)
+        site_skill_path = getattr(self.site_store, "site_skill_path", None)
+        if callable(site_skill_path):
+            return Path(site_skill_path(site_key))
         return self.site_store.site_dir(site_key) / "skills" / "SKILL.md"
 
     def _phase_prompts(self, site_key: str, *, allowed_slugs: set[str]):
@@ -262,9 +291,36 @@ class BrowserAutomationService:
 
     def _phase_step_timeout_seconds(self, phase_slug: str) -> int:
         base_timeout = int(self._phase_runtime_config.step_timeout_seconds or 30)
-        if str(phase_slug or "").strip() == "job_retrieval":
+        normalized_phase = str(phase_slug or "").strip()
+        if normalized_phase == "job_retrieval":
             return max(base_timeout, JOB_RETRIEVAL_STEP_TIMEOUT_SECONDS)
+        if normalized_phase == "apply":
+            return max(base_timeout, APPLY_STEP_TIMEOUT_SECONDS)
         return base_timeout
+
+    def _persist_apply_carry_forward(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        phase_memory: BrowserPhaseMemory | None,
+    ) -> None:
+        if not batch_id or not isinstance(phase_memory, BrowserPhaseMemory):
+            return
+        carry_forward = phase_memory.get_text("apply_carry_forward")
+        if not carry_forward:
+            return
+        save_run_context = getattr(self.site_store, "save_run_context", None)
+        if not callable(save_run_context):
+            return
+        save_run_context(
+            site_key,
+            batch_id,
+            {
+                "apply_carry_forward": carry_forward,
+                "apply_carry_forward_updated_at": now_iso(),
+            },
+        )
 
     def _create_phase_runtime(self, phase_slug: str = "") -> BrowserPhaseRuntime | Any:
         override = self.phase_runtime
@@ -477,40 +533,53 @@ class BrowserAutomationService:
                             phase_timeout_seconds = self._phase_timeout_seconds(phase.slug, phase_memory=timeout_memory)
                             self.site_store.append_event(site_key, "browser.phase.started", {"turn_id": turn_id, "phase": phase.slug})
                             extra_context_items = []
-                            phase_result = await phase_runtime.run_phase(
-                                site_key=site_key,
-                                site_name=site_name,
-                                entry_url=entry_url or active.entry_url,
-                                phase=phase,
-                                bridge=bridge,
-                                session=mcp_session,
-                                site_store=self.site_store,
-                                session_id=session_id,
-                                turn_id=turn_id,
-                                batch_id=batch_id,
-                                response_tools=response_tools,
-                                tool_names=tool_names,
-                                phase_handoff=phase_handoff,
-                                phase_timeout_seconds=(
-                                    max(phase_timeout_seconds, int(phase_timeout_seconds_override or 0))
-                                    if phase.slug == "apply"
-                                    else phase_timeout_seconds
-                                ),
-                                max_phase_steps=self._phase_max_steps(phase.slug),
-                                extra_context_items=extra_context_items,
-                                context_session=self._phase_context_session(
+                            override_seconds = int(phase_timeout_seconds_override or 0)
+                            effective_phase_timeout_seconds = phase_timeout_seconds
+                            if override_seconds > 0:
+                                if phase.slug == "apply":
+                                    effective_phase_timeout_seconds = override_seconds
+                                else:
+                                    effective_phase_timeout_seconds = max(phase_timeout_seconds, override_seconds)
+                            try:
+                                phase_result = await phase_runtime.run_phase(
                                     site_key=site_key,
-                                    phase_slug=phase.slug,
+                                    site_name=site_name,
+                                    entry_url=entry_url or active.entry_url,
+                                    phase=phase,
+                                    bridge=bridge,
+                                    session=mcp_session,
+                                    site_store=self.site_store,
+                                    session_id=session_id,
+                                    turn_id=turn_id,
                                     batch_id=batch_id,
-                                    target_job_ids=apply_target_job_ids,
-                                    staged_resume_pdf_path=apply_staged_resume_pdf_path,
-                                    phase_memory=phase_memory,
-                                ),
-                                apply_staged_resume_pdf_path=apply_staged_resume_pdf_path,
-                            )
+                                    response_tools=response_tools,
+                                    tool_names=tool_names,
+                                    phase_handoff=phase_handoff,
+                                    phase_timeout_seconds=effective_phase_timeout_seconds,
+                                    max_phase_steps=self._phase_max_steps(phase.slug),
+                                    extra_context_items=extra_context_items,
+                                    context_session=self._phase_context_session(
+                                        site_key=site_key,
+                                        phase_slug=phase.slug,
+                                        batch_id=batch_id,
+                                        target_job_ids=apply_target_job_ids,
+                                        staged_resume_pdf_path=apply_staged_resume_pdf_path,
+                                        phase_memory=phase_memory,
+                                    ),
+                                    apply_staged_resume_pdf_path=apply_staged_resume_pdf_path,
+                                )
+                            finally:
+                                if phase_runtime is not self.phase_runtime:
+                                    await self._aclose_phase_runtime(phase_runtime)
                             last_result = phase_result
                             current_url = str(phase_result.current_url or current_url or target_url)
                             if phase_result.status == "done":
+                                if phase.slug == "apply":
+                                    self._persist_apply_carry_forward(
+                                        site_key=site_key,
+                                        batch_id=batch_id,
+                                        phase_memory=phase_memory,
+                                    )
                                 previous_phase_memory = phase_memory
                                 phase_handoff = f"{phase.title} completed. {phase_result.summary.strip()[:300]}".strip()
                                 authenticated_ready = bool(session_state.get("authenticated_ready") or session_state.get("session_ready"))

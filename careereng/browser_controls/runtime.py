@@ -51,6 +51,7 @@ class ResponsesClient:
         self.api_key = api_key
         self.timeout_seconds = max(30.0, float(timeout_seconds or 30.0))
         self.client = self._build_client(timeout_seconds=self.timeout_seconds)
+        self._closed = False
 
     def _build_client(self, *, timeout_seconds: float) -> AsyncOpenAI:
         return AsyncOpenAI(
@@ -64,7 +65,17 @@ class ResponsesClient:
         if desired <= self.timeout_seconds:
             return
         self.timeout_seconds = desired
-        self.client = self._build_client(timeout_seconds=self.timeout_seconds)
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self.client, "close", None)
+        if not callable(close):
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
 
     @staticmethod
     def _normalize_stream_input(input_value: Any) -> list[dict[str, Any]]:
@@ -111,6 +122,10 @@ class ResponsesClient:
         return ""
 
     async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request_timeout_seconds = max(
+            1.0,
+            float(payload.get("_request_timeout_seconds") or self.timeout_seconds or 30.0),
+        )
         stream_payload: dict[str, Any] = {
             "model": payload.get("model"),
             "input": self._normalize_stream_input(payload.get("input")),
@@ -131,59 +146,65 @@ class ResponsesClient:
         response_id = ""
         response_status = "completed"
         stream_event_types: list[str] = []
+        stream_client = self.client.with_options(timeout=request_timeout_seconds)
         try:
-            async with self.client.responses.stream(**stream_payload) as stream:
-                async for event in stream:
-                    event_type = str(getattr(event, "type", "") or "")
-                    if event_type and event_type not in stream_event_types and len(stream_event_types) < 12:
-                        stream_event_types.append(event_type)
-                    if event_type == "response.created":
-                        response = getattr(event, "response", None)
-                        response_id = str(getattr(response, "id", "") or response_id)
-                        response_status = str(getattr(response, "status", "") or response_status)
-                    elif event_type == "response.output_item.added":
-                        item = self._dump_item(getattr(event, "item", None))
-                        item_key = self._stream_item_key(item.get("id"), getattr(event, "output_index", None))
-                        if item_key:
-                            if item_key not in partial_items:
-                                partial_item_order.append(item_key)
-                            partial_items[item_key] = item
-                    elif event_type == "response.output_text.delta":
-                        delta = str(getattr(event, "delta", "") or "")
-                        if delta:
-                            output_text_parts.append(delta)
-                    elif event_type == "response.output_text.done":
-                        item_key = self._stream_item_key(getattr(event, "item_id", None), getattr(event, "output_index", None))
-                        if item_key and item_key in partial_items:
-                            item = dict(partial_items[item_key])
-                            content = item.get("content")
-                            if not isinstance(content, list):
-                                content = []
-                            text = str(getattr(event, "text", "") or "")
-                            if text:
-                                content = [block for block in content if not isinstance(block, dict) or str(block.get("type") or "") != "output_text"]
-                                content.append({"type": "output_text", "text": text})
-                                item["content"] = content
-                                partial_items[item_key] = item
-                    elif event_type == "response.function_call_arguments.done":
-                        item_key = self._stream_item_key(getattr(event, "item_id", None), getattr(event, "output_index", None))
-                        if item_key and item_key in partial_items:
-                            item = dict(partial_items[item_key])
-                            item["arguments"] = str(getattr(event, "arguments", "") or "")
-                            partial_items[item_key] = item
-                    elif event_type == "response.output_item.done":
-                        dumped = self._dump_item(getattr(event, "item", None))
-                        if dumped:
-                            item_key = self._stream_item_key(dumped.get("id"), getattr(event, "output_index", None))
+            with anyio.fail_after(request_timeout_seconds):
+                async with stream_client.responses.stream(**stream_payload) as stream:
+                    async for event in stream:
+                        event_type = str(getattr(event, "type", "") or "")
+                        if event_type and event_type not in stream_event_types and len(stream_event_types) < 12:
+                            stream_event_types.append(event_type)
+                        if event_type == "response.created":
+                            response = getattr(event, "response", None)
+                            response_id = str(getattr(response, "id", "") or response_id)
+                            response_status = str(getattr(response, "status", "") or response_status)
+                        elif event_type == "response.output_item.added":
+                            item = self._dump_item(getattr(event, "item", None))
+                            item_key = self._stream_item_key(item.get("id"), getattr(event, "output_index", None))
                             if item_key:
                                 if item_key not in partial_items:
                                     partial_item_order.append(item_key)
-                                partial_items[item_key] = dumped
-                            else:
-                                output_items.append(dumped)
-                final = await stream.get_final_response()
-                response_id = str(getattr(final, "id", "") or response_id)
-                response_status = str(getattr(final, "status", "") or response_status)
+                                partial_items[item_key] = item
+                        elif event_type == "response.output_text.delta":
+                            delta = str(getattr(event, "delta", "") or "")
+                            if delta:
+                                output_text_parts.append(delta)
+                        elif event_type == "response.output_text.done":
+                            item_key = self._stream_item_key(getattr(event, "item_id", None), getattr(event, "output_index", None))
+                            if item_key and item_key in partial_items:
+                                item = dict(partial_items[item_key])
+                                content = item.get("content")
+                                if not isinstance(content, list):
+                                    content = []
+                                text = str(getattr(event, "text", "") or "")
+                                if text:
+                                    content = [block for block in content if not isinstance(block, dict) or str(block.get("type") or "") != "output_text"]
+                                    content.append({"type": "output_text", "text": text})
+                                    item["content"] = content
+                                    partial_items[item_key] = item
+                        elif event_type == "response.function_call_arguments.done":
+                            item_key = self._stream_item_key(getattr(event, "item_id", None), getattr(event, "output_index", None))
+                            if item_key and item_key in partial_items:
+                                item = dict(partial_items[item_key])
+                                item["arguments"] = str(getattr(event, "arguments", "") or "")
+                                partial_items[item_key] = item
+                        elif event_type == "response.output_item.done":
+                            dumped = self._dump_item(getattr(event, "item", None))
+                            if dumped:
+                                item_key = self._stream_item_key(dumped.get("id"), getattr(event, "output_index", None))
+                                if item_key:
+                                    if item_key not in partial_items:
+                                        partial_item_order.append(item_key)
+                                    partial_items[item_key] = dumped
+                                else:
+                                    output_items.append(dumped)
+                    final = await stream.get_final_response()
+                    response_id = str(getattr(final, "id", "") or response_id)
+                    response_status = str(getattr(final, "status", "") or response_status)
+        except TimeoutError as exc:
+            raise httpx.TimeoutException(
+                f"responses stream timed out after {request_timeout_seconds:.1f}s"
+            ) from exc
         except APIStatusError as exc:
             body = getattr(exc, "body", None)
             detail = json.dumps(body, ensure_ascii=False) if body is not None else str(exc)
@@ -247,6 +268,8 @@ class BrowserPhaseRuntime:
         "browser_snapshot",
         "browser_console_messages",
     )
+    JOB_RETRIEVAL_EMPTY_EVALUATE_MAX_SAME_PAGE_ATTEMPTS_WITH_CARRY_FORWARD = 25
+    JOB_RETRIEVAL_EMPTY_EVALUATE_MAX_SAME_PAGE_ATTEMPTS_WITHOUT_CARRY_FORWARD = 100
     JOB_RETRIEVAL_PAGE_ACTION_WAIT_SECONDS = 5.0
     PAGE_SETTLE_MAX_SNAPSHOT_RETRIES = 2
     PAGE_SETTLE_SLEEP_SECONDS = 0.75
@@ -260,12 +283,23 @@ class BrowserPhaseRuntime:
         sleep_fn=None,
     ):
         self.config = config
+        self._owns_responses_client = responses_client is None
         self.responses = responses_client or ResponsesClient(
             api_base=config.api_base,
             api_key=config.api_key,
             timeout_seconds=max(config.phase_timeout_seconds, config.step_timeout_seconds) + 30,
         )
         self.sleep_fn = sleep_fn or anyio.sleep
+
+    async def aclose(self) -> None:
+        if not self._owns_responses_client:
+            return
+        aclose = getattr(self.responses, "aclose", None)
+        if not callable(aclose):
+            return
+        result = aclose()
+        if inspect.isawaitable(result):
+            await result
 
     async def _sleep(self, seconds: float) -> None:
         result = self.sleep_fn(seconds)
@@ -366,15 +400,15 @@ class BrowserPhaseRuntime:
         )
 
     @staticmethod
-    def _apply_file_upload_requires_chooser_message(*, current_url: str, staged_path: str) -> str:
+    def _apply_file_upload_requires_ready_message(*, current_url: str, staged_path: str) -> str:
         url_line = f"Current page URL: {current_url}\n" if current_url else ""
         staged_line = f"Use this run-local staged PDF path when upload is ready: {staged_path}\n" if staged_path else ""
         return (
-            "The current live page does not show an active file chooser yet.\n"
+            "The current live page is not upload-ready yet.\n"
             f"{url_line}"
             f"{staged_line}"
-            "Do not call browser_file_upload yet. First use the page's own upload control so the live page enters file-chooser state, "
-            "then call browser_file_upload."
+            "Do not call browser_file_upload yet. First use the page's own upload flow until the current live page clearly shows either "
+            "an active file chooser or a direct file-upload field, then call browser_file_upload."
         )
 
     @staticmethod
@@ -489,10 +523,13 @@ class BrowserPhaseRuntime:
     async def _create_response_with_retry(self, payload: dict[str, Any]) -> dict[str, Any]:
         attempts = 0
         max_retries = 2
+        request_timeout_seconds = float(payload.get("_request_timeout_seconds") or 0.0)
         while True:
             try:
                 return await self.responses.create(payload)
             except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException):
+                if request_timeout_seconds > 0:
+                    raise TimeoutError("model response turn timed out")  # noqa: TRY301
                 attempts += 1
                 if attempts > max_retries:
                     raise
@@ -568,7 +605,6 @@ class BrowserPhaseRuntime:
             "employment_type": {"type": "string"},
             "match_label": {"type": "string"},
             "apply_state": {"type": "string"},
-            "card_text": {"type": "string"},
             "posted_at": {"type": "string"},
         }
         return {
@@ -605,7 +641,6 @@ class BrowserPhaseRuntime:
             "employment_type": {"type": "string"},
             "match_label": {"type": "string"},
             "apply_state": {"type": "string"},
-            "card_text": {"type": "string"},
             "posted_at": {"type": "string"},
             "description": {"type": "string"},
             "jd_sync_status": {"type": "string"},
@@ -748,7 +783,13 @@ class BrowserPhaseRuntime:
             return None
         return data
 
-    def _payload(self, *, input_items: Any, tools: list[dict[str, Any]]) -> dict[str, Any]:
+    def _payload(
+        self,
+        *,
+        input_items: Any,
+        tools: list[dict[str, Any]],
+        request_timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.config.model,
             "input": input_items,
@@ -758,6 +799,8 @@ class BrowserPhaseRuntime:
         effort = str(self.config.reasoning_effort or "").strip().lower()
         if effort:
             payload["reasoning"] = {"effort": effort}
+        if request_timeout_seconds is not None:
+            payload["_request_timeout_seconds"] = max(0.1, float(request_timeout_seconds))
         return payload
 
     def _system_prompt(self, *, site_name: str, phase: PhasePrompt) -> str:
@@ -1030,7 +1073,6 @@ class BrowserPhaseRuntime:
             "employment_type",
             "match_label",
             "apply_state",
-            "card_text",
             "posted_at",
         )
         normalized: dict[str, Any] = {}
@@ -1058,6 +1100,35 @@ class BrowserPhaseRuntime:
             str(parsed.netloc or "").lower(),
             str(parsed.path or ""),
             tuple(sorted(parse_qsl(parsed.query, keep_blank_values=True))),
+        )
+
+    @staticmethod
+    def _is_objective_stale_context_error(error_text: str) -> bool:
+        normalized = str(error_text or "").strip().lower()
+        if not normalized:
+            return False
+        patterns = (
+            r"\bref\s+\S+\s+not\s+found\s+in\s+the\s+current\s+page\s+snapshot\b",
+            r"\b(?:stale|old)\s+ref\b",
+            r"\bexecution context was destroyed\b",
+            r"\bframe was detached\b",
+            r"\belement is not attached to the dom\b",
+        )
+        return any(re.search(pattern, normalized) for pattern in patterns)
+
+    @staticmethod
+    def _stale_context_recovery_message(*, current_url: str, tool_name: str, error_text: str) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        tool_line = f"Failed tool: {tool_name}\n" if tool_name else ""
+        error_line = f"Observed stale-context error: {error_text}\n" if error_text else ""
+        return (
+            "Runtime note: the previous tool call used stale page context for the current live page.\n"
+            f"{url_line}"
+            f"{tool_line}"
+            f"{error_line}"
+            "A fresh live browser snapshot of the current page is attached separately. "
+            "Treat the failed call and any remaining tool calls from that same response as stale history. "
+            "Continue only from the fresh current live page."
         )
 
     @classmethod
@@ -1097,7 +1168,6 @@ class BrowserPhaseRuntime:
                     "employment_type",
                     "match_label",
                     "apply_state",
-                    "card_text",
                     "posted_at",
                 )
             )
@@ -1239,6 +1309,54 @@ class BrowserPhaseRuntime:
         return cls._payload_file_chooser_count(payload) > 0
 
     @staticmethod
+    def _payload_has_direct_file_upload_signal(payload: dict[str, Any] | None) -> bool:
+        text = BrowserPhaseRuntime._payload_upload_state_text(payload)
+        if not text:
+            return False
+        direct_patterns = (
+            r"<input\b[^>\n]{0,240}\btype\s*=\s*[\"']?file[\"']?",
+            r"\binput\b[^\n]{0,120}\btype\s*[:=]\s*[\"']?file[\"']?",
+            r"\bdrag(?:\s+and\s+drop|\s*&\s*drop)\b[^\n]{0,120}\b(file|files|document|documents|resume|cv|attachment)\b",
+            r"(^|\n)-\s*(?:button|link|input|label|generic)\b[^\n]{0,200}\b(upload|attach|browse|select)\b[^\n]{0,120}\b(file|files|document|documents|resume|cv|attachment)\b",
+        )
+        if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in direct_patterns):
+            return True
+        has_upload_entry = bool(
+            re.search(
+                r"(^|\n)-\s*(?:button|link|input|label|generic)\b[^\n]{0,200}\b(upload|attach|browse|select)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+        has_file_target = bool(
+            re.search(
+                r"\b(file|files|document|documents|resume|cv|attachment)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+        return has_upload_entry and has_file_target
+
+    @classmethod
+    def _payload_is_upload_ready(cls, payload: dict[str, Any] | None) -> bool:
+        return cls._payload_has_file_chooser(payload) or cls._payload_has_direct_file_upload_signal(payload)
+
+    @classmethod
+    def _should_use_fresh_snapshot_primary_context(
+        cls,
+        *,
+        tool_name: str,
+        fresh_snapshot_captured: bool,
+        error_text: str,
+    ) -> bool:
+        return bool(
+            fresh_snapshot_captured
+            and not str(error_text or "").strip()
+            and tool_name != "browser_snapshot"
+            and cls._is_page_settle_action(tool_name)
+        )
+
+    @staticmethod
     def _payload_has_extracted_jobs(payload: dict[str, Any]) -> bool:
         jobs = BrowserPhaseRuntime._extract_job_records(payload)
         if jobs is not None:
@@ -1340,17 +1458,6 @@ class BrowserPhaseRuntime:
         return "well-serializable" in normalized or "serializable" in normalized
 
     @staticmethod
-    def _job_retrieval_extracted_page_message(*, current_url: str, page_label: str) -> str:
-        page_line = f"Current page label: {page_label}\n" if page_label else ""
-        url_line = f"Current page URL: {current_url}\n" if current_url else ""
-        return (
-            "Runtime note: this unchanged retrieval page already yielded a non-empty jobs extraction in this run.\n"
-            f"{url_line}"
-            f"{page_line}"
-            "Continue from the active skills, current phase memory, and current live page."
-        )
-
-    @staticmethod
     def _payload_has_empty_extracted_jobs(payload: dict[str, Any]) -> bool:
         jobs = BrowserPhaseRuntime._extract_job_records(payload)
         if jobs is not None:
@@ -1361,6 +1468,12 @@ class BrowserPhaseRuntime:
         if not summary:
             return False
         return bool(re.search(r'"jobs"\s*:\s*\[\s*\]|\[\s*\]', summary))
+
+    @classmethod
+    def _job_retrieval_empty_evaluate_limit(cls, phase_memory: BrowserPhaseMemory | None) -> int:
+        if isinstance(phase_memory, BrowserPhaseMemory) and phase_memory.get_text("retrieval_carry_forward").strip():
+            return cls.JOB_RETRIEVAL_EMPTY_EVALUATE_MAX_SAME_PAGE_ATTEMPTS_WITH_CARRY_FORWARD
+        return cls.JOB_RETRIEVAL_EMPTY_EVALUATE_MAX_SAME_PAGE_ATTEMPTS_WITHOUT_CARRY_FORWARD
 
     @staticmethod
     def _payload_has_job_results_signal(payload: dict[str, Any] | None) -> bool:
@@ -1839,7 +1952,8 @@ class BrowserPhaseRuntime:
         recorded_job_ids: set[str] = set()
         new_job_ids: set[str] = set()
         recorded_page_fingerprints: set[str] = set()
-        extracted_page_key = ""
+        empty_extraction_page_key = ""
+        empty_extraction_count = 0
         latest_snapshot_payload = await self._capture_snapshot_payload(
             bridge=bridge,
             session=session,
@@ -1916,7 +2030,11 @@ class BrowserPhaseRuntime:
             try:
                 with anyio.fail_after(turn_timeout_seconds):
                     response = await self._create_response_with_retry(
-                        self._payload(input_items=base_items + static_context_items + loop_context_items, tools=active_tools)
+                        self._payload(
+                            input_items=base_items + static_context_items + loop_context_items,
+                            tools=active_tools,
+                            request_timeout_seconds=turn_timeout_seconds,
+                        )
                     )
             except TimeoutError:
                 response_turn_timeout_count += 1
@@ -2059,22 +2177,6 @@ class BrowserPhaseRuntime:
                         break
 
                 if name == "phase_result":
-                    if (
-                        phase.slug == "job_retrieval"
-                        and extracted_page_key
-                        and current_page_key
-                        and current_page_key == extracted_page_key
-                    ):
-                        history_items = [
-                            self._context_item(
-                                self._job_retrieval_extracted_page_message(
-                                    current_url=current_url,
-                                    page_label=current_page_label,
-                                )
-                            )
-                        ]
-                        retry_requested = True
-                        break
                     return BrowserPhaseResult(
                         status=str(arguments.get("status") or "blocked"),
                         reason_tag="phase_result",
@@ -2225,10 +2327,10 @@ class BrowserPhaseRuntime:
                         ]
                         retry_requested = True
                         break
-                    if not self._payload_has_file_chooser(current_signal_payload):
+                    if not self._payload_is_upload_ready(current_signal_payload):
                         history_items = [
                             self._context_item(
-                                self._apply_file_upload_requires_chooser_message(
+                                self._apply_file_upload_requires_ready_message(
                                     current_url=current_url,
                                     staged_path=staged_resume_pdf_path or upload_paths[0],
                                 )
@@ -2298,24 +2400,6 @@ class BrowserPhaseRuntime:
                         ]
                         retry_requested = True
                         break
-                if (
-                    phase.slug == "job_retrieval"
-                    and extracted_page_key
-                    and current_page_key
-                    and current_page_key == extracted_page_key
-                    and name != "record_jobs"
-                ):
-                    history_items = [
-                        self._context_item(
-                            self._job_retrieval_extracted_page_message(
-                                current_url=current_url,
-                                page_label=current_page_label,
-                            )
-                        )
-                    ]
-                    retry_requested = True
-                    break
-
                 step_count += 1
                 for attempt in range(1, max(1, int(self.config.max_step_retries or 0)) + 2):
                     site_store.save_browser_session(
@@ -2664,29 +2748,39 @@ class BrowserPhaseRuntime:
                             latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
                             last_payload=last_payload if isinstance(last_payload, dict) else None,
                         )
-                        if name == "record_jobs" and not error_text:
-                            extracted_page_key = ""
-                        elif (
-                            name == "browser_evaluate"
-                            and not error_text
-                            and self._payload_has_extracted_jobs(payload)
-                        ):
-                            extracted_page_key = latest_page_key or current_page_key
-                        elif (
-                            extracted_page_key
-                            and latest_page_key
-                            and latest_page_key != extracted_page_key
-                            and not error_text
-                        ):
-                            extracted_page_key = ""
-                    page_label = self._extract_page_label(latest_snapshot_payload) or self._extract_page_label(last_payload)
-                    signal_payload = (
-                        latest_snapshot_payload
-                        if isinstance(latest_snapshot_payload, dict)
-                        else last_payload
-                        if isinstance(last_payload, dict)
-                        else payload
+                        page_label = self._extract_page_label(latest_snapshot_payload) or self._extract_page_label(last_payload)
+                        signal_payload = (
+                            latest_snapshot_payload
+                            if isinstance(latest_snapshot_payload, dict)
+                            else last_payload
+                            if isinstance(last_payload, dict)
+                            else payload
+                        )
+                    empty_extraction_with_results_signal = (
+                        phase.slug == "job_retrieval"
+                        and name == "browser_evaluate"
+                        and not error_text
+                        and self._payload_has_empty_extracted_jobs(payload)
+                        and self._payload_has_job_results_signal(signal_payload)
                     )
+                    if empty_extraction_with_results_signal:
+                        latest_empty_page_key = latest_page_key or current_page_key or current_url or "__job_retrieval__"
+                        if latest_empty_page_key == empty_extraction_page_key:
+                            empty_extraction_count += 1
+                        else:
+                            empty_extraction_page_key = latest_empty_page_key
+                            empty_extraction_count = 1
+                    elif (
+                        phase.slug == "job_retrieval"
+                        and not error_text
+                        and (
+                            name == "record_jobs"
+                            or self._is_job_retrieval_page_action(name)
+                            or (name == "browser_evaluate" and self._payload_has_extracted_jobs(payload))
+                        )
+                    ):
+                        empty_extraction_page_key = ""
+                        empty_extraction_count = 0
                     if (
                         phase.slug == "job_retrieval"
                         and name == "browser_evaluate"
@@ -2705,13 +2799,23 @@ class BrowserPhaseRuntime:
                         last_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
                         retry_requested = True
                         break
-                    if (
-                        phase.slug == "job_retrieval"
-                        and name == "browser_evaluate"
-                        and not error_text
-                        and self._payload_has_empty_extracted_jobs(payload)
-                        and self._payload_has_job_results_signal(signal_payload)
-                    ):
+                    if empty_extraction_with_results_signal:
+                        empty_extraction_limit = self._job_retrieval_empty_evaluate_limit(phase_memory)
+                        if empty_extraction_count >= empty_extraction_limit:
+                            return BrowserPhaseResult(
+                                status="failed",
+                                reason_tag="empty_extraction_loop",
+                                summary=(
+                                    "same-page browser_evaluate returned empty jobs repeatedly "
+                                    "while the live page still showed job results signals"
+                                ),
+                                current_url=current_url,
+                                step_count=step_count,
+                                trace_ref=trace_ref,
+                                raw_text=output_text,
+                                recorded_count=len(recorded_job_ids),
+                                new_count=len(new_job_ids),
+                            )
                         history_items = [tool_feedback]
                         if fresh_snapshot_captured and name != "browser_snapshot":
                             history_items.append(self._context_item(self._live_snapshot_primary_message()))
@@ -2726,23 +2830,35 @@ class BrowserPhaseRuntime:
                         last_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
                         retry_requested = True
                         break
+                    use_fresh_snapshot_primary_context = self._should_use_fresh_snapshot_primary_context(
+                        tool_name=name,
+                        fresh_snapshot_captured=fresh_snapshot_captured,
+                        error_text=error_text,
+                    )
                     if (
                         phase.slug == "job_retrieval"
                         and not error_text
                         and self._is_job_retrieval_page_action(name)
                     ):
-                        extracted_page_key = ""
                         phase_memory.clear_recent_actions()
-                        history_items = [tool_feedback]
-                        if fresh_snapshot_captured and name != "browser_snapshot":
+                        history_items = []
+                        if use_fresh_snapshot_primary_context:
                             history_items.append(self._context_item(self._live_snapshot_primary_message()))
+                        else:
+                            history_items.append(tool_feedback)
+                            if fresh_snapshot_captured and name != "browser_snapshot":
+                                history_items.append(self._context_item(self._live_snapshot_primary_message()))
                         history_items.extend(post_tool_context_items)
                         last_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
                     else:
-                        history_items = [tool_feedback]
-                        history_items.extend(post_tool_context_items)
-                        if fresh_snapshot_captured and name != "browser_snapshot":
+                        history_items = []
+                        if use_fresh_snapshot_primary_context:
                             history_items.append(self._context_item(self._live_snapshot_primary_message()))
+                        else:
+                            history_items.append(tool_feedback)
+                            if fresh_snapshot_captured and name != "browser_snapshot":
+                                history_items.append(self._context_item(self._live_snapshot_primary_message()))
+                        history_items.extend(post_tool_context_items)
                         if phase.slug == "job_retrieval" and name == "record_jobs" and not error_text:
                             history_items.append(
                                 self._context_item(
@@ -2792,26 +2908,45 @@ class BrowserPhaseRuntime:
                         snapshot_url = MCPToolBridge.extract_current_url(snapshot_payload)
                         if snapshot_url:
                             current_url = snapshot_url
-                    history_items = [
-                        tool_feedback,
-                        self._context_item(
-                            self._page_action_failure_recovery_message(
-                                current_url=current_url,
-                                tool_name=failed_page_action_name or name,
-                            )
-                            if page_action_failed
-                            else (
-                                f"The previous tool call {name} failed with: {error_text}. "
-                                "Wait briefly if needed, then continue from the current page state with the official tools."
+                    stale_context_error = self._is_objective_stale_context_error(error_text)
+                    if stale_context_error:
+                        history_items = []
+                        if (
+                            isinstance(snapshot_payload, dict)
+                            and snapshot_payload
+                            and not bool(snapshot_payload.get("isError"))
+                        ):
+                            history_items.append(self._context_item(self._live_snapshot_primary_message()))
+                        history_items.append(
+                            self._context_item(
+                                self._stale_context_recovery_message(
+                                    current_url=current_url,
+                                    tool_name=name,
+                                    error_text=error_text,
+                                )
                             )
                         )
-                    ]
-                    if (
-                        isinstance(snapshot_payload, dict)
-                        and snapshot_payload
-                        and not bool(snapshot_payload.get("isError"))
-                    ):
-                        history_items.append(self._context_item(self._live_snapshot_primary_message()))
+                    else:
+                        history_items = [
+                            tool_feedback,
+                            self._context_item(
+                                self._page_action_failure_recovery_message(
+                                    current_url=current_url,
+                                    tool_name=failed_page_action_name or name,
+                                )
+                                if page_action_failed
+                                else (
+                                    f"The previous tool call {name} failed with: {error_text}. "
+                                    "Wait briefly if needed, then continue from the current page state with the official tools."
+                                )
+                            )
+                        ]
+                        if (
+                            isinstance(snapshot_payload, dict)
+                            and snapshot_payload
+                            and not bool(snapshot_payload.get("isError"))
+                        ):
+                            history_items.append(self._context_item(self._live_snapshot_primary_message()))
                     retry_requested = True
                     break
                 if not error_text and self._is_page_settle_action(name):
