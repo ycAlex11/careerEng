@@ -25,14 +25,22 @@ from careereng.tools.batch_apply_debug import BatchApplyDebugRunner
 from careereng.utils import make_id, safe_file_stem
 
 app = typer.Typer(help="CareerEng CLI")
+jobs_app = typer.Typer(help="Registered-site job retrieval/apply commands")
+profile_app = typer.Typer(help="Profile/persona commands")
 report_app = typer.Typer(help="Report review commands")
 resume_app = typer.Typer(help="Resume commands")
 route_app = typer.Typer(help="Route feedback commands")
 site_app = typer.Typer(help="Site registry commands")
+app.add_typer(jobs_app, name="jobs")
+app.add_typer(profile_app, name="profile")
 app.add_typer(report_app, name="report")
 app.add_typer(resume_app, name="resume")
 app.add_typer(route_app, name="route")
 app.add_typer(site_app, name="site")
+
+
+PROFILE_GENERATE_MESSAGE = "请根据当前 workspace 中已有的简历、profile sources 和对话信息，生成或更新用户画像 persona.md。"
+JOBS_APPLY_MESSAGE = "检索投递已注册的公司"
 
 
 def _project_root() -> Path:
@@ -77,6 +85,12 @@ def _build_loop() -> tuple[Any, Any]:
 
 def _job_store() -> JobStore:
     return JobStore(_workspace_path())
+
+
+def _close_loop_if_possible(loop: Any) -> None:
+    closer = getattr(loop, "close", None)
+    if callable(closer):
+        closer()
 
 
 _PHASE_EVENT_LABELS = {
@@ -156,37 +170,7 @@ def _emit_phase_progress(
         typer.echo(line)
 
 
-@app.command()
-def onboard():
-    """Create the editable workspace scaffold."""
-    project_root = _project_root()
-    project_rows = _ensure_project_templates(project_root)
-    workspace = runtime_workspace_path(project_root)
-    rows = bootstrap_workspace(workspace)
-    project_created = sum(1 for row in project_rows if row.get("status") == "created")
-    project_existing = len(project_rows) - project_created
-    created = sum(1 for row in rows if row.get("status") == "created")
-    existing = len(rows) - created
-
-    typer.echo(f"Project templates ready at {project_root}")
-    typer.echo(f"created={project_created} existing={project_existing}")
-    for row in project_rows:
-        marker = "+" if row.get("status") == "created" else "="
-        typer.echo(f"{marker} {row.get('path')}")
-    typer.echo("auth.json contains template fields only; add your own provider API keys.")
-    typer.echo(f"Workspace initialized at {workspace}")
-    typer.echo(f"created={created} existing={existing}")
-    for row in rows:
-        marker = "+" if row.get("status") == "created" else "="
-        typer.echo(f"{marker} {row.get('path')}")
-
-
-@app.command()
-def run(
-    message: str = typer.Option(..., "--message", "-m", help="Message to send"),
-    session: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
-):
-    """Run one chat turn."""
+def _dispatch_message_with_progress(*, message: str, session: str) -> str:
     root = _project_root()
     workspace = _workspace_path()
     baseline_batch_ids = {
@@ -227,8 +211,59 @@ def run(
     error = result.get("error")
     if isinstance(error, BaseException):
         raise error
-    reply = str(result.get("reply") or "")
-    typer.echo(reply)
+    return str(result.get("reply") or "")
+
+
+@app.command()
+def onboard():
+    """Create the editable workspace scaffold."""
+    project_root = _project_root()
+    project_rows = _ensure_project_templates(project_root)
+    workspace = runtime_workspace_path(project_root)
+    rows = bootstrap_workspace(workspace)
+    project_created = sum(1 for row in project_rows if row.get("status") == "created")
+    project_existing = len(project_rows) - project_created
+    created = sum(1 for row in rows if row.get("status") == "created")
+    existing = len(rows) - created
+
+    typer.echo(f"Project templates ready at {project_root}")
+    typer.echo(f"created={project_created} existing={project_existing}")
+    for row in project_rows:
+        marker = "+" if row.get("status") == "created" else "="
+        typer.echo(f"{marker} {row.get('path')}")
+    typer.echo("auth.json contains template fields only; add your own provider API keys.")
+    typer.echo(f"Workspace initialized at {workspace}")
+    typer.echo(f"created={created} existing={existing}")
+    for row in rows:
+        marker = "+" if row.get("status") == "created" else "="
+        typer.echo(f"{marker} {row.get('path')}")
+
+
+@app.command()
+def run(
+    message: str = typer.Option(..., "--message", "-m", help="Message to send"),
+    session: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
+):
+    """Run one chat turn."""
+    typer.echo(_dispatch_message_with_progress(message=message, session=session))
+
+
+@profile_app.command("generate")
+def profile_generate(
+    session: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
+    message: str = typer.Option(PROFILE_GENERATE_MESSAGE, "--message", "-m", help="Profile generation prompt"),
+):
+    """Generate or update persona.md through the normal agent flow."""
+    typer.echo(_dispatch_message_with_progress(message=message, session=session))
+
+
+@jobs_app.command("apply")
+def jobs_apply(
+    session: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
+    message: str = typer.Option(JOBS_APPLY_MESSAGE, "--message", "-m", help="Registered-sites retrieval/apply prompt"),
+):
+    """Retrieve and apply jobs for active registered sites."""
+    typer.echo(_dispatch_message_with_progress(message=message, session=session))
 
 
 @app.command("batch-list")
@@ -285,7 +320,7 @@ def batch_apply(
                 apply_only=apply_only,
             )
         finally:
-            loop.close()
+            _close_loop_if_possible(loop)
     except (FileNotFoundError, KeyError, ValueError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(reply)
@@ -314,7 +349,7 @@ def batch_debug_create(
                 title_contains=title,
             )
         finally:
-            loop.close()
+            _close_loop_if_possible(loop)
     except (FileNotFoundError, KeyError, ValueError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     normalized_site_key = safe_file_stem(site)
@@ -436,7 +471,7 @@ def resume_upload(
     try:
         reply = loop.process_resume_upload(session_id=session, text=text, source_name=path.name)
     finally:
-        loop.close()
+        _close_loop_if_possible(loop)
 
     workspace = _workspace_path()
     sources = workspace / "profile" / "sources"
@@ -519,7 +554,10 @@ def report_jobs(
     typer.echo(
         f"retrieved={int(totals.get('retrieved_count') or 0)} "
         f"submitted={int(totals.get('submitted_count') or 0)} "
-        f"already_applied={int(totals.get('already_applied_count') or 0)}"
+        f"already_applied={int(totals.get('already_applied_count') or 0)} "
+        f"new={int(totals.get('new_jobs_count') or 0)} "
+        f"new_submitted={int(totals.get('new_submitted_count') or 0)} "
+        f"new_filtered_out={int(totals.get('new_filtered_out_count') or 0)}"
     )
     typer.echo(f"json: {report.get('json_path')}")
     typer.echo(f"markdown: {report.get('markdown_path')}")

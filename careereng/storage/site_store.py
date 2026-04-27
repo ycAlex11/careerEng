@@ -15,6 +15,8 @@ from careereng.utils import dump_front_matter, ensure_dir, make_id, now_iso, par
 
 
 class SiteStore:
+    WORKDAY_JOB_NUMBER_RE = re.compile(r"\bJR\d{3,}\b", flags=re.IGNORECASE)
+
     RUN_JOB_STRING_FIELDS = (
         "batch_id",
         "session_id",
@@ -30,6 +32,7 @@ class SiteStore:
         "employment_type",
         "match_label",
         "apply_state",
+        "site_job_id",
         "description_ref",
         "jd_sync_status",
         "decision_status",
@@ -400,11 +403,34 @@ class SiteStore:
             return []
         return [row for row in payload if isinstance(row, dict)]
 
+    @staticmethod
+    def _history_apply_state_for_application_status(value: Any) -> str:
+        status = str(value or "").strip().lower()
+        return {
+            "submitted": "terminal_submitted",
+            "already_applied": "terminal_already_applied",
+            "apply_failed": "terminal_apply_failed",
+            "blocked": "terminal_blocked",
+        }.get(status, "")
+
+    @classmethod
+    def _normalize_history_row_for_write(cls, row: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        apply_state = cls._history_apply_state_for_application_status(normalized.get("application_status"))
+        if apply_state:
+            normalized["apply_state"] = apply_state
+        return normalized
+
     def _write_history_jobs(self, site_id: str, rows: list[dict[str, Any]]) -> None:
         path = self._history_jobs_path(site_id)
         ensure_dir(path.parent)
         path.write_text(
-            json.dumps([row for row in rows if isinstance(row, dict)], ensure_ascii=False, indent=2) + "\n",
+            json.dumps(
+                [self._normalize_history_row_for_write(row) for row in rows if isinstance(row, dict)],
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
             encoding="utf-8",
         )
 
@@ -750,12 +776,40 @@ class SiteStore:
     def _normalize_job_text(value: str) -> str:
         return re.sub(r"\s+", " ", str(value or "").strip()).lower()
 
-    def _job_source_ref(self, row: dict[str, Any]) -> str:
+    @classmethod
+    def _extract_workday_job_numbers(cls, *values: object) -> list[str]:
+        numbers: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            text = str(raw or "")
+            if not text:
+                continue
+            for match in cls.WORKDAY_JOB_NUMBER_RE.findall(text):
+                value = cls._normalize_job_text(match)
+                if value and value not in seen:
+                    seen.add(value)
+                    numbers.append(value)
+        return numbers
+
+    def _job_source_refs(self, row: dict[str, Any]) -> list[str]:
         if not isinstance(row, dict):
-            return ""
+            return []
+        refs: list[str] = []
+        seen: set[str] = set()
+
+        def add_ref(prefix: str, value: object) -> None:
+            normalized = self._normalize_job_text(str(value or ""))
+            if not normalized:
+                return
+            ref = f"{prefix}:{normalized}"
+            if ref not in seen:
+                seen.add(ref)
+                refs.append(ref)
+
         explicit_fields = (
             "source_job_ref",
             "source_job_id",
+            "site_job_id",
             "job_number",
             "job_number_raw",
             "requisition_id",
@@ -763,26 +817,38 @@ class SiteStore:
             "pid",
         )
         for field in explicit_fields:
-            value = self._normalize_job_text(str(row.get(field) or ""))
-            if value:
-                return f"{field}:{value}"
+            add_ref(field, row.get(field))
 
         url = self._normalize_url(str(row.get("url") or ""))
-        if not url:
-            return ""
-        try:
-            parsed = urlparse(url)
-        except Exception:
-            return ""
-        query = {k.lower(): v for k, v in parse_qsl(parsed.query, keep_blank_values=False)}
-        for field in ("pid", "jobid", "job_id", "jobnumber", "job_number", "requisitionid", "reqid"):
-            value = self._normalize_job_text(query.get(field, ""))
-            if value:
-                return f"{field}:{value}"
-        match = re.search(r"/job[s]?/([^/?#]+)", parsed.path, flags=re.IGNORECASE)
-        if match:
-            return f"path-job:{self._normalize_job_text(match.group(1))}"
-        return ""
+        if url:
+            try:
+                parsed = urlparse(url)
+            except Exception:
+                parsed = None
+            if parsed is not None:
+                query = {k.lower(): v for k, v in parse_qsl(parsed.query, keep_blank_values=False)}
+                for field in ("pid", "jobid", "job_id", "jobnumber", "job_number", "requisitionid", "reqid"):
+                    add_ref(field, query.get(field, ""))
+                match = re.search(r"/job[s]?/([^/?#]+)", parsed.path, flags=re.IGNORECASE)
+                if match and re.search(r"\d", match.group(1)):
+                    add_ref("path-job", match.group(1))
+                path_parts = [part for part in parsed.path.split("/") if part]
+                if path_parts and re.search(r"\d", path_parts[-1]):
+                    add_ref("path-tail", path_parts[-1])
+
+        job_number_fields = (
+            *explicit_fields,
+            "url",
+            "card_text",
+            "match_label",
+        )
+        for value in self._extract_workday_job_numbers(*(row.get(field) for field in job_number_fields), url):
+            add_ref("workday_job_number", value)
+        return refs
+
+    def _job_source_ref(self, row: dict[str, Any]) -> str:
+        refs = self._job_source_refs(row)
+        return refs[0] if refs else ""
 
     def _history_match_keys(self, site_id: str, row: dict[str, Any]) -> list[str]:
         if not isinstance(row, dict):
@@ -794,9 +860,27 @@ class SiteStore:
         if url:
             keys.append(f"url|{site}|{url}")
 
-        source_ref = self._job_source_ref(row)
-        if source_ref:
+        strong_source_value_prefixes = {
+            "source_job_ref",
+            "source_job_id",
+            "site_job_id",
+            "job_number",
+            "job_number_raw",
+            "requisition_id",
+            "requisition_number",
+            "pid",
+            "jobid",
+            "job_id",
+            "jobnumber",
+            "requisitionid",
+            "reqid",
+            "workday_job_number",
+        }
+        for source_ref in self._job_source_refs(row):
             keys.append(f"source|{site}|{source_ref}")
+            source_prefix, _, source_value = source_ref.partition(":")
+            if source_value and source_prefix in strong_source_value_prefixes:
+                keys.append(f"source-value|{site}|{source_value}")
 
         title = self._normalize_job_text(str(row.get("title") or ""))
         location = self._normalize_job_text(str(row.get("location") or ""))
@@ -846,6 +930,7 @@ class SiteStore:
             "employment_type",
             "match_label",
             "apply_state",
+            "site_job_id",
             "description_ref",
         ):
             value = str(incoming.get(field) or "").strip()
@@ -936,6 +1021,67 @@ class SiteStore:
             keys = self._history_match_keys(site_id, job if isinstance(job, dict) else {})
             flags.append(not any(key in lookup for key in keys))
         return flags
+
+    def _history_resolution_indexes(
+        self,
+        site_id: str,
+        rows: list[dict[str, Any]],
+    ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+        by_job_id: dict[str, int] = {}
+        by_canonical_job_id: dict[str, int] = {}
+        by_match_key: dict[str, int] = {}
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            job_id = str(row.get("job_id") or "").strip()
+            canonical_job_id = str(row.get("canonical_job_id") or "").strip()
+            if job_id:
+                by_job_id.setdefault(job_id, idx)
+            if canonical_job_id:
+                by_canonical_job_id.setdefault(canonical_job_id, idx)
+            for key in self._history_match_keys(site_id, row):
+                by_match_key.setdefault(key, idx)
+        return by_job_id, by_canonical_job_id, by_match_key
+
+    def _resolve_history_row_index(
+        self,
+        site_id: str,
+        row: dict[str, Any],
+        *,
+        by_job_id: dict[str, int],
+        by_canonical_job_id: dict[str, int],
+        by_match_key: dict[str, int],
+    ) -> int | None:
+        if not isinstance(row, dict):
+            return None
+        job_id = str(row.get("job_id") or "").strip()
+        if job_id and job_id in by_job_id:
+            return by_job_id[job_id]
+        canonical_job_id = str(row.get("canonical_job_id") or "").strip()
+        if canonical_job_id and canonical_job_id in by_canonical_job_id:
+            return by_canonical_job_id[canonical_job_id]
+        for key in self._history_match_keys(site_id, row):
+            if key in by_match_key:
+                return by_match_key[key]
+        return None
+
+    def match_history_rows(self, site_id: str, jobs: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
+        rows = self._load_history_jobs(site_id)
+        by_job_id, by_canonical_job_id, by_match_key = self._history_resolution_indexes(site_id, rows)
+        matches: list[dict[str, Any] | None] = []
+        for job in jobs:
+            match_idx = self._resolve_history_row_index(
+                site_id,
+                job if isinstance(job, dict) else {},
+                by_job_id=by_job_id,
+                by_canonical_job_id=by_canonical_job_id,
+                by_match_key=by_match_key,
+            )
+            if match_idx is None:
+                matches.append(None)
+                continue
+            matches.append(dict(rows[match_idx]))
+        return matches
 
     def append_event(self, site_id: str, name: str, payload: dict[str, Any]) -> None:
         JSONLStore(self.site_dir(site_id) / "events" / "all.jsonl").append(
@@ -1075,6 +1221,17 @@ class SiteStore:
         run_rows = self.list_run_jobs(site_id, batch_id)
         if not run_rows:
             return []
+        batch_key = str(batch_id or "").strip()
+
+        def merge_seen(current: dict[str, Any], row: dict[str, Any], now: str) -> dict[str, Any]:
+            already_seen_in_batch = bool(batch_key and str(current.get("last_seen_batch_id") or "") == batch_key)
+            merged = self._merge_job_row(current, row)
+            merged["last_seen_at"] = now
+            if not already_seen_in_batch:
+                merged["seen_count"] = int(merged.get("seen_count") or 0) + 1
+            if batch_key:
+                merged["last_seen_batch_id"] = batch_key
+            return merged
 
         aggregated_rows: dict[str, dict[str, Any]] = {}
         ordered_targets: list[str] = []
@@ -1113,15 +1270,15 @@ class SiteStore:
                     current["first_seen_at"] = now
                     current["last_seen_at"] = now
                     current["seen_count"] = 1
+                    if batch_key:
+                        current["last_seen_batch_id"] = batch_key
                     current["is_active"] = True
                     current["features_ref"] = str(current.get("features_ref") or "")
                     history_index[job_id] = current
                 else:
-                    current = self._merge_job_row(current, row)
+                    current = merge_seen(current, row, now)
                     current["job_id"] = job_id
                     current["canonical_job_id"] = canonical_job_id
-                    current["last_seen_at"] = now
-                    current["seen_count"] = int(current.get("seen_count") or 0) + 1
                     current["is_active"] = True
                     history_index[job_id] = current
             else:
@@ -1130,9 +1287,7 @@ class SiteStore:
             if current is None:
                 continue
             if not target.startswith("new:"):
-                current = self._merge_job_row(current, row)
-                current["last_seen_at"] = now
-                current["seen_count"] = int(current.get("seen_count") or 0) + 1
+                current = merge_seen(current, row, now)
                 current["is_active"] = True
                 history_index[job_id] = current
             for key in self._history_match_keys(site_id, current):
@@ -1146,15 +1301,21 @@ class SiteStore:
 
     def update_job_decisions(self, site_id: str, jobs: list[dict[str, Any]]) -> None:
         rows = self._load_history_jobs(site_id)
-        index = {str(row.get("job_id") or ""): row for row in rows if str(row.get("job_id") or "")}
+        by_job_id, by_canonical_job_id, by_match_key = self._history_resolution_indexes(site_id, rows)
         changed = False
         for job in jobs:
             if not isinstance(job, dict):
                 continue
-            job_id = str(job.get("job_id") or "")
-            current = index.get(job_id)
-            if not current:
+            match_idx = self._resolve_history_row_index(
+                site_id,
+                job,
+                by_job_id=by_job_id,
+                by_canonical_job_id=by_canonical_job_id,
+                by_match_key=by_match_key,
+            )
+            if match_idx is None:
                 continue
+            current = rows[match_idx]
             if "fit_apply" not in job and "fit_reason" not in job:
                 continue
             current["fit_apply"] = bool(job.get("fit_apply"))
@@ -1174,17 +1335,26 @@ class SiteStore:
 
     def update_job_application_outcomes(self, site_id: str, applications: list[dict[str, Any]]) -> None:
         rows = self._load_history_jobs(site_id)
-        index = {str(row.get("job_id") or ""): row for row in rows if str(row.get("job_id") or "")}
+        by_job_id, by_canonical_job_id, by_match_key = self._history_resolution_indexes(site_id, rows)
         changed = False
         for app in applications:
             if not isinstance(app, dict):
                 continue
-            job_id = str(app.get("job_id") or "")
-            current = index.get(job_id)
-            if not current:
+            match_idx = self._resolve_history_row_index(
+                site_id,
+                app,
+                by_job_id=by_job_id,
+                by_canonical_job_id=by_canonical_job_id,
+                by_match_key=by_match_key,
+            )
+            if match_idx is None:
                 continue
+            current = rows[match_idx]
             status = str(app.get("status") or ("submitted" if app.get("submitted") else "apply_failed"))
             current["application_status"] = status
+            apply_state = self._history_apply_state_for_application_status(status)
+            if apply_state:
+                current["apply_state"] = apply_state
             current["application_updated_at"] = now_iso()
             current["last_apply_error"] = str(
                 app.get("detail", {}).get("error") if isinstance(app.get("detail"), dict) else ""
@@ -1205,6 +1375,82 @@ class SiteStore:
                 **app,
             }
             store.append(row)
+
+    def append_application_reviews(
+        self,
+        site_id: str,
+        reviews: list[dict[str, Any]],
+        session_id: str,
+        turn_id: str,
+        batch_id: str = "",
+    ) -> dict[str, Any]:
+        store = JSONLStore(self.site_dir(site_id) / "applications" / "reviews" / f"{today_str()}.jsonl")
+        history_rows = self._load_history_jobs(site_id)
+        by_job_id, by_canonical_job_id, by_match_key = self._history_resolution_indexes(site_id, history_rows)
+        checked_at = now_iso()
+        recorded_count = 0
+        matched_count = 0
+        unmatched_count = 0
+        matched_job_ids: list[str] = []
+        changed = False
+
+        for raw in reviews:
+            if not isinstance(raw, dict):
+                continue
+            title = str(raw.get("title") or "").strip()
+            url = self._normalize_url(str(raw.get("url") or ""))
+            site_job_id = str(raw.get("site_job_id") or raw.get("source_job_id") or "").strip()
+            status = str(raw.get("application_review_status") or "").strip().lower()
+            if not title and not url and not site_job_id:
+                continue
+
+            review_row = {
+                "ts": checked_at,
+                "batch_id": str(batch_id or ""),
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "checked_at": checked_at,
+                "title": title,
+                "url": url,
+                "site_job_id": site_job_id,
+                "application_review_status": status,
+            }
+            match_idx = self._resolve_history_row_index(
+                site_id,
+                review_row,
+                by_job_id=by_job_id,
+                by_canonical_job_id=by_canonical_job_id,
+                by_match_key=by_match_key,
+            )
+            matched_job_id = ""
+            if match_idx is not None:
+                current = history_rows[match_idx]
+                matched_job_id = str(current.get("job_id") or "").strip()
+                if site_job_id:
+                    current["site_job_id"] = site_job_id
+                current["application_review_status"] = status
+                current["application_review_checked_at"] = checked_at
+                current["application_review_batch_id"] = str(batch_id or "")
+                if url:
+                    current["application_review_url"] = url
+                matched_count += 1
+                if matched_job_id:
+                    matched_job_ids.append(matched_job_id)
+                changed = True
+            else:
+                unmatched_count += 1
+
+            store.append({**review_row, "matched_job_id": matched_job_id})
+            recorded_count += 1
+
+        if changed:
+            self._write_history_jobs(site_id, history_rows)
+        return {
+            "recorded_count": recorded_count,
+            "matched_count": matched_count,
+            "unmatched_count": unmatched_count,
+            "matched_job_ids": matched_job_ids,
+        }
 
     def append_job_features(self, site_id: str, features: list[dict[str, Any]], session_id: str, turn_id: str) -> None:
         store = JSONLStore(self.site_dir(site_id) / "jobs" / "features.jsonl")

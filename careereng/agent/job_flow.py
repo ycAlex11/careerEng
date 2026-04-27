@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -16,9 +17,40 @@ from careereng.tools.site_tools import SiteTools
 
 class JobFlow:
     ENABLE_BROWSER_APPLY_PHASE = True
+    DISCOVERY_PHASES = (
+        "session_preparation",
+        "application_status_review",
+        "channel_discovery",
+        "job_filtering",
+        "job_retrieval",
+    )
     APPLY_JOB_PHASE_TIMEOUT_SECONDS = 3600
     APPLY_JOB_TIMEOUT_MS = 180000
     APPLY_SITE_PHASE_BUDGET_FACTOR = 0.8
+    AUTH_RECOVERY_PHASE = "session_preparation"
+    AUTH_RECOVERY_MARKERS = (
+        "auth_required",
+        "not authenticated",
+        "unauthenticated",
+        "not signed in",
+        "session expired",
+        "sign in required",
+        "signin required",
+        "login required",
+        "log in required",
+        "requires sign-in",
+        "requires signin",
+        "requires login",
+        "requires human credential",
+        "credential entry",
+        "login page",
+        "sign-in page",
+        "signin page",
+        "returning user login",
+        "需要登录",
+        "未登录",
+        "登录页",
+    )
 
     def __init__(
         self,
@@ -179,6 +211,8 @@ class JobFlow:
                 "batch_id": batch_id,
                 "json_path": str(report.get("json_path") or ""),
                 "markdown_path": str(report.get("markdown_path") or ""),
+                "final_json_path": str(report.get("final_json_path") or ""),
+                "final_markdown_path": str(report.get("final_markdown_path") or ""),
             },
         )
 
@@ -350,6 +384,103 @@ class JobFlow:
             },
         }
 
+    @classmethod
+    def _phase_requires_auth_recovery(cls, result: Any) -> bool:
+        status = str(getattr(result, "status", "") or "").strip().lower()
+        if status != "blocked":
+            return False
+        current_phase = str(getattr(result, "current_phase", "") or "").strip()
+        if not current_phase or current_phase == cls.AUTH_RECOVERY_PHASE:
+            return False
+        text = " ".join(
+            str(value or "")
+            for value in (
+                getattr(result, "reason_tag", ""),
+                getattr(result, "message", ""),
+                getattr(result, "current_url", ""),
+            )
+        ).lower()
+        return any(marker in text for marker in cls.AUTH_RECOVERY_MARKERS)
+
+    def _remaining_phases_from(self, phase_slug: str, phases: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = str(phase_slug or "").strip()
+        if not normalized:
+            return phases
+        try:
+            index = tuple(phases).index(normalized)
+        except ValueError:
+            return phases
+        return tuple(phases[index:])
+
+    def _run_site_with_auth_recovery(
+        self,
+        *,
+        site_key: str,
+        site_name: str,
+        entry_url: str,
+        session_id: str,
+        turn_id: str,
+        batch_id: str,
+        phase_slugs: tuple[str, ...],
+        resume: bool = False,
+        apply_target_job_ids: tuple[str, ...] | None = None,
+        phase_timeout_seconds_override: int | None = None,
+        timeout_ms_override: int | None = None,
+    ) -> Any:
+        result = self.browser_runner.run_site(
+            site_key=site_key,
+            site_name=site_name,
+            entry_url=entry_url,
+            session_id=session_id,
+            turn_id=turn_id,
+            batch_id=batch_id,
+            resume=resume,
+            phase_slugs=phase_slugs,
+            apply_target_job_ids=apply_target_job_ids,
+            phase_timeout_seconds_override=phase_timeout_seconds_override,
+            timeout_ms_override=timeout_ms_override,
+        )
+        if not self._phase_requires_auth_recovery(result):
+            return result
+
+        login_result = self.browser_runner.run_site(
+            site_key=site_key,
+            site_name=site_name,
+            entry_url=str(getattr(result, "current_url", "") or entry_url),
+            session_id=session_id,
+            turn_id=turn_id,
+            batch_id=batch_id,
+            resume=True,
+            phase_slugs=(self.AUTH_RECOVERY_PHASE,),
+            timeout_ms_override=timeout_ms_override,
+        )
+        if str(getattr(login_result, "status", "") or "") != "ready":
+            return login_result
+
+        remaining_phases = self._remaining_phases_from(
+            str(getattr(result, "current_phase", "") or ""),
+            tuple(phase_slugs),
+        )
+        if not remaining_phases:
+            return login_result
+        return self.browser_runner.run_site(
+            site_key=site_key,
+            site_name=site_name,
+            entry_url=str(
+                getattr(login_result, "current_url", "")
+                or getattr(result, "current_url", "")
+                or entry_url
+            ),
+            session_id=session_id,
+            turn_id=turn_id,
+            batch_id=batch_id,
+            resume=True,
+            phase_slugs=remaining_phases,
+            apply_target_job_ids=apply_target_job_ids,
+            phase_timeout_seconds_override=phase_timeout_seconds_override,
+            timeout_ms_override=timeout_ms_override,
+        )
+
     def _run_job_rows(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
         list_run_jobs = getattr(self.site_tools.site_store, "list_run_jobs", None)
         if not callable(list_run_jobs):
@@ -357,8 +488,55 @@ class JobFlow:
         rows = list_run_jobs(site_key, batch_id)
         return [row for row in rows if isinstance(row, dict)]
 
+    @staticmethod
+    def _run_job_identity(row: dict[str, Any]) -> str:
+        for field in ("job_id", "canonical_job_id", "url"):
+            value = str(row.get(field) or "").strip()
+            if value:
+                return f"{field}:{value}"
+        title = str(row.get("title") or "").strip()
+        location = str(row.get("location") or "").strip()
+        posted_label = str(row.get("posted_label") or "").strip()
+        return f"fallback:{title}|{location}|{posted_label}" if title else ""
+
+    @classmethod
+    def _merged_run_job_rows(cls, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged_by_key: dict[str, dict[str, Any]] = {}
+        ordered_keys: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = cls._run_job_identity(row)
+            if not key:
+                continue
+            current = merged_by_key.get(key)
+            if current is None:
+                merged_by_key[key] = dict(row)
+                ordered_keys.append(key)
+                continue
+            merged = dict(current)
+            for field, value in row.items():
+                if value is None or value == "":
+                    continue
+                merged[field] = value
+            merged_by_key[key] = merged
+        return [merged_by_key[key] for key in ordered_keys if key in merged_by_key]
+
+    def _merged_run_job_rows_for_batch(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
+        return self._merged_run_job_rows(self._run_job_rows(site_key, batch_id))
+
+    @staticmethod
+    def _terminal_application_status(row: dict[str, Any]) -> str:
+        application_status = str(row.get("application_status") or "").strip().lower()
+        if application_status in {"already_applied", "submitted", "apply_failed", "blocked"}:
+            return application_status
+        decision_status = str(row.get("decision_status") or "").strip().lower()
+        if decision_status == "already_applied":
+            return "already_applied"
+        return ""
+
     def _apply_counters_from_run(self, site_key: str, batch_id: str) -> dict[str, int]:
-        rows = self._run_job_rows(site_key, batch_id)
+        rows = self._merged_run_job_rows_for_batch(site_key, batch_id)
         counts = {
             "retrieved": len(rows),
             "attempted": 0,
@@ -370,8 +548,8 @@ class JobFlow:
         }
         for row in rows:
             decision_status = str(row.get("decision_status") or "").strip().lower()
-            application_status = str(row.get("application_status") or "").strip().lower()
-            if decision_status == "already_applied" or application_status == "already_applied":
+            application_status = self._terminal_application_status(row)
+            if application_status == "already_applied":
                 counts["already_applied"] += 1
             if decision_status == "filtered_out":
                 counts["filtered_out"] += 1
@@ -388,7 +566,7 @@ class JobFlow:
     @staticmethod
     def _is_apply_row_terminal(row: dict[str, Any]) -> bool:
         decision_status = str(row.get("decision_status") or "").strip().lower()
-        application_status = str(row.get("application_status") or "").strip().lower()
+        application_status = JobFlow._terminal_application_status(row)
         return decision_status in {"filtered_out", "already_applied"} or application_status in {
             "already_applied",
             "submitted",
@@ -405,7 +583,7 @@ class JobFlow:
         return "done"
 
     def _pending_apply_rows(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
-        return [row for row in self._run_job_rows(site_key, batch_id) if not self._is_apply_row_terminal(row)]
+        return [row for row in self._merged_run_job_rows_for_batch(site_key, batch_id) if not self._is_apply_row_terminal(row)]
 
     def _seal_apply_row_terminal(
         self,
@@ -594,7 +772,7 @@ class JobFlow:
                 self.APPLY_JOB_PHASE_TIMEOUT_SECONDS,
                 max(1, int(remaining_site_phase_seconds)),
             )
-            last_result = self.browser_runner.run_site(
+            last_result = self._run_site_with_auth_recovery(
                 site_key=site_key,
                 site_name=str(current.get("site_name") or site_key),
                 entry_url=job_url,
@@ -638,6 +816,11 @@ class JobFlow:
             last_result=last_result,
         )
 
+    def _promote_retrieved_run_to_history(self, *, site_key: str, batch_id: str) -> None:
+        promote = getattr(self.site_tools.site_store, "promote_run_jobs_to_history", None)
+        if callable(promote):
+            promote(site_key, batch_id)
+
     def _promote_apply_run_to_history(self, *, site_key: str, batch_id: str, session_id: str, turn_id: str) -> None:
         site_store = self.site_tools.site_store
         promote = getattr(site_store, "promote_run_jobs_to_history", None)
@@ -652,7 +835,7 @@ class JobFlow:
         for row in run_rows:
             if not isinstance(row, dict):
                 continue
-            status = str(row.get("application_status") or "").strip()
+            status = self._terminal_application_status(row)
             if not status:
                 continue
             detail: dict[str, Any] = {}
@@ -662,6 +845,7 @@ class JobFlow:
             applications.append(
                 {
                     "job_id": str(row.get("job_id") or ""),
+                    "canonical_job_id": str(row.get("canonical_job_id") or ""),
                     "status": status,
                     "submitted": status == "submitted",
                     "site_id": site_key,
@@ -827,24 +1011,40 @@ class JobFlow:
             self._generate_batch_report_if_possible(batch)
             return self._format_batch_summary(batch)
 
+        batch_id = str(batch.get("batch_id") or "")
+        batch_lock = threading.Lock()
+
+        def _save_site_snapshot(site_key: str, updated: dict[str, Any], *, generate_report: bool) -> dict[str, Any]:
+            nonlocal batch
+            with batch_lock:
+                latest = self.job_store.load_batch(batch_id) if batch_id else batch
+                batch = self.job_store.update_site(latest or batch, site_key, updated)
+                batch["status"] = self._compute_batch_status(batch)
+                batch = self.job_store.save_batch(batch)
+                if generate_report:
+                    self._generate_batch_report_if_possible(batch)
+                return batch
+
         def _job(site_key: str, current: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             allow_apply = str((current.get("apply") or {}).get("status") or "") != "skipped"
-            batch_id = str(batch.get("batch_id") or "")
-            result = self.browser_runner.run_site(
+            result = self._run_site_with_auth_recovery(
                 site_key=site_key,
                 site_name=str(current.get("site_name") or site_key),
                 entry_url=str(current.get("entry_url") or ""),
                 session_id=session_id,
                 turn_id=turn_id,
                 batch_id=batch_id,
-                resume=False,
-                phase_slugs=("session_preparation", "channel_discovery", "job_filtering", "job_retrieval"),
+                phase_slugs=self.DISCOVERY_PHASES,
             )
             updated = self._browser_result_to_site_row(result=result, existing=current, allow_apply=allow_apply)
+            retrieval_done = str((updated.get("retrieve") or {}).get("status") or "") == "done"
+            if retrieval_done:
+                self._promote_retrieved_run_to_history(site_key=site_key, batch_id=batch_id)
+                _save_site_snapshot(site_key, updated, generate_report=True)
             if (
                 effective_apply_requested
                 and allow_apply
-                and str((updated.get("retrieve") or {}).get("status") or "") == "done"
+                and retrieval_done
                 and str((updated.get("apply") or {}).get("status") or "") == "pending"
             ):
                 updated = self._apply_site_jobs(
@@ -867,9 +1067,7 @@ class JobFlow:
                 futures = [pool.submit(_job, site_key, row) for site_key, row in runnable_rows]
                 for future in concurrent.futures.as_completed(futures):
                     site_key, updated = future.result()
-                    batch = self.job_store.update_site(batch, site_key, updated)
-                    batch["status"] = self._compute_batch_status(batch)
-                    batch = self.job_store.save_batch(batch)
+                    _save_site_snapshot(site_key, updated, generate_report=True)
 
         batch["status"] = self._compute_batch_status(batch)
         batch = self.job_store.save_batch(batch)
@@ -912,7 +1110,7 @@ class JobFlow:
                 allow_apply=str((current.get("apply") or {}).get("status") or "") != "skipped",
             )
         else:
-            result = self.browser_runner.run_site(
+            result = self._run_site_with_auth_recovery(
                 site_key=site_key,
                 site_name=str(current.get("site_name") or site_key),
                 entry_url=str(current.get("entry_url") or current.get("current_url") or ""),
@@ -920,7 +1118,7 @@ class JobFlow:
                 turn_id=turn_id,
                 batch_id=str(batch.get("batch_id") or ""),
                 resume=True,
-                phase_slugs=("session_preparation", "channel_discovery", "job_filtering", "job_retrieval"),
+                phase_slugs=self.DISCOVERY_PHASES,
             )
             replacement = self._browser_result_to_site_row(
                 result=result,

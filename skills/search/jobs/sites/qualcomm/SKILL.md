@@ -2,7 +2,7 @@
 id: site-qualcomm
 name: qualcomm Site Skill
 version: v1
-updated_at: '2026-04-21'
+updated_at: '2026-04-28'
 scope: site
 site_key: qualcomm
 status: ready
@@ -31,24 +31,21 @@ apply_enabled: true
 - Before the Qualcomm resume step is satisfied, ignore the rest of `Profile`; do not inspect `About`, `Skills`, `Experience`, `Education`, or other profile sections first.
 - If `Resume Manager` is visible and the Qualcomm resume step is not yet satisfied in this run, click `Resume Manager` immediately.
 - If `Resume Manager` is not yet visible, stay on that same `Profile` page and keep rechecking only for `Resume Manager`.
-- In `Resume Manager`, check whether the current staged `cv.pdf` is visibly present.
-- If the current staged `cv.pdf` is not visibly present, upload it there.
-- Treat the Qualcomm resume step as satisfied the moment the current staged `cv.pdf` is visibly present in `Resume Manager`.
+- In `Resume Manager`, compare the visible Qualcomm resume filename against the current staged resume filename from the run context.
+- If the current staged resume filename is not visibly present, upload the current staged resume PDF there.
+- Treat the Qualcomm resume step as satisfied only when the current staged resume filename is visibly present in `Resume Manager`.
 - As soon as that Qualcomm resume step is satisfied, write it into `update_phase_memory` and mark `Resume Manager` as do-not-repeat for the current unchanged setup state.
 - Once the Qualcomm resume step is satisfied, stop treating `Resume Manager` as the next target.
 - If the resume dialog is still open after the Qualcomm resume step is satisfied, close it.
-- After the Qualcomm resume step is satisfied and the dialog is closed, the next action is `Search for Jobs`.
-- Do not reopen `Resume Manager` again in this same `session_preparation` run after `cv.pdf` has already been confirmed there.
-- Leave the browser on the Qualcomm jobs-search surface. Only then is `Session Preparation` complete.
+- Do not reopen `Resume Manager` again in this same `session_preparation` run after the current staged resume filename has already been confirmed there.
 
 ### Completion Or Blocked
 
-- End `Session Preparation` only after Qualcomm is signed in, the current staged `cv.pdf` is visibly present in `Resume Manager`, and the browser has returned to `Search for Jobs` or the searchable Qualcomm jobs surface.
+- End `Session Preparation` after Qualcomm is signed in, the current staged resume filename is visibly present in `Resume Manager`, and any resume dialog has been closed.
 - If the flow reaches password entry, MFA, verification code, CAPTCHA, email confirmation, or another explicit human-only challenge with no visible one-click Google continuation left, stop with `blocked`.
 
 ### Don't
 
-- Do not stop on a Qualcomm candidate home, profile page, or resume manager page if the flow has not yet returned to jobs search.
 - Do not use the homepage-level profile card or other broad profile shortcut when the header avatar/account dropdown is available.
 - Do not treat the `Profile` heading by itself as completion; `Resume Manager` still must be opened.
 - Do not keep observing or editing general Qualcomm profile fields such as About, Skills, or Experience before `Resume Manager` is satisfied.
@@ -56,9 +53,59 @@ apply_enabled: true
 - Do not click `Export as resume` before `Resume Manager`.
 - Do not scroll through or inspect the rest of `Profile` before clicking `Resume Manager`.
 - Do not substitute another resume area, profile section, or settings page for `Resume Manager`.
-- Do not substitute another navigation shortcut for `Search for Jobs` during this setup flow.
-- Do not upload a different file when the current staged `cv.pdf` is already visibly present in the Qualcomm resume manager.
-- Do not reopen `Resume Manager` after `cv.pdf` has already been confirmed there in the current `session_preparation` run.
+- Do not upload a different file when the current staged resume filename is already visibly present in the Qualcomm resume manager.
+- Do not reopen `Resume Manager` after the current staged resume filename has already been confirmed there in the current `session_preparation` run.
+
+## Application Status Review
+
+### Goal
+
+- After Qualcomm login is ready, review the candidate dashboard's existing applications before starting new job discovery.
+
+### Review Window
+
+- Only inspect and record Qualcomm applications applied on or after `2026-04-10`.
+- Use the application row date first, such as `Applied on Apr 23, 2026`.
+- If a visible row has no reliable date, open its detail only if needed to confirm whether it is inside the review window.
+- If no reliable date can be found for a row, skip that row instead of recording it.
+
+### Workflow
+
+- From the signed-in Qualcomm candidate flow, open the header avatar / account-name dropdown and choose `Profile`.
+- From `Profile`, choose `Dashboard`.
+- In `Dashboard`, open `Applications`.
+- Inspect `Submitted` once, then inspect `Inactive` once.
+- An empty Qualcomm tab, such as `Inactive 0`, counts as reviewed.
+- For each visible application row in `Submitted`, record the application with `application_review_status = active` unless the row itself shows a more specific terminal state.
+- For each visible application row in `Inactive`, record the application with `application_review_status = inactive` unless the row itself clearly says `rejected`, `closed`, or `withdrawn`.
+- Record the visible job title, the best available Qualcomm job/application URL, and any visible Qualcomm job number, requisition id, posting id, or application id as `site_job_id`.
+- If the current Qualcomm tab shows pagination, `Next`, `Show more`, or `Load more`, continue only while the visible application rows are still on or after `2026-04-10`, or while no reliable application date has been found yet.
+- If a visible row is older than `2026-04-10` and the tab appears sorted newest first, stop that tab and move to the next required tab.
+- After both `Submitted` and `Inactive` have been reviewed, call `record_application_reviews` once with the collected rows.
+- After `record_application_reviews` succeeds, immediately finish `Application Status Review` with `phase_result done`.
+
+### Status Mapping
+
+- Use `active` for applications still listed under `Submitted` with no clearer terminal status.
+- Use `inactive` for applications listed under `Inactive` with no clearer terminal status.
+- Use `rejected`, `closed`, or `withdrawn` only when Qualcomm clearly shows that exact meaning on the row or detail page.
+- Use `unknown` if the row is visible but the application group or status cannot be interpreted safely.
+
+### Completion Or Blocked
+
+- End `Application Status Review` only after both `Submitted` and `Inactive` have been checked and the review rows have been recorded.
+- If `Profile`, `Dashboard`, `Submitted`, or `Inactive` is not visible after login-ready navigation, refresh once and re-check the same path before stopping.
+- If Qualcomm returns to sign-in, password entry, MFA, CAPTCHA, verification, or another human-only challenge, stop with `blocked`.
+
+### Don't
+
+- Do not inspect new job search results during `Application Status Review`.
+- Do not create history rows for dashboard applications that are not already in local history; just record them through `record_application_reviews`.
+- Do not mark a `Submitted` application as rejected or inactive unless Qualcomm explicitly shows that terminal status.
+- Do not skip `Inactive`; it is the source of truth for older or no-longer-active applications.
+- Do not switch back to `Submitted` after it has already been reviewed once.
+- Do not switch back to `Inactive` after it has already been reviewed once.
+- Do not re-check either tab after `record_application_reviews` has succeeded.
 
 ## Channel Discovery
 
@@ -76,16 +123,19 @@ apply_enabled: true
 
 ### Filtering Goal
 
-- Stay on the current Qualcomm jobs surface and apply these Qualcomm targets when the page exposes them: `Location = China`, `Job Category / Function = Software Engineering`, `Machine Learning Engineering`, and `Software Applications Engineering`.
+- Stay on the current Qualcomm jobs surface and apply these Qualcomm targets when the page exposes them: `Location = China`, `Job Category / Function = Software Engineering`, `Machine Learning Engineering`, and `Software Applications Engineering`, and `Seniority = Senior` plus `Mid-Level`.
 
 ### Filtering Direction
 
 - Use `Location = China`.
 - If `View all jobs` or another Qualcomm jobs action removes the current China location state, restore `Location = China` before spending more work on category filters.
 - In the Qualcomm role, profession, category, or function filter, keep all visible target categories that match `Software Engineering`, `Machine Learning Engineering`, and `Software Applications Engineering`.
+- In the Qualcomm seniority filter, select both `Senior` and `Mid-Level` when those options are exposed.
 - When one of those three target category checkboxes is visible and not yet selected, click it directly.
+- When either `Senior` or `Mid-Level` is visible and not yet selected, click it directly.
 - Do not stall on repeated checkbox inspection when those visible target category checkboxes are still unchecked; use direct selection actions first.
 - Do not stop after selecting only one of those Qualcomm target categories if other target categories from that same set are also visible in the current filter surface.
+- Do not stop after selecting only `Senior` if `Mid-Level` is also visible on the current filter surface, and do not stop after only `Mid-Level` if `Senior` is also visible.
 - If Qualcomm already shows active chips, checked options, or URL state for one of those target dimensions, reuse that state and continue.
 - If one of the three target categories is not exposed on the current Qualcomm page, apply the remaining visible target categories and continue.
 - After the Qualcomm target family set is clearly selected, record that in `update_phase_memory` and do not reopen `All filters` only to re-check the same family set on the same unchanged page.

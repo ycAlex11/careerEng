@@ -605,6 +605,7 @@ class BrowserPhaseRuntime:
             "employment_type": {"type": "string"},
             "match_label": {"type": "string"},
             "apply_state": {"type": "string"},
+            "site_job_id": {"type": "string"},
             "posted_at": {"type": "string"},
         }
         return {
@@ -641,6 +642,7 @@ class BrowserPhaseRuntime:
             "employment_type": {"type": "string"},
             "match_label": {"type": "string"},
             "apply_state": {"type": "string"},
+            "site_job_id": {"type": "string"},
             "posted_at": {"type": "string"},
             "description": {"type": "string"},
             "jd_sync_status": {"type": "string"},
@@ -678,6 +680,40 @@ class BrowserPhaseRuntime:
                     }
                 },
                 "required": ["jobs"],
+                "additionalProperties": False,
+            },
+        }
+
+    @staticmethod
+    def record_application_reviews_tool() -> dict[str, Any]:
+        review_properties = {
+            "title": {"type": "string"},
+            "url": {"type": "string"},
+            "site_job_id": {"type": "string"},
+            "application_review_status": {
+                "type": "string",
+                "enum": ["active", "inactive", "rejected", "closed", "withdrawn", "unknown", "blocked"],
+            },
+        }
+        return {
+            "type": "function",
+            "name": "record_application_reviews",
+            "description": "Persist website-visible submitted-application review statuses for the active site.",
+            "strict": False,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reviews": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": review_properties,
+                            "required": ["title", "application_review_status"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["reviews"],
                 "additionalProperties": False,
             },
         }
@@ -893,6 +929,33 @@ class BrowserPhaseRuntime:
             "Use that current live page as the primary source of truth. "
             "Use recent trajectory only to remember what was just attempted."
         )
+
+    @staticmethod
+    def _staged_resume_context_items(resume_pdf_path: str) -> list[dict[str, str]]:
+        path_text = str(resume_pdf_path or "").strip()
+        if not path_text:
+            return []
+        basename = Path(path_text).name.strip()
+        items = [
+            {
+                "role": "user",
+                "content": (
+                    "Current staged resume PDF for this phase "
+                    f"(use this exact local path if upload is needed): {path_text}"
+                ),
+            }
+        ]
+        if basename:
+            items.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Current staged resume filename for this phase "
+                        f"(compare the live page's selected resume name against this basename): {basename}"
+                    ),
+                }
+            )
+        return items
 
     @staticmethod
     def _action_looks_like_close(arguments: dict[str, Any] | None) -> bool:
@@ -1188,13 +1251,7 @@ class BrowserPhaseRuntime:
             return False
         decision_status = str(row.get("decision_status") or "").strip().lower()
         application_status = str(row.get("application_status") or "").strip().lower()
-        apply_state = str(row.get("apply_state") or "").strip().lower()
         return decision_status in {"filtered_out", "already_applied"} or application_status in {
-            "already_applied",
-            "submitted",
-            "apply_failed",
-            "blocked",
-        } or apply_state in {
             "already_applied",
             "submitted",
             "apply_failed",
@@ -1766,6 +1823,43 @@ class BrowserPhaseRuntime:
             "content": [{"type": "text", "text": summary}],
         }
 
+    def _record_application_reviews_payload(
+        self,
+        *,
+        site_store: Any,
+        site_key: str,
+        session_id: str,
+        turn_id: str,
+        batch_id: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_reviews = arguments.get("reviews")
+        reviews = [dict(row) for row in raw_reviews if isinstance(row, dict)] if isinstance(raw_reviews, list) else []
+        append_reviews = getattr(site_store, "append_application_reviews", None)
+        if not callable(append_reviews):
+            raise RuntimeError("site store does not support application reviews")
+        summary = append_reviews(site_key, reviews, session_id or "", turn_id, batch_id)
+        recorded_count = int(summary.get("recorded_count") or 0) if isinstance(summary, dict) else 0
+        matched_count = int(summary.get("matched_count") or 0) if isinstance(summary, dict) else 0
+        unmatched_count = int(summary.get("unmatched_count") or 0) if isinstance(summary, dict) else 0
+        matched_job_ids = summary.get("matched_job_ids") if isinstance(summary, dict) else []
+        if not isinstance(matched_job_ids, list):
+            matched_job_ids = []
+        text = (
+            f"Recorded {recorded_count} application reviews "
+            f"({matched_count} matched history, {unmatched_count} unmatched)."
+        )
+        return {
+            "isError": False,
+            "structuredContent": {
+                "recorded_count": recorded_count,
+                "matched_count": matched_count,
+                "unmatched_count": unmatched_count,
+                "matched_job_ids": [str(job_id) for job_id in matched_job_ids if str(job_id).strip()],
+            },
+            "content": [{"type": "text", "text": text}],
+        }
+
     @staticmethod
     def _request_context_payload(*, context_session: Any | None, arguments: dict[str, Any]) -> dict[str, Any]:
         if context_session is None:
@@ -2024,6 +2118,8 @@ class BrowserPhaseRuntime:
                     ),
                 },
             ]
+            if phase.slug == "session_preparation":
+                base_items.extend(self._staged_resume_context_items(staged_resume_pdf_path))
             context_items = getattr(context_session, "items", None) if context_session is not None else None
             static_context_items = list(context_items() if callable(context_items) else (extra_context_items or []))
             turn_timeout_seconds = self._response_turn_timeout_seconds(deadline=deadline)
@@ -2426,6 +2522,15 @@ class BrowserPhaseRuntime:
                             )
                         elif name == "update_jobs":
                             payload = self._update_jobs_payload(
+                                site_store=site_store,
+                                site_key=site_key,
+                                session_id=session_id,
+                                turn_id=turn_id,
+                                batch_id=batch_id,
+                                arguments=arguments if isinstance(arguments, dict) else {},
+                            )
+                        elif name == "record_application_reviews":
+                            payload = self._record_application_reviews_payload(
                                 site_store=site_store,
                                 site_key=site_key,
                                 session_id=session_id,

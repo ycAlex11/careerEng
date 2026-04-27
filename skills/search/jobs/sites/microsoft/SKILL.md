@@ -2,11 +2,11 @@
 id: site-microsoft
 name: microsoft Site Skill
 version: v1
-updated_at: '2026-04-15'
+updated_at: '2026-04-28'
 scope: site
 site_key: microsoft
 status: ready
-apply_enabled: false
+apply_enabled: true
 ---
 # Microsoft Site Skill
 
@@ -14,7 +14,7 @@ apply_enabled: false
 
 ### Goal
 
-- Complete Microsoft careers login preparation and keep the browser inside the Microsoft careers or apply jobs flow for the next phase.
+- Complete Microsoft careers login preparation, confirm the current staged resume is synced in the Microsoft careers profile, and leave the browser inside the signed-in Microsoft careers or apply flow for the next phase.
 
 ### Site Facts
 
@@ -22,16 +22,29 @@ apply_enabled: false
 - If the page shows `Sign in`, use the sign-in entry for the current Microsoft careers or application flow.
 - The Microsoft auth flow can continue through a provider chooser, a Microsoft-account continuation step, or a remembered-account tile before returning to the jobs system.
 - After successful authentication, Microsoft may return to the careers home or apply jobs system instead of opening search results immediately.
-- Microsoft careers home can show an account menu before the actual apply/jobs session is fully reusable.
+- After login, the Microsoft careers avatar / account menu can expose `My profile`.
+- The required Microsoft resume setup target is `My profile` -> `Resume Manager`.
+
+### Workflow
+
+- If the current page still shows a visible `Sign in` entry for the Microsoft careers or application flow, continue that sign-in path instead of declaring readiness.
+- After login, use the Microsoft careers avatar / account menu, then choose `My profile`.
+- In `My profile`, open `Resume Manager` before inspecting other profile areas.
+- If `Resume Manager` is visible and the Microsoft resume step is not yet satisfied in this run, click `Resume Manager` immediately.
+- If `Resume Manager` is not yet visible, stay on the same Microsoft careers profile surface and keep rechecking only for `Resume Manager`.
+- In `Resume Manager`, compare the visible Microsoft resume filename against the current staged resume filename from the run context.
+- If the current staged resume filename is not visibly present, upload the current staged resume PDF there.
+- Treat the Microsoft resume step as satisfied only when the current staged resume filename is visibly present in `Resume Manager`.
+- As soon as that Microsoft resume step is satisfied, write it into `update_phase_memory` and mark `Resume Manager` as do-not-repeat for the current unchanged setup state.
+- Once the Microsoft resume step is satisfied, stop treating `Resume Manager` as the next target.
+- If the resume dialog is still open after the Microsoft resume step is satisfied, close it.
+- Do not reopen `Resume Manager` again in this same `session_preparation` run after the current staged resume filename has already been confirmed there.
+- Do not navigate to Microsoft jobs `Search` or `Find jobs` during `Session Preparation` when a profile, account, or Action Center surface is available. Jobs search belongs to `Channel Discovery` after `Application Status Review`.
 
 ### Completion Or Blocked
 
 - Do not treat the Microsoft careers or apply domain by itself as proof that login completed.
-- Do not treat the careers-home header account menu, avatar, `Account manager`, `Saved jobs`, `Settings`, or similar header-only account controls as final proof by themselves.
-- Treat those careers-home account controls only as a reusable-session hint. Before ending `Session Preparation`, confirm that the current Microsoft careers or apply flow is still signed in without a visible `Sign in` re-entry on the live working page.
-- If the current page is the Microsoft careers public home and it shows a visible jobs entry such as `Find jobs` or the careers jobs `Search` entry, use that entry to move into the real jobs/apply flow before deciding whether the session is ready, as long as the page is not already asking for password entry, verification, MFA, CAPTCHA, email confirmation, or another explicit human-only challenge.
-- If moving from careers home into the direct jobs/apply surface reveals `Sign in`, candidate login, create-profile/setup-profile, or another auth continuation, treat authentication as unresolved and continue the Microsoft careers auth flow instead of declaring success.
-- If the current live page inside the Microsoft careers or apply working flow shows a stable post-login identity surface and no visible `Sign in` re-entry on that same live page, end `Session Preparation` immediately.
+- End `Session Preparation` after Microsoft is signed in, the current staged resume filename is visibly present in `Resume Manager`, and any resume dialog has been closed.
 - If the current live page still shows `Sign in`, treat authentication as unresolved and continue the Microsoft careers auth flow instead of declaring success.
 - If the flow requires password entry, verification, MFA, CAPTCHA, email confirmation, or another explicit human-only challenge, stop with `blocked`.
 
@@ -42,13 +55,63 @@ apply_enabled: false
 ### Don't
 
 - Do not switch into a generic Microsoft homepage, store page, product page, profile page, account page, or broad Microsoft brand navigation during this phase.
-- Do not stop this phase only because careers home looks signed in. Microsoft must still stay signed in when the flow advances toward the real jobs/apply surface.
-- Do not keep exploring once authentication has already been confirmed on a reusable Microsoft careers or apply working page.
+- Do not use `Find jobs`, jobs `Search`, or a Microsoft jobs list as the normal proof of login during this phase when `My profile` is reachable.
+- Do not inspect or edit general Microsoft profile fields before `Resume Manager` is satisfied.
+- Do not substitute another resume area, profile section, or settings page for `Resume Manager`.
+- Do not upload a different file when the current staged resume filename is already visibly present in Microsoft `Resume Manager`.
+- Do not reopen `Resume Manager` after the current staged resume filename has already been confirmed there in the current `session_preparation` run.
+
+## Application Status Review
+
+### Goal
+
+- Review Microsoft Action Center application statuses before new job discovery.
+
+### Workflow
+
+- After Microsoft login is ready, open the Microsoft careers `Action Center`.
+- In `Action Center`, open `Applications`.
+- Review `Submitted` first, then review `Inactive`.
+- Treat `Submitted` and `Inactive` as a two-item checklist. Open each one only once.
+- For each currently visible applications page, classify the visible application dates before any recording, tab switch, page-number click, `Next`, `Show more`, or `Load more`.
+- If the current area has no application rows, the current area is complete.
+- If every visible application row in the current area is before `2026-04-10`, do not call `record_application_reviews` for that page. The current area is complete immediately.
+- If the current page has one or more rows on or after `2026-04-10`, call `record_application_reviews` immediately with only those in-window rows. Never include older rows in the tool call.
+- If the current page contains any row before `2026-04-10`, the current area is complete after any in-window rows on that page have been recorded. Do not paginate that area.
+- If all visible rows on the current page are on or after `2026-04-10`, the current page has been recorded, and a real `Next`, `Show more`, or `Load more` control is available for the current area, use it once to inspect the next page.
+- After `Submitted` is complete, open `Inactive` exactly once.
+- After `Inactive` is complete, immediately finish `Application Status Review` with `phase_result done`.
+
+### Recording
+
+- Record the visible job title, the best available Microsoft job or application URL, any visible Microsoft job number, requisition id, posting id, PID, or application id as `site_job_id`, and the normalized `application_review_status`.
+
+### Status Mapping
+
+- Use `active` for applications still listed under `Submitted` with no clearer terminal status.
+- Use `inactive` for applications listed under `Inactive` with no clearer terminal status.
+- Use `rejected`, `closed`, or `withdrawn` only when Microsoft clearly shows that exact meaning on the row or detail page.
+- Use `unknown` if a visible in-window row cannot be interpreted safely.
+
+### Completion Or Blocked
+
+- End `Application Status Review` only after `Submitted` and `Inactive` have both been checked and any in-window rows have been recorded.
+- If `Action Center`, `Applications`, `Submitted`, or `Inactive` is not visible after login-ready navigation, refresh once and re-check the same path before stopping.
+- If Microsoft returns to sign-in, password entry, MFA, CAPTCHA, verification, or another human-only challenge, stop with `blocked`.
+
+### Don't
+
+- Do not inspect new job search results during `Application Status Review`.
+- Do not create history rows for Action Center applications that are not already in local history; just record them through `record_application_reviews`.
+- Do not switch back to `Submitted` after it has already been reviewed once.
+- Do not switch back to `Inactive` after it has already been reviewed once.
+- Do not use Action Center tab switching as a progress check.
 
 ## Channel Discovery
 
 ### Navigation
 
+- If the current Microsoft page is `Action Center` after `Application Status Review`, use the visible jobs search, careers, or find-jobs entry from there to reach the searchable jobs surface.
 - If Microsoft lands on a dashboard, candidate home, or other logged-in landing page instead of the searchable jobs UI, navigate into the real jobs search surface from that logged-in landing page.
 - If Microsoft returns to the careers home page after login and the careers page shows its visible jobs `Search` icon or search button, click that jobs-search entry before ending channel discovery.
 - Click that jobs `Search` entry before typing into any search field. Do not use a generic global/header search box as a substitute for opening the real jobs-search surface.
@@ -56,7 +119,7 @@ apply_enabled: false
 - Do not treat the Microsoft careers home page by itself as channel discovery complete just because the session is authenticated.
 - Do not treat a logged-in landing page as discovery-complete while the visible careers search entry still needs to be opened to reach the real jobs search surface.
 - If Microsoft has already entered the careers or apply jobs system, stay in that system and continue forward to the searchable jobs surface instead of jumping back to broad Microsoft site navigation.
-- Do not click `Settings`, `Action Center`, `Saved jobs`, avatar/account controls, Q&A/community/help links, or other non-jobs navigation while channel discovery is still trying to open the jobs search surface.
+- Do not click `Settings`, `Saved jobs`, avatar/account controls, Q&A/community/help links, or other non-jobs navigation while channel discovery is still trying to open the jobs search surface.
 - If the current page already shows Microsoft job search controls, filters, or a real jobs list and no visible sign-in re-entry, stop discovery immediately.
 
 ### Success Signal

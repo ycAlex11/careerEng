@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from careereng.resume.export import ensure_default_resume_pdf
+from careereng.resume.export import default_apply_resume_pdf_path, ensure_default_resume_pdf
 from careereng.storage.site_store import SiteStore
 
 
@@ -22,7 +22,7 @@ class SiteTools:
         return False
 
     def default_resume_pdf_path(self) -> Path:
-        return (self.site_store.workspace / "cv" / "exports" / "cv.pdf").resolve()
+        return default_apply_resume_pdf_path(self.site_store.workspace)
 
     def ensure_default_resume_pdf(self) -> Path:
         return ensure_default_resume_pdf(self.site_store.workspace)

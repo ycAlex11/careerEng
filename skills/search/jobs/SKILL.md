@@ -65,6 +65,12 @@ Treat the active site skill as the primary source for site-specific login behavi
 Do not treat public jobs UI by itself as proof of readiness unless the site skill makes clear that the current state belongs to the post-login jobs flow.
 Treat clear signed-in identity signals such as candidate home, account menu, avatar, welcome banner, or profile entry inside the jobs flow as stronger evidence than the mere disappearance of a `Sign in` button.
 
+### Auth Recovery Signal
+
+If any phase after `Session Preparation` discovers that the site is not signed in, the session expired, or the page requires sign-in before the phase can continue, do not perform that phase's work.
+Finish the phase as `blocked` with a summary that starts with `auth_required:` and describes the visible sign-in requirement.
+The orchestration layer will re-run `Session Preparation` and then resume the interrupted phase.
+
 ### Don't
 
 Do not drift into company research, job review, or filtering work before session readiness is clear.
@@ -85,6 +91,62 @@ Do not keep exploring once the current phase goal is already satisfied.
 - community
 - promotional cards
 - video section
+
+## Application Status Review
+
+### Review Window
+
+Only inspect and record submitted-application statuses after `2026-04-10`.
+
+If the site groups applications into `active`, `inactive`, or similar sections, still record only applications in this review window.
+
+### Workflow
+
+The default workflow is: open the site's own submitted-application surface, read visible application records, record their current status, then finish this phase.
+
+If the current site skill defines a more specific `Application Status Review` workflow, entry point, grouping rule, or status interpretation, use the site skill first.
+
+This phase is read-only. Do not submit, edit, withdraw, or modify any application.
+
+Inspect each visible application area once. An empty area counts as reviewed.
+
+For sites with application tabs, sections, filters, or grouped areas such as `Active`, `Inactive`, `Submitted`, `Archived`, or `My Applications`, treat each required area as a checklist item:
+- Open each required area only once.
+- After an area has been inspected, mark it mentally complete and do not open it again.
+- Do not switch between already-inspected areas to verify progress.
+- Pagination belongs to the current area only; do not use another area as a continuation signal.
+
+Record only applications inside the review window.
+
+Before clicking `Next`, a page number, `Show more`, `Load more`, or any equivalent pagination control, inspect the current area's visible application dates.
+
+If any visible application in the current area is older than the review window, treat the current area as complete immediately:
+- Record only the visible rows that are still inside the review window.
+- Do not click `Next`, another page number, `Show more`, or `Load more` for that area.
+- Do not return to that area later in the same phase.
+
+Use pagination, `Next`, `Show more`, or `Load more` only while the current visible records are still inside the review window, or while no reliable application date has been found yet.
+
+After all required visible areas have been reviewed, call `record_application_reviews` once. After that tool succeeds, immediately finish `Application Status Review`; do not revisit already-reviewed areas.
+
+### Recording
+
+Record each visible application with its job title, job or application URL, the site's own job identifier, and the website-visible application status.
+
+The site job identifier may be a job id, requisition number, posting id, PID, or equivalent site-owned value.
+Do not overwrite local project-generated `job_id` or `canonical_job_id` with a site job identifier.
+
+### Status Values
+
+Normalize website-visible application status into one of these review statuses:
+
+- `active`
+- `inactive`
+- `rejected`
+- `closed`
+- `withdrawn`
+- `unknown`
+- `blocked`
 
 ## Company Discovery
 

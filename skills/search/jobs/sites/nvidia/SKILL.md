@@ -2,11 +2,11 @@
 id: site-nvidia
 name: nvidia Site Skill
 version: v1
-updated_at: '2026-04-10'
+updated_at: '2026-04-26'
 scope: site
 site_key: nvidia
 status: ready
-apply_enabled: false
+apply_enabled: true
 ---
 # NVIDIA Site Skill
 
@@ -41,11 +41,61 @@ apply_enabled: false
 - Do not keep exploring candidate, profile, account, or unrelated navigation paths after login preparation is already complete.
 - Do not start job filtering actions while still in `Session Preparation`.
 
+## Application Status Review
+
+### Goal
+
+- Review NVIDIA Workday application statuses from the signed-in candidate area before new job discovery.
+
+### Workflow
+
+- This NVIDIA workflow overrides the project-level default recording timing. Record per visible page when needed; do not wait and record everything once at the end.
+- If login completes on NVIDIA `Candidate Home`, start review there.
+- If the current signed-in NVIDIA page is not `Candidate Home` and the navigation shows `Candidate Home`, open `Candidate Home`.
+- From `Candidate Home`, use the NVIDIA Workday `My Applications` area.
+- Candidate Home normally opens with `Active` already selected. Treat that current visible `Active` table as the first review area; do not click `Inactive` first.
+- Process areas in this exact order: current `Active` table first, then `Inactive`.
+- For each currently visible `My Applications` table page, classify the page by the visible `Date Submitted` values before any recording, tab switch, page-number click, `Next`, `Last`, `Show more`, or `Load more`.
+- If the current visible page has no application rows, the current area is complete.
+- If every visible application row on the current page is before `2026-04-10`, do not call `record_application_reviews` for that page. The current area is complete immediately.
+- If the current page has one or more rows on or after `2026-04-10`, call `record_application_reviews` immediately with only those in-window rows. Never include older rows in the tool call.
+- If the current page contains any row before `2026-04-10`, the current area is complete after any in-window rows on that page have been recorded. Do not paginate that area.
+- If all visible rows on the current page are on or after `2026-04-10`, the current page has been recorded, and a `Next` control is available for the current area, use `Next` once to inspect the next page.
+- When `Active` is complete, click `Inactive` exactly once.
+- When `Inactive` is complete, immediately finish `Application Status Review` with `phase_result done`.
+- An empty NVIDIA tab, such as `Active (0)` or `Inactive (0)`, counts as complete.
+- For each recorded NVIDIA row, include the job title, the best available job or application URL, the visible Workday requisition/job id such as `JR...` as `site_job_id`, and the normalized `application_review_status`.
+
+### Status Mapping
+
+- Use `active` for NVIDIA applications that still appear open, in progress, submitted, under review, or active with no clearer terminal status.
+- Use `inactive` for NVIDIA applications shown under inactive/archived/no-longer-active surfaces with no clearer terminal status.
+- Use `rejected` for rows that say `Declined`, including `Declined. Thank you for applying`.
+- Use `rejected`, `closed`, or `withdrawn` only when NVIDIA clearly shows that exact meaning on the row or detail page.
+- Use `unknown` if a visible application row is inside the review window but the status cannot be interpreted safely.
+
+### Completion Or Blocked
+
+- End `Application Status Review` only after the visible NVIDIA application history has been checked and the review rows have been recorded.
+- If `Candidate Home` or application history is not visible after login-ready navigation, refresh once and re-check the same path before stopping.
+- If NVIDIA returns to sign-in, password entry, MFA, CAPTCHA, verification, or another human-only challenge, stop with `blocked`.
+
+### Don't
+
+- Do not inspect new job search results during `Application Status Review`.
+- Do not create history rows for application records that are not already in local history; just record them through `record_application_reviews`.
+- Do not revisit an application area after it has already been reviewed once.
+- Do not continue paging after seeing an older-than-window record in a newest-first list.
+- Do not click `Inactive` while `Active` is selected until the visible `Active` table page has been recorded and Active is complete.
+- Do not click any tab or pagination control while a visible application table page has not yet been recorded.
+- Do not use tab switching as a way to check progress.
+
 ## Channel Discovery
 
 ### Navigation
 
 - Start from the current NVIDIA jobs entry URL.
+- If the current signed-in NVIDIA page is `Candidate Home`, use `Search for Jobs` to reach the searchable jobs surface.
 - If the current page already shows the jobs-system search UI, filters, or visible job list, stop discovery immediately.
 - Stay inside the same NVIDIA jobs system page after login; only do extra in-page navigation if the searchable jobs UI still has not appeared.
 - Once login returns to the NVIDIA Workday jobs page with a search box, filters, or visible roles, end channel discovery and move straight into job filtering. Do not pause for user confirmation at that point.

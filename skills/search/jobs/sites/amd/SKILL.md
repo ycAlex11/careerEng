@@ -2,7 +2,7 @@
 id: site-amd
 name: AMD Site Skill
 version: v1
-updated_at: '2026-04-20'
+updated_at: '2026-04-28'
 scope: site
 site_key: amd
 status: ready
@@ -19,19 +19,17 @@ apply_enabled: true
 ### Authentication
 
 - Use the AMD careers candidate flow, not a generic AMD marketing page.
-- If the page shows `Return to Login` or similar, click it to reach the AMD login surface.
-- If the page shows `Returning User Login`, click it once only.
-- After clicking `Returning User Login`, immediately inspect open tabs/windows. If a new AMD candidate tab/window or an already signed-in AMD dashboard is available, switch to it and continue there.
-- Once a new AMD candidate tab/window or AMD dashboard is open, do not return to the old jobs page to click `Returning User Login` again.
+- If the current AMD jobs page shows `Returning User Login`, `Return to Login`, `Sign In`, or similar, click it during `Session Preparation` to reach the AMD login surface.
 - On the AMD login surface, use the visible `LinkedIn` account login option.
 - Continue through visible LinkedIn or remembered-account continuation steps when they are one-click browser actions.
 - If the flow reaches password entry, MFA, verification code, CAPTCHA, email confirmation, or another explicit human-only challenge with no visible one-click continuation left, stop with `blocked`.
 
 ### Ready Signal
 
-- Treat `Session Preparation` as complete only when AMD is signed in or otherwise ready to use the AMD jobs flow, and the current page can continue toward AMD job search.
-- If the current page is already the AMD candidate dashboard or another signed-in AMD jobs surface, treat `Session Preparation` as ready immediately.
-- Do not treat the generic login page, profile chooser, or marketing page as ready if the jobs surface is not reachable yet.
+- Treat `Session Preparation` as complete only when AMD is signed in.
+- Strong AMD signed-in signals include AMD candidate dashboard, visible signed-in identity, `Log Out`, `Past Job Submittals`, submitted-application table, or a comparable post-login candidate account surface.
+- Do not treat AMD public jobs search, generic login page, profile chooser, marketing page, or the mere presence of searchable jobs as login-ready.
+- If `Returning User Login` or another sign-in entry remains visible, login is not complete.
 
 ## Channel Discovery
 
@@ -103,16 +101,12 @@ apply_enabled: true
 ### Apply Flow
 
 - From a `recommended_apply` AMD job page, use the visible AMD apply entry action.
-- If the AMD apply entry opens an iCIMS `Login`, `GDPR`, or `Enter Your Information` page, treat that page as part of the current AMD apply flow, not as an immediate blocker.
-- While that AMD iCIMS page still shows usable required fields or forward actions such as `Email`, required consent checkboxes, `Next`, or `Continue`, keep completing the visible apply flow.
-- Only stop AMD apply as `blocked` if the flow reaches password entry, verification code, MFA, an active CAPTCHA challenge, or another explicit human-only challenge with no visible usable continuation left.
 - Fill only required fields.
 - For required email fields, use `ycalex1204@gmail.com`.
 - On AMD iCIMS `Enter Your Information` pages, fill the `Email` field with `ycalex1204@gmail.com`, accept the required privacy notice checkbox such as `I accept`, and then use `Next`.
-- If AMD asks `How did you hear about us`, choose the currently visible third option for that field, then continue.
 - Do not mark AMD apply as blocked only because a passive `Protected by hCaptcha` notice is visible; continue while the normal required fields and `Next` action remain usable.
 - Use the project-level resume source when AMD asks for a resume upload.
-- If the current AMD live page is already upload-ready, call `browser_file_upload` directly with the staged resume PDF. Otherwise, use AMD's own visible upload/select-file control until the page becomes upload-ready, then call `browser_file_upload`.
+- Trigger AMD's own upload/select-file control first, then call `browser_file_upload` with the staged resume PDF.
 - After upload, re-read the fresh live page and continue only after AMD shows the resume is selected or accepted.
 - Accept required AMD acknowledgements, policy consents, or terms checkboxes when they are required to proceed.
 - Use AMD's visible safe forward action such as `Next`, `Continue`, `Review`, or `Save and continue` to move through multi-page forms.
@@ -122,5 +116,6 @@ apply_enabled: true
 ### Submission Signal
 
 - Treat the AMD job as `submitted` only after AMD shows an explicit application-success confirmation on the live page.
+- Treat confirmation text such as `Your application was submitted successfully. Thank you for applying.` or a close equivalent as an explicit AMD application-success confirmation and record the current job as `submitted`.
 - If AMD shows the role was already applied to, record `already_applied`.
 - If final submit outcome is ambiguous, record the job as `blocked` with the visible reason.

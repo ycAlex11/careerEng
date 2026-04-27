@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import hashlib
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import uuid
 
 from careereng.utils import ensure_dir, safe_file_stem
 
@@ -46,6 +49,7 @@ def ensure_resume_assets(workspace: Path) -> dict[str, Path]:
     cv_dir = ensure_dir(workspace / "cv")
     templates_dir = ensure_dir(cv_dir / "templates")
     exports_dir = ensure_dir(cv_dir / "exports")
+    history_dir = ensure_dir(cv_dir / "history")
     variants_dir = ensure_dir(cv_dir / "variants")
     template_path = templates_dir / DEFAULT_RESUME_TEMPLATE_NAME
     if not template_path.exists():
@@ -54,6 +58,7 @@ def ensure_resume_assets(workspace: Path) -> dict[str, Path]:
         "cv_dir": cv_dir,
         "templates_dir": templates_dir,
         "exports_dir": exports_dir,
+        "history_dir": history_dir,
         "variants_dir": variants_dir,
         "template_path": template_path,
     }
@@ -320,9 +325,95 @@ def _resolve_template_path(*, workspace: Path, template: str) -> Path:
     return candidate.resolve()
 
 
+def _single_export_pdf_path(exports_dir: Path) -> Path | None:
+    pdfs = sorted(
+        path.resolve()
+        for path in ensure_dir(exports_dir).iterdir()
+        if path.is_file() and path.suffix.lower() == ".pdf"
+    )
+    if len(pdfs) > 1:
+        names = ", ".join(path.name for path in pdfs)
+        raise ResumeExportError(f"multiple resume PDFs found in workspace/cv/exports: {names}")
+    return pdfs[0] if pdfs else None
+
+
 def default_apply_resume_pdf_path(workspace: Path) -> Path:
     assets = ensure_resume_assets(workspace)
+    existing = _single_export_pdf_path(assets["exports_dir"])
+    if existing is not None:
+        return existing.resolve()
     return (assets["exports_dir"] / DEFAULT_APPLY_RESUME_PDF_NAME).resolve()
+
+
+def _default_export_pdf_path(*, exports_dir: Path, markdown_text: str) -> Path:
+    digest = hashlib.sha1(markdown_text.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return exports_dir / f"resume-{stamp}-{digest}.pdf"
+
+
+def _clean_exports_dir(exports_dir: Path) -> None:
+    ensure_dir(exports_dir)
+    for path in exports_dir.iterdir():
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
+def _snapshot_markdown_history_if_changed(*, assets: dict[str, Path], source_path: Path, markdown_text: str) -> None:
+    if source_path.suffix.lower() not in {".md", ".markdown"}:
+        return
+    history_dir = ensure_dir(assets["history_dir"])
+    normalized = str(markdown_text or "")
+    for path in history_dir.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            if path.read_text(encoding="utf-8") == normalized:
+                return
+        except Exception:
+            continue
+    digest = hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = safe_file_stem(source_path.stem or "resume") or "resume"
+    suffix = source_path.suffix.lower() if source_path.suffix else ".md"
+    target = history_dir / f"{stamp}-{digest}-{stem}{suffix}"
+    counter = 2
+    while target.exists():
+        target = history_dir / f"{stamp}-{digest}-{stem}-{counter}{suffix}"
+        counter += 1
+    target.write_text(normalized, encoding="utf-8")
+
+
+def _finalize_export_pair(
+    *,
+    exports_dir: Path,
+    temp_typ_path: Path,
+    temp_pdf_path: Path,
+    final_pdf_path: Path,
+) -> tuple[Path, Path]:
+    final_pdf_path = final_pdf_path.resolve()
+    final_typ_path = final_pdf_path.with_suffix(".typ")
+    if final_pdf_path.parent.resolve() == exports_dir.resolve():
+        _clean_exports_dir(exports_dir)
+    else:
+        ensure_dir(final_pdf_path.parent)
+    shutil.move(str(temp_pdf_path), str(final_pdf_path))
+    shutil.move(str(temp_typ_path), str(final_typ_path))
+    return final_typ_path.resolve(), final_pdf_path.resolve()
+
+
+def _replace_exports_with_pdf(*, exports_dir: Path, source_pdf: Path) -> Path:
+    target = exports_dir / source_pdf.name
+    temp_dir = ensure_dir(exports_dir.parent / f".export_tmp_{uuid.uuid4().hex}")
+    temp_pdf = temp_dir / target.name
+    try:
+        shutil.copy2(source_pdf, temp_pdf)
+        _clean_exports_dir(exports_dir)
+        shutil.move(str(temp_pdf), str(target))
+        return target.resolve()
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _default_resume_source_path(workspace: Path) -> Path | None:
@@ -339,23 +430,21 @@ def _default_resume_source_path(workspace: Path) -> Path | None:
 
 
 def ensure_default_resume_pdf(workspace: Path) -> Path:
-    pdf_path = default_apply_resume_pdf_path(workspace)
-    if pdf_path.exists() and pdf_path.is_file():
-        return pdf_path
+    assets = ensure_resume_assets(workspace)
+    existing = _single_export_pdf_path(assets["exports_dir"])
+    if existing is not None:
+        return existing.resolve()
 
     source_path = _default_resume_source_path(workspace)
     if source_path is None:
         raise ResumeExportError("no current resume source found under workspace/cv/current")
 
     if source_path.suffix.lower() == ".pdf":
-        ensure_dir(pdf_path.parent)
-        shutil.copy2(source_path, pdf_path)
-        return pdf_path.resolve()
+        return _replace_exports_with_pdf(exports_dir=assets["exports_dir"], source_pdf=source_path)
 
     result = export_resume_pdf(
         workspace=workspace,
         markdown_path=source_path,
-        output_path=pdf_path,
     )
     return result.pdf_path.resolve()
 
@@ -376,24 +465,42 @@ def export_resume_pdf(
     if not template_path.exists() or not template_path.is_file():
         raise ResumeExportError(f"template not found: {template_path}")
 
-    stem = safe_file_stem(source_path.stem or "resume") or "resume"
+    markdown_text = _read_text(source_path)
     if output_path is None:
-        pdf_path = assets["exports_dir"] / f"{stem}.pdf"
+        pdf_path = _default_export_pdf_path(exports_dir=assets["exports_dir"], markdown_text=markdown_text)
     else:
-        pdf_path = Path(output_path).expanduser()
+        candidate_output = Path(output_path).expanduser()
+        if not candidate_output.is_absolute() and candidate_output.parent == Path("."):
+            pdf_path = assets["exports_dir"] / candidate_output.name
+        else:
+            pdf_path = candidate_output
         if not pdf_path.is_absolute():
             pdf_path = pdf_path.resolve()
     pdf_path = pdf_path.with_suffix(".pdf")
-    typ_path = pdf_path.with_suffix(".typ")
+    temp_dir = ensure_dir(assets["cv_dir"] / f".export_tmp_{uuid.uuid4().hex}")
+    temp_pdf_path = temp_dir / pdf_path.name
+    temp_typ_path = temp_pdf_path.with_suffix(".typ")
 
-    markdown_text = _read_text(source_path)
     typst_content = convert_markdown_to_typst(markdown_text, fallback_title=source_path.stem or "Resume")
     template_text = _read_text(template_path)
     rendered_typst = render_typst_document(template_text=template_text, content_text=typst_content)
 
-    ensure_dir(typ_path.parent)
-    typ_path.write_text(rendered_typst, encoding="utf-8")
-    compile_typst(typ_path=typ_path, pdf_path=pdf_path)
+    try:
+        temp_typ_path.write_text(rendered_typst, encoding="utf-8")
+        compile_typst(typ_path=temp_typ_path, pdf_path=temp_pdf_path)
+        typ_path, pdf_path = _finalize_export_pair(
+            exports_dir=assets["exports_dir"],
+            temp_typ_path=temp_typ_path,
+            temp_pdf_path=temp_pdf_path,
+            final_pdf_path=pdf_path,
+        )
+        _snapshot_markdown_history_if_changed(
+            assets=assets,
+            source_path=source_path,
+            markdown_text=markdown_text,
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
     return ResumeExportResult(
         template_path=template_path.resolve(),

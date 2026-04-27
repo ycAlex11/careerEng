@@ -1,433 +1,301 @@
-# CareerEng (V1.1)
+# CareerEng
 
-CareerEng is a local CLI assistant for job search, site registration, job retrieval, and browser-driven application workflows.
+`Python 3.11+` · `Local-first` · `Human-in-the-loop` · `Skill-driven browser automation`
 
-## Current Capabilities
+A local AI workspace for job search, company research, application automation, and application tracking.
 
-- Single chat entry through `careereng run -m "..."`
-- Resume upload through `careereng resume upload --file <path>`
-- Resume PDF export through `careereng resume export-pdf --file <path>`
-- Automatic `persona.md` update from resume content
-- Conservative `intent.md` candidate generation with explicit `y/n` confirmation
-- Company search based on `message + intent + project search skills + workspace job skill`
-- Company registration with entry URL resolution and per-site runtime scaffold creation
-- Registered-site retrieval batches that write per-run job data and history
-- Apply continuation on sites whose site skill is `ready` and `apply_enabled: true`
-- Blocked-login recovery through `site_key y` / `site_key n`
-- Report review flow through `careereng report list` and `careereng report review --id <report_id>`
-- Site registry management through `careereng site add/list/activate/deactivate`
-- Batch state inspection and cleanup through `careereng batch-list` and `careereng batch-clear`
+## Welcome to the New Era of AI
+
+CareerEng is built on a broader premise: an effective job search is not only a matching problem, but also an iterative process of self-modeling, labor-market research, company understanding, and execution.
+
+It is a local workspace for understanding target roles, studying target companies, and turning the job-search process into a repeatable AI-assisted system.
+
+CareerEng is a local AI-assisted job-search, application, and application-tracking agent.
+
+It turns a resume into a working job-search profile, helps discover target companies, registers company career sites, runs browser-based search/apply workflows through site-specific AI Skills, and tracks previously submitted applications so every run can report what changed.
+
+```text
+[Resume]
+   -> [Persona]
+   -> [Company Discovery]
+   -> [Site Skills]
+   -> [Browser Automation]
+   -> [Reports]
+```
+
+## What It Does
+
+| Area | Capability |
+| --- | --- |
+| Persona | Builds or updates `persona.md` from your resume and workspace context. |
+| Company Discovery | Uses your resume, persona, intent, and job preferences to find target companies. |
+| Site Registration | Lets you register companies manually or from LLM-generated company candidates. |
+| Site Automation | Runs login, application-status review, job filtering, job retrieval, and apply workflows. |
+| Skills | Keeps common rules in project-level Skills and website-specific behavior in site Skills. |
+| Reports | Summarizes new jobs, submitted jobs, unsubmitted jobs, and reviewed application statuses. |
 
 ## Install
 
+CareerEng requires Python 3.11+.
+
+For normal use:
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
-pip install playwright
 python -m playwright install chromium
-typst --version  # ensure Typst is installed and on PATH
-careereng onboard
 ```
 
-Install Typst separately before using PDF export. Example on macOS:
+For development and tests:
+
+```bash
+pip install -e ".[dev]"
+python -m playwright install chromium
+```
+
+Resume PDF export uses Typst. Install it before using `careereng resume export-pdf`.
 
 ```bash
 brew install typst
+typst --version
 ```
 
-## First-Time Setup
+## Initialize
 
-Run `careereng onboard` once after install.
+Run onboarding once from the project root:
 
-It creates or reuses:
+```bash
+careereng onboard
+```
+
+This creates or reuses:
 
 - `config.toml`
 - `auth.json`
-- `workspace/...`
+- `workspace/`
 
-`careereng onboard` only creates templates. It does not write any real provider API key.
+Add provider API keys to `auth.json`, then adjust `config.toml` as needed. For visible browser automation, keep:
+
+```toml
+[browser]
+headless = false
+browser_name = "chrome"
+```
 
 ## Configuration
 
-After `careereng onboard`, fill in and adjust:
+CareerEng uses two local configuration files:
 
-- `config.toml`
-- `auth.json`
+- `auth.json` stores provider API keys.
+- `config.toml` controls runtime behavior.
 
-Set provider config in `config.toml`:
+Do not commit real API keys. Keep `auth.json` local.
+
+The main `config.toml` sections are:
+
+- `[agent]`: controls non-browser LLM work, including persona generation, company discovery, routing, relatedness checks, and how many company candidates to return.
+- `[browser]`: controls browser automation, including visible/headless mode, browser model, timeouts, retry behavior, phase limits, and site parallelism.
+- `[workspace]` or `[paths]`: controls where local workspace data is stored.
+- `[providers.openai]` / `[providers.openrouter]`: controls OpenAI-compatible provider endpoints and structured-output behavior.
+
+For site-skill development and debugging, prefer:
 
 ```toml
-[workspace]
-path = "./workspace"
-
-[agent]
-default_provider = "openrouter"
-default_model = "openai/gpt-4o-mini"
-max_history_messages = 50
-related_history_k = 6
-relatedness_threshold = 0.7
-site_parallelism = 2
-router_confidence_threshold = 0.75
-router_log_enabled = true
-search_company_top_k = 10
-
 [browser]
 headless = false
-keep_open = false
-timeout_ms = 45000
-slow_mo_ms = 0
-api_base = "https://api.openai.com/v1"
-model = "gpt-5"
-reasoning_effort = "high"
-site_parallelism = 2
-phase_timeout_seconds = 180
-step_timeout_seconds = 30
-max_step_retries = 1
-max_phase_steps = 24
-browser_name = "chrome"
-
-[providers.openrouter]
-api_base = "https://openrouter.ai/api/v1"
-structured_output_mode = "auto"
-
-[providers.openai]
-api_base = "https://api.openai.com/v1"
-structured_output_mode = "auto"
+keep_open = true
+site_parallelism = 1
 ```
 
-Browser notes:
+For regular multi-site runs, `site_parallelism = 2` is a practical default. Increase it only after the active site skills are stable.
 
-- `headless = false` means Playwright will open a visible Chromium window during search/apply flows.
-- If you prefer hidden browser automation, set `headless = true`.
+If you use an OpenAI-compatible proxy or gateway, update the relevant `api_base` values in `[browser]` and `[providers.<name>]`, then put the matching key in `auth.json`.
 
-`structured_output_mode` controls how provider-side JSON output is requested.
-Recommended default is `auto`, which tries `json_schema`, then `json_object`, then falls back to text-repair.
+## Resume Contract
 
-Set provider keys in `auth.json`:
+CareerEng expects one current resume source and one apply-ready PDF.
 
-```json
-{
-  "providers": {
-    "openai": {
-      "api_key": ""
-    },
-    "openrouter": {
-      "api_key": ""
-    }
-  }
-}
+- Current resume source: `workspace/cv/current/`
+- Resume history: `workspace/cv/history/`
+- Apply-ready PDF: `workspace/cv/exports/<one-file>.pdf`
+
+Do not keep multiple PDFs in `workspace/cv/exports/`. The apply flow treats multiple PDFs as ambiguous.
+
+Recommended flow:
+
+```bash
+careereng resume upload --file ./resume.md
+careereng resume export-pdf --file ./resume.md --output resume.cv.pdf
+careereng profile generate
 ```
+
+`resume upload` syncs the resume into the workspace and updates profile context. `resume export-pdf` converts Markdown to PDF through Typst, archives changed Markdown into history, and keeps `workspace/cv/exports/` focused on the current apply PDF.
 
 ## Quick Start
 
-```bash
-careereng onboard
-careereng resume upload --file ./cv.md --session cli:default
-careereng resume export-pdf --file ./cv.md
-careereng run -m "请帮我搜索后端岗位，偏外企" --session cli:default
-# assistant returns company list -> reply: 1 3 5
-careereng run -m "开始检索并投递已注册的公司" --session cli:default
-# if a site blocks for login recovery -> reply: microsoft y
-```
-
-## Resume, Persona, Intent
-
-- Do not manually copy a CV into `workspace/` as the main flow. Use `careereng resume upload --file <path>`.
-- After upload:
-  - the current normalized resume snapshot is stored under `workspace/cv/current/`
-  - previous current versions are archived under `workspace/cv/history/`
-  - a raw source snapshot is also saved under `workspace/profile/sources/`
-- PDF export uses:
-  - `workspace/cv/templates/default.typ` as the default editable Typst template
-  - `workspace/cv/exports/` as the default output directory for `.pdf` and generated `.typ`
-- Your current persona lives at `workspace/profile/persona.md`
-- Your current intent lives at `workspace/intent/intent.md`
-- Your user-owned job preference overlay lives at `workspace/skills/jobs/SKILL.md`
-
-## Company Search, Registration, Retrieval
-
-Company search:
-
-- Trigger through `careereng run -m "..."`
-- The system builds candidates from the current message, `intent.md`, project search skills, and `workspace/skills/jobs/SKILL.md`
-- Search artifacts are written under:
-  - `workspace/search/queries.jsonl`
-  - `workspace/search/web_results.jsonl`
-  - `workspace/search/company_candidates.jsonl`
-  - `workspace/search/company_decisions.jsonl`
-
-Company registration:
-
-- After you reply with company indices such as `1 3 5`, CareerEng resolves each entry URL and registers the site
-- Registration writes:
-  - `workspace/sites/registry.jsonl`
-  - `workspace/sites/<site_id>/site.json`
-  - `workspace/sites/<site_id>/skills/SKILL.md`
-  - `workspace/sites/<site_id>/browser/session.json`
-  - `workspace/sites/<site_id>/browser/user_data/`
-
-Registered-site retrieval and apply:
-
-- Trigger through `careereng run -m "开始检索并投递已注册的公司"`
-- Each successful retrieval run writes:
-  - `workspace/sites/<site_id>/jobs/runs/<batch_id>.jsonl`
-  - `workspace/sites/<site_id>/jobs/history_jobs.json`
-  - `workspace/jobs/batches/<batch_id>.json`
-  - `workspace/jobs/events.jsonl`
-- If a site is blocked for login, reply with `site_key y` after recovery, or `site_key n` to skip it
-
-## CLI Commands
-
-Core commands:
+The normal flow is: initialize, add resume, discover companies, register companies, then run retrieval/apply.
 
 ```bash
 careereng onboard
-careereng run -m "..." --session cli:default
-careereng batch-list --session cli:default
-careereng batch-clear --session cli:default
-careereng viewreport --id profile_report_xxx
+
+# 1. Add resume and generate persona
+careereng resume upload --file ./resume.md
+careereng resume export-pdf --file ./resume.md --output resume.cv.pdf
+careereng profile generate
+
+# 2. Ask for target companies
+careereng run -m "Find the top 10 foreign technology companies that fit my software engineering background"
+
+# 3. Register companies from the returned list by replying with indices
+careereng run -m "1 3 5"
+
+# 4. Run retrieval and apply for active registered sites
+careereng jobs apply
+
+# 5. Generate or inspect the latest job report
+careereng report jobs --batch latest
 ```
 
-Resume commands:
+You can also register a company directly:
 
 ```bash
-careereng resume upload --file ./cv.md --session cli:default
-careereng resume export-pdf --file ./cv.md
+careereng site add "Microsoft" --url https://careers.microsoft.com
 ```
 
-Report commands:
+## Skills
 
-```bash
-careereng report list
-careereng report review --id profile_report_xxx
-```
+CareerEng uses AI Skills as procedural instructions for the agent. Skills are plain Markdown files with YAML front matter.
 
-Route review commands:
+The important layers are:
 
-```bash
-careereng route feedback --event-id route_evt_xxx --correct no --expected-route search --comment "should be search"
-```
+- Project job skill: `skills/search/jobs/SKILL.md`
+- User job preference skill: `workspace/skills/jobs/SKILL.md`
+- Site skill: `skills/search/jobs/sites/<site>/SKILL.md` or `workspace/sites/<site>/skills/SKILL.md`
 
-Site registry commands:
+Priority is site-specific first during a site workflow, then user preferences, then project defaults, then `intent.md`.
 
-```bash
-careereng site add "Microsoft"
-careereng site list --status active
-careereng site deactivate microsoft
-careereng site activate microsoft --url https://careers.microsoft.com
-```
+Project-level job skill defines common behavior:
 
-`careereng batch-clear` clears open batch state by marking unfinished batches as cancelled. It does not kill OS processes.
+- search targets
+- filtering rules
+- matching rules
+- application-status review policy
+- auth recovery signal
+- report-relevant recording rules
 
-## Repository Layout
+Site skills define website-specific behavior:
+
+- how to log in
+- how to review submitted applications
+- how to filter jobs
+- how to detect already-applied jobs
+- how to fill site-specific forms
+- what counts as a successful submission
+
+When adding a new site, use AI to inspect the website and draft the site skill. Keep browser decisions in the skill, not hard-coded in Python.
+
+## Site Workflow
+
+The normal registered-site workflow is:
 
 ```text
-careerEng/
-├─ skills/
-│  ├─ README.md
-│  ├─ resume-sync/SKILL.md
-│  └─ search/
-│     ├─ SKILL.md
-│     ├─ jobs/SKILL.md
-│     └─ people/SKILL.md
-├─ evals/
-│  ├─ relatedness/
-│  │  ├─ few_shot.yaml
-│  │  ├─ evaluator.yaml
-│  │  └─ dataset.jsonl
-│  ├─ router/dataset.jsonl
-│  ├─ profile_extractor/few_shot.yaml
-│  └─ intent_extractor/few_shot.yaml
-├─ careereng/
-│  ├─ cli/
-│  ├─ agent/
-│  ├─ storage/
-│  ├─ tools/
-│  └─ providers/
-└─ workspace/
+session_preparation
+-> application_status_review
+-> channel_discovery
+-> job_filtering
+-> job_retrieval
+-> apply
 ```
 
-## Skill Layers
+`session_preparation` must finish login before later phases run. If a later phase discovers that the session expired or the site requires login again, the workflow returns to `session_preparation` and then resumes the interrupted phase.
 
-Search skill split:
+Human-only steps are intentionally blocked for user takeover:
 
-- `skills/search/SKILL.md`: project-level search orchestration policy
-- `skills/search/jobs/SKILL.md`: project-level job/company retrieval method
-- `workspace/skills/jobs/SKILL.md`: user-level job preference overlay scaffolded by `careereng onboard`; higher priority than `intent.md` during company recommendation
+- password entry
+- MFA
+- verification code
+- CAPTCHA
+- email confirmation
+- ambiguous required answers that cannot be derived from persona/CV/skill context
 
-## Workspace Layout
+## Reports
 
-Run `careereng onboard` once to scaffold the editable workspace files before your first real session.
+Each job batch writes run state and reports under `workspace/`.
 
-```text
-workspace/
-├─ sessions/
-├─ sessions_state/
-├─ chat/
-│  ├─ all.jsonl
-│  └─ daily/YYYY-MM-DD.jsonl
-├─ profile/
-│  ├─ persona.md
-│  ├─ history/
-│  ├─ profile_events.jsonl
-│  ├─ reports/
-│  └─ sources/
-├─ cv/
-│  ├─ current/
-│  ├─ history/
-│  ├─ templates/
-│  │  └─ default.typ
-│  ├─ exports/
-│  └─ variants/
-├─ intent/
-│  ├─ intent.md
-│  ├─ history/
-│  ├─ intent_events.jsonl
-│  └─ reports/
-├─ skills/
-│  └─ jobs/SKILL.md    # user-owned preference overlay, created by `careereng onboard`
-├─ search/
-│  ├─ queries.jsonl
-│  ├─ web_results.jsonl
-│  ├─ company_candidates.jsonl
-│  └─ company_decisions.jsonl
-├─ applications/
-│  ├─ all.jsonl
-│  └─ events.jsonl
-├─ jobs/
-│  ├─ batches/<batch_id>.json
-│  └─ events.jsonl
-├─ router/
-│  ├─ events.jsonl
-│  └─ feedback.jsonl
-├─ sites/
-│  ├─ registry.jsonl
-│  └─ <site_id>/
-│     ├─ site.json
-│     ├─ browser/
-│     │  ├─ session.json
-│     │  └─ user_data/
-│     ├─ jobs/runs/<batch_id>.jsonl
-│     ├─ jobs/history_jobs.json
-│     ├─ jobs/descriptions/<hash>.md
-│     ├─ jobs/features.jsonl
-│     ├─ applications/YYYY-MM-DD.jsonl
-│     ├─ events/all.jsonl
-│     └─ skills/SKILL.md
-└─ runs/daily/YYYY-MM-DD.jsonl
-```
+Important outputs:
 
-## Default Documents
+- Batch state: `workspace/jobs/batches/<batch_id>.json`
+- Per-site run jobs: `workspace/sites/<site>/jobs/runs/<batch_id>.jsonl`
+- Per-site job history: `workspace/sites/<site>/jobs/history_jobs.json`
+- Daily reports: `workspace/reports/jobs/YYYY-MM-DD/`
+- Daily final report: `workspace/reports/jobs/YYYY-MM-DD/final.md`
 
-`profile/persona.md` defaults include:
+Reports summarize:
 
-- `basic.nationality: China`
-- `basic.current_city: Taiyuan`
-- `constraints.visa: none`
-- `constraints.work_auth: china`
+- retrieved jobs
+- new jobs not already in local history
+- new submitted jobs
+- new unsubmitted or filtered jobs
+- application-status review results grouped by status
+- site-level retrieval/apply outcomes
 
-`intent/intent.md` defaults include:
+## Common CLI
 
-- `target_locations: ["China"]`
-- `location_note: "Any city in China is acceptable"`
-- `company_preferences: []`
-- `date_posted_after: <today-30d>`
+| Command | Purpose |
+| --- | --- |
+| `careereng onboard` | Create local config and workspace scaffolding. |
+| `careereng run -m "..."` | Send a normal chat/search/site-management instruction. |
+| `careereng resume upload --file ./resume.md` | Import resume text into the workspace. |
+| `careereng resume export-pdf --file ./resume.md --output resume.cv.pdf` | Convert Markdown resume to the apply-ready PDF. |
+| `careereng profile generate` | Generate or update `persona.md`. |
+| `careereng site add "Microsoft" --url https://careers.microsoft.com` | Register a company career site directly. |
+| `careereng site list --status active` | List active registered sites. |
+| `careereng site deactivate microsoft` | Disable a site without deleting local history. |
+| `careereng site activate microsoft` | Reactivate a registered site. |
+| `careereng jobs apply` | Run retrieval and apply for active registered sites. |
+| `careereng report jobs --batch latest` | Generate or inspect the latest job report. |
+| `careereng batch-list` | List open job batches. |
+| `careereng batch-clear` | Mark stale open batches as cancelled. |
 
-## Resume Sync (V1.1)
-
-- `resume upload` is an explicit profile/intention sync flow.
-- Resume parsing follows `skills/resume-sync/SKILL.md`.
-- Resume parsing does not inject `evals/*/few_shot.yaml` examples.
-- If resume extraction output is non-JSON, system runs one JSON patch repair retry.
-- If persona updates but intent extraction is empty, system generates a fallback intent candidate for `y/n` confirmation.
-- The system extracts and writes a persona patch automatically.
-- The system infers a conservative intent patch candidate.
-- User confirms `y/n` before writing intent patch.
-
-## Relatedness + Reports
-
-- Chat turns are first evaluated for profile/intent relatedness.
-- Only messages above threshold are counted as related.
-- Every 20 related events (profile and intent counted separately) triggers a new report.
-- In review, user marks each item relevant/irrelevant; only relevant items become patch candidates.
-- Final `y/n` decides whether patch is applied to `persona.md` / `intent.md`.
-
-## Site Workflow (V1)
-
-When user selects companies for registration:
-
-- Resolve an entry URL (official careers first, Google fallback)
-- Register/update `workspace/sites/registry.jsonl`
-- Create or reuse `workspace/sites/<site_id>/site.json`
-- Create or reuse `workspace/sites/<site_id>/skills/SKILL.md` with YAML front matter:
-  - `status: draft|ready`
-  - `apply_enabled: true|false`
-- Create or reuse `workspace/sites/<site_id>/browser/session.json`
-- Create or reuse `workspace/sites/<site_id>/browser/user_data/`
-- Do not write `jobs/catalog.jsonl` or `jobs/discoveries/*` during registration
-
-## Registered-Site Retrieve/Apply (V1.1)
-
-- Batch trigger stays in chat: `careereng run -m "开始检索并投递已注册的公司"`
-- The system only auto-applies when the site skill is both:
-  - `status: ready`
-  - `apply_enabled: true`
-- Preflight checks before a site can apply:
-  - site is `active`
-  - `entry_url` exists
-  - site skill exists and is `ready`
-  - browser session is ready
-- If `apply_enabled: false`, the site still runs retrieval only.
-- If session is not ready, the site becomes `blocked_login` and the batch keeps going for other ready sites.
-- Recovery flow:
-  - reply `site_key y` to continue that site
-  - if login browser is opened, finish login, close the site window, then reply `site_key y` again
-  - reply `site_key n` to skip that blocked site
-- First version keeps Chromium visible by default (`[browser].headless = false`) for easier debugging.
-
-## V1.1 Search + Storage Strategy
-
-- Conflict priority: `current message > search skills > intent.md > defaults`
-- Routing strategy:
-  - LLM route decision first (`chat/search/site/jobs_batch` + confidence + params)
-  - High confidence executes directly; medium confidence asks `y/n`; low confidence falls back to normal chat or deterministic detector
-  - Every route decision is logged in `workspace/router/events.jsonl`
-  - User confirmation / rejection is logged in `workspace/router/feedback.jsonl`
-- Search pipeline:
-  - `Extract`: build structured query spec
-  - `Reason`: LLM generates company shortlist from persona + intent + jobs skill
-  - `Select`: user selects company indices for registration
-  - `Locate`: optional Playwright Google lookup for apply channels (careers/workday/greenhouse/lever)
-  - `Calibrate`: low confidence jobs are not auto-applied
-- Search flow modules:
-  - `careereng/agent/search_flow.py`: selection parsing + registration summary
-  - `careereng/agent/channel_locator.py`: apply channel lookup/scoring + official careers优先停止
-- Registration storage policy:
-  - Source of truth: `workspace/sites/registry.jsonl`
-  - Per-site metadata: `workspace/sites/<site_id>/site.json`
-  - Legacy `catalog.jsonl` is seeded into `jobs/history_jobs.json` when history is still empty
-  - Legacy discoveries are marked with `site.json.legacy_discoveries_dirty = true`
-- Job storage policy:
-  - Registration does not write site job results
-  - Each successful retrieval run writes per-site run data to `workspace/sites/<site_id>/jobs/runs/<batch_id>.jsonl`
-  - After `job_retrieval` finishes successfully, that run is merged into `workspace/sites/<site_id>/jobs/history_jobs.json`
-  - Retrieve/apply batch state lives in `workspace/jobs/batches/<batch_id>.json`
-  - Batch event history lives in `workspace/jobs/events.jsonl`
-  - If retrieval succeeds but apply fails, discovered jobs are kept and the batch/site result is marked as "retrieved but not applied"
-
-## Skill Placement Rules
-
-- Put strategy/policy in `skills/`.
-- Put execution/safety/storage in code.
-- Search skills are layered as: core + domain (`jobs` or `people`), where `jobs` also carries preference overlay.
-
-## Evaluate relatedness
+Debug commands:
 
 ```bash
-python scripts/eval_relatedness.py
+careereng batch-debug-create --site amd --batch latest --title "Software Engineer"
+careereng batch-apply --site amd --batch <debug_batch_id> --limit 1
 ```
 
-## Evaluate router
+## Current Site Skills
 
-```bash
-python scripts/eval_router.py
-```
+| Site | Skill Status | Apply |
+| --- | --- | --- |
+| AMD | Ready | Enabled |
+| Microsoft | Ready | Enabled |
+| NVIDIA | Ready | Enabled |
+| Qualcomm | Ready | Enabled |
+| Amazon AWS | Draft / example | Disabled |
+| SAP | Draft / example | Disabled |
+
+## Safety Notes
+
+CareerEng is designed as a human-in-the-loop local assistant, not a blind auto-submit bot.
+
+- Keep `browser.headless = false` while developing or debugging site skills.
+- Review generated site skills before enabling `apply_enabled: true`.
+- Do not store multiple apply PDFs in `workspace/cv/exports/`.
+- Use `careereng batch-clear` to mark stale open batches as cancelled; it does not kill OS browser processes.
+- If a site gets stuck after network instability or page reloads, stop the run and restart from the CLI rather than editing browser state manually.
+
+## Tips
+
+CareerEng is intentionally AI-friendly.
+
+Most behavior is expressed through Markdown Skills, JSONL state, and small Python orchestration modules. If you want to add a new site skill, tune an existing workflow, or change what reports show, it is usually practical to ask an LLM to inspect the current files and make the change with you.
+
+For example, the report layer can be extended to answer questions such as:
+
+- How long does a specific company usually take to respond?
+- How many days pass between first seeing a job, applying, and observing a status change?
+- Which companies reject quickly, keep applications active, or leave them unresolved?
+
+The raw ingredients for this kind of analysis are already recorded across job runs, history files, application reviews, and daily reports. The recommended workflow is to describe the desired report insight in natural language, let an LLM locate the relevant storage files and report code, and then make a small targeted change.

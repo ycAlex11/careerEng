@@ -22,11 +22,20 @@ from careereng.resume.export import default_apply_resume_pdf_path
 from careereng.utils import now_iso
 
 
-SUPPORTED_PHASES = {"session_preparation", "channel_discovery", "job_filtering", "job_retrieval", "apply"}
-DEFAULT_RUN_PHASES = ("session_preparation", "channel_discovery", "job_filtering", "job_retrieval")
+SUPPORTED_PHASES = {
+    "session_preparation",
+    "application_status_review",
+    "channel_discovery",
+    "job_filtering",
+    "job_retrieval",
+    "apply",
+}
+DEFAULT_RUN_PHASES = ("session_preparation", "application_status_review", "channel_discovery")
 GLOBAL_BLOCKED_TOOL_NAMES = {"browser_run_code"}
 SESSION_PREPARATION_BLOCKED_TOOL_NAMES = {"browser_resize"}
 JOB_RETRIEVAL_BLOCKED_TOOL_NAMES = {"browser_navigate"}
+SESSION_PREPARATION_PHASE_TIMEOUT_SECONDS = 420
+APPLICATION_STATUS_REVIEW_PHASE_TIMEOUT_SECONDS = 300
 JOB_FILTERING_PHASE_TIMEOUT_SECONDS = 420
 JOB_RETRIEVAL_PHASE_TIMEOUT_SECONDS = 1500
 JOB_RETRIEVAL_TIMEOUT_SECONDS_PER_PAGE = 180
@@ -201,7 +210,12 @@ class BrowserAutomationService:
 
     def _phase_timeout_seconds(self, phase_slug: str, *, phase_memory: BrowserPhaseMemory | None = None) -> int:
         base = int(self.phase_timeout_seconds or 180)
-        if str(phase_slug or "").strip() == "job_retrieval":
+        normalized_phase = str(phase_slug or "").strip()
+        if normalized_phase == "session_preparation":
+            return max(base, SESSION_PREPARATION_PHASE_TIMEOUT_SECONDS)
+        if normalized_phase == "application_status_review":
+            return max(base, APPLICATION_STATUS_REVIEW_PHASE_TIMEOUT_SECONDS)
+        if normalized_phase == "job_retrieval":
             timeout = max(base, JOB_RETRIEVAL_PHASE_TIMEOUT_SECONDS)
             if isinstance(phase_memory, BrowserPhaseMemory):
                 budget_pages = phase_memory.retrieval_budget_pages(
@@ -211,9 +225,9 @@ class BrowserAutomationService:
                 if budget_pages:
                     timeout = max(timeout, int(budget_pages) * JOB_RETRIEVAL_TIMEOUT_SECONDS_PER_PAGE)
             return timeout
-        if str(phase_slug or "").strip() == "apply":
+        if normalized_phase == "apply":
             return max(base, APPLY_PHASE_TIMEOUT_SECONDS)
-        if str(phase_slug or "").strip() == "job_filtering":
+        if normalized_phase == "job_filtering":
             return max(base, JOB_FILTERING_PHASE_TIMEOUT_SECONDS)
         return base
 
@@ -240,6 +254,10 @@ class BrowserAutomationService:
         schema = BrowserPhaseRuntime.update_phase_memory_tool()
         response_tools.append(schema)
         tool_names.add(str(schema.get("name") or "update_phase_memory"))
+        if phase_slug == "application_status_review":
+            schema = BrowserPhaseRuntime.record_application_reviews_tool()
+            response_tools.append(schema)
+            tool_names.add(str(schema.get("name") or "record_application_reviews"))
         if phase_slug == "job_retrieval":
             schema = BrowserPhaseRuntime.record_jobs_tool()
             response_tools.append(schema)
