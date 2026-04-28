@@ -56,6 +56,7 @@ class AgentLoop:
         site_parallelism: int = 2,
         site_tools: SiteTools,
         browser_runner: Any | None = None,
+        browser_budgets: Any | None = None,
     ):
         self.workspace = workspace
         self.project_root = project_root
@@ -121,6 +122,7 @@ class AgentLoop:
             cv_store=self.cv_store,
             intent_store=self.intent_store,
             site_parallelism=self.site_parallelism,
+            browser_budgets=browser_budgets,
         )
 
     def close(self) -> None:

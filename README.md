@@ -95,7 +95,8 @@ Do not commit real API keys. Keep `auth.json` local.
 The main `config.toml` sections are:
 
 - `[agent]`: controls non-browser LLM work, including persona generation, company discovery, routing, relatedness checks, and how many company candidates to return.
-- `[browser]`: controls browser automation, including visible/headless mode, browser model, timeouts, retry behavior, phase limits, and site parallelism.
+- `[browser]`: controls browser automation, including visible/headless mode, retry behavior, and site parallelism.
+- `[browser.budgets]`: controls browser phase timeouts, step timeouts, max phase steps, and apply-job budgets.
 - `[workspace]` or `[paths]`: controls where local workspace data is stored.
 - `[providers.openai]` / `[providers.openrouter]`: controls OpenAI-compatible provider endpoints and structured-output behavior.
 
@@ -110,7 +111,17 @@ site_parallelism = 1
 
 For regular multi-site runs, `site_parallelism = 2` is a practical default. Increase it only after the active site skills are stable.
 
-If you use an OpenAI-compatible proxy or gateway, update the relevant `api_base` values in `[browser]` and `[providers.<name>]`, then put the matching key in `auth.json`.
+Browser automation uses `[providers.openai].api_base` and `[agent].default_model`; there is no separate browser `api_base` or browser model. If you use an OpenAI-compatible proxy or gateway, update `[providers.openai].api_base`, then put the matching key in `auth.json`.
+
+Common browser budget knobs live under `[browser.budgets]`, for example:
+
+```toml
+[browser.budgets]
+session_preparation_phase_timeout_seconds = 420
+application_status_review_phase_timeout_seconds = 300
+apply_job_phase_timeout_seconds = 3600
+apply_job_timeout_ms = 180000
+```
 
 ## Resume Contract
 

@@ -47,11 +47,8 @@ def workspace_path(project_root: Path) -> Path:
 
 
 def resolve_browser_api_base(config: Any) -> str:
-    browser_base = str(getattr(config.browser, "api_base", "") or "").strip()
     provider_base = str(getattr(config.providers.openai, "api_base", "") or "").strip()
-    if browser_base == "https://api.openai.com/v1" and provider_base and provider_base != browser_base:
-        return provider_base
-    return browser_base or provider_base or "https://api.openai.com/v1"
+    return provider_base or "https://api.openai.com/v1"
 
 
 def build_site_services(
@@ -89,15 +86,16 @@ def build_loop(*, project_root: Path, workspace: Path | None = None) -> tuple[Ag
         site_store=site_store,
         api_base=resolve_browser_api_base(config),
         api_key=str(auth.openai_api_key or ""),
-        model=str(config.browser.model or config.agent.default_model),
+        model=str(config.agent.default_model or "gpt-5"),
         reasoning_effort=str(config.browser.reasoning_effort or "high"),
         headless=bool(config.browser.headless),
         keep_open=bool(config.browser.keep_open),
         timeout_ms=int(config.browser.timeout_ms or 45000),
-        phase_timeout_seconds=int(config.browser.phase_timeout_seconds or 180),
-        step_timeout_seconds=int(config.browser.step_timeout_seconds or 30),
-        max_step_retries=int(config.browser.max_step_retries or 1),
-        max_phase_steps=int(config.browser.max_phase_steps or 24),
+        phase_timeout_seconds=int(config.browser.budgets.phase_timeout_seconds or 180),
+        step_timeout_seconds=int(config.browser.budgets.step_timeout_seconds or 30),
+        max_step_retries=int(config.browser.budgets.max_step_retries or 1),
+        max_phase_steps=int(config.browser.budgets.max_phase_steps or 24),
+        budgets=config.browser.budgets,
         browser_name=str(config.browser.browser_name or "chrome"),
     )
     loop = AgentLoop(
@@ -114,5 +112,6 @@ def build_loop(*, project_root: Path, workspace: Path | None = None) -> tuple[Ag
         site_parallelism=config.agent.site_parallelism,
         site_tools=site_tools,
         browser_runner=browser_runner,
+        browser_budgets=config.browser.budgets,
     )
     return loop, config

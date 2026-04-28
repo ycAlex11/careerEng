@@ -43,16 +43,17 @@ def _project_skill_path(project_root: Path) -> Path:
 def _build_runtime(project_root: Path) -> BrowserPhaseRuntime:
     config = load_config(project_root)
     auth = load_auth(project_root)
+    budgets = config.browser.budgets
     return BrowserPhaseRuntime(
         BrowserRuntimeConfig(
-            api_base=str(getattr(config.browser, "api_base", "") or config.providers.openai.api_base).rstrip("/"),
+            api_base=str(config.providers.openai.api_base or "https://api.openai.com/v1").rstrip("/"),
             api_key=str(auth.openai_api_key or ""),
-            model=str(getattr(config.browser, "model", "") or config.agent.default_model or "gpt-5"),
+            model=str(config.agent.default_model or "gpt-5"),
             reasoning_effort=str(getattr(config.browser, "reasoning_effort", "") or "high"),
-            phase_timeout_seconds=int(getattr(config.browser, "phase_timeout_seconds", 180) or 180),
-            step_timeout_seconds=int(getattr(config.browser, "step_timeout_seconds", 30) or 30),
-            max_step_retries=int(getattr(config.browser, "max_step_retries", 1) or 1),
-            max_phase_steps=int(getattr(config.browser, "max_phase_steps", 24) or 24),
+            phase_timeout_seconds=int(budgets.phase_timeout_seconds or 180),
+            step_timeout_seconds=int(budgets.step_timeout_seconds or 30),
+            max_step_retries=int(budgets.max_step_retries or 1),
+            max_phase_steps=int(budgets.max_phase_steps or 24),
         )
     )
 

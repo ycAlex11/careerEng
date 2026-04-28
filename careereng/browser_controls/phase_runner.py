@@ -18,6 +18,7 @@ from careereng.browser_controls.bridge import MCPToolBridge
 from careereng.browser_controls.prompting import build_phase_prompts, load_text
 from careereng.browser_controls.runtime import BrowserPhaseResult, BrowserPhaseRuntime, BrowserRuntimeConfig
 from careereng.browser_context import BrowserContextRegistry, BrowserContextSession, BrowserPhaseMemory
+from careereng.config.schema import BrowserBudgetsConfig
 from careereng.resume.export import default_apply_resume_pdf_path
 from careereng.utils import now_iso
 
@@ -34,17 +35,6 @@ DEFAULT_RUN_PHASES = ("session_preparation", "application_status_review", "chann
 GLOBAL_BLOCKED_TOOL_NAMES = {"browser_run_code"}
 SESSION_PREPARATION_BLOCKED_TOOL_NAMES = {"browser_resize"}
 JOB_RETRIEVAL_BLOCKED_TOOL_NAMES = {"browser_navigate"}
-SESSION_PREPARATION_PHASE_TIMEOUT_SECONDS = 420
-APPLICATION_STATUS_REVIEW_PHASE_TIMEOUT_SECONDS = 300
-JOB_FILTERING_PHASE_TIMEOUT_SECONDS = 420
-JOB_RETRIEVAL_PHASE_TIMEOUT_SECONDS = 1500
-JOB_RETRIEVAL_TIMEOUT_SECONDS_PER_PAGE = 180
-JOB_RETRIEVAL_TIMEOUT_MAX_PAGES = 10
-JOB_RETRIEVAL_STEP_TIMEOUT_SECONDS = 90
-JOB_RETRIEVAL_MAX_PHASE_STEPS = 96
-APPLY_STEP_TIMEOUT_SECONDS = 300
-APPLY_PHASE_TIMEOUT_SECONDS = 3600
-APPLY_PHASE_MAX_PHASE_STEPS = 240
 
 
 @dataclass(frozen=True)
@@ -93,6 +83,7 @@ class BrowserAutomationService:
         max_step_retries: int,
         max_phase_steps: int,
         browser_name: str,
+        budgets: BrowserBudgetsConfig | None = None,
     ):
         self.project_root = Path(project_root).resolve()
         self.workspace = Path(workspace).resolve()
@@ -101,8 +92,14 @@ class BrowserAutomationService:
         self.keep_open = bool(keep_open)
         self.timeout_ms = int(timeout_ms or 45000)
         self.browser_name = browser_name or "chrome"
-        self.phase_timeout_seconds = int(phase_timeout_seconds or 180)
-        self.max_phase_steps = int(max_phase_steps or 24)
+        self.budgets = budgets or BrowserBudgetsConfig(
+            phase_timeout_seconds=int(phase_timeout_seconds or 180),
+            step_timeout_seconds=int(step_timeout_seconds or 30),
+            max_step_retries=int(max_step_retries or 1),
+            max_phase_steps=int(max_phase_steps or 24),
+        )
+        self.phase_timeout_seconds = int(self.budgets.phase_timeout_seconds or phase_timeout_seconds or 180)
+        self.max_phase_steps = int(self.budgets.max_phase_steps or max_phase_steps or 24)
         self._lock = threading.Lock()
         self._active: dict[str, ActiveSiteRuntime] = {}
         self._browser_context_registry = BrowserContextRegistry(self.workspace)
@@ -112,8 +109,8 @@ class BrowserAutomationService:
             model=model,
             reasoning_effort=reasoning_effort,
             phase_timeout_seconds=self.phase_timeout_seconds,
-            step_timeout_seconds=step_timeout_seconds,
-            max_step_retries=max_step_retries,
+            step_timeout_seconds=int(self.budgets.step_timeout_seconds or step_timeout_seconds or 30),
+            max_step_retries=int(self.budgets.max_step_retries or max_step_retries or 1),
             max_phase_steps=self.max_phase_steps,
         )
         self.phase_runtime: BrowserPhaseRuntime | Any | None = None
@@ -209,34 +206,34 @@ class BrowserAutomationService:
         return True
 
     def _phase_timeout_seconds(self, phase_slug: str, *, phase_memory: BrowserPhaseMemory | None = None) -> int:
-        base = int(self.phase_timeout_seconds or 180)
+        base = int(self.budgets.phase_timeout_seconds or self.phase_timeout_seconds or 180)
         normalized_phase = str(phase_slug or "").strip()
         if normalized_phase == "session_preparation":
-            return max(base, SESSION_PREPARATION_PHASE_TIMEOUT_SECONDS)
+            return max(base, int(self.budgets.session_preparation_phase_timeout_seconds or base))
         if normalized_phase == "application_status_review":
-            return max(base, APPLICATION_STATUS_REVIEW_PHASE_TIMEOUT_SECONDS)
+            return max(base, int(self.budgets.application_status_review_phase_timeout_seconds or base))
         if normalized_phase == "job_retrieval":
-            timeout = max(base, JOB_RETRIEVAL_PHASE_TIMEOUT_SECONDS)
+            timeout = max(base, int(self.budgets.job_retrieval_phase_timeout_seconds or base))
             if isinstance(phase_memory, BrowserPhaseMemory):
                 budget_pages = phase_memory.retrieval_budget_pages(
                     default_page_size=10,
-                    max_pages=JOB_RETRIEVAL_TIMEOUT_MAX_PAGES,
+                    max_pages=int(self.budgets.job_retrieval_timeout_max_pages or 10),
                 )
                 if budget_pages:
-                    timeout = max(timeout, int(budget_pages) * JOB_RETRIEVAL_TIMEOUT_SECONDS_PER_PAGE)
+                    timeout = max(timeout, int(budget_pages) * int(self.budgets.job_retrieval_timeout_seconds_per_page or 180))
             return timeout
         if normalized_phase == "apply":
-            return max(base, APPLY_PHASE_TIMEOUT_SECONDS)
+            return max(base, int(self.budgets.apply_phase_timeout_seconds or base))
         if normalized_phase == "job_filtering":
-            return max(base, JOB_FILTERING_PHASE_TIMEOUT_SECONDS)
+            return max(base, int(self.budgets.job_filtering_phase_timeout_seconds or base))
         return base
 
     def _phase_max_steps(self, phase_slug: str) -> int:
-        base = int(self.max_phase_steps or 24)
+        base = int(self.budgets.max_phase_steps or self.max_phase_steps or 24)
         if str(phase_slug or "").strip() == "job_retrieval":
-            return max(base, JOB_RETRIEVAL_MAX_PHASE_STEPS)
+            return max(base, int(self.budgets.job_retrieval_max_phase_steps or base))
         if str(phase_slug or "").strip() == "apply":
-            return max(base, APPLY_PHASE_MAX_PHASE_STEPS)
+            return max(base, int(self.budgets.apply_max_phase_steps or base))
         return base
 
     def _response_tools_for_phase(self, tools: list[Any], phase_slug: str) -> tuple[list[dict[str, Any]], set[str]]:
@@ -308,12 +305,12 @@ class BrowserAutomationService:
         return staged_path
 
     def _phase_step_timeout_seconds(self, phase_slug: str) -> int:
-        base_timeout = int(self._phase_runtime_config.step_timeout_seconds or 30)
+        base_timeout = int(self.budgets.step_timeout_seconds or self._phase_runtime_config.step_timeout_seconds or 30)
         normalized_phase = str(phase_slug or "").strip()
         if normalized_phase == "job_retrieval":
-            return max(base_timeout, JOB_RETRIEVAL_STEP_TIMEOUT_SECONDS)
+            return max(base_timeout, int(self.budgets.job_retrieval_step_timeout_seconds or base_timeout))
         if normalized_phase == "apply":
-            return max(base_timeout, APPLY_STEP_TIMEOUT_SECONDS)
+            return max(base_timeout, int(self.budgets.apply_step_timeout_seconds or base_timeout))
         return base_timeout
 
     def _persist_apply_carry_forward(

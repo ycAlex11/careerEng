@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from careereng.config.schema import BrowserBudgetsConfig
 from careereng.utils import safe_file_stem
 
 
 class BatchApplyDebugRunner:
-    SESSION_PREPARATION_TIMEOUT_SECONDS = 600
     _TERMINAL_APPLY_STATES = {
         "already_applied",
         "submitted",
@@ -19,6 +19,12 @@ class BatchApplyDebugRunner:
 
     def __init__(self, job_flow: Any):
         self.job_flow = job_flow
+
+    @property
+    def session_preparation_timeout_seconds(self) -> int:
+        budgets = getattr(self.job_flow, "browser_budgets", None)
+        default = BrowserBudgetsConfig().debug_session_preparation_timeout_seconds
+        return int(getattr(budgets, "debug_session_preparation_timeout_seconds", default) or default)
 
     def _load_batch(self, *, batch_id: str, session_id: str) -> dict[str, Any]:
         requested = str(batch_id or "latest").strip() or "latest"
@@ -236,7 +242,7 @@ class BatchApplyDebugRunner:
                 batch_id=batch_id,
                 resume=False,
                 phase_slugs=("session_preparation",),
-                phase_timeout_seconds_override=self.SESSION_PREPARATION_TIMEOUT_SECONDS,
+                phase_timeout_seconds_override=self.session_preparation_timeout_seconds,
             )
             if str(getattr(login_result, "status", "") or "") in {"blocked", "failed"}:
                 updated = flow._browser_result_to_site_row(

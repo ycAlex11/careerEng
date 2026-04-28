@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from careereng.config.schema import BrowserBudgetsConfig
 from careereng.reporting.job_report import generate_job_batch_report
 from careereng.storage.application_store import ApplicationStore
 from careereng.storage.job_store import JobStore
@@ -24,9 +25,6 @@ class JobFlow:
         "job_filtering",
         "job_retrieval",
     )
-    APPLY_JOB_PHASE_TIMEOUT_SECONDS = 3600
-    APPLY_JOB_TIMEOUT_MS = 180000
-    APPLY_SITE_PHASE_BUDGET_FACTOR = 0.8
     AUTH_RECOVERY_PHASE = "session_preparation"
     AUTH_RECOVERY_MARKERS = (
         "auth_required",
@@ -65,6 +63,7 @@ class JobFlow:
         cv_store: Any,
         intent_store: Any,
         site_parallelism: int = 2,
+        browser_budgets: BrowserBudgetsConfig | None = None,
     ):
         self.project_root = project_root
         self.job_store = job_store
@@ -76,6 +75,19 @@ class JobFlow:
         self.cv_store = cv_store
         self.intent_store = intent_store
         self.site_parallelism = max(1, int(site_parallelism or 1))
+        self.browser_budgets = browser_budgets or BrowserBudgetsConfig()
+
+    @property
+    def APPLY_JOB_PHASE_TIMEOUT_SECONDS(self) -> int:
+        return int(self.browser_budgets.apply_job_phase_timeout_seconds)
+
+    @property
+    def APPLY_JOB_TIMEOUT_MS(self) -> int:
+        return int(self.browser_budgets.apply_job_timeout_ms)
+
+    @property
+    def APPLY_SITE_PHASE_BUDGET_FACTOR(self) -> float:
+        return float(self.browser_budgets.apply_site_phase_budget_factor)
 
     def close(self) -> None:
         closer = getattr(self.browser_runner, "close", None)

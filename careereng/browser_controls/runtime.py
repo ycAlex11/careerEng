@@ -146,7 +146,8 @@ class ResponsesClient:
         response_id = ""
         response_status = "completed"
         stream_event_types: list[str] = []
-        stream_client = self.client.with_options(timeout=request_timeout_seconds)
+        with_options = getattr(self.client, "with_options", None)
+        stream_client = with_options(timeout=request_timeout_seconds) if callable(with_options) else self.client
         try:
             with anyio.fail_after(request_timeout_seconds):
                 async with stream_client.responses.stream(**stream_payload) as stream:

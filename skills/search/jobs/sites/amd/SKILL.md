@@ -89,6 +89,18 @@ apply_enabled: true
 - If AMD shows a total count or page label that implies more results, re-check the jobs pagination/footer area before declaring retrieval complete.
 - Finish only when the current page is recorded and no further real AMD next-page or load-more action is available.
 
+## AMD Candidate Profile / Resume Update Handling
+
+- Treat `Candidate Profile - <job>` pages inside `global-external-amd.icims.com/jobs/<job_id>/<slug>/candidate?mode=apply...` as a normal AMD apply step, not as an error.
+- If an AMD apply step reaches `Candidate Profile`, update only the resume unless a required field is explicitly blocking progress.
+- Use `Replace Resume`, `Upload Resume`, `My Computer`, or the closest visible AMD resume upload control to upload the staged resume PDF.
+- Do not proactively change name, phone, address, education, professional experience, or other profile fields.
+- After the resume is selected or accepted, click `Update Profile` and treat it as AMD's safe forward action for the `Candidate Profile` apply step.
+- If `Update Profile` reports a required-field error that cannot be answered from persona, resume, or visible facts, record the job as `blocked` with the visible reason.
+- Do not enter AMD dashboard profile maintenance routes such as `questions?back=dashboard`, `candidate?back=dashboard`, or generic profile-update links just to continue search, review, retrieval, or apply.
+- If a non-apply phase unexpectedly lands on an AMD apply `Candidate Profile - <job>` page, follow this section only if the current task is applying to that job; otherwise return to the phase target page or stop with `blocked`.
+- Do not click accessibility skip links such as `Skip Branding`, `Skip to Main Content`, or `Skip Navigation`; they are not AMD business actions and can trap browser automation. Read and act on the real iCIMS content frame instead.
+
 ## Apply
 
 ### Matching
@@ -105,11 +117,9 @@ apply_enabled: true
 - For required email fields, use `ycalex1204@gmail.com`.
 - On AMD iCIMS `Enter Your Information` pages, fill the `Email` field with `ycalex1204@gmail.com`, accept the required privacy notice checkbox such as `I accept`, and then use `Next`.
 - Do not mark AMD apply as blocked only because a passive `Protected by hCaptcha` notice is visible; continue while the normal required fields and `Next` action remain usable.
-- Use the project-level resume source when AMD asks for a resume upload.
-- Trigger AMD's own upload/select-file control first, then call `browser_file_upload` with the staged resume PDF.
-- After upload, re-read the fresh live page and continue only after AMD shows the resume is selected or accepted.
+- When AMD reaches `Candidate Profile` or resume upload/update UI, follow `AMD Candidate Profile / Resume Update Handling`.
 - Accept required AMD acknowledgements, policy consents, or terms checkboxes when they are required to proceed.
-- Use AMD's visible safe forward action such as `Next`, `Continue`, `Review`, or `Save and continue` to move through multi-page forms.
+- Use AMD's visible safe forward action such as `Next`, `Continue`, `Review`, `Save and continue`, or apply-step `Update Profile` to move through multi-page forms.
 - Do not treat clicking `Next`, `Continue`, or `Submit` as completion by itself; always re-read the fresh live page.
 - On the final confirmation page for a `recommended_apply` job, use the final submit action.
 
