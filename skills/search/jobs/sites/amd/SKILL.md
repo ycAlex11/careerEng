@@ -2,7 +2,7 @@
 id: site-amd
 name: AMD Site Skill
 version: v1
-updated_at: '2026-04-28'
+updated_at: '2026-05-02'
 scope: site
 site_key: amd
 status: ready
@@ -30,6 +30,13 @@ apply_enabled: true
 - Strong AMD signed-in signals include AMD candidate dashboard, visible signed-in identity, `Log Out`, `Past Job Submittals`, submitted-application table, or a comparable post-login candidate account surface.
 - Do not treat AMD public jobs search, generic login page, profile chooser, marketing page, or the mere presence of searchable jobs as login-ready.
 - If `Returning User Login` or another sign-in entry remains visible, login is not complete.
+
+### Login Entry Boundaries
+
+- `Session Preparation` is the normal place to establish AMD login.
+- During AMD search phases (`Channel Discovery`, `Job Filtering`, and `Job Retrieval`), do not click `Returning User Login`, `Return to Login`, `Sign In`, or other account login entries.
+- During search phases, if the current page is already a real AMD jobs-search surface, continue the search work even if a header login link is visible.
+- During search phases, if login is unexpectedly required before jobs can be searched, stop the phase with `blocked` instead of starting a new login flow.
 
 ## Channel Discovery
 
@@ -116,6 +123,12 @@ apply_enabled: true
 - Fill only required fields.
 - For required email fields, use `ycalex1204@gmail.com`.
 - On AMD iCIMS `Enter Your Information` pages, fill the `Email` field with `ycalex1204@gmail.com`, accept the required privacy notice checkbox such as `I accept`, and then use `Next`.
+- If an apply step requires login, first use a visible `LinkedIn`, `Continue with LinkedIn`, remembered LinkedIn account, or equivalent one-click LinkedIn continuation.
+- Do not click a public/header `Returning User Login` link during apply when it belongs to AMD search chrome, marketing chrome, or a generic account entry outside the current job's iCIMS apply flow.
+- The only acceptable `Returning User Login` click during apply is a single click on the current job's iCIMS apply-login bridge, and only when it clearly belongs to the same job being applied to.
+- After that single current-job apply-login bridge attempt, continue only if AMD reaches a normal apply form, a dashboard/past-submittal status for the same job, a `submit_apply` page, or an explicit submitted/already-applied state.
+- If AMD reaches `login.icims.com/u/login/password`, a visible password field, MFA, verification code, CAPTCHA, email confirmation, or any human-only login challenge with no visible LinkedIn continuation, record the current job as `blocked` with `apply_state = blocked_login_password_required`, then move to the next saved job.
+- Do not loop through AMD identifier/email/password login screens for the same job.
 - Do not mark AMD apply as blocked only because a passive `Protected by hCaptcha` notice is visible; continue while the normal required fields and `Next` action remain usable.
 - When AMD reaches `Candidate Profile` or resume upload/update UI, follow `AMD Candidate Profile / Resume Update Handling`.
 - Accept required AMD acknowledgements, policy consents, or terms checkboxes when they are required to proceed.

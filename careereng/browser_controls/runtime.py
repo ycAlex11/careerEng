@@ -27,7 +27,7 @@ class BrowserRuntimeConfig:
     model: str
     reasoning_effort: str = "high"
     phase_timeout_seconds: int = 180
-    step_timeout_seconds: int = 30
+    step_timeout_seconds: int = 90
     max_step_retries: int = 1
     max_phase_steps: int = 24
 
@@ -269,6 +269,10 @@ class BrowserPhaseRuntime:
         "browser_snapshot",
         "browser_console_messages",
     )
+    NO_PROGRESS_INTERNAL_TOOLS = (
+        "request_context",
+        "update_phase_memory",
+    )
     JOB_RETRIEVAL_EMPTY_EVALUATE_MAX_SAME_PAGE_ATTEMPTS_WITH_CARRY_FORWARD = 25
     JOB_RETRIEVAL_EMPTY_EVALUATE_MAX_SAME_PAGE_ATTEMPTS_WITHOUT_CARRY_FORWARD = 100
     JOB_RETRIEVAL_PAGE_ACTION_WAIT_SECONDS = 5.0
@@ -313,6 +317,11 @@ class BrowserPhaseRuntime:
         return normalized in BrowserPhaseRuntime.OBSERVATION_ONLY_TOOLS
 
     @staticmethod
+    def _is_no_progress_internal_tool(name: str) -> bool:
+        normalized = str(name or "").strip().lower()
+        return normalized in BrowserPhaseRuntime.NO_PROGRESS_INTERNAL_TOOLS
+
+    @staticmethod
     def _observation_guard_applies(
         *,
         phase: PhasePrompt,
@@ -330,6 +339,44 @@ class BrowserPhaseRuntime:
             return False
         return True
 
+    @staticmethod
+    def _same_page_evaluate_guard_applies(
+        *,
+        phase: PhasePrompt,
+        same_page_evaluate_streak: int,
+        current_url: str,
+        last_evaluate_url: str,
+        apply_upload_requires_observation: bool,
+        apply_upload_modal_unresolved: bool,
+    ) -> bool:
+        if phase.slug == "job_retrieval":
+            return False
+        if same_page_evaluate_streak < 2:
+            return False
+        if last_evaluate_url and current_url and current_url != last_evaluate_url:
+            return False
+        if phase.slug == "apply" and (apply_upload_requires_observation or apply_upload_modal_unresolved):
+            return False
+        return True
+
+    @staticmethod
+    def _no_progress_internal_guard_applies(
+        *,
+        phase: PhasePrompt,
+        no_progress_internal_streak: int,
+        current_url: str,
+        last_no_progress_internal_url: str,
+        apply_upload_requires_observation: bool,
+        apply_upload_modal_unresolved: bool,
+    ) -> bool:
+        if no_progress_internal_streak < 2:
+            return False
+        if last_no_progress_internal_url and current_url and current_url != last_no_progress_internal_url:
+            return False
+        if phase.slug == "apply" and (apply_upload_requires_observation or apply_upload_modal_unresolved):
+            return False
+        return True
+
     @classmethod
     def _filter_tools_for_observation_guard(
         cls, response_tools: list[dict[str, Any]], available_tool_names: set[str]
@@ -340,6 +387,41 @@ class BrowserPhaseRuntime:
             tool_name = str(tool.get("name") or "").strip()
             if cls._is_observation_tool(tool_name):
                 filtered_names.discard(tool_name)
+                continue
+            filtered_tools.append(tool)
+        return filtered_tools, filtered_names
+
+    @staticmethod
+    def _filter_tool_by_name(
+        response_tools: list[dict[str, Any]], available_tool_names: set[str], blocked_tool_name: str
+    ) -> tuple[list[dict[str, Any]], set[str]]:
+        blocked = str(blocked_tool_name or "").strip().lower()
+        if not blocked:
+            return response_tools, available_tool_names
+        filtered_tools: list[dict[str, Any]] = []
+        filtered_names = set(available_tool_names)
+        filtered_names.discard(blocked)
+        for tool in response_tools:
+            tool_name = str(tool.get("name") or "").strip().lower()
+            if tool_name == blocked:
+                continue
+            filtered_tools.append(tool)
+        return filtered_tools, filtered_names
+
+    @staticmethod
+    def _filter_tools_by_names(
+        response_tools: list[dict[str, Any]], available_tool_names: set[str], blocked_tool_names: set[str]
+    ) -> tuple[list[dict[str, Any]], set[str]]:
+        blocked = {str(name or "").strip().lower() for name in blocked_tool_names if str(name or "").strip()}
+        if not blocked:
+            return response_tools, available_tool_names
+        filtered_tools: list[dict[str, Any]] = []
+        filtered_names = set(available_tool_names)
+        for name in blocked:
+            filtered_names.discard(name)
+        for tool in response_tools:
+            tool_name = str(tool.get("name") or "").strip().lower()
+            if tool_name in blocked:
                 continue
             filtered_tools.append(tool)
         return filtered_tools, filtered_names
@@ -441,6 +523,28 @@ class BrowserPhaseRuntime:
             "Do not call another observation-only browser tool right now. "
             "Use the existing page evidence and skill guidance to either take the next safe browser action or finish the phase with phase_result."
             f"{phase_tail}"
+        )
+
+    @staticmethod
+    def _same_page_evaluate_guard_message(*, phase: PhasePrompt, current_url: str) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        return (
+            f"You have evaluated the same page multiple times during `{phase.slug}` without a page-changing action or state update.\n"
+            f"{url_line}"
+            "Do not call browser_evaluate again right now. Use the current page evidence, active skill guidance, "
+            "and available phase tools to take one recovery step: use an official browser action, navigate/back/re-enter the flow, "
+            "record the observed state with the phase recording tool if available, or finish the phase as blocked/done with phase_result."
+        )
+
+    @staticmethod
+    def _no_progress_internal_guard_message(*, phase: PhasePrompt, current_url: str) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        return (
+            f"You have repeatedly used non-browser context or memory tools during `{phase.slug}` without changing the page or writing terminal state.\n"
+            f"{url_line}"
+            "Do not call request_context or update_phase_memory again right now. Use the current live page, active skills, and phase memory to "
+            "take a concrete recovery step: use an official browser action, go back/re-enter the flow, record the terminal state with the phase-specific "
+            "recording tool if available, or finish the phase as blocked/done with phase_result."
         )
 
     @staticmethod
@@ -695,6 +799,8 @@ class BrowserPhaseRuntime:
                 "type": "string",
                 "enum": ["active", "inactive", "rejected", "closed", "withdrawn", "unknown", "blocked"],
             },
+            "application_review_status_raw": {"type": "string"},
+            "application_review_stage": {"type": "string"},
         }
         return {
             "type": "function",
@@ -2044,6 +2150,10 @@ class BrowserPhaseRuntime:
         current_url = str(entry_url or "")
         observation_streak = 0
         last_observation_url = ""
+        same_page_evaluate_streak = 0
+        last_evaluate_url = ""
+        no_progress_internal_streak = 0
+        last_no_progress_internal_url = ""
         recorded_job_ids: set[str] = set()
         new_job_ids: set[str] = set()
         recorded_page_fingerprints: set[str] = set()
@@ -2105,6 +2215,40 @@ class BrowserPhaseRuntime:
             if observation_guard_active:
                 active_tools, active_tool_names = self._filter_tools_for_observation_guard(active_tools, active_tool_names)
                 loop_context_items.append(self._context_item(self._observation_guard_message(phase=phase, current_url=current_url)))
+            same_page_evaluate_guard_active = self._same_page_evaluate_guard_applies(
+                phase=phase,
+                same_page_evaluate_streak=same_page_evaluate_streak,
+                current_url=current_url,
+                last_evaluate_url=last_evaluate_url,
+                apply_upload_requires_observation=apply_upload_requires_observation,
+                apply_upload_modal_unresolved=apply_upload_modal_unresolved,
+            )
+            if same_page_evaluate_guard_active:
+                active_tools, active_tool_names = self._filter_tool_by_name(
+                    active_tools,
+                    active_tool_names,
+                    "browser_evaluate",
+                )
+                loop_context_items.append(
+                    self._context_item(self._same_page_evaluate_guard_message(phase=phase, current_url=current_url))
+                )
+            no_progress_internal_guard_active = self._no_progress_internal_guard_applies(
+                phase=phase,
+                no_progress_internal_streak=no_progress_internal_streak,
+                current_url=current_url,
+                last_no_progress_internal_url=last_no_progress_internal_url,
+                apply_upload_requires_observation=apply_upload_requires_observation,
+                apply_upload_modal_unresolved=apply_upload_modal_unresolved,
+            )
+            if no_progress_internal_guard_active:
+                active_tools, active_tool_names = self._filter_tools_by_names(
+                    active_tools,
+                    active_tool_names,
+                    set(self.NO_PROGRESS_INTERNAL_TOOLS),
+                )
+                loop_context_items.append(
+                    self._context_item(self._no_progress_internal_guard_message(phase=phase, current_url=current_url))
+                )
             base_items: list[dict[str, Any]] = [
                 {"role": "system", "content": self._system_prompt(site_name=site_name, phase=phase)},
                 {
@@ -2291,6 +2435,32 @@ class BrowserPhaseRuntime:
                         status="failed",
                         reason_tag="observation_limit",
                         summary="repeated observation-only tool calls on the same page exceeded limits",
+                        current_url=current_url,
+                        step_count=step_count,
+                        trace_ref=trace_ref,
+                        raw_text=output_text,
+                        recorded_count=len(recorded_job_ids),
+                        new_count=len(new_job_ids),
+                    )
+
+                if same_page_evaluate_guard_active and name == "browser_evaluate" and name not in active_tool_names:
+                    return BrowserPhaseResult(
+                        status="failed",
+                        reason_tag="same_page_evaluate_limit",
+                        summary="repeated browser_evaluate calls on the same page exceeded limits without progress",
+                        current_url=current_url,
+                        step_count=step_count,
+                        trace_ref=trace_ref,
+                        raw_text=output_text,
+                        recorded_count=len(recorded_job_ids),
+                        new_count=len(new_job_ids),
+                    )
+
+                if no_progress_internal_guard_active and self._is_no_progress_internal_tool(name) and name not in active_tool_names:
+                    return BrowserPhaseResult(
+                        status="failed",
+                        reason_tag="no_progress_internal_limit",
+                        summary="repeated non-browser context or memory tool calls exceeded limits without page action or terminal state update",
                         current_url=current_url,
                         step_count=step_count,
                         trace_ref=trace_ref,
@@ -2640,6 +2810,13 @@ class BrowserPhaseRuntime:
                             latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
                             staged_resume_pdf_path=staged_resume_pdf_path,
                         )
+                        if no_progress_internal_streak > 0 and (
+                            not last_no_progress_internal_url or current_url == last_no_progress_internal_url
+                        ):
+                            no_progress_internal_streak += 1
+                        else:
+                            no_progress_internal_streak = 1
+                        last_no_progress_internal_url = current_url
                         history_items = [tool_feedback]
                         retry_requested = True
                         break
@@ -2847,6 +3024,28 @@ class BrowserPhaseRuntime:
                     else:
                         observation_streak = 0
                         last_observation_url = ""
+                    if name == "browser_evaluate":
+                        if same_page_evaluate_streak > 0 and (
+                            not last_evaluate_url or current_url == last_evaluate_url
+                        ):
+                            same_page_evaluate_streak += 1
+                        else:
+                            same_page_evaluate_streak = 1
+                        last_evaluate_url = current_url
+                    elif not is_observation_tool:
+                        same_page_evaluate_streak = 0
+                        last_evaluate_url = ""
+                    if self._is_no_progress_internal_tool(name):
+                        if no_progress_internal_streak > 0 and (
+                            not last_no_progress_internal_url or current_url == last_no_progress_internal_url
+                        ):
+                            no_progress_internal_streak += 1
+                        else:
+                            no_progress_internal_streak = 1
+                        last_no_progress_internal_url = current_url
+                    else:
+                        no_progress_internal_streak = 0
+                        last_no_progress_internal_url = ""
                     latest_page_key = ""
                     if phase.slug == "job_retrieval":
                         latest_page_key = self._job_retrieval_page_fingerprint(

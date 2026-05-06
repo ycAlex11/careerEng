@@ -136,6 +136,14 @@ Record each visible application with its job title, job or application URL, the 
 The site job identifier may be a job id, requisition number, posting id, PID, or equivalent site-owned value.
 Do not overwrite local project-generated `job_id` or `canonical_job_id` with a site job identifier.
 
+For every site, treat application status as a lifecycle record:
+- Write `application_review_status` as the normalized cross-site bucket: `active`, `inactive`, `rejected`, `closed`, `withdrawn`, `unknown`, or `blocked`.
+- Write `application_review_status_raw` as the exact website-visible status text whenever it is visible, such as `Application Received`, `Application in Review`, `In Process`, `Submitted`, `Inactive`, `Not Selected`, or `Interview Scheduled`.
+- If no row-level status text is visible but the current tab or section has clear meaning, use that tab or section label as `application_review_status_raw`, such as `Submitted` or `Inactive`.
+- Write `application_review_stage` only when the page gives explicit lifecycle evidence. Use concise snake_case values such as `received`, `resume_review`, `in_process`, `assessment`, `interview`, `offer`, `rejected_before_interview`, `rejected_after_interview`, `withdrawn`, `closed`, or `unknown`.
+- Do not infer an interview from vague active states. For example, `In Process` means `application_review_stage = in_process` unless the page explicitly mentions interview, assessment, phone screen, recruiter screen, onsite, offer, or another concrete interview-stage signal.
+- Do not guess rejection stage. If the page only says rejected / not selected, record the raw status and normalized `rejected`; use `rejected_after_interview` only when the page or known application timeline clearly shows an interview happened before the rejection.
+
 ### Status Values
 
 Normalize website-visible application status into one of these review statuses:

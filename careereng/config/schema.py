@@ -22,11 +22,11 @@ class AgentConfig:
 @dataclass
 class BrowserBudgetsConfig:
     phase_timeout_seconds: int = 180
-    step_timeout_seconds: int = 30
+    step_timeout_seconds: int = 90
     max_step_retries: int = 1
     max_phase_steps: int = 24
     session_preparation_phase_timeout_seconds: int = 420
-    application_status_review_phase_timeout_seconds: int = 300
+    application_status_review_phase_timeout_seconds: int = 600
     job_filtering_phase_timeout_seconds: int = 420
     job_retrieval_phase_timeout_seconds: int = 1500
     job_retrieval_timeout_seconds_per_page: int = 180

@@ -74,15 +74,18 @@ apply_enabled: true
 - From the signed-in Qualcomm candidate flow, open the header avatar / account-name dropdown and choose `Profile`.
 - From `Profile`, choose `Dashboard`.
 - In `Dashboard`, open `Applications`.
-- Inspect `Submitted` once, then inspect `Inactive` once.
+- Inspect `Submitted` first. Do not inspect `Inactive` until the visible `Submitted` rows have been recorded.
 - An empty Qualcomm tab, such as `Inactive 0`, counts as reviewed.
 - For each visible application row in `Submitted`, record the application with `application_review_status = active` unless the row itself shows a more specific terminal state.
 - For each visible application row in `Inactive`, record the application with `application_review_status = inactive` unless the row itself clearly says `rejected`, `closed`, or `withdrawn`.
 - Record the visible job title, the best available Qualcomm job/application URL, and any visible Qualcomm job number, requisition id, posting id, or application id as `site_job_id`.
+- Call `record_application_reviews` immediately after reading the current visible page of a tab. Do not carry rows across tab switches.
 - If the current Qualcomm tab shows pagination, `Next`, `Show more`, or `Load more`, continue only while the visible application rows are still on or after `2026-04-10`, or while no reliable application date has been found yet.
 - If a visible row is older than `2026-04-10` and the tab appears sorted newest first, stop that tab and move to the next required tab.
-- After both `Submitted` and `Inactive` have been reviewed, call `record_application_reviews` once with the collected rows.
-- After `record_application_reviews` succeeds, immediately finish `Application Status Review` with `phase_result done`.
+- After all visible in-window `Submitted` rows have been recorded, treat `Submitted` as complete and do not switch back to it.
+- Then inspect `Inactive` once. If `Inactive` is empty, treat it as complete without recording an empty payload.
+- If `Inactive` has visible in-window rows, call `record_application_reviews` immediately after reading the current visible page of `Inactive`.
+- After both `Submitted` and `Inactive` are complete, immediately finish `Application Status Review` with `phase_result done`.
 
 ### Status Mapping
 
@@ -93,7 +96,7 @@ apply_enabled: true
 
 ### Completion Or Blocked
 
-- End `Application Status Review` only after both `Submitted` and `Inactive` have been checked and the review rows have been recorded.
+- End `Application Status Review` only after `Submitted` and `Inactive` have both been checked, and every visible in-window row from each non-empty tab has already been recorded through `record_application_reviews`.
 - If `Profile`, `Dashboard`, `Submitted`, or `Inactive` is not visible after login-ready navigation, refresh once and re-check the same path before stopping.
 - If Qualcomm returns to sign-in, password entry, MFA, CAPTCHA, verification, or another human-only challenge, stop with `blocked`.
 
@@ -103,6 +106,8 @@ apply_enabled: true
 - Do not create history rows for dashboard applications that are not already in local history; just record them through `record_application_reviews`.
 - Do not mark a `Submitted` application as rejected or inactive unless Qualcomm explicitly shows that terminal status.
 - Do not skip `Inactive`; it is the source of truth for older or no-longer-active applications.
+- Do not wait until both tabs are reviewed before calling `record_application_reviews`; record the current tab/page immediately.
+- Do not carry a collected list of `Submitted` rows while switching to `Inactive`.
 - Do not switch back to `Submitted` after it has already been reviewed once.
 - Do not switch back to `Inactive` after it has already been reviewed once.
 - Do not re-check either tab after `record_application_reviews` has succeeded.
@@ -167,15 +172,17 @@ apply_enabled: true
 ### Matching Override
 
 - Open the Qualcomm job URL first, then use the current live page's Qualcomm match signal as the application gate.
-- Only apply to Qualcomm roles labeled `Strong Match` or `Good Match`.
+- The Qualcomm match gate is mandatory and exclusive: only `Strong Match` or `Good Match` allows the job to continue toward apply.
 - After opening the Qualcomm job URL, first make sure the actual job content has appeared on that same job page. A header-only shell, `Single Position` shell, generic welcome text, or page without the job's match label / apply entry / real job details is not ready for a match decision.
 - If the job page is not ready yet, stay on that same job URL and re-read the live page; do not mark the job `filtered_out`, do not mark it failed, and do not move to another job from a header-only or partial page.
-- Make the match decision from the job detail page or the first apply-entry page where the Qualcomm match signal is visible.
-- When a visible Qualcomm match signal is `Strong Match` or `Good Match`, use it as the decision to continue the live application flow.
-- On a Qualcomm job-detail page, if `Strong Match` or `Good Match` is visible and the same live page also shows `Apply Now`, click that same page's `Apply Now` before writing any non-terminal `recommended_apply` / `ready_to_start_apply` update.
-- Do not call `update_jobs` only to record `recommended_apply` while `Apply Now` is already available on the same live page; that intermediate record can wait until the job reaches a real terminal result.
+- Make the match decision from the current live job detail page, or from the first apply-entry page only if that page visibly carries the Qualcomm match signal for the same job.
+- If the current live page shows `Strong Match` or `Good Match`, record that exact label in phase memory for the current job URL before clicking `Apply Now`.
+- If the current live page shows any other match label, immediately write `update_jobs` with `decision_status = filtered_out`, `application_status = filtered_out`, `apply_state = terminal_filtered_out`, `decision_rule_name = qualcomm_match_label_gate`, `decision_rule_source = live_page`, `match_label` set to the observed label, `fit_apply = false`, and a `fit_reason` that the Qualcomm match gate rejected the role.
+- If the current live page shows no Qualcomm match label after the job content is ready, immediately write `update_jobs` with `decision_status = filtered_out`, `application_status = filtered_out`, `apply_state = terminal_filtered_out`, `decision_rule_name = qualcomm_match_label_gate`, `decision_rule_source = live_page`, `match_label = ""`, `fit_apply = false`, and `fit_reason = "No visible Qualcomm Strong Match or Good Match label on the live job page."`
+- Missing, hidden, unclear, or unknown Qualcomm match signals all mean `filtered_out`; do not use persona, CV, JD scoring, title relevance, or the presence of `Apply Now` as a fallback.
+- Do not click `Apply Now` unless the current job URL already has a phase-memory confirmation that the live Qualcomm match label is exactly `Strong Match` or `Good Match`.
 - When the current Qualcomm job reaches `submitted`, `already_applied`, `filtered_out`, or `blocked`, write one final `update_jobs` record that includes the observed `match_label`, decision, terminal application status, and any confirmed job id / job number.
-- If the current Qualcomm role does not show a clear `Strong Match` or `Good Match` signal at that decision point, mark it `filtered_out` and move on.
+- A terminal `submitted` record is valid only when it includes `match_label` or `site_match_signal_raw` with `Strong Match` or `Good Match` for the same current job.
 - Once the current Qualcomm job has already been marked `recommended_apply` from a visible `Strong Match` or `Good Match` signal, do not reverse it to `filtered_out` later just because a deeper apply form page no longer shows the match label in the current snapshot.
 - After `recommended_apply` is established for the current Qualcomm job, the remaining apply pages are form-completion and submission pages, not a new match-gating step.
 - Do not fall back to the shared project matching rule for Qualcomm when the live Qualcomm match signal is absent, unclear, or weaker than `Good Match`.
@@ -189,6 +196,7 @@ apply_enabled: true
 - For work authorization or legal right to work in China questions, answer `Yes`.
 - If the Qualcomm page already shows an acceptable value in a required field, keep it and move on instead of rewriting it.
 - After entering the Qualcomm apply form for a `recommended_apply` job, first satisfy visible required fields and visible validation errors, then continue toward the final submit step.
+- Before clicking `Submit application`, confirm the current job URL still has phase-memory proof that the Qualcomm match gate passed with `Strong Match` or `Good Match`.
 - Do not treat a click on `Submit application` as completion by itself.
 - After any final submit click, immediately re-read the fresh live page and verify whether Qualcomm shows an explicit application-success confirmation.
 - If the form is still open, the page still shows required fields, or Qualcomm shows validation errors after the submit click, the current job is not finished yet; keep working that same job instead of moving on.

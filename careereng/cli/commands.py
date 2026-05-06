@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +17,12 @@ from careereng.core.runtime import build_loop as runtime_build_loop
 from careereng.core.runtime import build_site_services as runtime_build_site_services
 from careereng.core.runtime import project_root_from_cwd, workspace_path as runtime_workspace_path
 from careereng.core.workspace_bootstrap import bootstrap_workspace
-from careereng.core.workspace_manager import dispatch_manager_message, serve_workspace_manager
+from careereng.core.workspace_manager import (
+    dispatch_manager_message,
+    serve_workspace_manager,
+    shutdown_workspace_manager,
+    start_manager_jobs_batch,
+)
 from careereng.resume.export import ResumeExportError, export_resume_pdf as export_resume_pdf_file
 from careereng.reporting.job_report import generate_job_batch_report
 from careereng.storage.job_store import JobStore
@@ -41,6 +50,7 @@ app.add_typer(site_app, name="site")
 
 PROFILE_GENERATE_MESSAGE = "请根据当前 workspace 中已有的简历、profile sources 和对话信息，生成或更新用户画像 persona.md。"
 JOBS_APPLY_MESSAGE = "检索投递已注册的公司"
+JOBS_REVIEW_STATUS_MESSAGE = "检查已投递岗位状态"
 
 
 def _project_root() -> Path:
@@ -121,7 +131,7 @@ def _emit_phase_progress(
     session_id: str,
     baseline_batch_ids: set[str],
     state: dict[str, Any],
-) -> None:
+) -> int:
     job_store = JobStore(workspace)
     batch_id = str(state.get("batch_id") or "")
     if not batch_id:
@@ -133,7 +143,7 @@ def _emit_phase_progress(
                 batch_id = candidate
                 break
     if not batch_id:
-        return
+        return 0
     batch = job_store.load_batch(batch_id)
     turn_id = str(state.get("turn_id") or batch.get("turn_id") or "")
     if turn_id:
@@ -168,6 +178,7 @@ def _emit_phase_progress(
     for _, line, key in pending:
         seen.add(key)
         typer.echo(line)
+    return len(pending)
 
 
 def _dispatch_message_with_progress(*, message: str, session: str) -> str:
@@ -212,6 +223,273 @@ def _dispatch_message_with_progress(*, message: str, session: str) -> str:
     if isinstance(error, BaseException):
         raise error
     return str(result.get("reply") or "")
+
+
+_BATCH_MONITOR_DONE_STATUSES = {"completed", "partial_completed", "failed", "cancelled", "waiting_user"}
+_BATCH_MONITOR_HEARTBEAT_SECONDS = 60.0
+
+
+def _format_elapsed(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    minutes, remainder = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes}m"
+    if minutes:
+        return f"{minutes}m{remainder}s"
+    return f"{remainder}s"
+
+
+def _batch_report_paths(workspace: Path, batch: dict[str, Any]) -> tuple[Path | None, Path | None]:
+    batch_id = str(batch.get("batch_id") or "")
+    report_date = str(batch.get("created_at") or "")[:10]
+    if not batch_id or not report_date:
+        return None, None
+    report_dir = workspace / "reports" / "jobs" / report_date
+    return report_dir / f"{batch_id}.md", report_dir / "final.md"
+
+
+def _format_active_batch_work(batch: dict[str, Any]) -> str:
+    operation = str(batch.get("operation") or "job_search")
+    apply_requested = bool(batch.get("apply_requested"))
+    sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+    active: list[str] = []
+    for site_key in sorted(sites.keys()):
+        row = sites.get(site_key)
+        if not isinstance(row, dict):
+            continue
+        status = str(row.get("status") or "")
+        retrieve = row.get("retrieve") if isinstance(row.get("retrieve"), dict) else {}
+        apply = row.get("apply") if isinstance(row.get("apply"), dict) else {}
+        retrieve_status = str(retrieve.get("status") or "")
+        apply_status = str(apply.get("status") or "")
+        if (
+            operation == "job_search"
+            and apply_requested
+            and status not in {"blocked_login", "blocked", "failed", "skipped"}
+            and (apply_status == "running" or (apply_status == "pending" and retrieve_status == "done"))
+        ):
+            active.append(f"{site_key}:apply")
+            continue
+        if status in {"queued", "running", "ready"}:
+            active.append(f"{site_key}:{row.get('current_phase') or status}")
+            continue
+        if status in {"blocked_login", "blocked"}:
+            active.append(f"{site_key}:blocked")
+    return ", ".join(active) if active else "none"
+
+
+def _format_batch_heartbeat(*, batch: dict[str, Any], workspace: Path, elapsed_seconds: float) -> str:
+    batch_id = str(batch.get("batch_id") or "")
+    report_path, _final_report_path = _batch_report_paths(workspace, batch)
+    parts = [
+        f"still running batch={batch_id}",
+        f"elapsed={_format_elapsed(elapsed_seconds)}",
+        f"active={_format_active_batch_work(batch)}",
+    ]
+    if report_path:
+        parts.append(f"report={report_path}")
+    return " ".join(parts)
+
+
+def _format_monitored_batch_summary(batch: dict[str, Any], *, workspace: Path | None = None) -> str:
+    batch_id = str(batch.get("batch_id") or "")
+    status = str(batch.get("status") or "unknown")
+    operation = str(batch.get("operation") or "job_search")
+    lines = [f"batch={batch_id} status={status} operation={operation}"]
+    if workspace is not None:
+        report_path, final_report_path = _batch_report_paths(workspace, batch)
+        if report_path:
+            lines.append(f"report={report_path}")
+        if final_report_path:
+            lines.append(f"final_report={final_report_path}")
+    sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+    for site_key in sorted(sites.keys()):
+        row = sites.get(site_key)
+        if not isinstance(row, dict):
+            continue
+        retrieve = row.get("retrieve") if isinstance(row.get("retrieve"), dict) else {}
+        apply = row.get("apply") if isinstance(row.get("apply"), dict) else {}
+        parts = [
+            f"- {row.get('site_name') or site_key} [{site_key}]",
+            f"status={row.get('status') or 'unknown'}",
+            f"phase={row.get('current_phase') or ''}",
+            f"retrieve={retrieve.get('status') or 'skipped'}",
+            f"apply={apply.get('status') or 'skipped'}",
+        ]
+        reason = str(row.get("reason_tag") or apply.get("reason_tag") or retrieve.get("reason_tag") or "")
+        if reason:
+            parts.append(f"reason={reason}")
+        lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
+def _shutdown_manager_after_terminal_batch(*, root: Path, workspace: Path) -> str:
+    try:
+        response = shutdown_workspace_manager(
+            project_root=root,
+            workspace=workspace,
+            cancel_open_batches=False,
+            wait_timeout_seconds=10.0,
+        )
+    except Exception as exc:
+        return f"manager_shutdown=failed error={exc}"
+    if not bool(response.get("running")):
+        return "manager=not_running"
+    if bool(response.get("stopped")):
+        return "manager=stopped"
+    return "manager_shutdown=pending"
+
+
+def _workspace_browser_profile_dirs(workspace: Path) -> list[Path]:
+    sites_dir = Path(workspace) / "sites"
+    if not sites_dir.exists():
+        return []
+    return sorted(path.resolve() for path in sites_dir.glob("*/browser/user_data") if path.exists())
+
+
+def _list_workspace_browser_pids(workspace: Path) -> list[int]:
+    markers = [str(path) for path in _workspace_browser_profile_dirs(workspace)]
+    if not markers:
+        return []
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    current_pid = os.getpid()
+    pids: set[int] = set()
+    for line in str(proc.stdout or "").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        pid_text, _, command = raw.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        if any(marker in command for marker in markers):
+            pids.add(pid)
+    return sorted(pids)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_pids_exit(pids: set[int], *, timeout_seconds: float) -> set[int]:
+    deadline = time.time() + max(0.0, float(timeout_seconds or 0.0))
+    alive = set(pids)
+    while alive and time.time() < deadline:
+        alive = {pid for pid in alive if _pid_alive(pid)}
+        if alive:
+            time.sleep(0.1)
+    return {pid for pid in alive if _pid_alive(pid)}
+
+
+def _stop_workspace_browser_processes(workspace: Path) -> int:
+    pids = set(_list_workspace_browser_pids(workspace))
+    if not pids:
+        return 0
+    for pid in sorted(pids):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+    survivors = _wait_for_pids_exit(pids, timeout_seconds=3.0)
+    for pid in sorted(survivors):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+    return len(pids)
+
+
+def _dispatch_jobs_batch_with_monitor(
+    *,
+    operation: str,
+    apply_requested: bool,
+    message: str,
+    session: str,
+) -> str:
+    root = _project_root()
+    workspace = _workspace_path()
+    job_store = JobStore(workspace)
+    baseline_batch_ids = {
+        str(row.get("batch_id") or "")
+        for row in job_store.list_batches(session_id=session, include_terminal=True)
+        if str(row.get("batch_id") or "")
+    }
+    response = start_manager_jobs_batch(
+        project_root=root,
+        workspace=workspace,
+        session_id=session,
+        message=message,
+        operation=operation,
+        apply_requested=apply_requested,
+    )
+    if not bool(response.get("accepted")):
+        return str(response.get("reply") or "job batch was not accepted")
+    batch_id = str(response.get("batch_id") or "")
+    turn_id = str(response.get("turn_id") or "")
+    progress_state: dict[str, Any] = {"batch_id": batch_id, "turn_id": turn_id}
+    typer.echo(str(response.get("reply") or f"batch={batch_id} status=running"))
+    started_at = time.monotonic()
+    last_activity_at = started_at
+    try:
+        while True:
+            emitted_count = _emit_phase_progress(
+                workspace=workspace,
+                session_id=session,
+                baseline_batch_ids=baseline_batch_ids,
+                state=progress_state,
+            )
+            if emitted_count:
+                last_activity_at = time.monotonic()
+            try:
+                batch = job_store.load_batch(batch_id)
+            except Exception:
+                time.sleep(0.75)
+                continue
+            status = str(batch.get("status") or "")
+            if status in _BATCH_MONITOR_DONE_STATUSES:
+                _emit_phase_progress(
+                    workspace=workspace,
+                    session_id=session,
+                    baseline_batch_ids=baseline_batch_ids,
+                    state=progress_state,
+                )
+                summary = _format_monitored_batch_summary(batch, workspace=workspace)
+                if status == "waiting_user":
+                    return f"{summary}\nmanager=running"
+                shutdown_line = _shutdown_manager_after_terminal_batch(root=root, workspace=workspace)
+                return f"{summary}\n{shutdown_line}"
+            now = time.monotonic()
+            if now - last_activity_at >= _BATCH_MONITOR_HEARTBEAT_SECONDS:
+                typer.echo(_format_batch_heartbeat(batch=batch, workspace=workspace, elapsed_seconds=now - started_at))
+                last_activity_at = now
+            time.sleep(0.75)
+    except KeyboardInterrupt:
+        return f"batch={batch_id} status=running\n后台批次仍可能继续运行；可用 batch-list 查看状态。"
 
 
 @app.command()
@@ -263,7 +541,30 @@ def jobs_apply(
     message: str = typer.Option(JOBS_APPLY_MESSAGE, "--message", "-m", help="Registered-sites retrieval/apply prompt"),
 ):
     """Retrieve and apply jobs for active registered sites."""
-    typer.echo(_dispatch_message_with_progress(message=message, session=session))
+    typer.echo(
+        _dispatch_jobs_batch_with_monitor(
+            operation="job_search",
+            apply_requested=True,
+            message=message,
+            session=session,
+        )
+    )
+
+
+@jobs_app.command("review-status")
+def jobs_review_status(
+    session: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
+    message: str = typer.Option(JOBS_REVIEW_STATUS_MESSAGE, "--message", "-m", help="Application status review prompt"),
+):
+    """Review submitted application statuses for active registered sites."""
+    typer.echo(
+        _dispatch_jobs_batch_with_monitor(
+            operation="application_status_review",
+            apply_requested=False,
+            message=message,
+            session=session,
+        )
+    )
 
 
 @app.command("batch-list")
@@ -297,6 +598,35 @@ def batch_clear(
     typer.echo(f"cleared={len(rows)}")
     for row in rows:
         typer.echo(f"{row.get('batch_id')}\t{row.get('session_id')}\t{row.get('status')}")
+
+
+@app.command("batch-stop")
+def batch_stop(
+    session: str = typer.Option("", "--session", "-s", help="Optional session ID filter"),
+):
+    """Cancel open job batches and stop the workspace manager/browser runtime."""
+    root = _project_root()
+    workspace = _workspace_path()
+    session_filter = session or None
+    try:
+        response = shutdown_workspace_manager(
+            project_root=root,
+            workspace=workspace,
+            cancel_open_batches=True,
+            session_id=session_filter,
+            wait_timeout_seconds=10.0,
+        )
+    except Exception as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    cancelled = int(response.get("cancelled") or 0)
+    stopped_browser_processes = _stop_workspace_browser_processes(workspace)
+    if not bool(response.get("running")):
+        rows = JobStore(workspace).clear_open_batches(session_id=session_filter)
+        cancelled = len(rows)
+        typer.echo(f"manager=not_running cancelled={cancelled} browser_processes_stopped={stopped_browser_processes}")
+        return
+    status = "stopped" if bool(response.get("stopped")) else "shutdown_pending"
+    typer.echo(f"manager={status} cancelled={cancelled} browser_processes_stopped={stopped_browser_processes}")
 
 
 @app.command("batch-apply")

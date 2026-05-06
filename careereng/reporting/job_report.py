@@ -227,12 +227,18 @@ def _review_status(row: dict[str, Any]) -> str:
 
 def _review_entry(row: dict[str, Any]) -> dict[str, Any]:
     return {
-        "job_id": str(row.get("job_id") or ""),
+        "job_id": str(row.get("job_id") or row.get("matched_job_id") or ""),
         "canonical_job_id": str(row.get("canonical_job_id") or ""),
         "title": str(row.get("title") or ""),
         "url": str(row.get("url") or row.get("application_review_url") or ""),
         "site_job_id": str(row.get("site_job_id") or ""),
         "application_review_status": _review_status(row),
+        "application_review_status_raw": str(row.get("application_review_status_raw") or ""),
+        "application_review_stage": str(row.get("application_review_stage") or ""),
+        "previous_application_review_status": _normalize_status(row.get("previous_application_review_status")),
+        "previous_application_review_status_raw": str(row.get("previous_application_review_status_raw") or ""),
+        "previous_application_review_stage": str(row.get("previous_application_review_stage") or ""),
+        "application_review_status_changed": bool(row.get("application_review_status_changed")),
         "application_review_checked_at": str(row.get("application_review_checked_at") or row.get("checked_at") or ""),
     }
 
@@ -283,6 +289,11 @@ def _review_summary(
         for row in review_rows
         if not str(row.get("matched_job_id") or "").strip()
     ]
+    review_changes = [
+        _review_entry(row)
+        for row in review_rows
+        if bool(row.get("application_review_status_changed")) and str(row.get("matched_job_id") or "").strip()
+    ]
     counts = {status: 0 for status in APPLICATION_REVIEW_STATUSES}
     for row in history_review_jobs:
         status = str(row.get("application_review_status") or "")
@@ -293,6 +304,8 @@ def _review_summary(
         "unmatched_review_count": len(unmatched_review_records),
         "review_status_counts": counts,
         "reviewed_jobs": history_review_jobs,
+        "review_changes": review_changes,
+        "changed_count": len(review_changes),
         "unmatched_review_records": unmatched_review_records,
     }
 
@@ -318,7 +331,7 @@ def _append_new_job_lines(lines: list[str], jobs: list[dict[str, Any]], *, inclu
             lines.append(f"- JD 摘要: {summary}")
 
 
-def _review_job_line(job: dict[str, Any], *, include_site: bool) -> str:
+def _review_job_line(job: dict[str, Any], *, include_site: bool, include_status_detail: bool = True) -> str:
     title = str(job.get("title") or "Untitled")
     site_job_id = str(job.get("site_job_id") or "").strip()
     if site_job_id:
@@ -326,7 +339,57 @@ def _review_job_line(job: dict[str, Any], *, include_site: bool) -> str:
     if include_site:
         site_name = str(job.get("site_name") or job.get("site_key") or "site")
         title = f"{site_name}: {title}"
+    if include_status_detail:
+        raw_status = _collapse_text(str(job.get("application_review_status_raw") or ""))
+        stage = _collapse_text(str(job.get("application_review_stage") or ""))
+        if raw_status and stage and raw_status.lower() != stage.lower():
+            title = f"{title} - {raw_status} / {stage}"
+        elif raw_status:
+            title = f"{title} - {raw_status}"
+        elif stage:
+            title = f"{title} - {stage}"
     return f"- {title}"
+
+
+def _changed_pair(previous: Any, current: Any) -> tuple[str, str] | None:
+    old = _collapse_text(str(previous or ""))
+    new = _collapse_text(str(current or ""))
+    if not old or not new:
+        return None
+    if old.lower() == new.lower():
+        return None
+    return old, new
+
+
+def _review_change_text(job: dict[str, Any]) -> str:
+    stage_pair = _changed_pair(job.get("previous_application_review_stage"), job.get("application_review_stage"))
+    if stage_pair is not None:
+        old, new = stage_pair
+        return f"Stage: {old} -> {new}"
+    raw_pair = _changed_pair(
+        job.get("previous_application_review_status_raw"),
+        job.get("application_review_status_raw"),
+    )
+    if raw_pair is not None:
+        old, new = raw_pair
+        return f"Status: {old} -> {new}"
+    status_pair = _changed_pair(
+        job.get("previous_application_review_status"),
+        job.get("application_review_status"),
+    )
+    if status_pair is not None:
+        old, new = status_pair
+        return f"Status: {old} -> {new}"
+    return "Status changed"
+
+
+def _append_review_change_lines(lines: list[str], jobs: list[dict[str, Any]], *, include_site: bool) -> None:
+    if not jobs:
+        lines.extend(["", "- 无"])
+        return
+    for job in jobs:
+        title = _review_job_line(job, include_site=include_site, include_status_detail=False).lstrip("- ")
+        lines.append(f"- {title}: {_review_change_text(job)}")
 
 
 def _append_review_group_lines(lines: list[str], reviewed_jobs: list[dict[str, Any]], *, include_site: bool) -> None:
@@ -360,6 +423,7 @@ def _site_markdown(report: dict[str, Any]) -> str:
         f"- 本次投递: {report.get('submitted_count', 0)}",
         f"- 已投递: {report.get('already_applied_count', 0)}",
         f"- 已检查申请状态: {report.get('application_review', {}).get('reviewed_count', 0)}",
+        f"- 申请状态变化: {report.get('application_review', {}).get('changed_count', 0)}",
         f"- 未匹配网站申请记录: {report.get('application_review', {}).get('unmatched_review_count', 0)}",
     ]
 
@@ -372,8 +436,12 @@ def _site_markdown(report: dict[str, Any]) -> str:
     lines.extend(["", "### 没投递"])
     _append_new_job_lines(lines, new_unsubmitted_jobs, include_site=False)
 
-    lines.extend(["", "## 申请状态检查"])
     review = report.get("application_review") if isinstance(report.get("application_review"), dict) else {}
+    review_changes = review.get("review_changes") if isinstance(review.get("review_changes"), list) else []
+    lines.extend(["", "## 申请状态变化"])
+    _append_review_change_lines(lines, review_changes, include_site=False)
+
+    lines.extend(["", "## 申请状态检查"])
     reviewed_jobs = review.get("reviewed_jobs") if isinstance(review.get("reviewed_jobs"), list) else []
     _append_review_group_lines(lines, reviewed_jobs, include_site=False)
     return "\n".join(lines)
@@ -392,6 +460,7 @@ def _batch_markdown(report: dict[str, Any]) -> str:
         f"- 本次投递: {totals.get('submitted_count', 0)}",
         f"- 已投递: {totals.get('already_applied_count', 0)}",
         f"- 已检查申请状态: {totals.get('application_reviewed_count', 0)}",
+        f"- 申请状态变化: {totals.get('application_review_changed_count', 0)}",
         f"- 未匹配网站申请记录: {totals.get('unmatched_review_count', 0)}",
         "",
         "## Sites",
@@ -406,7 +475,8 @@ def _batch_markdown(report: dict[str, Any]) -> str:
             f"新岗位 {site.get('new_jobs_count', 0)}，"
             f"新投递 {site.get('new_submitted_count', 0)}，"
             f"新过滤 {site.get('new_filtered_out_count', 0)}，"
-            f"申请状态检查 {site.get('application_review', {}).get('reviewed_count', 0)}"
+            f"申请状态检查 {site.get('application_review', {}).get('reviewed_count', 0)}，"
+            f"状态变化 {site.get('application_review', {}).get('changed_count', 0)}"
         )
 
     new_submitted_jobs = report.get("new_submitted_jobs") if isinstance(report.get("new_submitted_jobs"), list) else []
@@ -417,6 +487,10 @@ def _batch_markdown(report: dict[str, Any]) -> str:
     _append_new_job_lines(lines, new_submitted_jobs, include_site=True)
     lines.extend(["", "### 没投递"])
     _append_new_job_lines(lines, new_unsubmitted_jobs, include_site=True)
+
+    review_changes = report.get("application_review_changes") if isinstance(report.get("application_review_changes"), list) else []
+    lines.extend(["", "## 申请状态变化"])
+    _append_review_change_lines(lines, review_changes, include_site=True)
 
     reviewed_jobs = report.get("reviewed_jobs") if isinstance(report.get("reviewed_jobs"), list) else []
     lines.extend(["", "## 申请状态检查"])
@@ -437,6 +511,9 @@ def _daily_final_payload(report: dict[str, Any], *, batch_json_path: Path, batch
             report.get("new_unsubmitted_jobs") if isinstance(report.get("new_unsubmitted_jobs"), list) else []
         ),
         "reviewed_jobs": report.get("reviewed_jobs") if isinstance(report.get("reviewed_jobs"), list) else [],
+        "application_review_changes": (
+            report.get("application_review_changes") if isinstance(report.get("application_review_changes"), list) else []
+        ),
         "unmatched_review_records": (
             report.get("unmatched_review_records") if isinstance(report.get("unmatched_review_records"), list) else []
         ),
@@ -470,6 +547,7 @@ def _daily_final_markdown(report: dict[str, Any]) -> str:
         f"- Submitted: {totals.get('submitted_count', 0)}",
         f"- Already applied: {totals.get('already_applied_count', 0)}",
         f"- Application reviews: {totals.get('application_reviewed_count', 0)}",
+        f"- Application status changes: {totals.get('application_review_changed_count', 0)}",
         f"- Unmatched application reviews: {totals.get('unmatched_review_count', 0)}",
         "",
         "## Sites",
@@ -487,7 +565,8 @@ def _daily_final_markdown(report: dict[str, Any]) -> str:
             f"新岗位 {site.get('new_jobs_count', 0)}，"
             f"新投递 {site.get('new_submitted_count', 0)}，"
             f"新过滤 {site.get('new_filtered_out_count', 0)}，"
-            f"申请状态检查 {review.get('reviewed_count', 0)}"
+            f"申请状态检查 {review.get('reviewed_count', 0)}，"
+            f"状态变化 {review.get('changed_count', 0)}"
         )
 
     new_submitted_jobs = report.get("new_submitted_jobs") if isinstance(report.get("new_submitted_jobs"), list) else []
@@ -498,6 +577,12 @@ def _daily_final_markdown(report: dict[str, Any]) -> str:
     _append_new_job_lines(lines, new_submitted_jobs, include_site=True)
     lines.extend(["", "### 没投递"])
     _append_new_job_lines(lines, new_unsubmitted_jobs, include_site=True)
+
+    review_changes = (
+        report.get("application_review_changes") if isinstance(report.get("application_review_changes"), list) else []
+    )
+    lines.extend(["", "## 申请状态变化"])
+    _append_review_change_lines(lines, review_changes, include_site=True)
 
     reviewed_jobs = report.get("reviewed_jobs") if isinstance(report.get("reviewed_jobs"), list) else []
     lines.extend(["", "## 申请状态检查"])
@@ -597,11 +682,15 @@ def build_site_report(
         "submitted_count": submitted_count,
         "already_applied_count": already_applied_count,
         "previously_applied_count": len(previously_applied_jobs),
+        "application_review_changed_count": int(application_review.get("changed_count") or 0),
         "application_review": application_review,
         "applied_jobs": applied_jobs,
         "previously_applied_jobs": previously_applied_jobs,
         "new_submitted_jobs": new_submitted_jobs,
         "new_unsubmitted_jobs": new_unsubmitted_jobs,
+        "application_review_changes": (
+            application_review.get("review_changes") if isinstance(application_review.get("review_changes"), list) else []
+        ),
     }
     json_path, md_path = _site_report_paths(workspace, site_key, batch_id, report_date)
     _write_json(json_path, report)
@@ -648,6 +737,7 @@ def generate_job_batch_report(
         "already_applied_count": 0,
         "previously_applied_count": 0,
         "application_reviewed_count": 0,
+        "application_review_changed_count": 0,
         "unmatched_review_count": 0,
     }
     for site_key in sorted(sites.keys()):
@@ -691,6 +781,7 @@ def generate_job_batch_report(
                 {"site_key": site_key, "site_name": str(site_report.get("site_name") or site_key), **job}
             )
     reviewed_jobs: list[dict[str, Any]] = []
+    application_review_changes: list[dict[str, Any]] = []
     unmatched_review_records: list[dict[str, Any]] = []
     for site_report in site_reports:
         site_key = str(site_report.get("site_key") or "")
@@ -699,6 +790,9 @@ def generate_job_batch_report(
         for job in application_review.get("reviewed_jobs") or []:
             if isinstance(job, dict):
                 reviewed_jobs.append({"site_key": site_key, "site_name": site_name, **job})
+        for job in application_review.get("review_changes") or []:
+            if isinstance(job, dict):
+                application_review_changes.append({"site_key": site_key, "site_name": site_name, **job})
         for row in application_review.get("unmatched_review_records") or []:
             if isinstance(row, dict):
                 unmatched_review_records.append({"site_key": site_key, "site_name": site_name, **row})
@@ -714,6 +808,7 @@ def generate_job_batch_report(
         "new_submitted_jobs": new_submitted_jobs,
         "new_unsubmitted_jobs": new_unsubmitted_jobs,
         "reviewed_jobs": reviewed_jobs,
+        "application_review_changes": application_review_changes,
         "unmatched_review_records": unmatched_review_records,
     }
     json_path, md_path = _batch_report_paths(workspace, batch_id, report_date)

@@ -1,26 +1,23 @@
 # CareerEng
 
-`Python 3.11+` · `Local-first` · `Human-in-the-loop` · `Skill-driven browser automation`
+`Python 3.11+` · `Local-first` · `Human-in-the-loop` · `AI Skills` · `Browser automation`
 
-A local AI workspace for job search, company research, application automation, and application tracking.
+A local AI workspace for running an adaptive, evidence-driven job search across company career sites.
 
-## Welcome to the New Era of AI
+## What CareerEng Is
 
-CareerEng is built on a broader premise: an effective job search is not only a matching problem, but also an iterative process of self-modeling, labor-market research, company understanding, and execution.
+CareerEng uses AI to turn your resume, preferences, target companies, career-site behavior, and application history into reusable operating knowledge. That knowledge lives in Markdown Skills, local profile files, job records, and reports, so future runs can make better decisions with less repeated setup.
 
-It is a local workspace for understanding target roles, studying target companies, and turning the job-search process into a repeatable AI-assisted system.
-
-CareerEng is a local AI-assisted job-search, application, and application-tracking agent.
-
-It turns a resume into a working job-search profile, helps discover target companies, registers company career sites, runs browser-based search/apply workflows through site-specific AI Skills, and tracks previously submitted applications so every run can report what changed.
+When action is needed, CareerEng uses browser automation as the execution layer: opening company career sites, reviewing application status, retrieving matching jobs, and applying when the active Skills and local context say it is appropriate.
 
 ```text
-[Resume]
-   -> [Persona]
+[Resume + Preferences]
+   -> [Persona + Intent]
    -> [Company Discovery]
-   -> [Site Skills]
-   -> [Browser Automation]
-   -> [Reports]
+   -> [Project + Site Skills]
+   -> [Browser Execution]
+   -> [Application History + Reports]
+   -> [Better Next Runs]
 ```
 
 ## What It Does
@@ -31,7 +28,7 @@ It turns a resume into a working job-search profile, helps discover target compa
 | Company Discovery | Uses your resume, persona, intent, and job preferences to find target companies. |
 | Site Registration | Lets you register companies manually or from LLM-generated company candidates. |
 | Site Automation | Runs login, application-status review, job filtering, job retrieval, and apply workflows. |
-| Skills | Keeps common rules in project-level Skills and website-specific behavior in site Skills. |
+| Skills | Keeps shared job-search policy in project Skills and website-specific behavior in site Skills. |
 | Reports | Summarizes new jobs, submitted jobs, unsubmitted jobs, and reviewed application statuses. |
 
 ## Install
@@ -176,15 +173,16 @@ careereng site add "Microsoft" --url https://careers.microsoft.com
 
 ## Skills
 
-CareerEng uses AI Skills as procedural instructions for the agent. Skills are plain Markdown files with YAML front matter.
+CareerEng uses AI Skills as procedural memory for the agent. Skills are plain Markdown files with YAML front matter.
 
-The important layers are:
+The active runtime layers are:
 
 - Project job skill: `skills/search/jobs/SKILL.md`
-- User job preference skill: `workspace/skills/jobs/SKILL.md`
-- Site skill: `skills/search/jobs/sites/<site>/SKILL.md` or `workspace/sites/<site>/skills/SKILL.md`
+- Site skill: `skills/search/jobs/sites/<site>/SKILL.md`
 
-Priority is site-specific first during a site workflow, then user preferences, then project defaults, then `intent.md`.
+Workspace-level Skill files may exist under `workspace/`, but they are not part of the active runtime contract. Treat them as legacy or local notes unless a specific workflow explicitly loads them.
+
+During a site workflow, site-specific instructions take priority over project defaults. User preferences come from the current request, `persona.md`, `intent.md`, resume context, and local history.
 
 Project-level job skill defines common behavior:
 
@@ -204,7 +202,7 @@ Site skills define website-specific behavior:
 - how to fill site-specific forms
 - what counts as a successful submission
 
-When adding a new site, use AI to inspect the website and draft the site skill. Keep browser decisions in the skill, not hard-coded in Python.
+When adding a new site, use AI to inspect the website and draft the site skill. Keep browser decisions in Skills; Python should stay focused on orchestration, browser sessions, timeouts, persistence, and safety gates.
 
 ## Site Workflow
 
@@ -299,9 +297,7 @@ CareerEng is designed as a human-in-the-loop local assistant, not a blind auto-s
 
 ## Tips
 
-CareerEng is intentionally AI-friendly.
-
-Most behavior is expressed through Markdown Skills, JSONL state, and small Python orchestration modules. If you want to add a new site skill, tune an existing workflow, or change what reports show, it is usually practical to ask an LLM to inspect the current files and make the change with you.
+CareerEng keeps behavior inspectable: workflow policy lives in Markdown Skills, durable state lives in JSONL files, and Python modules handle orchestration and storage. If you want to add a new site skill, tune an existing workflow, or change what reports show, it is usually practical to ask an LLM to inspect the current files and make a small targeted change with you.
 
 For example, the report layer can be extended to answer questions such as:
 

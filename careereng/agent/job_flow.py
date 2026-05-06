@@ -25,6 +25,12 @@ class JobFlow:
         "job_filtering",
         "job_retrieval",
     )
+    OPERATION_APPLICATION_STATUS_REVIEW = "application_status_review"
+    OPERATION_JOB_SEARCH = "job_search"
+    PHASE_PLANS = {
+        OPERATION_APPLICATION_STATUS_REVIEW: ("session_preparation", "application_status_review"),
+        OPERATION_JOB_SEARCH: DISCOVERY_PHASES,
+    }
     AUTH_RECOVERY_PHASE = "session_preparation"
     AUTH_RECOVERY_MARKERS = (
         "auth_required",
@@ -95,11 +101,39 @@ class JobFlow:
             closer()
         return None
 
+    @classmethod
+    def _normalize_operation(cls, operation: str) -> str:
+        normalized = str(operation or "").strip().lower()
+        if normalized in cls.PHASE_PLANS:
+            return normalized
+        return cls.OPERATION_JOB_SEARCH
+
+    def _phase_plan_for_operation(self, operation: str) -> tuple[str, ...]:
+        normalized = self._normalize_operation(operation)
+        if normalized == self.OPERATION_JOB_SEARCH:
+            return tuple(self.DISCOVERY_PHASES)
+        return tuple(self.PHASE_PLANS[normalized])
+
+    def _terminal_phase_for_operation(self, operation: str) -> str:
+        phases = self._phase_plan_for_operation(operation)
+        return phases[-1] if phases else ""
+
     def _compute_batch_status(self, batch: dict[str, Any]) -> str:
         sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
         rows = [row for row in sites.values() if isinstance(row, dict)]
+        operation = self._normalize_operation(str(batch.get("operation") or ""))
+        apply_requested = bool(batch.get("apply_requested"))
         if any(str(row.get("status") or "") in {"queued", "running"} for row in rows):
             return "running"
+        if operation == self.OPERATION_JOB_SEARCH and apply_requested:
+            for row in rows:
+                row_status = str(row.get("status") or "")
+                retrieve_status = str((row.get("retrieve") or {}).get("status") or "")
+                apply_status = str((row.get("apply") or {}).get("status") or "")
+                if row_status in {"blocked_login", "blocked", "failed", "skipped"}:
+                    continue
+                if apply_status == "running" or (apply_status == "pending" and retrieve_status == "done"):
+                    return "running"
         if any(str(row.get("status") or "") in {"blocked_login", "blocked"} for row in rows):
             return "waiting_user"
         if any(
@@ -141,6 +175,9 @@ class JobFlow:
                 )
             )
             return f"- {site_name} [{site_key}]: {message}"
+        if str(row.get("operation") or "") == self.OPERATION_APPLICATION_STATUS_REVIEW and status == "completed":
+            message = str(row.get("message") or "申请状态检查已完成。")
+            return f"- {site_name} [{site_key}]: {message}"
         if str(retrieve.get("status") or "") == "failed":
             return f"- {site_name} [{site_key}]: 岗位检索失败（{reason or 'retrieve_failed'}）。"
         retrieve_count = int(retrieve.get("count") or 0)
@@ -172,6 +209,8 @@ class JobFlow:
     def _ready_message_for_phase(cls, phase_slug: str, *, authenticated_ready: bool, jobs_surface_ready: bool) -> str:
         normalized = str(phase_slug or "").strip()
         if authenticated_ready:
+            if normalized == "application_status_review":
+                return "登录已就绪，申请状态检查已完成。"
             if normalized == "job_retrieval":
                 return "登录已就绪，岗位检索已完成，等待后续投递。"
             if normalized == "job_filtering":
@@ -180,6 +219,8 @@ class JobFlow:
                 return "登录已就绪，岗位入口已定位，等待后续岗位检索。"
             return "登录已就绪，等待后续岗位检索。"
         if jobs_surface_ready:
+            if normalized == "application_status_review":
+                return "申请状态检查已完成。"
             if normalized == "job_retrieval":
                 return "岗位检索已完成，当前 jobs 页面可继续，等待后续投递。"
             if normalized == "job_filtering":
@@ -236,10 +277,12 @@ class JobFlow:
         entry_url: str,
         skill_path: str,
         allow_apply: bool,
+        operation: str = OPERATION_JOB_SEARCH,
     ) -> dict[str, Any]:
         return {
             "site_key": site_key,
             "site_name": site_name,
+            "operation": self._normalize_operation(operation),
             "status": "failed",
             "reason_tag": "browser_automation_disabled",
             "entry_url": entry_url,
@@ -261,17 +304,25 @@ class JobFlow:
         entry_url: str,
         skill_path: str,
         allow_apply: bool,
+        operation: str = OPERATION_JOB_SEARCH,
     ) -> dict[str, Any]:
+        normalized_operation = self._normalize_operation(operation)
         return {
             "site_key": site_key,
             "site_name": site_name,
+            "operation": normalized_operation,
             "status": "running",
             "reason_tag": "",
             "entry_url": entry_url,
             "skill_path": skill_path,
-            "retrieve": {"status": "running", "count": 0},
+            "retrieve": {
+                "status": "skipped" if normalized_operation == self.OPERATION_APPLICATION_STATUS_REVIEW else "running",
+                "count": 0,
+            },
             "apply": {
-                "status": "pending" if allow_apply else "skipped",
+                "status": "pending"
+                if allow_apply and normalized_operation == self.OPERATION_JOB_SEARCH
+                else "skipped",
                 "attempted": 0,
                 "submitted": 0,
             },
@@ -283,7 +334,10 @@ class JobFlow:
         result: Any,
         existing: dict[str, Any],
         allow_apply: bool,
+        operation: str = OPERATION_JOB_SEARCH,
     ) -> dict[str, Any]:
+        normalized_operation = self._normalize_operation(operation)
+        terminal_phase = self._terminal_phase_for_operation(normalized_operation)
         site_key = str(existing.get("site_key") or getattr(result, "site_key", ""))
         site_name = str(existing.get("site_name") or getattr(result, "site_name", site_key))
         entry_url = str(existing.get("entry_url") or existing.get("current_url") or "")
@@ -300,10 +354,40 @@ class JobFlow:
         jobs_surface_ready = bool(getattr(result, "jobs_surface_ready", False))
 
         if status == "ready":
-            if current_phase == "job_retrieval":
+            if current_phase == terminal_phase and normalized_operation == self.OPERATION_APPLICATION_STATUS_REVIEW:
                 return {
                     "site_key": site_key,
                     "site_name": site_name,
+                    "operation": normalized_operation,
+                    "status": "completed",
+                    "reason_tag": reason_tag,
+                    "message": message
+                    or self._ready_message_for_phase(
+                        current_phase,
+                        authenticated_ready=authenticated_ready,
+                        jobs_surface_ready=jobs_surface_ready,
+                    ),
+                    "entry_url": entry_url,
+                    "current_phase": current_phase,
+                    "current_url": current_url,
+                    "trace_ref": trace_ref,
+                    "step_count": step_count,
+                    "skill_path": skill_path,
+                    "authenticated_ready": authenticated_ready,
+                    "jobs_surface_ready": jobs_surface_ready,
+                    "session_ready": authenticated_ready,
+                    "retrieve": {"status": "skipped", "count": 0},
+                    "apply": {
+                        "status": "skipped",
+                        "attempted": 0,
+                        "submitted": 0,
+                    },
+                }
+            if current_phase == terminal_phase and normalized_operation == self.OPERATION_JOB_SEARCH:
+                return {
+                    "site_key": site_key,
+                    "site_name": site_name,
+                    "operation": normalized_operation,
                     "status": "completed",
                     "reason_tag": reason_tag,
                     "message": message
@@ -331,6 +415,7 @@ class JobFlow:
             return {
                 "site_key": site_key,
                 "site_name": site_name,
+                "operation": normalized_operation,
                 "status": "ready",
                 "reason_tag": reason_tag,
                 "message": message
@@ -350,7 +435,7 @@ class JobFlow:
                 "session_ready": authenticated_ready,
                 "retrieve": {"status": "pending", "count": retrieved_count},
                 "apply": {
-                    "status": "pending" if allow_apply else "skipped",
+                    "status": "pending" if allow_apply and normalized_operation == self.OPERATION_JOB_SEARCH else "skipped",
                     "attempted": 0,
                     "submitted": 0,
                 },
@@ -359,6 +444,7 @@ class JobFlow:
             return {
                 "site_key": site_key,
                 "site_name": site_name,
+                "operation": normalized_operation,
                 "status": "blocked",
                 "reason_tag": reason_tag,
                 "message": message or f"{site_key} 需要先完成登录，关闭窗口后再回复 `{site_key} done`。",
@@ -368,9 +454,12 @@ class JobFlow:
                 "trace_ref": trace_ref,
                 "step_count": step_count,
                 "skill_path": skill_path,
-                "retrieve": {"status": "blocked", "count": retrieved_count},
+                "retrieve": {
+                    "status": "skipped" if normalized_operation == self.OPERATION_APPLICATION_STATUS_REVIEW else "blocked",
+                    "count": retrieved_count,
+                },
                 "apply": {
-                    "status": "pending" if allow_apply else "skipped",
+                    "status": "pending" if allow_apply and normalized_operation == self.OPERATION_JOB_SEARCH else "skipped",
                     "attempted": 0,
                     "submitted": 0,
                 },
@@ -378,6 +467,7 @@ class JobFlow:
         return {
             "site_key": site_key,
             "site_name": site_name,
+            "operation": normalized_operation,
             "status": "failed",
             "reason_tag": reason_tag or "browser_runtime_failed",
             "message": message,
@@ -387,9 +477,13 @@ class JobFlow:
             "trace_ref": trace_ref,
             "step_count": step_count,
             "skill_path": skill_path,
-            "retrieve": {"status": "failed", "count": retrieved_count, "error": message},
+            "retrieve": {
+                "status": "skipped" if normalized_operation == self.OPERATION_APPLICATION_STATUS_REVIEW else "failed",
+                "count": retrieved_count,
+                "error": message,
+            },
             "apply": {
-                "status": "failed" if allow_apply else "skipped",
+                "status": "failed" if allow_apply and normalized_operation == self.OPERATION_JOB_SEARCH else "skipped",
                 "attempted": 0,
                 "submitted": 0,
                 "reason_tag": reason_tag or "browser_runtime_failed",
@@ -675,6 +769,47 @@ class JobFlow:
             "apply": apply,
         }
 
+    def _apply_progress_site_row(
+        self,
+        *,
+        site_key: str,
+        existing: dict[str, Any],
+        batch_id: str,
+        last_result: Any | None,
+    ) -> dict[str, Any]:
+        retrieve = dict(existing.get("retrieve") or {})
+        apply = dict(existing.get("apply") or {})
+        counters = self._apply_counters_from_run(site_key, batch_id)
+        apply.update(
+            {
+                "status": "running",
+                "attempted": counters["attempted"],
+                "submitted": counters["submitted"],
+                "already_applied": counters["already_applied"],
+                "filtered_out": counters["filtered_out"],
+                "failed": counters["failed"],
+                "blocked": counters["blocked"],
+            }
+        )
+        retrieve["count"] = max(int(retrieve.get("count") or 0), counters["retrieved"])
+        current_url = str(
+            getattr(last_result, "current_url", "") or existing.get("current_url") or existing.get("entry_url") or ""
+        )
+        trace_ref = str(getattr(last_result, "trace_ref", "") or existing.get("trace_ref") or "")
+        step_count = int(getattr(last_result, "step_count", 0) or existing.get("step_count") or 0)
+        return {
+            **existing,
+            "status": "running",
+            "reason_tag": str(existing.get("reason_tag") or ""),
+            "message": "",
+            "current_phase": "apply",
+            "current_url": current_url,
+            "trace_ref": trace_ref,
+            "step_count": step_count,
+            "retrieve": retrieve,
+            "apply": apply,
+        }
+
     def _apply_site_phase_budget_seconds(self, *, job_count: int) -> int:
         count = max(0, int(job_count or 0))
         if count <= 0:
@@ -731,6 +866,7 @@ class JobFlow:
         batch_id: str,
         session_id: str,
         turn_id: str,
+        progress_callback: Any | None = None,
     ) -> dict[str, Any]:
         try:
             self.site_tools.ensure_default_resume_pdf()
@@ -801,6 +937,15 @@ class JobFlow:
             latest_rows = {str(row.get("job_id") or ""): row for row in self._run_job_rows(site_key, batch_id)}
             latest_row = latest_rows.get(job_id) or {}
             if self._is_apply_row_terminal(latest_row):
+                if callable(progress_callback):
+                    current = progress_callback(
+                        self._apply_progress_site_row(
+                            site_key=site_key,
+                            existing=current,
+                            batch_id=batch_id,
+                            last_result=last_result,
+                        )
+                    )
                 continue
             status = "blocked" if str(getattr(last_result, "status", "") or "") == "blocked" else "apply_failed"
             error_text = str(getattr(last_result, "message", "") or "").strip() or "apply phase ended without terminal job update"
@@ -813,6 +958,15 @@ class JobFlow:
                 status=status,
                 error_text=error_text,
             )
+            if callable(progress_callback):
+                current = progress_callback(
+                    self._apply_progress_site_row(
+                        site_key=site_key,
+                        existing=current,
+                        batch_id=batch_id,
+                        last_result=last_result,
+                    )
+                )
 
         if not self._pending_apply_rows(site_key, batch_id):
             self._promote_apply_run_to_history(
@@ -957,27 +1111,40 @@ class JobFlow:
             "apply": apply,
         }
 
-    def start_batch(self, *, session_id: str, turn_id: str, user_message: str, apply_requested: bool) -> str:
+    def create_batch(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        user_message: str,
+        apply_requested: bool,
+        operation: str = OPERATION_JOB_SEARCH,
+    ) -> dict[str, Any]:
+        normalized_operation = self._normalize_operation(operation)
         active_sites = self.site_tools.site_store.list_sites("active")
         if not active_sites:
-            return "当前没有已注册的 active sites。请先完成公司注册。"
-        effective_apply_requested = bool(apply_requested and self.ENABLE_BROWSER_APPLY_PHASE)
+            return {}
+        effective_apply_requested = bool(
+            normalized_operation == self.OPERATION_JOB_SEARCH
+            and apply_requested
+            and self.ENABLE_BROWSER_APPLY_PHASE
+        )
 
         site_rows: list[dict[str, Any]] = []
-        runnable_keys: list[str] = []
         for row in active_sites:
             site_key = str(row.get("site_key") or "")
             preflight = self.site_tools.preflight_site(site_key, apply_requested=effective_apply_requested)
             site_name = str(preflight.get("site_name") or row.get("canonical_company") or site_key)
             skill_path = str(preflight.get("skill_path") or "")
             entry_url = str(preflight.get("entry_url") or row.get("base_url") or "")
-            allow_apply = bool(preflight.get("allow_apply"))
+            allow_apply = bool(preflight.get("allow_apply")) and normalized_operation == self.OPERATION_JOB_SEARCH
             preflight_status = str(preflight.get("status") or "failed")
             if preflight_status != "ready":
                 site_rows.append(
                     {
                         "site_key": site_key,
                         "site_name": site_name,
+                        "operation": normalized_operation,
                         "status": preflight_status,
                         "reason_tag": str(preflight.get("reason_tag") or ""),
                         "entry_url": entry_url,
@@ -994,17 +1161,67 @@ class JobFlow:
                     entry_url=entry_url,
                     skill_path=skill_path,
                     allow_apply=allow_apply,
+                    operation=normalized_operation,
                 )
             )
-            runnable_keys.append(site_key)
 
-        batch = self.job_store.create_batch(
+        return self.job_store.create_batch(
             session_id=session_id,
             turn_id=turn_id,
             user_message=user_message,
             apply_requested=effective_apply_requested,
+            operation=normalized_operation,
             sites=site_rows,
         )
+
+    def fail_batch(self, *, batch_id: str, error: str) -> dict[str, Any]:
+        batch = self.job_store.load_batch(batch_id)
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        updated_sites: dict[str, Any] = {}
+        for site_key, row in sites.items():
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "")
+            if status in {"queued", "running", "ready"}:
+                patched = dict(row)
+                patched["status"] = "failed"
+                patched["reason_tag"] = "batch_worker_failed"
+                patched["message"] = str(error or "")
+                updated_sites[str(site_key)] = patched
+            else:
+                updated_sites[str(site_key)] = row
+        batch["sites"] = updated_sites
+        batch["status"] = "failed"
+        batch = self.job_store.save_batch(batch)
+        self.job_store.append_event(
+            "batch.failed",
+            {
+                "batch_id": str(batch.get("batch_id") or batch_id),
+                "error": str(error or ""),
+            },
+        )
+        self._generate_batch_report_if_possible(batch)
+        return batch
+
+    def run_batch(self, batch_id: str) -> str:
+        batch = self.job_store.load_batch(batch_id)
+        if not batch:
+            return f"batch={batch_id} status=failed"
+        normalized_operation = self._normalize_operation(str(batch.get("operation") or self.OPERATION_JOB_SEARCH))
+        phase_slugs = self._phase_plan_for_operation(normalized_operation)
+        session_id = str(batch.get("session_id") or "cli:default")
+        turn_id = str(batch.get("turn_id") or "")
+        effective_apply_requested = bool(
+            normalized_operation == self.OPERATION_JOB_SEARCH
+            and batch.get("apply_requested")
+            and self.ENABLE_BROWSER_APPLY_PHASE
+        )
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        runnable_keys = [
+            str(site_key)
+            for site_key, row in sites.items()
+            if isinstance(row, dict) and str(row.get("status") or "") in {"queued", "running", "ready"}
+        ]
         if not self.browser_runner:
             for site_key in runnable_keys:
                 current = batch["sites"].get(site_key) if isinstance(batch.get("sites"), dict) else None
@@ -1016,6 +1233,7 @@ class JobFlow:
                     entry_url=str(current.get("entry_url") or ""),
                     skill_path=str(current.get("skill_path") or ""),
                     allow_apply=str((current.get("apply") or {}).get("status") or "") != "skipped",
+                    operation=normalized_operation,
                 )
                 batch = self.job_store.update_site(batch, site_key, disabled)
             batch["status"] = self._compute_batch_status(batch)
@@ -1035,10 +1253,15 @@ class JobFlow:
                 batch = self.job_store.save_batch(batch)
                 if generate_report:
                     self._generate_batch_report_if_possible(batch)
-                return batch
+                latest_sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+                latest_row = latest_sites.get(site_key)
+                return dict(latest_row) if isinstance(latest_row, dict) else dict(updated)
 
         def _job(site_key: str, current: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-            allow_apply = str((current.get("apply") or {}).get("status") or "") != "skipped"
+            allow_apply = (
+                normalized_operation == self.OPERATION_JOB_SEARCH
+                and str((current.get("apply") or {}).get("status") or "") != "skipped"
+            )
             result = self._run_site_with_auth_recovery(
                 site_key=site_key,
                 site_name=str(current.get("site_name") or site_key),
@@ -1046,9 +1269,21 @@ class JobFlow:
                 session_id=session_id,
                 turn_id=turn_id,
                 batch_id=batch_id,
-                phase_slugs=self.DISCOVERY_PHASES,
+                phase_slugs=phase_slugs,
             )
-            updated = self._browser_result_to_site_row(result=result, existing=current, allow_apply=allow_apply)
+            updated = self._browser_result_to_site_row(
+                result=result,
+                existing=current,
+                allow_apply=allow_apply,
+                operation=normalized_operation,
+            )
+            operation_done = (
+                normalized_operation == self.OPERATION_APPLICATION_STATUS_REVIEW
+                and str(updated.get("status") or "") == "completed"
+            )
+            if operation_done:
+                _save_site_snapshot(site_key, updated, generate_report=True)
+                return site_key, updated
             retrieval_done = str((updated.get("retrieve") or {}).get("status") or "") == "done"
             if retrieval_done:
                 self._promote_retrieved_run_to_history(site_key=site_key, batch_id=batch_id)
@@ -1065,6 +1300,7 @@ class JobFlow:
                     batch_id=batch_id,
                     session_id=session_id,
                     turn_id=turn_id,
+                    progress_callback=lambda row: _save_site_snapshot(site_key, row, generate_report=True),
                 )
             return site_key, updated
 
@@ -1085,6 +1321,26 @@ class JobFlow:
         batch = self.job_store.save_batch(batch)
         self._generate_batch_report_if_possible(batch)
         return self._format_batch_summary(batch)
+
+    def start_batch(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        user_message: str,
+        apply_requested: bool,
+        operation: str = OPERATION_JOB_SEARCH,
+    ) -> str:
+        batch = self.create_batch(
+            session_id=session_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            apply_requested=apply_requested,
+            operation=operation,
+        )
+        if not batch:
+            return "当前没有已注册的 active sites。请先完成公司注册。"
+        return self.run_batch(str(batch.get("batch_id") or ""))
 
     def _parse_resume_signal(self, message: str) -> tuple[str, str] | None:
         raw = message.strip()

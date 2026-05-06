@@ -16,6 +16,8 @@ from careereng.utils import dump_front_matter, ensure_dir, make_id, now_iso, par
 
 class SiteStore:
     WORKDAY_JOB_NUMBER_RE = re.compile(r"\bJR\d{3,}\b", flags=re.IGNORECASE)
+    YEAR_PREFIXED_JOB_ID_RE = re.compile(r"\b(?:19|20)\d{2}[-_](\d{3,})\b", flags=re.IGNORECASE)
+    SITE_JOB_ID_LIKE_RE = re.compile(r"(?:\d{3,}|(?:19|20)\d{2}[-_]\d{3,}|[a-z]{1,12}[-_]?\d{3,})")
 
     RUN_JOB_STRING_FIELDS = (
         "batch_id",
@@ -776,6 +778,15 @@ class SiteStore:
     def _normalize_job_text(value: str) -> str:
         return re.sub(r"\s+", " ", str(value or "").strip()).lower()
 
+    @staticmethod
+    def _normalize_review_stage(value: object) -> str:
+        text = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower())
+        return text.strip("_")
+
+    @staticmethod
+    def _normalize_review_compare(value: object) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
     @classmethod
     def _extract_workday_job_numbers(cls, *values: object) -> list[str]:
         numbers: list[str] = []
@@ -790,6 +801,42 @@ class SiteStore:
                     seen.add(value)
                     numbers.append(value)
         return numbers
+
+    @classmethod
+    def _site_job_id_aliases(cls, value: object) -> list[str]:
+        text = cls._normalize_job_text(str(value or ""))
+        if not text:
+            return []
+        aliases = [text]
+        for match in cls.YEAR_PREFIXED_JOB_ID_RE.finditer(text):
+            suffix = cls._normalize_job_text(match.group(1))
+            if suffix and suffix not in aliases:
+                aliases.append(suffix)
+        return aliases
+
+    @classmethod
+    def _is_site_job_id_like(cls, value: object) -> bool:
+        text = cls._normalize_job_text(str(value or ""))
+        return bool(text and cls.SITE_JOB_ID_LIKE_RE.fullmatch(text))
+
+    def _infer_site_job_id_from_url(self, url: object) -> str:
+        normalized = self._normalize_url(str(url or ""))
+        if not normalized:
+            return ""
+        try:
+            parsed = urlparse(normalized)
+        except Exception:
+            return ""
+        path_parts = [part for part in parsed.path.split("/") if part]
+        for index, part in enumerate(path_parts[:-1]):
+            if part.lower() not in {"job", "jobs"}:
+                continue
+            candidate = path_parts[index + 1].strip()
+            if self._is_site_job_id_like(candidate):
+                return candidate
+        if path_parts and self._is_site_job_id_like(path_parts[-1]):
+            return path_parts[-1]
+        return ""
 
     def _job_source_refs(self, row: dict[str, Any]) -> list[str]:
         if not isinstance(row, dict):
@@ -817,7 +864,8 @@ class SiteStore:
             "pid",
         )
         for field in explicit_fields:
-            add_ref(field, row.get(field))
+            for alias in self._site_job_id_aliases(row.get(field)):
+                add_ref(field, alias)
 
         url = self._normalize_url(str(row.get("url") or ""))
         if url:
@@ -828,13 +876,16 @@ class SiteStore:
             if parsed is not None:
                 query = {k.lower(): v for k, v in parse_qsl(parsed.query, keep_blank_values=False)}
                 for field in ("pid", "jobid", "job_id", "jobnumber", "job_number", "requisitionid", "reqid"):
-                    add_ref(field, query.get(field, ""))
+                    for alias in self._site_job_id_aliases(query.get(field, "")):
+                        add_ref(field, alias)
                 match = re.search(r"/job[s]?/([^/?#]+)", parsed.path, flags=re.IGNORECASE)
-                if match and re.search(r"\d", match.group(1)):
-                    add_ref("path-job", match.group(1))
+                if match and self._is_site_job_id_like(match.group(1)):
+                    for alias in self._site_job_id_aliases(match.group(1)):
+                        add_ref("path-job", alias)
                 path_parts = [part for part in parsed.path.split("/") if part]
-                if path_parts and re.search(r"\d", path_parts[-1]):
-                    add_ref("path-tail", path_parts[-1])
+                if path_parts and self._is_site_job_id_like(path_parts[-1]):
+                    for alias in self._site_job_id_aliases(path_parts[-1]):
+                        add_ref("path-tail", alias)
 
         job_number_fields = (
             *explicit_fields,
@@ -875,6 +926,8 @@ class SiteStore:
             "requisitionid",
             "reqid",
             "workday_job_number",
+            "path-job",
+            "path-tail",
         }
         for source_ref in self._job_source_refs(row):
             keys.append(f"source|{site}|{source_ref}")
@@ -963,6 +1016,12 @@ class SiteStore:
         turn_id: str,
         batch_id: str,
     ) -> dict[str, Any]:
+        incoming = dict(incoming)
+        if not str(incoming.get("site_job_id") or "").strip():
+            inferred_site_job_id = self._infer_site_job_id_from_url(incoming.get("url") or base.get("url") or "")
+            if inferred_site_job_id:
+                incoming["site_job_id"] = inferred_site_job_id
+
         merged = dict(base)
         merged["job_id"] = job_id
         merged["ts"] = now_iso()
@@ -1160,9 +1219,7 @@ class SiteStore:
             rows.append(snapshot)
             appended_rows.append(snapshot)
 
-        run_rows = [row for row in rows if isinstance(row, dict)]
-        run_rows.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("observation_id") or ""), str(r.get("job_id") or "")))
-        run_store.write_all(run_rows)
+        run_store.write_all([row for row in rows if isinstance(row, dict)])
         return appended_rows
 
     def update_run_jobs(
@@ -1202,7 +1259,6 @@ class SiteStore:
                 rows.append(merged)
             updated_rows.append(merged)
 
-        rows.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("observation_id") or ""), str(r.get("job_id") or "")))
         run_store.write_all(rows)
         return updated_rows
 
@@ -1401,6 +1457,8 @@ class SiteStore:
             url = self._normalize_url(str(raw.get("url") or ""))
             site_job_id = str(raw.get("site_job_id") or raw.get("source_job_id") or "").strip()
             status = str(raw.get("application_review_status") or "").strip().lower()
+            status_raw = re.sub(r"\s+", " ", str(raw.get("application_review_status_raw") or status).strip())
+            stage = self._normalize_review_stage(raw.get("application_review_stage"))
             if not title and not url and not site_job_id:
                 continue
 
@@ -1414,6 +1472,8 @@ class SiteStore:
                 "url": url,
                 "site_job_id": site_job_id,
                 "application_review_status": status,
+                "application_review_status_raw": status_raw,
+                "application_review_stage": stage,
             }
             match_idx = self._resolve_history_row_index(
                 site_id,
@@ -1426,9 +1486,31 @@ class SiteStore:
             if match_idx is not None:
                 current = history_rows[match_idx]
                 matched_job_id = str(current.get("job_id") or "").strip()
+                previous_status = str(current.get("application_review_status") or "").strip().lower()
+                previous_raw = re.sub(r"\s+", " ", str(current.get("application_review_status_raw") or "").strip())
+                previous_stage = self._normalize_review_stage(current.get("application_review_stage"))
+                status_changed = bool(
+                    (previous_status and status and previous_status != status)
+                    or (
+                        previous_raw
+                        and status_raw
+                        and self._normalize_review_compare(previous_raw) != self._normalize_review_compare(status_raw)
+                    )
+                    or (previous_stage and stage and previous_stage != stage)
+                )
+                review_row["previous_application_review_status"] = previous_status
+                review_row["previous_application_review_status_raw"] = previous_raw
+                review_row["previous_application_review_stage"] = previous_stage
+                review_row["application_review_status_changed"] = status_changed
                 if site_job_id:
                     current["site_job_id"] = site_job_id
                 current["application_review_status"] = status
+                current["application_review_status_raw"] = status_raw
+                current["application_review_stage"] = stage
+                current["previous_application_review_status"] = previous_status
+                current["previous_application_review_status_raw"] = previous_raw
+                current["previous_application_review_stage"] = previous_stage
+                current["application_review_status_changed"] = status_changed
                 current["application_review_checked_at"] = checked_at
                 current["application_review_batch_id"] = str(batch_id or "")
                 if url:

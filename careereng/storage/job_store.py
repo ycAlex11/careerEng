@@ -30,6 +30,7 @@ class JobStore:
         user_message: str,
         apply_requested: bool,
         sites: list[dict[str, Any]],
+        operation: str = "job_search",
     ) -> dict[str, Any]:
         batch_id = make_id("job_batch")
         now = now_iso()
@@ -38,6 +39,7 @@ class JobStore:
             "session_id": session_id,
             "turn_id": turn_id,
             "user_message": user_message,
+            "operation": str(operation or "job_search"),
             "apply_requested": bool(apply_requested),
             "status": "running",
             "created_at": now,
@@ -51,6 +53,7 @@ class JobStore:
                 "batch_id": batch_id,
                 "session_id": session_id,
                 "turn_id": turn_id,
+                "operation": str(operation or "job_search"),
                 "apply_requested": bool(apply_requested),
                 "site_count": len(payload["sites"]),
             },

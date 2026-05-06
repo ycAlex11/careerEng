@@ -52,11 +52,11 @@ mcp_port_start = 8931
 
 [browser.budgets]
 phase_timeout_seconds = 180
-step_timeout_seconds = 30
+step_timeout_seconds = 90
 max_step_retries = 1
 max_phase_steps = 24
 session_preparation_phase_timeout_seconds = 420
-application_status_review_phase_timeout_seconds = 300
+application_status_review_phase_timeout_seconds = 600
 job_filtering_phase_timeout_seconds = 420
 job_retrieval_phase_timeout_seconds = 1500
 job_retrieval_timeout_seconds_per_page = 180
