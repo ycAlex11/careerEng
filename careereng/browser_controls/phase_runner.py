@@ -112,6 +112,7 @@ class BrowserAutomationService:
             step_timeout_seconds=int(self.budgets.step_timeout_seconds or step_timeout_seconds or 30),
             max_step_retries=int(self.budgets.max_step_retries or max_step_retries or 1),
             max_phase_steps=self.max_phase_steps,
+            metrics_workspace=str(self.workspace),
         )
         self.phase_runtime: BrowserPhaseRuntime | Any | None = None
 

@@ -18,6 +18,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpe
 from careereng.browser_context import BrowserPhaseMemory
 from careereng.browser_controls.bridge import MCPToolBridge
 from careereng.browser_controls.prompting import PhasePrompt
+from careereng.metrics import LLMUsageRecorder, extract_usage
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class BrowserRuntimeConfig:
     step_timeout_seconds: int = 90
     max_step_retries: int = 1
     max_phase_steps: int = 24
+    metrics_workspace: str = ""
 
 
 @dataclass(frozen=True)
@@ -46,10 +48,18 @@ class BrowserPhaseResult:
 
 
 class ResponsesClient:
-    def __init__(self, *, api_base: str, api_key: str, timeout_seconds: float):
+    def __init__(
+        self,
+        *,
+        api_base: str,
+        api_key: str,
+        timeout_seconds: float,
+        metrics_recorder: LLMUsageRecorder | None = None,
+    ):
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.timeout_seconds = max(30.0, float(timeout_seconds or 30.0))
+        self.metrics_recorder = metrics_recorder
         self.client = self._build_client(timeout_seconds=self.timeout_seconds)
         self._closed = False
 
@@ -122,10 +132,12 @@ class ResponsesClient:
         return ""
 
     async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
         request_timeout_seconds = max(
             1.0,
             float(payload.get("_request_timeout_seconds") or self.timeout_seconds or 30.0),
         )
+        metrics_context = payload.get("_metrics_context") if isinstance(payload.get("_metrics_context"), dict) else {}
         stream_payload: dict[str, Any] = {
             "model": payload.get("model"),
             "input": self._normalize_stream_input(payload.get("input")),
@@ -146,6 +158,7 @@ class ResponsesClient:
         response_id = ""
         response_status = "completed"
         stream_event_types: list[str] = []
+        final_usage: Any = None
         with_options = getattr(self.client, "with_options", None)
         stream_client = with_options(timeout=request_timeout_seconds) if callable(with_options) else self.client
         try:
@@ -202,15 +215,40 @@ class ResponsesClient:
                     final = await stream.get_final_response()
                     response_id = str(getattr(final, "id", "") or response_id)
                     response_status = str(getattr(final, "status", "") or response_status)
+                    final_usage = getattr(final, "usage", None)
         except TimeoutError as exc:
+            self._record_metric(
+                model=str(payload.get("model") or ""),
+                started=started,
+                status="error",
+                error_type="timeout",
+                context=metrics_context,
+                stream_event_types=stream_event_types,
+            )
             raise httpx.TimeoutException(
                 f"responses stream timed out after {request_timeout_seconds:.1f}s"
             ) from exc
         except APIStatusError as exc:
+            self._record_metric(
+                model=str(payload.get("model") or ""),
+                started=started,
+                status="error",
+                error_type=f"http_{getattr(exc, 'status_code', 'unknown')}",
+                context=metrics_context,
+                stream_event_types=stream_event_types,
+            )
             body = getattr(exc, "body", None)
             detail = json.dumps(body, ensure_ascii=False) if body is not None else str(exc)
             raise RuntimeError(detail[:2000] or f"responses api error {getattr(exc, 'status_code', 'unknown')}") from exc
         except (APIConnectionError, APITimeoutError) as exc:
+            self._record_metric(
+                model=str(payload.get("model") or ""),
+                started=started,
+                status="error",
+                error_type=exc.__class__.__name__,
+                context=metrics_context,
+                stream_event_types=stream_event_types,
+            )
             cause = exc.__cause__ or exc.__context__
             if isinstance(cause, (httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException)):
                 raise cause
@@ -229,7 +267,48 @@ class ResponsesClient:
         }
         if output_text:
             data["output_text"] = output_text
+        self._record_metric(
+            model=str(payload.get("model") or ""),
+            started=started,
+            status="ok",
+            usage=final_usage,
+            context=metrics_context,
+            stream_event_types=stream_event_types,
+            tool_call_count=sum(1 for item in output_items if isinstance(item, dict) and item.get("type") == "function_call"),
+        )
         return data
+
+    def _record_metric(
+        self,
+        *,
+        model: str,
+        started: float,
+        status: str,
+        usage: Any = None,
+        error_type: str = "",
+        context: dict[str, Any] | None = None,
+        stream_event_types: list[str] | None = None,
+        tool_call_count: int | None = None,
+    ) -> None:
+        recorder = self.metrics_recorder
+        if recorder is None:
+            return
+        context_payload = dict(context or {})
+        if tool_call_count is None:
+            tool_call_count = 0
+        recorder.record(
+            provider="openai",
+            model=model,
+            api_type="responses_stream",
+            operation="browser_phase",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            status=status,
+            error_type=error_type,
+            stream_event_types=list(stream_event_types or []),
+            tool_call_count=int(tool_call_count),
+            **context_payload,
+            **extract_usage(usage),
+        )
 
 
 class BrowserPhaseRuntime:
@@ -293,6 +372,7 @@ class BrowserPhaseRuntime:
             api_base=config.api_base,
             api_key=config.api_key,
             timeout_seconds=max(config.phase_timeout_seconds, config.step_timeout_seconds) + 30,
+            metrics_recorder=LLMUsageRecorder(config.metrics_workspace) if config.metrics_workspace else None,
         )
         self.sleep_fn = sleep_fn or anyio.sleep
 
@@ -1949,6 +2029,7 @@ class BrowserPhaseRuntime:
         recorded_count = int(summary.get("recorded_count") or 0) if isinstance(summary, dict) else 0
         matched_count = int(summary.get("matched_count") or 0) if isinstance(summary, dict) else 0
         unmatched_count = int(summary.get("unmatched_count") or 0) if isinstance(summary, dict) else 0
+        created_history_count = int(summary.get("created_history_count") or 0) if isinstance(summary, dict) else 0
         matched_job_ids = summary.get("matched_job_ids") if isinstance(summary, dict) else []
         if not isinstance(matched_job_ids, list):
             matched_job_ids = []
@@ -1956,12 +2037,15 @@ class BrowserPhaseRuntime:
             f"Recorded {recorded_count} application reviews "
             f"({matched_count} matched history, {unmatched_count} unmatched)."
         )
+        if created_history_count:
+            text += f" Created {created_history_count} minimal history row(s)."
         return {
             "isError": False,
             "structuredContent": {
                 "recorded_count": recorded_count,
                 "matched_count": matched_count,
                 "unmatched_count": unmatched_count,
+                "created_history_count": created_history_count,
                 "matched_job_ids": [str(job_id) for job_id in matched_job_ids if str(job_id).strip()],
             },
             "content": [{"type": "text", "text": text}],
@@ -2269,14 +2353,22 @@ class BrowserPhaseRuntime:
             static_context_items = list(context_items() if callable(context_items) else (extra_context_items or []))
             turn_timeout_seconds = self._response_turn_timeout_seconds(deadline=deadline)
             try:
+                response_payload = self._payload(
+                    input_items=base_items + static_context_items + loop_context_items,
+                    tools=active_tools,
+                    request_timeout_seconds=turn_timeout_seconds,
+                )
+                response_payload["_metrics_context"] = {
+                    "site_id": site_key,
+                    "site_key": site_key,
+                    "batch_id": batch_id,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "phase": phase.slug,
+                    "current_url": current_url,
+                }
                 with anyio.fail_after(turn_timeout_seconds):
-                    response = await self._create_response_with_retry(
-                        self._payload(
-                            input_items=base_items + static_context_items + loop_context_items,
-                            tools=active_tools,
-                            request_timeout_seconds=turn_timeout_seconds,
-                        )
-                    )
+                    response = await self._create_response_with_retry(response_payload)
             except TimeoutError:
                 response_turn_timeout_count += 1
                 snapshot_payload = await self._capture_snapshot_payload(

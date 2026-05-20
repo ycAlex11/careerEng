@@ -2,7 +2,7 @@
 id: site-nvidia
 name: nvidia Site Skill
 version: v1
-updated_at: '2026-04-26'
+updated_at: '2026-05-12'
 scope: site
 site_key: nvidia
 status: ready
@@ -132,9 +132,12 @@ apply_enabled: true
 - Record the full current NVIDIA results page before any stop decision.
 - Do not open a single NVIDIA job detail before the current NVIDIA results page has been recorded.
 - Retrieve NVIDIA jobs from the current live listing and keep the retrieved results for later filtering and decision-making.
+- For NVIDIA, only keep roles posted within the last 10 days for application consideration.
+- If a visible NVIDIA role is marked older than 10 days, do not keep it as an apply candidate.
+- If the current NVIDIA results page is sorted newest first and the visible page contains any role older than 10 days, finish recording only the within-window roles from that page, then stop retrieval without opening the next page.
 - If the live NVIDIA page still shows result signals such as page labels, visible job cards, or pagination but the current attempt returns zero jobs, capture a fresh snapshot and retry the same current results page once before stopping or paginating.
-- Treat `Posted 30+ Days Ago` as an old-role signal.
-- If the current visible NVIDIA page contains any roles marked `Posted 30+ Days Ago`, finish recording that full page and then stop retrieval without opening the next page.
+- Treat `Posted 10+ Days Ago` or any larger age signal as an old-role signal.
+- If the current visible NVIDIA page contains any roles marked older than 10 days, finish recording that full page and then stop retrieval without opening the next page.
 
 ## Apply
 
@@ -142,6 +145,8 @@ apply_enabled: true
 
 - NVIDIA does not add a stronger fit rule here by default.
 - Use the common matching rule from the project jobs skill unless the live page exposes a clearer site-native decision signal for the current role.
+- Do not apply to NVIDIA roles posted more than 10 days ago.
+- If the saved NVIDIA job lacks a reliable posted age or date, re-check the live job page before applying. If the posted timing still cannot be confirmed as within the last 10 days, mark the job as `filtered_out` instead of applying.
 
 ### Form Filling
 

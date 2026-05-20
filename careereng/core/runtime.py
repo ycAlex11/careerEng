@@ -70,13 +70,13 @@ def build_site_services(
 def build_loop(*, project_root: Path, workspace: Path | None = None) -> tuple[AgentLoop, Any]:
     config = load_config(project_root)
     auth = load_auth(project_root)
+    resolved_workspace = workspace or config.paths.workspace_path(project_root)
+    resolved_workspace.mkdir(parents=True, exist_ok=True)
     try:
-        _, provider = create_provider(config, auth)
+        _, provider = create_provider(config, auth, workspace=resolved_workspace)
     except ProviderError as exc:
         provider = FallbackProvider(str(exc))
 
-    resolved_workspace = workspace or config.paths.workspace_path(project_root)
-    resolved_workspace.mkdir(parents=True, exist_ok=True)
     site_store = SiteStore(resolved_workspace, project_root=project_root)
     site_tools = SiteTools(site_store)
     site_tools.project_root = project_root

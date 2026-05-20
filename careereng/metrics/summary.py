@@ -1,0 +1,173 @@
+"""Aggregate LLM usage metrics."""
+
+from __future__ import annotations
+
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+from careereng.storage.job_store import JobStore
+from careereng.storage.jsonl import JSONLStore
+from careereng.utils import ensure_dir, now_iso, safe_file_stem, write_json
+
+
+GROUP_KEYS = ("site_key", "phase", "api_type", "status", "model")
+
+
+def _int_value(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _metrics_path(workspace: Path) -> Path:
+    return workspace / "metrics" / "llm_usage.jsonl"
+
+
+def _load_rows(workspace: Path) -> list[dict[str, Any]]:
+    path = _metrics_path(workspace)
+    if not path.exists():
+        return []
+    return JSONLStore(path).read_all()
+
+
+def _latest_batch_id(workspace: Path, rows: list[dict[str, Any]]) -> str:
+    batches = JobStore(workspace).list_batches(include_terminal=True)
+    known_batch_ids = {str(batch.get("batch_id") or "").strip() for batch in batches}
+    for row in reversed(rows):
+        batch_id = str(row.get("batch_id") or "").strip()
+        if batch_id and (not known_batch_ids or batch_id in known_batch_ids):
+            return batch_id
+    return ""
+
+
+def _filter_rows(
+    rows: list[dict[str, Any]],
+    *,
+    batch_id: str = "",
+    site_key: str = "",
+    phase: str = "",
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        if batch_id and str(row.get("batch_id") or "") != batch_id:
+            continue
+        if site_key and str(row.get("site_key") or row.get("site_id") or "") != site_key:
+            continue
+        if phase and str(row.get("phase") or "") != phase:
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def _empty_totals() -> dict[str, Any]:
+    return {
+        "calls": 0,
+        "ok_calls": 0,
+        "error_calls": 0,
+        "elapsed_ms": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "unknown_token_calls": 0,
+    }
+
+
+def _accumulate(totals: dict[str, Any], row: dict[str, Any]) -> None:
+    totals["calls"] += 1
+    if str(row.get("status") or "") == "ok":
+        totals["ok_calls"] += 1
+    else:
+        totals["error_calls"] += 1
+    totals["elapsed_ms"] += _int_value(row.get("elapsed_ms"))
+    total_tokens = row.get("total_tokens")
+    if total_tokens is None:
+        totals["unknown_token_calls"] += 1
+    else:
+        totals["total_tokens"] += _int_value(total_tokens)
+    totals["input_tokens"] += _int_value(row.get("input_tokens"))
+    totals["output_tokens"] += _int_value(row.get("output_tokens"))
+
+
+def _group_summary(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        value = str(row.get(key) or "unknown")
+        if not value.strip():
+            value = "unknown"
+        bucket = grouped.setdefault(value, {"name": value, **_empty_totals()})
+        _accumulate(bucket, row)
+    return sorted(
+        grouped.values(),
+        key=lambda item: (_int_value(item.get("total_tokens")), _int_value(item.get("elapsed_ms")), str(item.get("name"))),
+        reverse=True,
+    )
+
+
+def build_metrics_summary(
+    *,
+    workspace: Path | str,
+    batch_id: str = "",
+    site_key: str = "",
+    phase: str = "",
+) -> dict[str, Any]:
+    workspace_path = Path(workspace)
+    rows = _load_rows(workspace_path)
+    requested_batch = str(batch_id or "").strip()
+    resolved_batch = _latest_batch_id(workspace_path, rows) if requested_batch == "latest" else requested_batch
+    filtered_rows = _filter_rows(
+        rows,
+        batch_id=resolved_batch,
+        site_key=str(site_key or "").strip(),
+        phase=str(phase or "").strip(),
+    )
+    totals = _empty_totals()
+    providers: Counter[str] = Counter()
+    models: Counter[str] = Counter()
+    api_types: Counter[str] = Counter()
+    statuses: Counter[str] = Counter()
+    for row in filtered_rows:
+        _accumulate(totals, row)
+        providers[str(row.get("provider") or "unknown")] += 1
+        models[str(row.get("model") or "unknown")] += 1
+        api_types[str(row.get("api_type") or "unknown")] += 1
+        statuses[str(row.get("status") or "unknown")] += 1
+    return {
+        "generated_at": now_iso(),
+        "source_path": str(_metrics_path(workspace_path)),
+        "filters": {
+            "batch_id": resolved_batch,
+            "site_key": str(site_key or "").strip(),
+            "phase": str(phase or "").strip(),
+        },
+        "totals": totals,
+        "providers": dict(providers),
+        "models": dict(models),
+        "api_types": dict(api_types),
+        "statuses": dict(statuses),
+        "groups": {key: _group_summary(filtered_rows, key) for key in GROUP_KEYS},
+        "error_rows": [
+            {
+                "ts": str(row.get("ts") or ""),
+                "batch_id": str(row.get("batch_id") or ""),
+                "site_key": str(row.get("site_key") or ""),
+                "phase": str(row.get("phase") or ""),
+                "status": str(row.get("status") or ""),
+                "error_type": str(row.get("error_type") or ""),
+                "elapsed_ms": _int_value(row.get("elapsed_ms")),
+            }
+            for row in filtered_rows
+            if str(row.get("status") or "") != "ok"
+        ],
+    }
+
+
+def save_metrics_summary(summary: dict[str, Any], *, workspace: Path | str) -> Path:
+    workspace_path = Path(workspace)
+    filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
+    batch_id = str(filters.get("batch_id") or "").strip()
+    name = safe_file_stem(batch_id) if batch_id else f"summary_{safe_file_stem(str(summary.get('generated_at') or now_iso()))}"
+    path = ensure_dir(workspace_path / "metrics" / "summaries") / f"{name}.json"
+    write_json(path, summary)
+    return path

@@ -18,6 +18,18 @@ class SiteStore:
     WORKDAY_JOB_NUMBER_RE = re.compile(r"\bJR\d{3,}\b", flags=re.IGNORECASE)
     YEAR_PREFIXED_JOB_ID_RE = re.compile(r"\b(?:19|20)\d{2}[-_](\d{3,})\b", flags=re.IGNORECASE)
     SITE_JOB_ID_LIKE_RE = re.compile(r"(?:\d{3,}|(?:19|20)\d{2}[-_]\d{3,}|[a-z]{1,12}[-_]?\d{3,})")
+    APPLICATION_REVIEW_NON_JOB_PATH_SEGMENTS = {
+        "dashboard",
+        "candidate-home",
+        "candidate_home",
+        "candidatehome",
+        "my-applications",
+        "my_applications",
+        "application-center",
+        "action-center",
+        "applications",
+        "profile",
+    }
 
     RUN_JOB_STRING_FIELDS = (
         "batch_id",
@@ -838,6 +850,81 @@ class SiteStore:
             return path_parts[-1]
         return ""
 
+    def _is_application_review_non_job_url(self, url: object) -> bool:
+        normalized = self._normalize_url(str(url or ""))
+        if not normalized:
+            return False
+        try:
+            parsed = urlparse(normalized)
+        except Exception:
+            return False
+        query = parsed.query.lower()
+        if "bga=true" in query:
+            return True
+        segments = {segment.strip().lower() for segment in parsed.path.split("/") if segment.strip()}
+        return bool(segments & self.APPLICATION_REVIEW_NON_JOB_PATH_SEGMENTS)
+
+    def _is_real_job_posting_url(self, url: object) -> bool:
+        normalized = self._normalize_url(str(url or ""))
+        if not normalized or self._is_application_review_non_job_url(normalized):
+            return False
+        try:
+            parsed = urlparse(normalized)
+        except Exception:
+            return False
+        path = parsed.path.lower()
+        return bool(re.search(r"/(?:careers/)?job[s]?/", path)) or bool(self._infer_site_job_id_from_url(normalized))
+
+    def _build_application_review_history_row(
+        self,
+        *,
+        site_id: str,
+        review_row: dict[str, Any],
+        session_id: str,
+        turn_id: str,
+        batch_id: str,
+        checked_at: str,
+    ) -> dict[str, Any] | None:
+        title = str(review_row.get("title") or "").strip()
+        raw_url = self._normalize_url(str(review_row.get("url") or ""))
+        site_job_id = str(review_row.get("site_job_id") or review_row.get("source_job_id") or "").strip()
+        job_url = raw_url if self._is_real_job_posting_url(raw_url) else ""
+        review_url = raw_url if raw_url else ""
+        if not site_job_id and not job_url:
+            return None
+
+        row: dict[str, Any] = {
+            "ts": checked_at,
+            "batch_id": str(batch_id or ""),
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "site_id": site_id,
+            "employer": site_id,
+            "title": title,
+            "application_status": "already_applied",
+            "apply_state": "terminal_already_applied",
+            "history_source": "application_status_review",
+            "application_origin": "external_or_prior",
+            "jd_sync_status": "missing",
+            "first_seen_at": checked_at,
+            "last_seen_at": checked_at,
+            "seen_count": 1,
+            "features_ref": "",
+        }
+        if batch_id:
+            row["last_seen_batch_id"] = str(batch_id)
+        if site_job_id:
+            row["site_job_id"] = site_job_id
+        if job_url:
+            row["url"] = job_url
+        if review_url:
+            row["application_review_url"] = review_url
+
+        job_id, canonical_job_id = self._history_ids(site_id, row)
+        row["job_id"] = job_id
+        row["canonical_job_id"] = canonical_job_id
+        return row
+
     def _job_source_refs(self, row: dict[str, Any]) -> list[str]:
         if not isinstance(row, dict):
             return []
@@ -1447,6 +1534,7 @@ class SiteStore:
         recorded_count = 0
         matched_count = 0
         unmatched_count = 0
+        created_history_count = 0
         matched_job_ids: list[str] = []
         changed = False
 
@@ -1483,6 +1571,23 @@ class SiteStore:
                 by_match_key=by_match_key,
             )
             matched_job_id = ""
+            if match_idx is None:
+                created = self._build_application_review_history_row(
+                    site_id=site_id,
+                    review_row=review_row,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    batch_id=str(batch_id or ""),
+                    checked_at=checked_at,
+                )
+                if created is not None:
+                    history_rows.append(created)
+                    match_idx = len(history_rows) - 1
+                    by_job_id, by_canonical_job_id, by_match_key = self._history_resolution_indexes(
+                        site_id, history_rows
+                    )
+                    created_history_count += 1
+                    changed = True
             if match_idx is not None:
                 current = history_rows[match_idx]
                 matched_job_id = str(current.get("job_id") or "").strip()
@@ -1531,6 +1636,7 @@ class SiteStore:
             "recorded_count": recorded_count,
             "matched_count": matched_count,
             "unmatched_count": unmatched_count,
+            "created_history_count": created_history_count,
             "matched_job_ids": matched_job_ids,
         }
 

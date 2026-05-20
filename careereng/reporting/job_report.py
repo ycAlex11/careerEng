@@ -24,6 +24,13 @@ APPLICATION_REVIEW_LABELS = {
     "blocked": "Blocked",
     "unknown": "Unknown",
 }
+REJECTED_TRANSITION_LABELS = {
+    "received": "简历初筛后被拒",
+    "resume_review": "简历评审后被拒",
+    "in_process": "流程中被拒",
+    "assessment": "评估阶段后被拒",
+    "interview": "面试阶段后被拒",
+}
 
 
 def _collapse_text(value: str) -> str:
@@ -361,24 +368,30 @@ def _changed_pair(previous: Any, current: Any) -> tuple[str, str] | None:
     return old, new
 
 
+def _review_transition_pair(job: dict[str, Any]) -> tuple[str, str] | None:
+    for previous_key, current_key in (
+        ("previous_application_review_status_raw", "application_review_status_raw"),
+        ("previous_application_review_stage", "application_review_stage"),
+        ("previous_application_review_status", "application_review_status"),
+    ):
+        pair = _changed_pair(job.get(previous_key), job.get(current_key))
+        if pair is not None:
+            return pair
+    return None
+
+
 def _review_change_text(job: dict[str, Any]) -> str:
-    stage_pair = _changed_pair(job.get("previous_application_review_stage"), job.get("application_review_stage"))
-    if stage_pair is not None:
-        old, new = stage_pair
-        return f"Stage: {old} -> {new}"
-    raw_pair = _changed_pair(
-        job.get("previous_application_review_status_raw"),
-        job.get("application_review_status_raw"),
-    )
-    if raw_pair is not None:
-        old, new = raw_pair
-        return f"Status: {old} -> {new}"
-    status_pair = _changed_pair(
-        job.get("previous_application_review_status"),
-        job.get("application_review_status"),
-    )
-    if status_pair is not None:
-        old, new = status_pair
+    pair = _review_transition_pair(job)
+    previous_stage = _normalize_status(job.get("previous_application_review_stage"))
+    current_status = _review_status(job)
+    if current_status == "rejected" and previous_stage in REJECTED_TRANSITION_LABELS:
+        label = REJECTED_TRANSITION_LABELS[previous_stage]
+        if pair is not None:
+            old, new = pair
+            return f"{label}: {old} -> {new}"
+        return label
+    if pair is not None:
+        old, new = pair
         return f"Status: {old} -> {new}"
     return "Status changed"
 

@@ -12,6 +12,13 @@ from typing import Any
 
 import typer
 import yaml
+from careereng.application_summary import (
+    build_application_summary,
+    inspect_history_repairs,
+    save_application_summary,
+    save_history_repair_plan,
+)
+from careereng.cleanup import build_cleanup_plan, execute_cleanup_plan
 from careereng.config.loader import ensure_files
 from careereng.core.runtime import build_loop as runtime_build_loop
 from careereng.core.runtime import build_site_services as runtime_build_site_services
@@ -23,6 +30,7 @@ from careereng.core.workspace_manager import (
     shutdown_workspace_manager,
     start_manager_jobs_batch,
 )
+from careereng.metrics import build_metrics_summary, save_metrics_summary
 from careereng.resume.export import ResumeExportError, export_resume_pdf as export_resume_pdf_file
 from careereng.reporting.job_report import generate_job_batch_report
 from careereng.storage.job_store import JobStore
@@ -34,13 +42,17 @@ from careereng.tools.batch_apply_debug import BatchApplyDebugRunner
 from careereng.utils import make_id, safe_file_stem
 
 app = typer.Typer(help="CareerEng CLI")
+application_summary_app = typer.Typer(help="Application lifecycle summary commands")
 jobs_app = typer.Typer(help="Registered-site job retrieval/apply commands")
 profile_app = typer.Typer(help="Profile/persona commands")
+metrics_app = typer.Typer(help="Metrics summary commands")
 report_app = typer.Typer(help="Report review commands")
 resume_app = typer.Typer(help="Resume commands")
 route_app = typer.Typer(help="Route feedback commands")
 site_app = typer.Typer(help="Site registry commands")
+app.add_typer(application_summary_app, name="application-summary")
 app.add_typer(jobs_app, name="jobs")
+app.add_typer(metrics_app, name="metrics")
 app.add_typer(profile_app, name="profile")
 app.add_typer(report_app, name="report")
 app.add_typer(resume_app, name="resume")
@@ -51,6 +63,7 @@ app.add_typer(site_app, name="site")
 PROFILE_GENERATE_MESSAGE = "请根据当前 workspace 中已有的简历、profile sources 和对话信息，生成或更新用户画像 persona.md。"
 JOBS_APPLY_MESSAGE = "检索投递已注册的公司"
 JOBS_REVIEW_STATUS_MESSAGE = "检查已投递岗位状态"
+APPLICATION_SUMMARY_REPAIR_THRESHOLD = 25
 
 
 def _project_root() -> Path:
@@ -101,6 +114,128 @@ def _close_loop_if_possible(loop: Any) -> None:
     closer = getattr(loop, "close", None)
     if callable(closer):
         closer()
+
+
+def _format_bytes(value: int) -> str:
+    size = float(max(0, int(value)))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0 or unit == "GB":
+            if unit == "B":
+                return f"{int(size)}{unit}"
+            return f"{size:.1f}{unit}"
+        size /= 1024.0
+    return f"{size:.1f}GB"
+
+
+def _format_duration(milliseconds: int) -> str:
+    total_seconds = max(0, int(milliseconds) // 1000)
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes}m{seconds}s"
+    if minutes:
+        return f"{minutes}m{seconds}s"
+    return f"{seconds}s"
+
+
+def _format_int(value: Any) -> str:
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _metrics_group_lines(title: str, rows: list[dict[str, Any]]) -> list[str]:
+    lines = [title]
+    if not rows:
+        lines.append("- none")
+        return lines
+    for row in rows:
+        lines.append(
+            f"- {row.get('name')}: "
+            f"calls={_format_int(row.get('calls'))} "
+            f"elapsed={_format_duration(int(row.get('elapsed_ms') or 0))} "
+            f"tokens={_format_int(row.get('total_tokens'))} "
+            f"unknown={_format_int(row.get('unknown_token_calls'))}"
+        )
+    return lines
+
+
+@application_summary_app.command("build")
+def application_summary_build(
+    since: str = typer.Option("2026-04-01", "--since", help="Only include application data on or after this date"),
+    all_time: bool = typer.Option(False, "--all-time", help="Include all historical application data"),
+):
+    """Build the machine-readable application lifecycle summary."""
+    root = _project_root()
+    workspace = _workspace_path()
+    summary = build_application_summary(workspace=workspace, project_root=root, since=None if all_time else since)
+    path = save_application_summary(summary, workspace=workspace)
+    source = summary.get("source") if isinstance(summary.get("source"), dict) else {}
+    filters = source.get("filters") if isinstance(source.get("filters"), dict) else {}
+    totals = summary.get("totals") if isinstance(summary.get("totals"), dict) else {}
+    typer.echo(
+        "application_summary: "
+        f"since={filters.get('since') or 'all'} "
+        f"sites={_format_int(source.get('site_count'))} "
+        f"jobs={_format_int(totals.get('history_jobs'))} "
+        f"submitted={_format_int(totals.get('submitted'))} "
+        f"active={_format_int(totals.get('active'))} "
+        f"rejected={_format_int(totals.get('rejected'))} "
+        f"transitions={_format_int(len(summary.get('lifecycle_transitions') or []))} "
+        f"unmatched={_format_int(totals.get('unmatched_reviews'))} "
+        f"legacy_unmatched={_format_int(totals.get('legacy_unmatched_reviews'))} "
+        f"rematched={_format_int(totals.get('rematched_reviews'))} "
+        f"signals={_format_int(len(summary.get('signals') or []))}"
+    )
+    typer.echo(f"path: {path}")
+    legacy_unmatched = int(totals.get("legacy_unmatched_reviews") or 0)
+    if legacy_unmatched >= APPLICATION_SUMMARY_REPAIR_THRESHOLD:
+        typer.echo(
+            "repair_recommended: "
+            f"legacy_unmatched={legacy_unmatched} threshold={APPLICATION_SUMMARY_REPAIR_THRESHOLD}; "
+            "run `python -m careereng application-summary repair-history` before applying safe repairs."
+        )
+
+
+@application_summary_app.command("repair-history")
+def application_summary_repair_history(
+    since: str = typer.Option("2026-04-01", "--since", help="Only inspect application data on or after this date"),
+    all_time: bool = typer.Option(False, "--all-time", help="Inspect all historical application data"),
+    apply_repairs: bool = typer.Option(
+        False,
+        "--apply",
+        help=(
+            "Apply only safe repairs: review-log matched_job_id backfill, missing site_job_id, "
+            "missing review raw/stage, and dashboard URL anomaly markers"
+        ),
+    ),
+):
+    """Inspect history data quality and optionally apply safe repairs."""
+    root = _project_root()
+    workspace = _workspace_path()
+    plan = inspect_history_repairs(
+        workspace=workspace,
+        project_root=root,
+        since=None if all_time else since,
+        apply=apply_repairs,
+    )
+    path = save_history_repair_plan(plan, workspace=workspace)
+    source = plan.get("source") if isinstance(plan.get("source"), dict) else {}
+    filters = source.get("filters") if isinstance(source.get("filters"), dict) else {}
+    totals = plan.get("totals") if isinstance(plan.get("totals"), dict) else {}
+    category_counts = plan.get("category_counts") if isinstance(plan.get("category_counts"), dict) else {}
+    typer.echo(
+        "history_repair: "
+        f"mode={plan.get('mode') or 'dry_run'} "
+        f"since={filters.get('since') or 'all'} "
+        f"issues={_format_int(totals.get('issue_count'))} "
+        f"safe_repairable={_format_int(totals.get('safe_repairable_count'))} "
+        f"applied={_format_int(totals.get('applied_count'))}"
+    )
+    for key in sorted(category_counts):
+        typer.echo(f"- {key}: {_format_int(category_counts.get(key))}")
+    typer.echo(f"path: {path}")
 
 
 _PHASE_EVENT_LABELS = {
@@ -567,6 +702,63 @@ def jobs_review_status(
     )
 
 
+@metrics_app.command("summary")
+def metrics_summary(
+    batch: str = typer.Option("", "--batch", help="Batch ID, or latest"),
+    site: str = typer.Option("", "--site", help="Optional site key filter"),
+    phase: str = typer.Option("", "--phase", help="Optional phase filter"),
+    save: bool = typer.Option(False, "--save", help="Save JSON summary under workspace/metrics/summaries"),
+):
+    """Summarize recorded LLM token and timing usage."""
+    workspace = _workspace_path()
+    summary = build_metrics_summary(workspace=workspace, batch_id=batch, site_key=site, phase=phase)
+    totals = summary.get("totals") if isinstance(summary.get("totals"), dict) else {}
+    filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
+    lines = [
+        "Metrics Summary",
+        f"- source: {summary.get('source_path')}",
+        f"- batch: {filters.get('batch_id') or 'all'}",
+        f"- site: {filters.get('site_key') or 'all'}",
+        f"- phase: {filters.get('phase') or 'all'}",
+        f"- calls: {_format_int(totals.get('calls'))}",
+        f"- ok calls: {_format_int(totals.get('ok_calls'))}",
+        f"- error calls: {_format_int(totals.get('error_calls'))}",
+        f"- elapsed: {_format_duration(int(totals.get('elapsed_ms') or 0))}",
+        f"- input tokens: {_format_int(totals.get('input_tokens'))}",
+        f"- output tokens: {_format_int(totals.get('output_tokens'))}",
+        f"- total tokens: {_format_int(totals.get('total_tokens'))}",
+        f"- unknown token calls: {_format_int(totals.get('unknown_token_calls'))}",
+        "",
+    ]
+    groups = summary.get("groups") if isinstance(summary.get("groups"), dict) else {}
+    for title, key in (
+        ("By Site", "site_key"),
+        ("By Phase", "phase"),
+        ("By Model", "model"),
+        ("By API Type", "api_type"),
+        ("By Status", "status"),
+    ):
+        lines.extend(_metrics_group_lines(title, groups.get(key) if isinstance(groups.get(key), list) else []))
+        lines.append("")
+    errors = summary.get("error_rows") if isinstance(summary.get("error_rows"), list) else []
+    lines.append("Errors")
+    if not errors:
+        lines.append("- none")
+    else:
+        for row in errors[:50]:
+            lines.append(
+                f"- {row.get('ts')} batch={row.get('batch_id') or '-'} "
+                f"site={row.get('site_key') or '-'} phase={row.get('phase') or '-'} "
+                f"error={row.get('error_type') or row.get('status') or 'error'}"
+            )
+        if len(errors) > 50:
+            lines.append(f"- ... {len(errors) - 50} more")
+    if save:
+        path = save_metrics_summary(summary, workspace=workspace)
+        lines.extend(["", f"saved: {path}"])
+    typer.echo("\n".join(lines).rstrip())
+
+
 @app.command("batch-list")
 def batch_list(
     session: str = typer.Option("", "--session", "-s", help="Optional session ID filter"),
@@ -627,6 +819,49 @@ def batch_stop(
         return
     status = "stopped" if bool(response.get("stopped")) else "shutdown_pending"
     typer.echo(f"manager={status} cancelled={cancelled} browser_processes_stopped={stopped_browser_processes}")
+
+
+@app.command("cleanup")
+def cleanup_workspace(
+    days: int = typer.Option(30, "--days", min=0, help="Delete runtime artifacts older than this many days"),
+    site: str = typer.Option("", "--site", help="Optional site key to limit cleanup"),
+    dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run", help="Preview cleanup without deleting files"),
+    force: bool = typer.Option(False, "--force", help="Actually delete planned files"),
+    include_profile_backups: bool = typer.Option(
+        False,
+        "--include-profile-backups",
+        help="Also include browser/user_data.backup.* files; never includes browser/user_data",
+    ),
+):
+    """Safely clean old runtime/debug artifacts without deleting job history or login profiles."""
+    workspace = _workspace_path()
+    plan = build_cleanup_plan(
+        workspace=workspace,
+        days=days,
+        site=site,
+        include_profile_backups=include_profile_backups,
+    )
+    typer.echo(
+        f"cleanup candidates={len(plan.candidates)} bytes={_format_bytes(plan.total_bytes)} "
+        f"days={plan.days} site={site or 'all'}"
+    )
+    for candidate in plan.candidates[:200]:
+        rel = candidate.path
+        try:
+            rel = candidate.path.relative_to(workspace)
+        except ValueError:
+            pass
+        typer.echo(f"- {rel}\t{_format_bytes(candidate.size_bytes)}\t{candidate.reason}")
+    if len(plan.candidates) > 200:
+        typer.echo(f"... {len(plan.candidates) - 200} more")
+    if not force:
+        if not dry_run:
+            typer.echo("refusing to delete without --force")
+        else:
+            typer.echo("dry_run=true; pass --force to delete these files")
+        return
+    result = execute_cleanup_plan(plan)
+    typer.echo(f"deleted={result['deleted']} bytes={_format_bytes(result['deleted_bytes'])}")
 
 
 @app.command("batch-apply")
