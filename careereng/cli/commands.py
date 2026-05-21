@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -30,6 +31,7 @@ from careereng.core.workspace_manager import (
     shutdown_workspace_manager,
     start_manager_jobs_batch,
 )
+from careereng.integrations.assistant_bridge import AssistantThreadStateStore, ingest_assistant_message
 from careereng.metrics import build_metrics_summary, save_metrics_summary
 from careereng.resume.export import ResumeExportError, export_resume_pdf as export_resume_pdf_file
 from careereng.reporting.job_report import generate_job_batch_report
@@ -43,6 +45,7 @@ from careereng.utils import make_id, safe_file_stem
 
 app = typer.Typer(help="CareerEng CLI")
 application_summary_app = typer.Typer(help="Application lifecycle summary commands")
+assistant_app = typer.Typer(help="External AI assistant bridge commands")
 jobs_app = typer.Typer(help="Registered-site job retrieval/apply commands")
 profile_app = typer.Typer(help="Profile/persona commands")
 metrics_app = typer.Typer(help="Metrics summary commands")
@@ -51,6 +54,7 @@ resume_app = typer.Typer(help="Resume commands")
 route_app = typer.Typer(help="Route feedback commands")
 site_app = typer.Typer(help="Site registry commands")
 app.add_typer(application_summary_app, name="application-summary")
+app.add_typer(assistant_app, name="assistant")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(metrics_app, name="metrics")
 app.add_typer(profile_app, name="profile")
@@ -659,6 +663,50 @@ def run(
 ):
     """Run one chat turn."""
     typer.echo(_dispatch_message_with_progress(message=message, session=session))
+
+
+@assistant_app.command("ingest")
+def assistant_ingest(
+    message: str = typer.Option(..., "--message", "-m", help="Assistant-side user message to classify and store"),
+    client: str = typer.Option("codex", "--client", help="External assistant client name"),
+    thread: str = typer.Option("default", "--thread", help="External assistant thread/conversation ID"),
+    session: str = typer.Option("", "--session", "-s", help="Optional CareerEng session ID"),
+    processor: str = typer.Option("local", "--processor", help="Processor adapter backend"),
+):
+    """Classify and persist an external assistant message for CareerEng."""
+    result = ingest_assistant_message(
+        workspace=_workspace_path(),
+        message=message,
+        client=client,
+        thread_id=thread,
+        session_id=session,
+        processor_backend=processor,
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@assistant_app.command("state")
+def assistant_state(
+    client: str = typer.Option("codex", "--client", help="External assistant client name"),
+    thread: str = typer.Option("", "--thread", help="Optional external assistant thread/conversation ID"),
+):
+    """Show assistant bridge thread scope state."""
+    store = AssistantThreadStateStore(_workspace_path())
+    if thread:
+        payload = store.get(client=client, thread_id=thread)
+    else:
+        payload = store.load()
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@assistant_app.command("end")
+def assistant_end(
+    client: str = typer.Option("codex", "--client", help="External assistant client name"),
+    thread: str = typer.Option("default", "--thread", help="External assistant thread/conversation ID"),
+):
+    """Close an active assistant bridge career scope."""
+    payload = AssistantThreadStateStore(_workspace_path()).close_scope(client=client, thread_id=thread)
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 @profile_app.command("generate")

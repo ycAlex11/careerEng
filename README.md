@@ -30,6 +30,8 @@ When action is needed, CareerEng uses browser automation as the execution layer:
 | Site Automation | Runs login, application-status review, job filtering, job retrieval, and apply workflows. |
 | Skills | Keeps shared job-search policy in project Skills and website-specific behavior in site Skills. |
 | Reports | Summarizes new jobs, submitted jobs, unsubmitted jobs, and reviewed application statuses. |
+| Assistant Bridge | Lets external AI assistants route `@career` requests into local CareerEng commands and memory. |
+| Metrics | Records runtime and usage summaries for debugging and future workflow optimization. |
 
 ## Install
 
@@ -171,6 +173,34 @@ You can also register a company directly:
 careereng site add "Microsoft" --url https://careers.microsoft.com
 ```
 
+## Assistant Bridge
+
+CareerEng includes a generic assistant bridge for Codex, Claude Code, Cursor, or other local AI assistants. The first supported interaction pattern is explicit routing with `@career`.
+
+For example, an assistant can translate:
+
+```text
+@career 检查投递状态
+```
+
+into:
+
+```bash
+python -m careereng assistant ingest --client codex --thread <thread_id> -m "@career 检查投递状态"
+```
+
+The bridge classifies the message, records the event locally, tracks thread scope for multi-turn career conversations, and returns a suggested CareerEng command. High-impact operations such as applying to jobs should still require an explicit user request or confirmation from the assistant side.
+
+Useful bridge commands:
+
+```bash
+python -m careereng assistant ingest --client codex --thread <thread_id> -m "@career 总结一下投递情况"
+python -m careereng assistant state --client codex --thread <thread_id>
+python -m careereng assistant end --client codex --thread <thread_id>
+```
+
+Assistant-facing instructions live in `docs/assistant_bridge/`. Project-specific Codex entry rules live in `AGENTS.md`.
+
 ## Skills
 
 CareerEng uses AI Skills as procedural memory for the agent. Skills are plain Markdown files with YAML front matter.
@@ -249,6 +279,20 @@ Reports summarize:
 - application-status review results grouped by status
 - site-level retrieval/apply outcomes
 
+## Local Debugging And Evolution Data
+
+CareerEng records structured local data so an assistant can debug runs from evidence instead of guessing.
+
+Important local signals include:
+
+- Assistant bridge events: `workspace/assistant_bridge/`
+- Career memory signals: `workspace/memory/`
+- Interview records: `workspace/interviews/`
+- Metrics summaries and usage records: `workspace/metrics/`
+- Browser-control evolution events: `workspace/evolution/browser_control/`
+
+These files are intentionally local-first. They can support later improvements such as better command routing, more accurate application summaries, retrieval-stop tuning, site-skill refinement, and interview preparation memory.
+
 ## Common CLI
 
 | Command | Purpose |
@@ -264,8 +308,16 @@ Reports summarize:
 | `careereng site activate microsoft` | Reactivate a registered site. |
 | `careereng jobs apply` | Run retrieval and apply for active registered sites. |
 | `careereng report jobs --batch latest` | Generate or inspect the latest job report. |
+| `careereng jobs review-status` | Review application status for active registered sites and stop after reporting. |
+| `careereng application-summary build` | Build an application summary from local history and review data. |
+| `careereng application-summary repair-history` | Apply safe history repairs for legacy unmatched review records. |
+| `careereng metrics summary` | Summarize runtime and usage metrics. |
+| `careereng assistant ingest --client codex --thread <id> -m "@career ..."` | Route an external assistant message through the local assistant bridge. |
+| `careereng assistant state --client codex --thread <id>` | Inspect assistant bridge thread scope. |
+| `careereng assistant end --client codex --thread <id>` | Close assistant bridge career scope for a thread. |
 | `careereng batch-list` | List open job batches. |
 | `careereng batch-clear` | Mark stale open batches as cancelled. |
+| `careereng batch-stop` | Stop CareerEng manager/browser runtime processes owned by the current workspace. |
 
 Debug commands:
 

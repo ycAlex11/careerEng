@@ -18,6 +18,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpe
 from careereng.browser_context import BrowserPhaseMemory
 from careereng.browser_controls.bridge import MCPToolBridge
 from careereng.browser_controls.prompting import PhasePrompt
+from careereng.evolution.browser_control.events import append_phase_event
 from careereng.metrics import LLMUsageRecorder, extract_usage
 
 
@@ -265,6 +266,9 @@ class ResponsesClient:
             "output": output_items,
             "stream_event_types": stream_event_types,
         }
+        usage_payload = extract_usage(final_usage)
+        if usage_payload:
+            data["usage"] = usage_payload
         if output_text:
             data["output_text"] = output_text
         self._record_metric(
@@ -352,8 +356,11 @@ class BrowserPhaseRuntime:
         "request_context",
         "update_phase_memory",
     )
-    JOB_RETRIEVAL_EMPTY_EVALUATE_MAX_SAME_PAGE_ATTEMPTS_WITH_CARRY_FORWARD = 25
-    JOB_RETRIEVAL_EMPTY_EVALUATE_MAX_SAME_PAGE_ATTEMPTS_WITHOUT_CARRY_FORWARD = 100
+    JOB_RETRIEVAL_EMPTY_EVALUATE_MAX_SAME_PAGE_ATTEMPTS_WITH_CARRY_FORWARD = 8
+    JOB_RETRIEVAL_EMPTY_EVALUATE_MAX_SAME_PAGE_ATTEMPTS_WITHOUT_CARRY_FORWARD = 15
+    SAME_URL_NO_PROGRESS_TOOL_CALL_LIMIT = 5
+    SAME_URL_NO_PROGRESS_TOKEN_LIMIT = 60000
+    RETRIEVAL_POLICY_PAGINATION_VIOLATION_LIMIT = 2
     JOB_RETRIEVAL_PAGE_ACTION_WAIT_SECONDS = 5.0
     PAGE_SETTLE_MAX_SNAPSHOT_RETRIES = 2
     PAGE_SETTLE_SLEEP_SECONDS = 0.75
@@ -625,6 +632,32 @@ class BrowserPhaseRuntime:
             "Do not call request_context or update_phase_memory again right now. Use the current live page, active skills, and phase memory to "
             "take a concrete recovery step: use an official browser action, go back/re-enter the flow, record the terminal state with the phase-specific "
             "recording tool if available, or finish the phase as blocked/done with phase_result."
+        )
+
+    @staticmethod
+    def _job_retrieval_enrichment_required_message(*, current_url: str, enrichment_needed_count: int, enrichment_job_ids: list[str]) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        ids_line = f"Jobs needing enrichment: {', '.join(enrichment_job_ids[:5])}\n" if enrichment_job_ids else ""
+        return (
+            "Runtime note: the last record_jobs call found existing jobs on this same results page that still need enrichment.\n"
+            f"{url_line}"
+            f"Enrichment-needed count: {max(1, int(enrichment_needed_count or 0))}\n"
+            f"{ids_line}"
+            "Do not paginate away from this results page yet. Open or inspect the needed current-page job(s), fill missing JD/URL/posted/location with update_jobs, "
+            "or finish job_retrieval as blocked if the site prevents enrichment."
+        )
+
+    @staticmethod
+    def _same_url_no_progress_message(*, phase: PhasePrompt, current_url: str, tool_calls: int, tokens: int) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        token_line = f"Same-page no-progress tokens: {tokens}\n" if tokens > 0 else ""
+        return (
+            f"Repeated no-progress tool calls were detected during `{phase.slug}`.\n"
+            f"{url_line}"
+            f"Same-page no-progress tool calls: {tool_calls}\n"
+            f"{token_line}"
+            "The runtime stopped this phase to avoid an expensive browser loop. "
+            "Use the trace and evolution event to refine the active skill or recovery path."
         )
 
     @staticmethod
@@ -1026,6 +1059,168 @@ class BrowserPhaseRuntime:
             payload["_request_timeout_seconds"] = max(0.1, float(request_timeout_seconds))
         return payload
 
+    @staticmethod
+    def _response_total_tokens(response: dict[str, Any]) -> int:
+        usage = response.get("usage") if isinstance(response, dict) else None
+        if not isinstance(usage, dict):
+            return 0
+        value = usage.get("total_tokens")
+        try:
+            return max(0, int(value or 0))
+        except Exception:
+            return 0
+
+    @classmethod
+    def _phase_progress_key(
+        cls,
+        *,
+        phase: PhasePrompt,
+        current_url: str,
+        latest_snapshot_payload: dict[str, Any] | None,
+        last_payload: dict[str, Any] | None,
+    ) -> str:
+        if phase.slug == "job_retrieval":
+            return cls._job_retrieval_page_fingerprint(
+                current_url=current_url,
+                latest_snapshot_payload=latest_snapshot_payload,
+                last_payload=last_payload,
+            )
+        url = str(current_url or "").strip()
+        title = ""
+        for payload in (latest_snapshot_payload, last_payload):
+            title = MCPToolBridge.extract_page_title(payload) if isinstance(payload, dict) else ""
+            if title:
+                break
+        if url and title:
+            return f"{url}#title={title.strip().lower()}"
+        return url or title.strip().lower()
+
+    @staticmethod
+    def _record_jobs_policy_from_structured(
+        structured: dict[str, Any],
+        *,
+        current_url: str,
+        page_key: str,
+    ) -> dict[str, Any]:
+        if not isinstance(structured, dict):
+            return {}
+
+        def int_value(key: str) -> int:
+            try:
+                return max(0, int(structured.get(key) or 0))
+            except Exception:
+                return 0
+
+        enrichment_job_ids = [
+            str(job_id).strip()
+            for job_id in structured.get("enrichment_job_ids") or []
+            if str(job_id).strip()
+        ]
+        return {
+            "current_url": str(current_url or "").strip(),
+            "page_key": str(page_key or "").strip(),
+            "recorded_count": int_value("recorded_count"),
+            "new_count": int_value("new_count"),
+            "existing_count": int_value("existing_count"),
+            "existing_complete_count": int_value("existing_complete_count"),
+            "enrichment_needed_count": int_value("enrichment_needed_count"),
+            "enrichment_job_ids": enrichment_job_ids,
+            "stop_recommended": bool(structured.get("stop_recommended")),
+            "stop_reason": str(structured.get("stop_reason") or "").strip(),
+        }
+
+    @staticmethod
+    def _record_jobs_policy_applies(
+        policy: dict[str, Any],
+        *,
+        current_url: str,
+        current_page_key: str,
+    ) -> bool:
+        if not isinstance(policy, dict) or not policy:
+            return False
+        policy_page_key = str(policy.get("page_key") or "").strip()
+        if policy_page_key and current_page_key and policy_page_key == current_page_key:
+            return True
+        policy_url = str(policy.get("current_url") or "").strip()
+        return bool(policy_url and current_url and policy_url == current_url)
+
+    @staticmethod
+    def _structured_positive_count(structured: dict[str, Any], *keys: str) -> bool:
+        if not isinstance(structured, dict):
+            return False
+        for key in keys:
+            value = structured.get(key)
+            if isinstance(value, list) and value:
+                return True
+            try:
+                if int(value or 0) > 0:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    @classmethod
+    def _tool_call_made_runtime_progress(
+        cls,
+        *,
+        tool_name: str,
+        error_text: str,
+        pre_progress_key: str,
+        post_progress_key: str,
+        payload: dict[str, Any] | None,
+    ) -> bool:
+        if str(error_text or "").strip():
+            return False
+        if pre_progress_key and post_progress_key and pre_progress_key != post_progress_key:
+            return True
+        structured = payload.get("structuredContent") if isinstance(payload, dict) else None
+        if tool_name == "record_jobs" and isinstance(structured, dict):
+            return cls._structured_positive_count(structured, "recorded_count", "job_ids")
+        if tool_name == "update_jobs" and isinstance(structured, dict):
+            return cls._structured_positive_count(structured, "updated_count", "jobs", "terminal_job_ids")
+        if tool_name == "record_application_reviews" and isinstance(structured, dict):
+            return cls._structured_positive_count(structured, "recorded_count", "matched_count", "unmatched_count")
+        if tool_name == "request_context" and isinstance(structured, dict):
+            return str(structured.get("status") or "").strip().lower() == "attached"
+        return False
+
+    def _record_browser_control_event(
+        self,
+        *,
+        site_store: Any,
+        event_type: str,
+        batch_id: str,
+        site_key: str,
+        phase: PhasePrompt,
+        turn_id: str,
+        current_url: str,
+        guard_name: str,
+        trigger_values: dict[str, Any] | None = None,
+        last_record_jobs_policy: dict[str, Any] | None = None,
+        trace_ref: str = "",
+        summary: str = "",
+    ) -> None:
+        workspace = getattr(site_store, "workspace", None)
+        if not workspace:
+            return
+        try:
+            append_phase_event(
+                workspace=workspace,
+                event_type=event_type,
+                batch_id=batch_id,
+                site_key=site_key,
+                phase=phase.slug,
+                turn_id=turn_id,
+                current_url=current_url,
+                guard_name=guard_name,
+                trigger_values=trigger_values,
+                last_record_jobs_policy=last_record_jobs_policy,
+                trace_ref=trace_ref,
+                summary=summary,
+            )
+        except Exception:
+            return
+
     def _system_prompt(self, *, site_name: str, phase: PhasePrompt) -> str:
         return (
             "You are controlling a live browser through official Playwright MCP tools. "
@@ -1323,6 +1518,7 @@ class BrowserPhaseRuntime:
             "employment_type",
             "match_label",
             "apply_state",
+            "site_job_id",
             "posted_at",
         )
         normalized: dict[str, Any] = {}
@@ -1937,35 +2133,86 @@ class BrowserPhaseRuntime:
             normalized = self._normalize_record_job(job)
             if normalized:
                 jobs.append(normalized)
+        classify_history_matches = getattr(site_store, "classify_history_matches", None)
         list_jobs = getattr(site_store, "list_jobs", None)
         preview_new_flags = getattr(site_store, "preview_history_new_flags", None)
         before_rows = list_jobs(site_key) if callable(list_jobs) else []
         before_ids = {str(row.get("job_id") or "") for row in before_rows if isinstance(row, dict)}
-        if callable(preview_new_flags):
+        if callable(classify_history_matches):
+            try:
+                history_matches = list(classify_history_matches(site_key, jobs))
+            except Exception:
+                history_matches = []
+        else:
+            history_matches = []
+        if not history_matches and callable(preview_new_flags):
             try:
                 new_flags = list(preview_new_flags(site_key, jobs))
             except Exception:
                 new_flags = []
         else:
-            new_flags = []
+            new_flags = [row.get("history_match_status") == "new" for row in history_matches]
         saved_rows = site_store.append_jobs(site_key, jobs, session_id or "", turn_id, batch_id)
         saved_ids: list[str] = []
         new_ids: list[str] = []
+        history_match_results: list[dict[str, Any]] = []
         for idx, row in enumerate(saved_rows):
             if not isinstance(row, dict):
                 continue
             record_id = str(row.get("observation_id") or row.get("job_id") or "").strip()
             if not record_id:
                 continue
+            run_job_id = str(row.get("job_id") or "").strip()
             saved_ids.append(record_id)
             is_new = idx < len(new_flags) and bool(new_flags[idx])
             if not new_flags and str(row.get("job_id") or "").strip() not in before_ids:
                 is_new = True
             if is_new:
                 new_ids.append(record_id)
+            classification = history_matches[idx] if idx < len(history_matches) and isinstance(history_matches[idx], dict) else {}
+            status = str(classification.get("history_match_status") or ("new" if is_new else "existing_complete"))
+            reasons = classification.get("enrichment_reasons")
+            if not isinstance(reasons, list):
+                reasons = []
+            history_match_results.append(
+                {
+                    "record_id": record_id,
+                    "job_id": run_job_id,
+                    "title": str(row.get("title") or ""),
+                    "url": str(row.get("url") or ""),
+                    "site_job_id": str(row.get("site_job_id") or ""),
+                    "history_match_status": status,
+                    "matched_job_id": str(classification.get("matched_job_id") or ""),
+                    "application_status": str(classification.get("application_status") or ""),
+                    "application_review_status": str(classification.get("application_review_status") or ""),
+                    "application_review_status_raw": str(classification.get("application_review_status_raw") or ""),
+                    "enrichment_reasons": [str(reason) for reason in reasons if str(reason).strip()],
+                }
+            )
         recorded_count = len(saved_ids)
         new_count = len(new_ids)
-        summary = f"Recorded {recorded_count} jobs from the current page ({new_count} new)."
+        existing_count = sum(
+            1 for item in history_match_results if str(item.get("history_match_status") or "").startswith("existing_")
+        )
+        enrichment_needed = [
+            item for item in history_match_results if item.get("history_match_status") == "existing_needs_enrichment"
+        ]
+        existing_complete_count = sum(
+            1 for item in history_match_results if item.get("history_match_status") == "existing_complete"
+        )
+        enrichment_needed_count = len(enrichment_needed)
+        stop_recommended = bool(existing_count >= 3 and enrichment_needed_count == 0)
+        stop_reason = (
+            "current page contains at least 3 existing complete jobs and no enrichment targets"
+            if stop_recommended
+            else ""
+        )
+        summary = (
+            f"Recorded {recorded_count} jobs from the current page "
+            f"({new_count} new, {existing_count} existing, {enrichment_needed_count} need enrichment)."
+        )
+        if stop_recommended:
+            summary += " Stop pagination is recommended by history match policy."
         return {
             "isError": False,
             "current_url": current_url,
@@ -1973,8 +2220,19 @@ class BrowserPhaseRuntime:
                 "current_url": current_url,
                 "recorded_count": recorded_count,
                 "new_count": new_count,
+                "existing_count": existing_count,
+                "existing_complete_count": existing_complete_count,
+                "enrichment_needed_count": enrichment_needed_count,
+                "stop_recommended": stop_recommended,
+                "stop_reason": stop_reason,
                 "job_ids": saved_ids,
                 "new_job_ids": new_ids,
+                "history_matches": history_match_results,
+                "enrichment_job_ids": [
+                    str(item.get("job_id") or item.get("record_id") or "")
+                    for item in enrichment_needed
+                    if str(item.get("job_id") or item.get("record_id") or "")
+                ],
             },
             "content": [{"type": "text", "text": summary}],
         }
@@ -2269,6 +2527,110 @@ class BrowserPhaseRuntime:
         failed_page_action_name = ""
         response_turn_timeout_count = 0
         max_response_turn_timeouts = max(1, int(self.config.max_step_retries or 0)) + 1
+        last_record_jobs_policy: dict[str, Any] = {}
+        retrieval_policy_pagination_violation_count = 0
+        same_url_no_progress_key = ""
+        same_url_no_progress_tool_calls = 0
+        same_url_no_progress_tokens = 0
+
+        def track_same_url_no_progress(
+            *,
+            made_progress: bool,
+            tool_name: str,
+            pre_progress_key: str,
+            post_progress_key: str,
+            response_tokens: int,
+            output_text: str,
+        ) -> BrowserPhaseResult | None:
+            nonlocal same_url_no_progress_key
+            nonlocal same_url_no_progress_tool_calls
+            nonlocal same_url_no_progress_tokens
+            if made_progress:
+                same_url_no_progress_key = ""
+                same_url_no_progress_tool_calls = 0
+                same_url_no_progress_tokens = 0
+                return None
+            progress_key = post_progress_key or pre_progress_key or str(current_url or "").strip()
+            if not progress_key:
+                return None
+            if progress_key == same_url_no_progress_key:
+                same_url_no_progress_tool_calls += 1
+            else:
+                same_url_no_progress_key = progress_key
+                same_url_no_progress_tool_calls = 1
+                same_url_no_progress_tokens = 0
+            same_url_no_progress_tokens += max(0, int(response_tokens or 0))
+            trigger_values = {
+                "tool_name": str(tool_name or ""),
+                "progress_key": progress_key,
+                "same_url_no_progress_tool_calls": same_url_no_progress_tool_calls,
+                "same_url_no_progress_tokens": same_url_no_progress_tokens,
+            }
+            if same_url_no_progress_tokens >= self.SAME_URL_NO_PROGRESS_TOKEN_LIMIT:
+                summary = self._same_url_no_progress_message(
+                    phase=phase,
+                    current_url=current_url,
+                    tool_calls=same_url_no_progress_tool_calls,
+                    tokens=same_url_no_progress_tokens,
+                )
+                self._record_browser_control_event(
+                    site_store=site_store,
+                    event_type="same_url_no_progress_tokens",
+                    batch_id=batch_id,
+                    site_key=site_key,
+                    phase=phase,
+                    turn_id=turn_id,
+                    current_url=current_url,
+                    guard_name="same_url_no_progress_tokens",
+                    trigger_values=trigger_values,
+                    last_record_jobs_policy=last_record_jobs_policy,
+                    trace_ref=trace_ref,
+                    summary=summary,
+                )
+                return BrowserPhaseResult(
+                    status="failed",
+                    reason_tag="same_url_no_progress_tokens",
+                    summary=summary,
+                    current_url=current_url,
+                    step_count=step_count,
+                    trace_ref=trace_ref,
+                    raw_text=output_text,
+                    recorded_count=len(recorded_job_ids),
+                    new_count=len(new_job_ids),
+                )
+            if same_url_no_progress_tool_calls >= self.SAME_URL_NO_PROGRESS_TOOL_CALL_LIMIT:
+                summary = self._same_url_no_progress_message(
+                    phase=phase,
+                    current_url=current_url,
+                    tool_calls=same_url_no_progress_tool_calls,
+                    tokens=same_url_no_progress_tokens,
+                )
+                self._record_browser_control_event(
+                    site_store=site_store,
+                    event_type="same_url_no_progress",
+                    batch_id=batch_id,
+                    site_key=site_key,
+                    phase=phase,
+                    turn_id=turn_id,
+                    current_url=current_url,
+                    guard_name="same_url_no_progress",
+                    trigger_values=trigger_values,
+                    last_record_jobs_policy=last_record_jobs_policy,
+                    trace_ref=trace_ref,
+                    summary=summary,
+                )
+                return BrowserPhaseResult(
+                    status="failed",
+                    reason_tag="same_url_no_progress",
+                    summary=summary,
+                    current_url=current_url,
+                    step_count=step_count,
+                    trace_ref=trace_ref,
+                    raw_text=output_text,
+                    recorded_count=len(recorded_job_ids),
+                    new_count=len(new_job_ids),
+                )
+            return None
 
         while time.monotonic() < deadline and step_count < max(1, effective_max_phase_steps):
             loop_context_items = list(history_items)
@@ -2419,6 +2781,7 @@ class BrowserPhaseRuntime:
             response_turn_timeout_count = 0
             output_items = self._extract_output_items(response)
             output_text = self._extract_output_text(response)
+            response_total_tokens = self._response_total_tokens(response)
             fallback_result = self._maybe_parse_phase_result_text(output_text)
             if fallback_result is not None:
                 return BrowserPhaseResult(
@@ -2482,6 +2845,12 @@ class BrowserPhaseRuntime:
                         last_payload=last_payload if isinstance(last_payload, dict) else None,
                     )
                     current_page_label = self._extract_page_label(latest_snapshot_payload) or self._extract_page_label(last_payload)
+                pre_tool_progress_key = self._phase_progress_key(
+                    phase=phase,
+                    current_url=current_url,
+                    latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
+                    last_payload=last_payload if isinstance(last_payload, dict) else None,
+                )
 
                 if phase.slug == "apply" and apply_upload_requires_observation and name == "phase_result":
                     history_items = [
@@ -2759,6 +3128,97 @@ class BrowserPhaseRuntime:
                         ]
                         retry_requested = True
                         break
+                if (
+                    phase.slug == "job_retrieval"
+                    and self._looks_like_pagination_action(name, arguments if isinstance(arguments, dict) else None)
+                    and self._record_jobs_policy_applies(
+                        last_record_jobs_policy,
+                        current_url=current_url,
+                        current_page_key=current_page_key,
+                    )
+                ):
+                    if bool(last_record_jobs_policy.get("stop_recommended")):
+                        summary = "Job retrieval stopped because the current page already matched the history stop policy."
+                        self._record_browser_control_event(
+                            site_store=site_store,
+                            event_type="ignored_stop_recommended",
+                            batch_id=batch_id,
+                            site_key=site_key,
+                            phase=phase,
+                            turn_id=turn_id,
+                            current_url=current_url,
+                            guard_name="retrieval_stop_recommended",
+                            trigger_values={
+                                "attempted_tool": name,
+                                "attempted_arguments": arguments,
+                                "stop_recommended": True,
+                            },
+                            last_record_jobs_policy=last_record_jobs_policy,
+                            trace_ref=trace_ref,
+                            summary=summary,
+                        )
+                        return BrowserPhaseResult(
+                            status="done",
+                            reason_tag="retrieval_stop_recommended",
+                            summary=summary,
+                            current_url=current_url,
+                            step_count=step_count,
+                            trace_ref=trace_ref,
+                            raw_text=output_text,
+                            recorded_count=len(recorded_job_ids),
+                            new_count=len(new_job_ids),
+                        )
+                    enrichment_needed_count = int(last_record_jobs_policy.get("enrichment_needed_count") or 0)
+                    if enrichment_needed_count > 0:
+                        retrieval_policy_pagination_violation_count += 1
+                        enrichment_job_ids = [
+                            str(job_id).strip()
+                            for job_id in last_record_jobs_policy.get("enrichment_job_ids") or []
+                            if str(job_id).strip()
+                        ]
+                        summary = "Job retrieval blocked pagination because current-page history matches still need enrichment."
+                        self._record_browser_control_event(
+                            site_store=site_store,
+                            event_type="ignored_enrichment_required",
+                            batch_id=batch_id,
+                            site_key=site_key,
+                            phase=phase,
+                            turn_id=turn_id,
+                            current_url=current_url,
+                            guard_name="retrieval_enrichment_required",
+                            trigger_values={
+                                "attempted_tool": name,
+                                "attempted_arguments": arguments,
+                                "enrichment_needed_count": enrichment_needed_count,
+                                "violation_count": retrieval_policy_pagination_violation_count,
+                            },
+                            last_record_jobs_policy=last_record_jobs_policy,
+                            trace_ref=trace_ref,
+                            summary=summary,
+                        )
+                        if retrieval_policy_pagination_violation_count >= self.RETRIEVAL_POLICY_PAGINATION_VIOLATION_LIMIT:
+                            return BrowserPhaseResult(
+                                status="failed",
+                                reason_tag="retrieval_enrichment_required",
+                                summary=summary,
+                                current_url=current_url,
+                                step_count=step_count,
+                                trace_ref=trace_ref,
+                                raw_text=output_text,
+                                recorded_count=len(recorded_job_ids),
+                                new_count=len(new_job_ids),
+                            )
+                        history_items = [
+                            self._context_item(
+                                self._job_retrieval_enrichment_required_message(
+                                    current_url=current_url,
+                                    enrichment_needed_count=enrichment_needed_count,
+                                    enrichment_job_ids=enrichment_job_ids,
+                                )
+                            )
+                        ]
+                        retry_requested = True
+                        break
                 step_count += 1
                 for attempt in range(1, max(1, int(self.config.max_step_retries or 0)) + 2):
                     site_store.save_browser_session(
@@ -2839,6 +3299,12 @@ class BrowserPhaseRuntime:
                         for job_id in structured.get("new_job_ids") or []:
                             if isinstance(job_id, str) and job_id.strip():
                                 new_job_ids.add(job_id.strip())
+                        last_record_jobs_policy = self._record_jobs_policy_from_structured(
+                            structured,
+                            current_url=current_url,
+                            page_key=recorded_page_key,
+                        )
+                        retrieval_policy_pagination_violation_count = 0
                     current_url = MCPToolBridge.extract_current_url(payload) or current_url or str(entry_url or "")
 
                     trace_ref = site_store.append_step_trace(
@@ -2909,6 +3375,28 @@ class BrowserPhaseRuntime:
                         else:
                             no_progress_internal_streak = 1
                         last_no_progress_internal_url = current_url
+                        post_tool_progress_key = self._phase_progress_key(
+                            phase=phase,
+                            current_url=current_url,
+                            latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
+                            last_payload=last_payload if isinstance(last_payload, dict) else None,
+                        )
+                        no_progress_result = track_same_url_no_progress(
+                            made_progress=self._tool_call_made_runtime_progress(
+                                tool_name=name,
+                                error_text=error_text,
+                                pre_progress_key=pre_tool_progress_key,
+                                post_progress_key=post_tool_progress_key,
+                                payload=payload,
+                            ),
+                            tool_name=name,
+                            pre_progress_key=pre_tool_progress_key,
+                            post_progress_key=post_tool_progress_key,
+                            response_tokens=response_total_tokens,
+                            output_text=output_text,
+                        )
+                        if no_progress_result is not None:
+                            return no_progress_result
                         history_items = [tool_feedback]
                         retry_requested = True
                         break
@@ -3153,14 +3641,13 @@ class BrowserPhaseRuntime:
                             if isinstance(last_payload, dict)
                             else payload
                         )
-                    empty_extraction_with_results_signal = (
+                    empty_extraction_signal = (
                         phase.slug == "job_retrieval"
                         and name == "browser_evaluate"
                         and not error_text
                         and self._payload_has_empty_extracted_jobs(payload)
-                        and self._payload_has_job_results_signal(signal_payload)
                     )
-                    if empty_extraction_with_results_signal:
+                    if empty_extraction_signal:
                         latest_empty_page_key = latest_page_key or current_page_key or current_url or "__job_retrieval__"
                         if latest_empty_page_key == empty_extraction_page_key:
                             empty_extraction_count += 1
@@ -3196,16 +3683,35 @@ class BrowserPhaseRuntime:
                         last_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
                         retry_requested = True
                         break
-                    if empty_extraction_with_results_signal:
+                    if empty_extraction_signal:
                         empty_extraction_limit = self._job_retrieval_empty_evaluate_limit(phase_memory)
                         if empty_extraction_count >= empty_extraction_limit:
+                            summary = (
+                                "same-page browser_evaluate returned empty jobs repeatedly "
+                                "without recording retrieval progress"
+                            )
+                            self._record_browser_control_event(
+                                site_store=site_store,
+                                event_type="empty_extraction_loop",
+                                batch_id=batch_id,
+                                site_key=site_key,
+                                phase=phase,
+                                turn_id=turn_id,
+                                current_url=current_url,
+                                guard_name="empty_extraction_loop",
+                                trigger_values={
+                                    "empty_extraction_count": empty_extraction_count,
+                                    "empty_extraction_limit": empty_extraction_limit,
+                                    "page_key": empty_extraction_page_key,
+                                },
+                                last_record_jobs_policy=last_record_jobs_policy,
+                                trace_ref=trace_ref,
+                                summary=summary,
+                            )
                             return BrowserPhaseResult(
                                 status="failed",
                                 reason_tag="empty_extraction_loop",
-                                summary=(
-                                    "same-page browser_evaluate returned empty jobs repeatedly "
-                                    "while the live page still showed job results signals"
-                                ),
+                                summary=summary,
                                 current_url=current_url,
                                 step_count=step_count,
                                 trace_ref=trace_ref,
@@ -3227,6 +3733,28 @@ class BrowserPhaseRuntime:
                         last_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
                         retry_requested = True
                         break
+                    post_tool_progress_key = self._phase_progress_key(
+                        phase=phase,
+                        current_url=current_url,
+                        latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
+                        last_payload=last_payload if isinstance(last_payload, dict) else None,
+                    )
+                    no_progress_result = track_same_url_no_progress(
+                        made_progress=self._tool_call_made_runtime_progress(
+                            tool_name=name,
+                            error_text=error_text,
+                            pre_progress_key=pre_tool_progress_key,
+                            post_progress_key=post_tool_progress_key,
+                            payload=payload,
+                        ),
+                        tool_name=name,
+                        pre_progress_key=pre_tool_progress_key,
+                        post_progress_key=post_tool_progress_key,
+                        response_tokens=response_total_tokens,
+                        output_text=output_text,
+                    )
+                    if no_progress_result is not None:
+                        return no_progress_result
                     use_fresh_snapshot_primary_context = self._should_use_fresh_snapshot_primary_context(
                         tool_name=name,
                         fresh_snapshot_captured=fresh_snapshot_captured,

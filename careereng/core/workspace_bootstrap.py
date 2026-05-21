@@ -149,6 +149,21 @@ def bootstrap_workspace(workspace: Path) -> list[WorkspaceEntry]:
     _ensure_empty_file(workspace / "router" / "events.jsonl", rows, workspace)
     _ensure_empty_file(workspace / "router" / "feedback.jsonl", rows, workspace)
 
+    _ensure_dir(workspace / "assistant_bridge", rows, workspace)
+    _ensure_empty_file(workspace / "assistant_bridge" / "intake_events.jsonl", rows, workspace)
+    _ensure_empty_file(workspace / "assistant_bridge" / "action_events.jsonl", rows, workspace)
+    _ensure_empty_file(workspace / "assistant_bridge" / "correction_events.jsonl", rows, workspace)
+    _ensure_empty_file(workspace / "assistant_bridge" / "routing_examples.jsonl", rows, workspace)
+    _ensure_text_file(workspace / "assistant_bridge" / "thread_state.json", '{"threads": {}}\n', rows, workspace)
+
+    _ensure_dir(workspace / "memory", rows, workspace)
+    _ensure_empty_file(workspace / "memory" / "profile_signals.jsonl", rows, workspace)
+    _ensure_empty_file(workspace / "memory" / "intent_signals.jsonl", rows, workspace)
+    _ensure_empty_file(workspace / "memory" / "application_feedback_signals.jsonl", rows, workspace)
+
+    _ensure_dir(workspace / "interviews", rows, workspace)
+    _ensure_empty_file(workspace / "interviews" / "events.jsonl", rows, workspace)
+
     _ensure_dir(workspace / "runs", rows, workspace)
     _ensure_dir(workspace / "runs" / "daily", rows, workspace)
 

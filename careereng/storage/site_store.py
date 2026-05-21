@@ -1072,6 +1072,7 @@ class SiteStore:
             "apply_state",
             "site_job_id",
             "description_ref",
+            "jd_sync_status",
         ):
             value = str(incoming.get(field) or "").strip()
             if value:
@@ -1150,23 +1151,93 @@ class SiteStore:
             )
         return merged
 
-    def preview_history_new_flags(self, site_id: str, jobs: list[dict[str, Any]]) -> list[bool]:
-        history_rows = self._load_history_jobs(site_id)
-        lookup: dict[str, str] = {}
-        for row in history_rows:
-            if not isinstance(row, dict):
-                continue
-            job_id = str(row.get("job_id") or "").strip()
-            if not job_id:
-                continue
-            for key in self._history_match_keys(site_id, row):
-                lookup.setdefault(key, job_id)
+    def _history_enrichment_reasons(self, row: dict[str, Any]) -> list[str]:
+        if not isinstance(row, dict):
+            return []
+        reasons: list[str] = []
 
-        flags: list[bool] = []
+        def add(reason: str) -> None:
+            if reason and reason not in reasons:
+                reasons.append(reason)
+
+        history_source = self._normalize_job_text(str(row.get("history_source") or ""))
+        application_origin = self._normalize_job_text(str(row.get("application_origin") or ""))
+        jd_sync_status = self._normalize_job_text(str(row.get("jd_sync_status") or ""))
+        url_quality = self._normalize_job_text(str(row.get("url_quality") or ""))
+        description_ref = str(row.get("description_ref") or "").strip()
+        url = self._normalize_url(str(row.get("url") or ""))
+        application_review_url = self._normalize_url(str(row.get("application_review_url") or ""))
+
+        if jd_sync_status in {"missing", "partial"}:
+            add(f"{jd_sync_status}_jd")
+        if (
+            not description_ref
+            and (
+                history_source == "application_status_review"
+                or application_origin == "external_or_prior"
+                or jd_sync_status in {"missing", "partial"}
+            )
+        ):
+            add("missing_description")
+        if not url:
+            add("missing_real_job_url")
+        elif url_quality == "dashboard_or_non_job" or self._is_application_review_non_job_url(url):
+            add("dashboard_url_only")
+        if history_source == "application_status_review" and not description_ref:
+            add("review_only_history")
+        if application_review_url and not url:
+            add("review_url_only")
+        return reasons
+
+    def classify_history_matches(self, site_id: str, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        history_rows = self._load_history_jobs(site_id)
+        by_job_id, by_canonical_job_id, by_match_key = self._history_resolution_indexes(site_id, history_rows)
+        classifications: list[dict[str, Any]] = []
         for job in jobs:
-            keys = self._history_match_keys(site_id, job if isinstance(job, dict) else {})
-            flags.append(not any(key in lookup for key in keys))
-        return flags
+            if not isinstance(job, dict):
+                classifications.append(
+                    {
+                        "history_match_status": "new",
+                        "matched_job_id": "",
+                        "enrichment_reasons": [],
+                    }
+                )
+                continue
+            match_idx = self._resolve_history_row_index(
+                site_id,
+                job,
+                by_job_id=by_job_id,
+                by_canonical_job_id=by_canonical_job_id,
+                by_match_key=by_match_key,
+            )
+            if match_idx is None:
+                classifications.append(
+                    {
+                        "history_match_status": "new",
+                        "matched_job_id": "",
+                        "enrichment_reasons": [],
+                    }
+                )
+                continue
+            matched = history_rows[match_idx]
+            reasons = self._history_enrichment_reasons(matched)
+            classifications.append(
+                {
+                    "history_match_status": "existing_needs_enrichment" if reasons else "existing_complete",
+                    "matched_job_id": str(matched.get("job_id") or ""),
+                    "matched_canonical_job_id": str(matched.get("canonical_job_id") or ""),
+                    "matched_title": str(matched.get("title") or ""),
+                    "matched_url": str(matched.get("url") or ""),
+                    "application_status": str(matched.get("application_status") or ""),
+                    "application_review_status": str(matched.get("application_review_status") or ""),
+                    "application_review_status_raw": str(matched.get("application_review_status_raw") or ""),
+                    "enrichment_reasons": reasons,
+                }
+            )
+        return classifications
+
+    def preview_history_new_flags(self, site_id: str, jobs: list[dict[str, Any]]) -> list[bool]:
+        return [row.get("history_match_status") == "new" for row in self.classify_history_matches(site_id, jobs)]
 
     def _history_resolution_indexes(
         self,

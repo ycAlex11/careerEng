@@ -304,6 +304,19 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - Do not open each job detail page just to capture long descriptions in this phase.
 - Do not apply in this phase.
 
+### History Match Feedback
+
+- After `record_jobs` succeeds, read the tool result before deciding whether to paginate.
+- Treat each returned `history_match_status` as the local history verdict for that current-page job:
+  - `new`: not found in this site's local history yet.
+  - `existing_complete`: already present in this site's local history and no retrieval enrichment is needed.
+  - `existing_needs_enrichment`: already present, but local history still needs a real job URL, JD/description, or cleanup from an application-review-only record.
+- If `record_jobs` returns any `existing_needs_enrichment` jobs, prioritize those current-page jobs for enrichment before paginating when the live site allows opening their details from the current page.
+- Enrichment means opening the matching job detail, collecting the real job URL, visible site job id, location, posted label/date, and JD/description when available, then calling `update_jobs` for the returned run `job_id`.
+- Do not apply to enrichment jobs during retrieval. Only update the stored job data and return to the results page.
+- If `record_jobs` returns `stop_recommended = true`, finish retrieval after updating phase memory unless the current site skill has a stricter still-unmet stop condition.
+- If `record_jobs` returns `stop_recommended = false` because enrichment is needed, do not stop merely because existing jobs were found; handle the enrichment targets first.
+
 ### Carry-Forward Usage
 
 - If current phase memory already contains `retrieval_carry_forward`, the next results page's first same-page read must start from that carried guidance instead of restarting from a blank search.
@@ -333,6 +346,8 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 ### Pagination
 
 - After recording the current page, check the current site-specific stop condition.
+- Also check the project history match stop condition from the `record_jobs` result: if at least 3 jobs on the current page already exist in local history and none need enrichment, stop pagination.
+- If the current site skill defines a date, page, posted-age, or other retrieval stop condition, combine it with the project history match stop condition using OR: stop when any one stop condition is satisfied.
 - If no stop condition is triggered and a real next-page / next-results / load-more action is available, continue to the next results page and repeat.
 - Use only a real visible pagination control, next-page control, or load-more action from the live page. Do not guess or synthesize pagination URLs.
 - When paginating through numbered results, move sequentially page by page instead of jumping ahead from inferred totals or URL parameters.
