@@ -31,6 +31,7 @@ from careereng.core.workspace_manager import (
     shutdown_workspace_manager,
     start_manager_jobs_batch,
 )
+from careereng.evolution import build_evolution_review, save_evolution_review
 from careereng.integrations.assistant_bridge import AssistantThreadStateStore, ingest_assistant_message
 from careereng.metrics import build_metrics_summary, save_metrics_summary
 from careereng.resume.export import ResumeExportError, export_resume_pdf as export_resume_pdf_file
@@ -46,6 +47,7 @@ from careereng.utils import make_id, safe_file_stem
 app = typer.Typer(help="CareerEng CLI")
 application_summary_app = typer.Typer(help="Application lifecycle summary commands")
 assistant_app = typer.Typer(help="External AI assistant bridge commands")
+evolution_app = typer.Typer(help="Evolution review commands")
 jobs_app = typer.Typer(help="Registered-site job retrieval/apply commands")
 profile_app = typer.Typer(help="Profile/persona commands")
 metrics_app = typer.Typer(help="Metrics summary commands")
@@ -55,6 +57,7 @@ route_app = typer.Typer(help="Route feedback commands")
 site_app = typer.Typer(help="Site registry commands")
 app.add_typer(application_summary_app, name="application-summary")
 app.add_typer(assistant_app, name="assistant")
+app.add_typer(evolution_app, name="evolution")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(metrics_app, name="metrics")
 app.add_typer(profile_app, name="profile")
@@ -805,6 +808,27 @@ def metrics_summary(
         path = save_metrics_summary(summary, workspace=workspace)
         lines.extend(["", f"saved: {path}"])
     typer.echo("\n".join(lines).rstrip())
+
+
+@evolution_app.command("review")
+def evolution_review(
+    max_evidence: int = typer.Option(200, "--max-evidence", min=1, help="Maximum recent evidence rows to include"),
+):
+    """Build an evidence-backed evolution review and context pack."""
+    workspace = _workspace_path()
+    review = build_evolution_review(workspace=workspace, project_root=_project_root(), max_evidence=max_evidence)
+    paths = save_evolution_review(review, workspace=workspace)
+    lines = [
+        "Evolution Review",
+        f"- evidence: {_format_int(review.get('evidence_count'))}",
+        f"- open candidates: {_format_int(review.get('candidate_count'))}",
+        f"- memory units: {_format_int(review.get('memory_count'))}",
+        f"- review: {paths['review_markdown']}",
+        f"- review_json: {paths['review_json']}",
+        f"- context: {paths['context_markdown']}",
+        f"- candidates: {paths['open_candidates_store']}",
+    ]
+    typer.echo("\n".join(lines))
 
 
 @app.command("batch-list")

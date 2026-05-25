@@ -164,6 +164,18 @@ def bootstrap_workspace(workspace: Path) -> list[WorkspaceEntry]:
     _ensure_dir(workspace / "interviews", rows, workspace)
     _ensure_empty_file(workspace / "interviews" / "events.jsonl", rows, workspace)
 
+    _ensure_dir(workspace / "evolution", rows, workspace)
+    _ensure_dir(workspace / "evolution" / "browser_control", rows, workspace)
+    _ensure_empty_file(workspace / "evolution" / "browser_control" / "phase_events.jsonl", rows, workspace)
+    _ensure_dir(workspace / "evolution" / "evidence", rows, workspace)
+    _ensure_empty_file(workspace / "evolution" / "evidence" / "all.jsonl", rows, workspace)
+    _ensure_dir(workspace / "evolution" / "candidates", rows, workspace)
+    _ensure_empty_file(workspace / "evolution" / "candidates" / "open.jsonl", rows, workspace)
+    _ensure_dir(workspace / "evolution" / "memory", rows, workspace)
+    _ensure_empty_file(workspace / "evolution" / "memory" / "units.jsonl", rows, workspace)
+    _ensure_dir(workspace / "evolution" / "reviews", rows, workspace)
+    _ensure_dir(workspace / "evolution" / "context", rows, workspace)
+
     _ensure_dir(workspace / "runs", rows, workspace)
     _ensure_dir(workspace / "runs" / "daily", rows, workspace)
 
