@@ -1,23 +1,25 @@
 # CareerEng
 
-`Python 3.11+` · `Local-first` · `Human-in-the-loop` · `AI Skills` · `Browser automation`
+`Python 3.11+` · `Local-first` · `Human-in-the-loop` · `AI Skills` · `Browser automation` · `Codex-ready`
 
 A local AI workspace for running an adaptive, evidence-driven job search across company career sites.
 
 ## What CareerEng Is
 
-CareerEng uses AI to turn your resume, preferences, target companies, career-site behavior, and application history into reusable operating knowledge. That knowledge lives in Markdown Skills, local profile files, job records, and reports, so future runs can make better decisions with less repeated setup.
+CareerEng is not a closed job-search app. It is a local, AI-operable workspace for running an adaptive job search with Codex or other AI assistants.
 
-When action is needed, CareerEng uses browser automation as the execution layer: opening company career sites, reviewing application status, retrieving matching jobs, and applying when the active Skills and local context say it is appropriate.
+Humans decide goals, safety boundaries, target companies, and whether to submit applications. Codex/LLMs inspect local files, run commands, draft Skills, explain reports, and propose improvements. CareerEng stores the durable state: resume, persona, intent, site Skills, job history, reports, metrics, memory, action cards, and evolution evidence.
+
+When action is needed, browser automation becomes the execution layer: opening company career sites, reviewing application status, retrieving matching jobs, and applying when the active Skills and local context say it is appropriate.
 
 ```text
 [Resume + Preferences]
    -> [Persona + Intent]
    -> [Company Discovery]
    -> [Project + Site Skills]
-   -> [Browser Execution]
-   -> [Application History + Reports]
-   -> [Better Next Runs]
+   -> [Assistant Bridge + Browser Execution]
+   -> [Application History + Reports + Metrics]
+   -> [Evidence Packs + Better Next Runs]
 ```
 
 ## What It Does
@@ -29,10 +31,12 @@ When action is needed, CareerEng uses browser automation as the execution layer:
 | Site Registration | Lets you register companies manually or from LLM-generated company candidates. |
 | Site Automation | Runs login, application-status review, job filtering, job retrieval, and apply workflows. |
 | Skills | Keeps shared job-search policy in project Skills and website-specific behavior in site Skills. |
-| Reports | Summarizes new jobs, submitted jobs, unsubmitted jobs, and reviewed application statuses. |
-| Assistant Bridge | Lets external AI assistants route `@career` requests into local CareerEng commands and memory. |
-| Action Cards | Creates local review task cards when Codex/user judgment is needed. |
+| Reports | Summarizes new jobs, submitted jobs, reviewed application statuses, raw status labels, and status changes. |
+| Application Summary | Builds a local summary of application outcomes, unmatched reviews, and repair opportunities. |
+| Assistant Bridge | Lets Codex or other assistants route `@career` requests into local commands and career memory. |
+| Action Cards | Creates local review task cards when Codex/user judgment is needed instead of immediate execution. |
 | Metrics | Records runtime and usage summaries for debugging and future workflow optimization. |
+| Evolution Scaffolding | Builds evidence packs, proposals, evaluations, and rollback records for future workflow improvement. |
 
 ## Install
 
@@ -174,48 +178,26 @@ You can also register a company directly:
 careereng site add "Microsoft" --url https://careers.microsoft.com
 ```
 
-## Assistant Bridge
+## AI Assistant Usage
 
-CareerEng includes a generic assistant bridge for Codex, Claude Code, Cursor, or other local AI assistants. The first supported interaction pattern is explicit routing with `@career`.
+CareerEng is designed to be operated with Codex or another AI assistant. The main entry point is simple: start a message with `@career`.
 
-For example, an assistant can translate:
+Use `@career` when you want the assistant to operate CareerEng instead of only chatting about the project. The assistant sends the message into CareerEng, CareerEng classifies it, records it, and returns the suggested local action.
+
+Examples:
 
 ```text
+@career 查看一下投递情况
 @career 检查投递状态
+@career 总结一下我们的投递情况
+@career 激活高通和 AMD
+@career 停用英伟达
+@career 我想投 AI infra，需要补什么？
 ```
 
-into:
+Codex should route these messages through the local assistant bridge. Detailed assistant rules live in `AGENTS.md` and `docs/assistant_bridge/`.
 
-```bash
-python -m careereng assistant ingest --client codex --thread <thread_id> -m "@career 检查投递状态"
-```
-
-The bridge classifies the message, records the event locally, tracks thread scope for multi-turn career conversations, and returns a suggested CareerEng command. High-impact operations such as applying to jobs should still require an explicit user request or confirmation from the assistant side.
-
-Action cards are the local handoff layer for work that should be reviewed or drafted by Codex. For example, when a newly registered company only has a draft site AI Skill, CareerEng creates a `codex_draft` card with `metadata.task = "site_skill_bootstrap"` so Codex can draft the site-specific workflow from existing site patterns.
-
-Career memory is the next layer. After assistant messages are classified and saved, CareerEng can promote them into unified long-term job-search memory units:
-
-```bash
-python -m careereng career-memory promote
-python -m careereng career-memory list
-```
-
-When Codex can see a longer current thread, it can curate recent career-relevant messages into JSON/JSONL candidates and import them with:
-
-```bash
-python -m careereng career-memory import-candidates /path/to/memory_candidates.jsonl
-```
-
-Useful bridge commands:
-
-```bash
-python -m careereng assistant ingest --client codex --thread <thread_id> -m "@career 总结一下投递情况"
-python -m careereng assistant state --client codex --thread <thread_id>
-python -m careereng assistant end --client codex --thread <thread_id>
-```
-
-Assistant-facing instructions live in `docs/assistant_bridge/`. Project-specific Codex entry rules live in `AGENTS.md`.
+The important design boundary is simple: Codex can understand the current conversation and help draft changes; CareerEng owns local storage, command execution, history, reports, and business state.
 
 ## Skills
 
@@ -293,7 +275,53 @@ Reports summarize:
 - new submitted jobs
 - new unsubmitted or filtered jobs
 - application-status review results grouped by status
+- raw status labels observed on career sites
+- status changes since the previous known application state
 - site-level retrieval/apply outcomes
+- unmatched application review records that need history repair or future enrichment
+
+Application summaries are separate from human-facing reports. They are built from local history and review data, and are intended to support later analysis and evolution:
+
+```bash
+careereng application-summary build
+careereng application-summary repair-history
+```
+
+Use summaries when you want to answer questions such as:
+
+- How many applications are still active?
+- Which applications were rejected, closed, withdrawn, or forwarded?
+- Which review records came from the site dashboard but were not yet matched to local job history?
+- Which history rows can be repaired safely from stronger site/job identifiers?
+
+## Metrics And Evolution
+
+CareerEng records runtime evidence so future changes can be evaluated instead of guessed.
+
+Metrics are stored under `workspace/metrics/` and can be summarized with:
+
+```bash
+careereng metrics summary
+careereng metrics summary --batch latest
+careereng metrics summary --site nvidia
+careereng metrics summary --phase job_retrieval
+```
+
+The metrics layer records request timing, stream event types, tool-call counts, and token usage when the provider returns usage data. This is useful for debugging slow phases, no-progress loops, unstable site skills, and future workflow optimization.
+
+Evolution is evidence-backed, not blind self-modification. CareerEng records what happened, builds an evidence pack, lets Codex/LLMs propose targeted changes, evaluates later outcomes, and keeps rollback records.
+
+What can evolve today:
+
+- Site workflow behavior: improve how a site Skill logs in, reviews applications, searches, retrieves jobs, detects already-applied jobs, fills forms, or avoids no-progress loops.
+- Application matching strategy: improve how the system decides whether a job should be applied to, using persona/CV, JD text, rejection patterns, in-process signals, and company-specific evidence.
+- Assistant routing and memory intake: improve when `@career` or a Codex conversation should enter local CareerEng memory, and how it should be classified.
+- Resume/profile direction: use accumulated job-search outcomes, application feedback, and user-confirmed facts to suggest resume/persona/profile changes.
+- History repair and data quality: reduce unmatched application reviews, enrich missing job IDs/JD fields, and make local history more useful for future reasoning.
+
+The evolution cadence is intentionally configurable. Some users may ask Codex to review a site Skill after every 10 successful runs; others may wait for repeated failures, repeated fast rejections, repeated unmatched records, or enough before/after metrics to compare behavior.
+
+Detailed evolution rules, candidate specs, proposal schema, evaluation, and rollback behavior live in `docs/evolution/`.
 
 ## Local Debugging And Evolution Data
 
@@ -304,11 +332,10 @@ Important local signals include:
 - Assistant bridge events: `workspace/assistant_bridge/`
 - Action cards for Codex/user follow-up: `workspace/action_cards/`
 - Career memory signals: `workspace/memory/`
-- Interview records: `workspace/interviews/`
 - Metrics summaries and usage records: `workspace/metrics/`
 - Browser-control evolution events: `workspace/evolution/browser_control/`
 
-These files are intentionally local-first. They can support later improvements such as better command routing, more accurate application summaries, retrieval-stop tuning, site-skill refinement, and interview preparation memory.
+These files are intentionally local-first. They can support later improvements such as better command routing, more accurate application summaries, retrieval-stop tuning, site-skill refinement, and stronger application matching.
 
 ## Common CLI
 
@@ -328,18 +355,13 @@ These files are intentionally local-first. They can support later improvements s
 | `careereng report jobs --batch latest` | Generate or inspect the latest job report. |
 | `careereng jobs review-status` | Review application status for active registered sites and stop after reporting. |
 | `careereng application-summary build` | Build an application summary from local history and review data. |
-| `careereng interview create --company NVIDIA --title "SDET"` | Create an interview session linked to a company/job. |
-| `careereng interview create --created-reason ad_hoc_assist` | Start an ad-hoc interview assist session with unknown company/title. |
-| `careereng interview update <session_id> --company OpenAI --title "AI Infra"` | Enrich or correct an interview session after more context is known. |
-| `careereng interview candidates --company NVIDIA --title SDET` | Find local job/application candidates before binding an interview session. |
-| `careereng interview create-from-candidate --candidate-id <id>` | Create or reuse an interview session after confirming a candidate. |
-| `careereng interview add-prep-event <session_id> --summary "..."` | Attach structured interview-prep context without duplicating raw Codex chat. |
-| `careereng interview add-turn <session_id> --speaker interviewer --type question --text "..."` | Record an interview transcript turn from manual, Codex, Teams, or transcript input. |
-| `careereng interview add-evidence <session_id> --type skill_gap --summary "..."` | Store interview evidence and sync it into evolution evidence. |
-| `careereng interview audio-devices` | List local audio devices for interview capture. |
-| `careereng interview capture-audio <session_id> --device 4` | Record continuous local audio and use `q/a/n/s` to save question/answer/unknown/stop chunks. |
 | `careereng application-summary repair-history` | Apply safe history repairs for legacy unmatched review records. |
 | `careereng metrics summary` | Summarize runtime and usage metrics. |
+| `careereng evolution candidates` | List available evolution candidate specs. |
+| `careereng evolution run --candidate <candidate_id>` | Archive an evidence pack for one evolution candidate. |
+| `careereng evolution evaluate --run <run_id>` | Evaluate an applied evolution run and write selection results. |
+| `careereng evolution rollback --run <run_id>` | Roll back an applied evolution run from archived snapshots. |
+| `careereng evolution trigger-scan` | Scan local evidence and create evolution triggers. |
 | `careereng assistant ingest --client codex --thread <id> -m "@career ..."` | Route an external assistant message through the local assistant bridge. |
 | `careereng assistant state --client codex --thread <id>` | Inspect assistant bridge thread scope. |
 | `careereng assistant end --client codex --thread <id>` | Close assistant bridge career scope for a thread. |
@@ -383,12 +405,10 @@ CareerEng is designed as a human-in-the-loop local assistant, not a blind auto-s
 
 ## Tips
 
-CareerEng keeps behavior inspectable: workflow policy lives in Markdown Skills, durable state lives in JSONL files, and Python modules handle orchestration and storage. If you want to add a new site skill, tune an existing workflow, or change what reports show, it is usually practical to ask an LLM to inspect the current files and make a small targeted change with you.
+Use AI to operate CareerEng.
 
-For example, the report layer can be extended to answer questions such as:
+CareerEng is intentionally structured to be friendly to assistants like Codex: commands are exposed through the CLI, workflows are described in Markdown Skills, durable state is stored locally, and reports, metrics, memory, action cards, and evidence packs are readable by both humans and AI.
 
-- How long does a specific company usually take to respond?
-- How many days pass between first seeing a job, applying, and observing a status change?
-- Which companies reject quickly, keep applications active, or leave them unresolved?
+When you want to add a site, tune a skill, understand a failed run, change a report, repair history, summarize outcomes, or evolve a workflow, the recommended path is to ask Codex or another LLM to inspect the local files and make a targeted change with you.
 
-The raw ingredients for this kind of analysis are already recorded across job runs, history files, application reviews, and daily reports. The recommended workflow is to describe the desired report insight in natural language, let an LLM locate the relevant storage files and report code, and then make a small targeted change.
+Evolution should also be adjusted this way. The default cadence and trigger rules are only starting points; you can ask AI to tune the evolution rhythm based on your own situation, data volume, risk tolerance, and job-search strategy. For example, one user may want to review a site Skill after every 10 runs, while another may wait for stronger evidence such as repeated failures, repeated rejections in the same role family, or enough metrics to compare before/after behavior.
