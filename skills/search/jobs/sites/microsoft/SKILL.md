@@ -14,7 +14,7 @@ apply_enabled: true
 
 ### Goal
 
-- Complete Microsoft careers login preparation, confirm the current staged resume is synced in the Microsoft careers profile, and leave the browser inside the signed-in Microsoft careers or apply flow for the next phase.
+- Complete Microsoft careers login preparation, update the Microsoft careers profile resume only when the runtime resume freshness context says it is needed, and leave the browser inside the signed-in Microsoft careers or apply flow for the next phase.
 
 ### Site Facts
 
@@ -28,7 +28,9 @@ apply_enabled: true
 ### Workflow
 
 - If the current page still shows a visible `Sign in` entry for the Microsoft careers or application flow, continue that sign-in path instead of declaring readiness.
-- After login, use the Microsoft careers avatar / account menu, then choose `My profile`.
+- Read the runtime resume freshness context first.
+- If `resume_upload_needed = false`, do not open `My profile` or `Resume Manager` only to upload or re-check the resume. Continue toward the login-ready completion condition unless the live site clearly shows that the remote resume is missing, mismatched, or unusable.
+- If `resume_upload_needed = true`, after login use the Microsoft careers avatar / account menu, then choose `My profile`.
 - In `My profile`, open `Resume Manager` before inspecting other profile areas.
 - If `Resume Manager` is visible and the Microsoft resume step is not yet satisfied in this run, click `Resume Manager` immediately.
 - If `Resume Manager` is not yet visible, stay on the same Microsoft careers profile surface and keep rechecking only for `Resume Manager`.
@@ -44,7 +46,7 @@ apply_enabled: true
 ### Completion Or Blocked
 
 - Do not treat the Microsoft careers or apply domain by itself as proof that login completed.
-- End `Session Preparation` after Microsoft is signed in, the current staged resume filename is visibly present in `Resume Manager`, and any resume dialog has been closed.
+- End `Session Preparation` after Microsoft is signed in and either `resume_upload_needed = false` or the current staged resume filename is visibly present in `Resume Manager`; close any resume dialog before finishing.
 - If the current live page still shows `Sign in`, treat authentication as unresolved and continue the Microsoft careers auth flow instead of declaring success.
 - If the flow requires password entry, verification, MFA, CAPTCHA, email confirmation, or another explicit human-only challenge, stop with `blocked`.
 
@@ -58,6 +60,7 @@ apply_enabled: true
 - Do not use `Find jobs`, jobs `Search`, or a Microsoft jobs list as the normal proof of login during this phase when `My profile` is reachable.
 - Do not inspect or edit general Microsoft profile fields before `Resume Manager` is satisfied.
 - Do not substitute another resume area, profile section, or settings page for `Resume Manager`.
+- Do not open or re-open `Resume Manager` when `resume_upload_needed = false` unless the live page clearly shows the remote resume is missing, mismatched, or unusable.
 - Do not upload a different file when the current staged resume filename is already visibly present in Microsoft `Resume Manager`.
 - Do not reopen `Resume Manager` after the current staged resume filename has already been confirmed there in the current `session_preparation` run.
 

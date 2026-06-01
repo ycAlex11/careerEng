@@ -389,6 +389,7 @@ def _application_summary_evidence(workspace: Path, *, project_root: Path) -> lis
 
 
 def _memory_units_from_local_signals(workspace: Path) -> list[dict[str, Any]]:
+    unified_units_path = workspace / "memory" / "memory_units.jsonl"
     specs = [
         ("profile_resume_signal", workspace / "memory" / "profile_signals.jsonl"),
         ("career_intent_strategy", workspace / "memory" / "intent_signals.jsonl"),
@@ -416,6 +417,27 @@ def _memory_units_from_local_signals(workspace: Path) -> list[dict[str, Any]]:
                     confidence=float(row.get("confidence") or 0.0),
                 )
             )
+    for idx, row in _read_jsonl_with_refs(unified_units_path):
+        memory_type = _text(row.get("category"))
+        summary = _text(row.get("summary"))
+        content = _text(row.get("source_text")) or summary
+        if not memory_type or not (summary or content):
+            continue
+        entities = row.get("entities") if isinstance(row.get("entities"), dict) else {}
+        labels = [str(item) for item in row.get("tags") or [] if str(item).strip()]
+        units.append(
+            _memory_unit(
+                created_at=_text(row.get("created_at")),
+                memory_type=memory_type,
+                status=_text(row.get("status")) or "active",
+                summary=_truncate(summary or content, 180),
+                content=content,
+                entities=entities,
+                labels=labels,
+                source_refs=[_source_ref(workspace, unified_units_path, idx)],
+                confidence=float(row.get("confidence") or 0.0),
+            )
+        )
     return units
 
 
@@ -717,6 +739,7 @@ def _input_paths(workspace: Path) -> dict[str, str]:
         "browser_control_events": str(Path("evolution") / "browser_control" / "phase_events.jsonl"),
         "assistant_routing_examples": str(Path("assistant_bridge") / "routing_examples.jsonl"),
         "assistant_corrections": str(Path("assistant_bridge") / "correction_events.jsonl"),
+        "career_memory_units": str(Path("memory") / "memory_units.jsonl"),
         "metrics_usage": str(Path("metrics") / "llm_usage.jsonl"),
         "site_history": str(Path("sites") / "*" / "jobs" / "history_jobs.json"),
         "workspace": str(workspace),

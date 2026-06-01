@@ -1,0 +1,421 @@
+"""Typed career memory units built from assistant bridge signals."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+from careereng.integrations.assistant_bridge.schema import (
+    DATA_CATEGORY_APPLICATION_FEEDBACK,
+    DATA_CATEGORY_CAREER_INTENT_STRATEGY,
+    DATA_CATEGORY_CORRECTION,
+    DATA_CATEGORY_INTERVIEW_RECORD,
+    DATA_CATEGORY_PROFILE_RESUME_SIGNAL,
+    DATA_CATEGORIES,
+)
+from careereng.storage.jsonl import JSONLStore
+from careereng.utils import ensure_dir, make_id, now_iso
+
+
+PROMOTABLE_CATEGORIES = {
+    DATA_CATEGORY_PROFILE_RESUME_SIGNAL,
+    DATA_CATEGORY_CAREER_INTENT_STRATEGY,
+    DATA_CATEGORY_APPLICATION_FEEDBACK,
+    DATA_CATEGORY_INTERVIEW_RECORD,
+    DATA_CATEGORY_CORRECTION,
+}
+
+SIGNAL_SPECS = (
+    (DATA_CATEGORY_PROFILE_RESUME_SIGNAL, Path("memory/profile_signals.jsonl"), "signal_id"),
+    (DATA_CATEGORY_CAREER_INTENT_STRATEGY, Path("memory/intent_signals.jsonl"), "signal_id"),
+    (DATA_CATEGORY_APPLICATION_FEEDBACK, Path("memory/application_feedback_signals.jsonl"), "signal_id"),
+    (DATA_CATEGORY_INTERVIEW_RECORD, Path("interviews/events.jsonl"), "interview_event_id"),
+    (DATA_CATEGORY_CORRECTION, Path("assistant_bridge/correction_events.jsonl"), "correction_id"),
+)
+
+MAX_SUMMARY_CHARS = 220
+MAX_TEXT_CHARS = 2000
+
+
+class CareerMemoryError(RuntimeError):
+    """Raised when career memory input cannot be validated."""
+
+
+class CareerMemoryStore:
+    def __init__(self, workspace: Path | str):
+        self.workspace = Path(workspace)
+        self.memory_dir = ensure_dir(self.workspace / "memory")
+        self.units = JSONLStore(self.memory_dir / "memory_units.jsonl")
+
+    def read_units(self) -> list[dict[str, Any]]:
+        return self.units.read_all()
+
+    def write_units(self, rows: list[dict[str, Any]]) -> None:
+        self.units.write_all(rows)
+
+    def append_units(self, rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            self.units.append(row)
+
+
+def promote_assistant_signals(*, workspace: Path | str, limit: int | None = None) -> dict[str, Any]:
+    """Promote existing assistant bridge signal rows into unified memory units."""
+
+    workspace_path = Path(workspace)
+    store = CareerMemoryStore(workspace_path)
+    existing = store.read_units()
+    existing_keys = {_dedupe_key(row) for row in existing if _dedupe_key(row)}
+
+    created: list[dict[str, Any]] = []
+    skipped = 0
+    scanned = 0
+    max_rows = int(limit or 0)
+
+    for category, relative_path, id_field in SIGNAL_SPECS:
+        path = workspace_path / relative_path
+        rows = JSONLStore(path).read_all() if path.exists() else []
+        for row in rows:
+            scanned += 1
+            unit = _unit_from_signal(
+                category=category,
+                source_path=relative_path.as_posix(),
+                id_field=id_field,
+                row=row,
+            )
+            key = _dedupe_key(unit)
+            if not key or key in existing_keys:
+                skipped += 1
+                continue
+            existing_keys.add(key)
+            created.append(unit)
+            if max_rows > 0 and len(created) >= max_rows:
+                break
+        if max_rows > 0 and len(created) >= max_rows:
+            break
+
+    store.append_units(created)
+    return {
+        "workspace": str(workspace_path),
+        "memory_units_path": str(store.units.path),
+        "scanned": scanned,
+        "created": len(created),
+        "skipped_existing": skipped,
+        "memory_ids": [str(row.get("memory_id") or "") for row in created],
+    }
+
+
+def import_memory_candidates(*, workspace: Path | str, input_path: Path | str) -> dict[str, Any]:
+    """Import Codex-curated memory candidates after schema validation."""
+
+    workspace_path = Path(workspace)
+    path = Path(input_path)
+    if not path.exists():
+        raise CareerMemoryError(f"candidate input file not found: {path}")
+
+    candidates = _read_candidate_file(path)
+    store = CareerMemoryStore(workspace_path)
+    existing = store.read_units()
+    existing_keys = {_dedupe_key(row) for row in existing if _dedupe_key(row)}
+
+    created: list[dict[str, Any]] = []
+    skipped = 0
+    for idx, candidate in enumerate(candidates, 1):
+        unit = _unit_from_candidate(candidate, source_path=str(path), index=idx)
+        key = _dedupe_key(unit)
+        if not key or key in existing_keys:
+            skipped += 1
+            continue
+        existing_keys.add(key)
+        created.append(unit)
+
+    store.append_units(created)
+    return {
+        "workspace": str(workspace_path),
+        "memory_units_path": str(store.units.path),
+        "input_path": str(path),
+        "read": len(candidates),
+        "created": len(created),
+        "skipped_existing": skipped,
+        "memory_ids": [str(row.get("memory_id") or "") for row in created],
+    }
+
+
+def list_memory_units(
+    *,
+    workspace: Path | str,
+    category: str = "",
+    status: str = "",
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    rows = CareerMemoryStore(workspace).read_units()
+    if category:
+        rows = [row for row in rows if str(row.get("category") or "") == category]
+    if status:
+        rows = [row for row in rows if str(row.get("status") or "") == status]
+    rows = sorted(rows, key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
+    return rows[: max(0, int(limit))]
+
+
+def show_memory_unit(*, workspace: Path | str, memory_id: str) -> dict[str, Any]:
+    wanted = str(memory_id or "").strip()
+    if not wanted:
+        raise CareerMemoryError("memory_id is required")
+    for row in CareerMemoryStore(workspace).read_units():
+        if str(row.get("memory_id") or "") == wanted:
+            return row
+    raise CareerMemoryError(f"memory unit not found: {wanted}")
+
+
+def _unit_from_signal(*, category: str, source_path: str, id_field: str, row: dict[str, Any]) -> dict[str, Any]:
+    now = now_iso()
+    source_signal_id = str(row.get(id_field) or "")
+    source_event_id = str(row.get("intake_event_id") or "")
+    source_text = _source_text(row)
+    semantic_labels = _string_list(row.get("semantic_labels"))
+    entities = _dict(row.get("detected_entities"))
+    facts = _facts_from_signal(category=category, row=row)
+    tags = _tags_for_category(category, semantic_labels)
+    summary = _summary_from_parts(source_text, facts=facts)
+
+    return {
+        "memory_id": make_id("memory"),
+        "created_at": now,
+        "updated_at": now,
+        "category": category,
+        "source_event_id": source_event_id,
+        "source_signal_id": source_signal_id,
+        "source_path": source_path,
+        "source_text": _clip(source_text, MAX_TEXT_CHARS),
+        "summary": summary,
+        "facts": facts,
+        "entities": entities,
+        "confidence": _float(row.get("confidence"), default=0.5),
+        "status": _memory_status_for_category(category),
+        "tags": tags,
+        "supersedes": [],
+        "evidence_refs": _evidence_refs(source_path=source_path, source_event_id=source_event_id, source_signal_id=source_signal_id),
+        "dedupe_key": _stable_key(
+            "signal",
+            category,
+            source_path,
+            source_signal_id,
+            source_event_id,
+            source_text,
+        ),
+    }
+
+
+def _unit_from_candidate(candidate: dict[str, Any], *, source_path: str, index: int) -> dict[str, Any]:
+    if not isinstance(candidate, dict):
+        raise CareerMemoryError(f"candidate #{index} must be an object")
+
+    category = str(candidate.get("category") or "").strip()
+    if category not in PROMOTABLE_CATEGORIES:
+        raise CareerMemoryError(f"candidate #{index} has unsupported category: {category or '<empty>'}")
+
+    summary = str(candidate.get("summary") or "").strip()
+    evidence_text = str(candidate.get("evidence_text") or candidate.get("source_text") or "").strip()
+    if not summary:
+        summary = _clip(evidence_text, MAX_SUMMARY_CHARS)
+    if not summary:
+        raise CareerMemoryError(f"candidate #{index} must include summary or evidence_text")
+
+    now = now_iso()
+    source_thread_id = str(candidate.get("source_thread_id") or "").strip()
+    source_event_id = str(candidate.get("source_event_id") or "").strip()
+    source_signal_id = str(candidate.get("source_signal_id") or "").strip()
+    facts = _dict(candidate.get("facts"))
+    entities = _dict(candidate.get("entities"))
+    tags = _string_list(candidate.get("tags"))
+    semantic_labels = _string_list(candidate.get("semantic_labels"))
+    confidence = _float(candidate.get("confidence"), default=0.7)
+    status = str(candidate.get("status") or "active").strip() or "active"
+
+    return {
+        "memory_id": str(candidate.get("memory_id") or "").strip() or make_id("memory"),
+        "created_at": str(candidate.get("created_at") or "").strip() or now,
+        "updated_at": str(candidate.get("updated_at") or "").strip() or now,
+        "category": category,
+        "source_event_id": source_event_id,
+        "source_signal_id": source_signal_id,
+        "source_thread_id": source_thread_id,
+        "source_path": source_path,
+        "source_text": _clip(evidence_text, MAX_TEXT_CHARS),
+        "summary": _clip(summary, MAX_SUMMARY_CHARS),
+        "facts": facts,
+        "entities": entities,
+        "confidence": confidence,
+        "status": status,
+        "tags": sorted(set(_tags_for_category(category, semantic_labels) + tags)),
+        "supersedes": _string_list(candidate.get("supersedes")),
+        "evidence_refs": _candidate_evidence_refs(candidate, source_path=source_path),
+        "dedupe_key": _stable_key(
+            "candidate",
+            category,
+            source_thread_id,
+            source_event_id,
+            source_signal_id,
+            summary,
+            evidence_text,
+        ),
+    }
+
+
+def _read_candidate_file(path: Path) -> list[dict[str, Any]]:
+    text = path.read_text(encoding="utf-8")
+    stripped = text.strip()
+    if not stripped:
+        return []
+    if stripped.startswith("["):
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise CareerMemoryError(f"invalid JSON candidate file: {exc}") from exc
+        if not isinstance(data, list):
+            raise CareerMemoryError("candidate JSON file must contain a list")
+        if not all(isinstance(item, dict) for item in data):
+            raise CareerMemoryError("candidate JSON list must contain objects")
+        return list(data)
+
+    rows: list[dict[str, Any]] = []
+    for line_no, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CareerMemoryError(f"invalid JSONL candidate line {line_no}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise CareerMemoryError(f"candidate line {line_no} must be an object")
+        rows.append(data)
+    return rows
+
+
+def _source_text(row: dict[str, Any]) -> str:
+    for key in ("source_text", "evidence", "content", "user_correction"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _facts_from_signal(*, category: str, row: dict[str, Any]) -> dict[str, Any]:
+    skip = {
+        "signal_id",
+        "interview_event_id",
+        "correction_id",
+        "created_at",
+        "updated_at",
+        "status",
+        "intake_event_id",
+        "source_text",
+        "semantic_labels",
+        "detected_entities",
+        "confidence",
+        "candidate_patch",
+    }
+    facts: dict[str, Any] = {"source_category": category}
+    for key, value in row.items():
+        if key in skip or value in (None, "", [], {}):
+            continue
+        if isinstance(value, (str, int, float, bool, list, dict)):
+            facts[key] = value
+    return facts
+
+
+def _summary_from_parts(source_text: str, *, facts: dict[str, Any]) -> str:
+    text = str(source_text or "").strip()
+    if text:
+        return _clip(text, MAX_SUMMARY_CHARS)
+    fallback_parts = [str(value) for value in facts.values() if isinstance(value, str) and value.strip()]
+    return _clip("; ".join(fallback_parts), MAX_SUMMARY_CHARS)
+
+
+def _tags_for_category(category: str, semantic_labels: list[str]) -> list[str]:
+    tags = [category]
+    tags.extend(semantic_labels)
+    if category == DATA_CATEGORY_CORRECTION:
+        tags.append("router_feedback")
+    return sorted({tag for tag in tags if tag})
+
+
+def _memory_status_for_category(category: str) -> str:
+    if category == DATA_CATEGORY_CORRECTION:
+        return "raw"
+    return "active"
+
+
+def _candidate_evidence_refs(candidate: dict[str, Any], *, source_path: str) -> list[dict[str, Any]]:
+    refs = candidate.get("evidence_refs")
+    if isinstance(refs, list):
+        cleaned = [ref for ref in refs if isinstance(ref, dict)]
+        if cleaned:
+            return cleaned
+    out: list[dict[str, Any]] = [{"source_path": source_path}]
+    thread_id = str(candidate.get("source_thread_id") or "").strip()
+    if thread_id:
+        out[0]["source_thread_id"] = thread_id
+    return out
+
+
+def _evidence_refs(*, source_path: str, source_event_id: str, source_signal_id: str) -> list[dict[str, Any]]:
+    ref: dict[str, Any] = {"source_path": source_path}
+    if source_event_id:
+        ref["source_event_id"] = source_event_id
+    if source_signal_id:
+        ref["source_signal_id"] = source_signal_id
+    return [ref]
+
+
+def _dedupe_key(row: dict[str, Any]) -> str:
+    explicit = str(row.get("dedupe_key") or "").strip()
+    if explicit:
+        return explicit
+    return _stable_key(
+        str(row.get("category") or ""),
+        str(row.get("source_path") or ""),
+        str(row.get("source_signal_id") or ""),
+        str(row.get("source_event_id") or ""),
+        str(row.get("source_thread_id") or ""),
+        str(row.get("summary") or ""),
+        str(row.get("source_text") or ""),
+    )
+
+
+def _stable_key(*parts: Any) -> str:
+    payload = "\x1f".join(str(part or "").strip() for part in parts)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _float(value: Any, *, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _clip(value: str, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def validate_memory_category(category: str) -> None:
+    if category not in DATA_CATEGORIES:
+        raise CareerMemoryError(f"unknown memory category: {category}")

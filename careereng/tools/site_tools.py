@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from careereng.action_cards import create_site_skill_bootstrap_card
 from careereng.resume.export import default_apply_resume_pdf_path, ensure_default_resume_pdf
 from careereng.storage.site_store import SiteStore
 
@@ -74,6 +75,18 @@ class SiteTools:
         target_url = str(site.get("base_url") or "")
         skill_path, _ = self.site_store.ensure_skill_template(site_id)
         skill_template_created = not skill_preexisted
+        skill_state = self._site_skill_state(site_id)
+        action_card: dict[str, Any] = {}
+        if skill_template_created or str(skill_state.get("status") or "draft") == "draft":
+            action_card = create_site_skill_bootstrap_card(
+                workspace=self.site_store.workspace,
+                project_root=self.project_root or self.site_store.project_root,
+                site_key=site_id,
+                site_name=str(site.get("canonical_company") or site_name),
+                base_url=target_url,
+                skill_path=skill_path,
+                registry_id=str(site.get("registry_id") or ""),
+            )
         session_payload = self.site_store.ensure_browser_session(site_id)
         self.site_store.append_event(
             site_id,
@@ -86,6 +99,7 @@ class SiteTools:
                 "apply_requested": bool(apply_requested),
                 "source_type": source_type,
                 "skill_template_created": skill_template_created,
+                "action_card_id": action_card.get("card_id") or "",
             },
         )
         return {
@@ -96,6 +110,12 @@ class SiteTools:
             "has_skill": self.site_store.has_skill(site_id),
             "skill_path": self._display_path(skill_path),
             "skill_template_created": skill_template_created,
+            "action_card_id": str(action_card.get("card_id") or ""),
+            "action_card_path": self._display_path(
+                self.site_store.workspace / str(action_card.get("markdown_path") or "")
+            )
+            if action_card.get("markdown_path")
+            else "",
             "apply_requested": apply_requested,
             "status": str(site.get("status") or "active"),
             "registry_id": str(site.get("registry_id") or ""),

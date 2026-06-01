@@ -75,4 +75,9 @@ class SearchFlow:
                 lines.append("   - entry_url: 未定位到，可后续手动更新")
             if skill_path:
                 lines.append(f"   - site_skill: {skill_path} ({skill_note})")
+            if site_result.get("action_card_id"):
+                lines.append(
+                    f"   - action_card: {site_result.get('action_card_id')} "
+                    f"({site_result.get('action_card_path') or '-'})"
+                )
         return "\n".join(lines)

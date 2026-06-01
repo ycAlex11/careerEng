@@ -47,5 +47,7 @@ def format_site_result_text(site_result: dict[str, Any]) -> str:
     if site_result.get("skill_path"):
         label = "已生成模板" if site_result.get("skill_template_created") else "沿用已有模板"
         lines.append(f"站点 Skill: {site_result.get('skill_path')} ({label})")
+    if site_result.get("action_card_id"):
+        lines.append(f"Action Card: {site_result.get('action_card_id')} ({site_result.get('action_card_path') or '-'})")
     lines.append("当前阶段仅登记站点，不写入岗位发现数据。")
     return "\n".join(lines)

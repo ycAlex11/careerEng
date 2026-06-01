@@ -82,6 +82,24 @@ First version rule:
 - Do not automatically execute high-impact commands unless the user explicitly asks and the assistant is already allowed to run project commands.
 - If there is no `@career` and no active scope, use the bridge for suggestion first.
 
+## Action Cards
+
+When CareerEng needs Codex/user review instead of immediate execution, it may create an action card under:
+
+```text
+workspace/action_cards/open/
+```
+
+Use these commands:
+
+```bash
+python -m careereng action-card list
+python -m careereng action-card show <card_id>
+python -m careereng action-card close <card_id> --result "<summary>"
+```
+
+Action cards are review tasks. Do not treat them as automatic permission to modify files or run high-impact workflows.
+
 ## Data Categories
 
 The bridge classifies data into six first-version categories:
@@ -111,6 +129,30 @@ Primary paths:
 - `workspace/memory/application_feedback_signals.jsonl`
 - `workspace/interviews/events.jsonl`
 
+## Career Memory Promotion
+
+Assistant bridge stores raw intake events and typed raw signals. Long-term job-search memory is owned by `careereng/career_memory/`, not by the bridge.
+
+Promote stored assistant signals into unified memory units with:
+
+```bash
+python -m careereng career-memory promote
+```
+
+Memory units are stored at:
+
+```text
+workspace/memory/memory_units.jsonl
+```
+
+When Codex can see a long current thread, it may curate the recent career-relevant messages into JSON/JSONL memory candidates and import them:
+
+```bash
+python -m careereng career-memory import-candidates /path/to/memory_candidates.jsonl
+```
+
+This keeps Codex responsible for thread-level understanding, while CareerEng validates, deduplicates, and persists local memory.
+
 ## Adapter Boundary
 
 Processor adapters are pluggable.
@@ -127,4 +169,3 @@ The adapter may help with:
 - thread summarization
 
 The adapter must not own CareerEng storage, command execution, or business history.
-

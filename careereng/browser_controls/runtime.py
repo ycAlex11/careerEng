@@ -132,6 +132,35 @@ class ResponsesClient:
             return f"output_index:{output_index}"
         return ""
 
+    @staticmethod
+    def _has_salvageable_stream_output(
+        *,
+        output_text_parts: list[str],
+        output_items: list[dict[str, Any]],
+        partial_items: dict[str, dict[str, Any]],
+    ) -> bool:
+        if any(str(part or "").strip() for part in output_text_parts):
+            return True
+        if any(isinstance(item, dict) and item for item in output_items):
+            return True
+        for item in partial_items.values():
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "") == "function_call" and str(item.get("arguments") or "").strip():
+                return True
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and str(block.get("text") or "").strip():
+                    return True
+        return False
+
+    @staticmethod
+    def _is_malformed_final_response_error(exc: TypeError) -> bool:
+        message = str(exc)
+        return "NoneType" in message and "iterable" in message
+
     async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
         started = time.monotonic()
         request_timeout_seconds = max(
@@ -160,6 +189,7 @@ class ResponsesClient:
         response_status = "completed"
         stream_event_types: list[str] = []
         final_usage: Any = None
+        stream_final_parse_warning = ""
         with_options = getattr(self.client, "with_options", None)
         stream_client = with_options(timeout=request_timeout_seconds) if callable(with_options) else self.client
         try:
@@ -217,6 +247,14 @@ class ResponsesClient:
                     response_id = str(getattr(final, "id", "") or response_id)
                     response_status = str(getattr(final, "status", "") or response_status)
                     final_usage = getattr(final, "usage", None)
+        except TypeError as exc:
+            if not self._is_malformed_final_response_error(exc) or not self._has_salvageable_stream_output(
+                output_text_parts=output_text_parts,
+                output_items=output_items,
+                partial_items=partial_items,
+            ):
+                raise
+            stream_final_parse_warning = str(exc)
         except TimeoutError as exc:
             self._record_metric(
                 model=str(payload.get("model") or ""),
@@ -271,11 +309,14 @@ class ResponsesClient:
             data["usage"] = usage_payload
         if output_text:
             data["output_text"] = output_text
+        if stream_final_parse_warning:
+            data["stream_final_parse_warning"] = stream_final_parse_warning
         self._record_metric(
             model=str(payload.get("model") or ""),
             started=started,
             status="ok",
             usage=final_usage,
+            error_type="stream_final_parse_warning" if stream_final_parse_warning else "",
             context=metrics_context,
             stream_event_types=stream_event_types,
             tool_call_count=sum(1 for item in output_items if isinstance(item, dict) and item.get("type") == "function_call"),
@@ -2712,7 +2753,9 @@ class BrowserPhaseRuntime:
             if phase.slug == "session_preparation":
                 base_items.extend(self._staged_resume_context_items(staged_resume_pdf_path))
             context_items = getattr(context_session, "items", None) if context_session is not None else None
-            static_context_items = list(context_items() if callable(context_items) else (extra_context_items or []))
+            static_context_items = list(extra_context_items or [])
+            if callable(context_items):
+                static_context_items.extend(context_items())
             turn_timeout_seconds = self._response_turn_timeout_seconds(deadline=deadline)
             try:
                 response_payload = self._payload(

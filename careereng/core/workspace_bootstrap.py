@@ -156,13 +156,23 @@ def bootstrap_workspace(workspace: Path) -> list[WorkspaceEntry]:
     _ensure_empty_file(workspace / "assistant_bridge" / "routing_examples.jsonl", rows, workspace)
     _ensure_text_file(workspace / "assistant_bridge" / "thread_state.json", '{"threads": {}}\n', rows, workspace)
 
+    _ensure_dir(workspace / "action_cards", rows, workspace)
+    _ensure_dir(workspace / "action_cards" / "open", rows, workspace)
+    _ensure_dir(workspace / "action_cards" / "done", rows, workspace)
+    _ensure_dir(workspace / "action_cards" / "cancelled", rows, workspace)
+    _ensure_empty_file(workspace / "action_cards" / "index.jsonl", rows, workspace)
+    _ensure_empty_file(workspace / "action_cards" / "events.jsonl", rows, workspace)
+
     _ensure_dir(workspace / "memory", rows, workspace)
+    _ensure_empty_file(workspace / "memory" / "memory_units.jsonl", rows, workspace)
     _ensure_empty_file(workspace / "memory" / "profile_signals.jsonl", rows, workspace)
     _ensure_empty_file(workspace / "memory" / "intent_signals.jsonl", rows, workspace)
     _ensure_empty_file(workspace / "memory" / "application_feedback_signals.jsonl", rows, workspace)
 
     _ensure_dir(workspace / "interviews", rows, workspace)
+    _ensure_empty_file(workspace / "interviews" / "sessions.jsonl", rows, workspace)
     _ensure_empty_file(workspace / "interviews" / "events.jsonl", rows, workspace)
+    _ensure_empty_file(workspace / "interviews" / "candidates.jsonl", rows, workspace)
 
     _ensure_dir(workspace / "evolution", rows, workspace)
     _ensure_dir(workspace / "evolution" / "browser_control", rows, workspace)
@@ -175,6 +185,14 @@ def bootstrap_workspace(workspace: Path) -> list[WorkspaceEntry]:
     _ensure_empty_file(workspace / "evolution" / "memory" / "units.jsonl", rows, workspace)
     _ensure_dir(workspace / "evolution" / "reviews", rows, workspace)
     _ensure_dir(workspace / "evolution" / "context", rows, workspace)
+    _ensure_dir(workspace / "evolution" / "runs", rows, workspace)
+    _ensure_dir(workspace / "evolution" / "triggers", rows, workspace)
+    _ensure_text_file(
+        workspace / "evolution" / "triggers" / "site_workflow_state.json",
+        '{"version": 1, "site_workflow": {}, "target_company_intelligence": {}, "assistant_router_memory_intake": {}, "updated_at": ""}\n',
+        rows,
+        workspace,
+    )
 
     _ensure_dir(workspace / "runs", rows, workspace)
     _ensure_dir(workspace / "runs" / "daily", rows, workspace)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from typing import Any
 
 from careereng.integrations.assistant_bridge.schema import (
@@ -260,6 +261,33 @@ class LocalProcessorAdapter:
                 reason="message requests closing assistant bridge scope",
             )
 
+        interview_command = cls._interview_candidates_command(text, entities=entities)
+        if interview_command:
+            command, interview_entities = interview_command
+            return cls._decision(
+                DATA_CATEGORY_CAREERENG_COMMAND,
+                0.88,
+                route="interview_prep",
+                labels=["interview_candidates", "interview_binding"],
+                entities=interview_entities,
+                action="interview_candidates",
+                command=command,
+                reason="message requests interview preparation or recording; local candidate confirmation is required first",
+            )
+
+        ad_hoc_interview = cls._ad_hoc_interview_command(text)
+        if ad_hoc_interview:
+            return cls._decision(
+                DATA_CATEGORY_CAREERENG_COMMAND,
+                0.86,
+                route="interview_record",
+                labels=["interview_ad_hoc", "interview_assist"],
+                entities=entities,
+                action="interview_create_ad_hoc",
+                command=ad_hoc_interview,
+                reason="message requests starting interview assist without enough company/job context",
+            )
+
         if cls._contains_any(text, ("检查投递状态", "查看投递状态", "投递状态", "申请状态", "review-status", "review status")) or (
             cls._contains_any(text, ("查看", "检查", "看看", "看一下")) and ("投递情况" in text or "投递" in text)
         ):
@@ -274,9 +302,10 @@ class LocalProcessorAdapter:
                 reason="message requests application status review",
             )
 
-        if cls._contains_any(text, ("检索投递", "开始投递", "投递已注册", "jobs apply", "retrieve and apply")) and not cls._contains_any(
-            text, ("建议", "有什么建议", "需要做什么", "怎么准备")
-        ):
+        if (
+            cls._contains_any(text, ("检索投递", "开始投递", "投递已注册", "jobs apply", "retrieve and apply"))
+            or (cls._contains_any(text, ("投递", "apply")) and cls._contains_any(text, ("已注册", "已激活", "激活的网站", "active sites", "registered sites")))
+        ) and not cls._contains_any(text, ("建议", "有什么建议", "需要做什么", "怎么准备")):
             return cls._decision(
                 DATA_CATEGORY_CAREERENG_COMMAND,
                 0.9,
@@ -378,6 +407,20 @@ class LocalProcessorAdapter:
                 reason="message requests registered site listing",
             )
 
+        bootstrap = cls._site_bootstrap_command(text, entities=entities)
+        if bootstrap:
+            command, bootstrap_entities = bootstrap
+            return cls._decision(
+                DATA_CATEGORY_CAREERENG_COMMAND,
+                0.84,
+                route="site",
+                labels=["site_bootstrap", "new_site"],
+                entities=bootstrap_entities,
+                action="site_bootstrap",
+                command=command,
+                reason="message requests preparing a target company site through bootstrap",
+            )
+
         if "http://" in lowered or "https://" in lowered:
             match = re.search(r"https?://[^\s]+", text)
             url = match.group(0) if match else ""
@@ -396,6 +439,39 @@ class LocalProcessorAdapter:
         return None
 
     @classmethod
+    def _interview_candidates_command(cls, text: str, *, entities: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        if not cls._contains_any(text, ("面试", "interview")):
+            return None
+        if not cls._contains_any(text, ("准备", "记录", "开始", "prep", "prepare", "record")):
+            return None
+        company = str(entities.get("company") or "").strip()
+        title = cls._extract_interview_title(text, company=company)
+        roles = entities.get("roles") if isinstance(entities.get("roles"), list) else []
+        if not title and roles:
+            title = " ".join(str(role) for role in roles if str(role).strip())
+        if not company and not title:
+            return None
+        command = "python -m careereng interview candidates"
+        if company:
+            command += f" --company {shlex.quote(company)}"
+        if title:
+            command += f" --title {shlex.quote(title)}"
+        next_entities = dict(entities)
+        if company:
+            next_entities["company"] = company
+        if title:
+            next_entities["interview_title_query"] = title
+        return command, next_entities
+
+    @classmethod
+    def _ad_hoc_interview_command(cls, text: str) -> str:
+        if not cls._contains_any(text, ("面试", "interview")):
+            return ""
+        if not cls._contains_any(text, ("辅助", "开启", "开始", "记录", "assist", "start", "record")):
+            return ""
+        return "python -m careereng interview create --company unknown --title unknown --created-reason ad_hoc_assist"
+
+    @classmethod
     def _entities(cls, text: str) -> dict[str, Any]:
         lowered = text.lower()
         site_key = ""
@@ -412,6 +488,10 @@ class LocalProcessorAdapter:
             company_match = re.search(r"(?:公司|company)\s*[:：]?\s*([\w\u4e00-\u9fff&.\- ]{2,40})", text, flags=re.I)
             if company_match:
                 company = company_match.group(1).strip()
+                site_key = safe_file_stem(company)
+        if not company:
+            company = cls._extract_bootstrap_company(text)
+            if company:
                 site_key = safe_file_stem(company)
         roles: list[str] = []
         for role in ("ai infra", "software engineer", "sdet", "ai架构", "架构师", "后端", "平台"):
@@ -433,3 +513,119 @@ class LocalProcessorAdapter:
         if skills:
             entities["skills"] = skills
         return entities
+
+    @classmethod
+    def _site_bootstrap_command(cls, text: str, *, entities: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        if not cls._looks_like_site_bootstrap(text):
+            return None
+        company = str(entities.get("company") or "").strip() or cls._extract_bootstrap_company(text)
+        if not company:
+            return None
+        url = cls._extract_url(text)
+        command = f"python -m careereng site bootstrap {shlex.quote(company)}"
+        if url:
+            command += f" --url {shlex.quote(url)}"
+        next_entities = dict(entities)
+        next_entities["company"] = company
+        next_entities["site_key"] = str(next_entities.get("site_key") or safe_file_stem(company))
+        if url:
+            next_entities["url"] = url
+        return command, next_entities
+
+    @classmethod
+    def _looks_like_site_bootstrap(cls, text: str) -> bool:
+        lowered = text.lower()
+        if cls._contains_any(text, ("建议", "有什么建议", "需要做什么", "怎么准备", "需要补什么", "还需要做什么", "怎么办")):
+            return False
+        if cls._contains_any(
+            text,
+            (
+                "投递已注册",
+                "检索投递",
+                "开始投递",
+                "jobs apply",
+                "retrieve and apply",
+                "检查投递",
+                "投递状态",
+                "申请状态",
+                "review-status",
+                "review status",
+                "总结投递",
+                "投递总结",
+                "已注册",
+                "已激活",
+                "激活的网站",
+                "active sites",
+                "registered sites",
+                "registered companies",
+            ),
+        ):
+            return False
+        if cls._contains_any(text, ("添加", "新增", "注册", "add", "register", "site bootstrap", "bootstrap")) and cls._extract_bootstrap_company(text):
+            return True
+        if cls._contains_any(text, ("想投", "帮我投", "投 ", "投", "apply to", "apply for")):
+            company = cls._extract_bootstrap_company(text)
+            return bool(company and company.lower() not in {"已注册的公司", "registered sites", "registered companies"})
+        return bool(("http://" in lowered or "https://" in lowered) and cls._contains_any(text, ("添加", "新增", "注册", "add", "register")))
+
+    @staticmethod
+    def _extract_url(text: str) -> str:
+        match = re.search(r"https?://[^\s]+", text)
+        return match.group(0).rstrip("，,。.;；)") if match else ""
+
+    @classmethod
+    def _extract_interview_title(cls, text: str, *, company: str) -> str:
+        cleaned = str(text or "").strip()
+        cleaned = re.sub(r"^@career\s*", "", cleaned, flags=re.I).strip()
+        cleaned = re.sub(r"(请|帮我|一下|这个岗位|的面试|面试|interview|准备|记录|开始记录|开始|prep|prepare|record)", " ", cleaned, flags=re.I)
+        if company:
+            cleaned = re.sub(re.escape(company), " ", cleaned, flags=re.I)
+        for alias in SITE_ALIASES:
+            cleaned = re.sub(re.escape(alias), " ", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_，,。.;；:：")
+        if len(cleaned) > 80:
+            cleaned = cleaned[:80].strip()
+        return cleaned
+
+    @classmethod
+    def _extract_bootstrap_company(cls, text: str) -> str:
+        cleaned = str(text or "").strip()
+        cleaned = re.sub(r"^@career\s*", "", cleaned, flags=re.I).strip()
+        url = cls._extract_url(cleaned)
+        if url:
+            cleaned = cleaned.replace(url, " ").strip()
+
+        patterns = (
+            r"(?:帮我)?(?:投|投递|想投)\s*([\w\u4e00-\u9fff&.\- ]{2,50})",
+            r"(?:添加|新增|注册)\s*([\w\u4e00-\u9fff&.\- ]{2,50}?)(?:\s*(?:网站|站点|site|career site))?$",
+            r"(?:apply\s+(?:to|for)\s+)([A-Za-z0-9&.\- ]{2,50})",
+            r"(?:(?:add|register)\s+)([A-Za-z0-9&.\- ]{2,50}?)(?:\s+(?:site|career site|careers site))?$",
+            r"(?:site\s+bootstrap\s+)([A-Za-z0-9&.\- ]{2,50})",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, cleaned, flags=re.I)
+            if not match:
+                continue
+            company = cls._clean_company_candidate(match.group(1))
+            if company:
+                return company
+        return ""
+
+    @staticmethod
+    def _clean_company_candidate(value: str) -> str:
+        text = str(value or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"(网站|站点|官网|career site|careers site|site)$", "", text, flags=re.I).strip()
+        text = text.strip(" -_，,。.;；:：")
+        blocked = {
+            "已注册的公司",
+            "已注册公司",
+            "registered sites",
+            "registered companies",
+            "all registered sites",
+            "公司",
+            "网站",
+        }
+        if not text or text.lower() in blocked:
+            return ""
+        return text

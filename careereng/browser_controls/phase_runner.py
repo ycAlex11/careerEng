@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 import shutil
 import threading
@@ -20,6 +21,7 @@ from careereng.browser_controls.runtime import BrowserPhaseResult, BrowserPhaseR
 from careereng.browser_context import BrowserContextRegistry, BrowserContextSession, BrowserPhaseMemory
 from careereng.config.schema import BrowserBudgetsConfig
 from careereng.resume.export import default_apply_resume_pdf_path
+from careereng.storage.jsonl import JSONLStore
 from careereng.utils import now_iso
 
 
@@ -293,6 +295,87 @@ class BrowserAutomationService:
             )
         return BrowserContextSession.for_phase(phase_memory=phase_memory)
 
+    def _session_preparation_context_items(self, site_key: str) -> list[dict[str, str]]:
+        resume_updated_at = self._latest_current_resume_markdown_updated_at()
+        if not resume_updated_at:
+            return []
+        last_preparation_at = self._last_successful_session_preparation_at(site_key)
+        upload_needed = self._resume_upload_needed(
+            resume_updated_at=resume_updated_at,
+            last_preparation_at=last_preparation_at,
+        )
+        if not last_preparation_at:
+            reason = "No previous successful session_preparation was found for this site."
+        elif upload_needed:
+            reason = "The current Markdown resume is newer than the last successful session_preparation for this site."
+        else:
+            reason = "The current Markdown resume is not newer than the last successful session_preparation for this site."
+        return [
+            {
+                "role": "user",
+                "content": (
+                    "Resume freshness context for this session_preparation phase:\n"
+                    f"- current_resume_markdown_updated_at: {resume_updated_at or '(missing)'}\n"
+                    f"- last_successful_session_preparation_at: {last_preparation_at or '(none)'}\n"
+                    f"- resume_upload_needed: {'true' if upload_needed else 'false'}\n"
+                    f"- reason: {reason}\n"
+                    "If resume_upload_needed is false, do not reopen the site's resume manager just to upload again. "
+                    "Only repair the remote resume if the live site clearly shows that the resume is missing, mismatched, or unusable."
+                ),
+            }
+        ]
+
+    def _latest_current_resume_markdown_updated_at(self) -> str:
+        current_dir = self.workspace / "cv" / "current"
+        if not current_dir.exists():
+            return ""
+        candidates = [path for path in current_dir.glob("*.md") if path.is_file()]
+        if not candidates:
+            return ""
+        latest = max(candidates, key=lambda path: path.stat().st_mtime)
+        return datetime.fromtimestamp(latest.stat().st_mtime).isoformat(timespec="seconds")
+
+    def _last_successful_session_preparation_at(self, site_key: str) -> str:
+        path = self.site_store.site_dir(site_key) / "events" / "all.jsonl"
+        if not path.exists():
+            return ""
+        latest = ""
+        for row in JSONLStore(path).read_all():
+            if str(row.get("name") or "") != "browser.phase.done":
+                continue
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if str(payload.get("phase") or "") != "session_preparation":
+                continue
+            ts = str(row.get("ts") or "")
+            if ts and ts > latest:
+                latest = ts
+        return latest
+
+    @classmethod
+    def _resume_upload_needed(cls, *, resume_updated_at: str, last_preparation_at: str) -> bool:
+        if not resume_updated_at:
+            return False
+        if not last_preparation_at:
+            return True
+        resume_dt = cls._parse_iso_timestamp(resume_updated_at)
+        preparation_dt = cls._parse_iso_timestamp(last_preparation_at)
+        if resume_dt is None or preparation_dt is None:
+            return resume_updated_at > last_preparation_at
+        try:
+            return resume_dt > preparation_dt
+        except TypeError:
+            return resume_updated_at > last_preparation_at
+
+    @staticmethod
+    def _parse_iso_timestamp(value: str) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
     def _stage_apply_resume_pdf(self, *, runtime_output_dir: Path) -> Path:
         source_path = default_apply_resume_pdf_path(self.workspace)
         if not source_path.is_file():
@@ -547,8 +630,14 @@ class BrowserAutomationService:
                             phase_memory = BrowserPhaseMemory()
                             timeout_memory = previous_phase_memory if phase.slug == "job_retrieval" else None
                             phase_timeout_seconds = self._phase_timeout_seconds(phase.slug, phase_memory=timeout_memory)
-                            self.site_store.append_event(site_key, "browser.phase.started", {"turn_id": turn_id, "phase": phase.slug})
+                            self.site_store.append_event(
+                                site_key,
+                                "browser.phase.started",
+                                {"turn_id": turn_id, "batch_id": batch_id, "phase": phase.slug},
+                            )
                             extra_context_items = []
+                            if phase.slug == "session_preparation":
+                                extra_context_items.extend(self._session_preparation_context_items(site_key))
                             override_seconds = int(phase_timeout_seconds_override or 0)
                             effective_phase_timeout_seconds = phase_timeout_seconds
                             if override_seconds > 0:
@@ -622,7 +711,16 @@ class BrowserAutomationService:
                                 self.site_store.append_event(
                                     site_key,
                                     "browser.phase.done",
-                                    {"turn_id": turn_id, "phase": phase.slug, "summary": phase_result.summary},
+                                    {
+                                        "turn_id": turn_id,
+                                        "batch_id": batch_id,
+                                        "phase": phase.slug,
+                                        "summary": phase_result.summary,
+                                        "step_count": phase_result.step_count,
+                                        "recorded_count": phase_result.recorded_count,
+                                        "new_count": phase_result.new_count,
+                                        "trace_ref": phase_result.trace_ref,
+                                    },
                                 )
                                 session_state = self.site_store.ensure_browser_session(site_key)
                                 continue
@@ -647,7 +745,15 @@ class BrowserAutomationService:
                                 self.site_store.append_event(
                                     site_key,
                                     "browser.phase.blocked",
-                                    {"turn_id": turn_id, "phase": phase.slug, "summary": phase_result.summary},
+                                    {
+                                        "turn_id": turn_id,
+                                        "batch_id": batch_id,
+                                        "phase": phase.slug,
+                                        "summary": phase_result.summary,
+                                        "reason_tag": phase_result.reason_tag,
+                                        "step_count": phase_result.step_count,
+                                        "trace_ref": phase_result.trace_ref,
+                                    },
                                 )
                                 keep_runtime = True
                                 result = BrowserAutomationResult(
@@ -667,7 +773,17 @@ class BrowserAutomationService:
                             self.site_store.append_event(
                                 site_key,
                                 "browser.phase.failed",
-                                {"turn_id": turn_id, "phase": phase.slug, "summary": phase_result.summary, "reason_tag": phase_result.reason_tag},
+                                {
+                                    "turn_id": turn_id,
+                                    "batch_id": batch_id,
+                                    "phase": phase.slug,
+                                    "summary": phase_result.summary,
+                                    "reason_tag": phase_result.reason_tag,
+                                    "step_count": phase_result.step_count,
+                                    "recorded_count": phase_result.recorded_count,
+                                    "new_count": phase_result.new_count,
+                                    "trace_ref": phase_result.trace_ref,
+                                },
                             )
                             result = BrowserAutomationResult(
                                 site_key=site_key,

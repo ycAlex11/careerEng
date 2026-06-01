@@ -31,6 +31,7 @@ When action is needed, CareerEng uses browser automation as the execution layer:
 | Skills | Keeps shared job-search policy in project Skills and website-specific behavior in site Skills. |
 | Reports | Summarizes new jobs, submitted jobs, unsubmitted jobs, and reviewed application statuses. |
 | Assistant Bridge | Lets external AI assistants route `@career` requests into local CareerEng commands and memory. |
+| Action Cards | Creates local review task cards when Codex/user judgment is needed. |
 | Metrics | Records runtime and usage summaries for debugging and future workflow optimization. |
 
 ## Install
@@ -191,6 +192,21 @@ python -m careereng assistant ingest --client codex --thread <thread_id> -m "@ca
 
 The bridge classifies the message, records the event locally, tracks thread scope for multi-turn career conversations, and returns a suggested CareerEng command. High-impact operations such as applying to jobs should still require an explicit user request or confirmation from the assistant side.
 
+Action cards are the local handoff layer for work that should be reviewed or drafted by Codex. For example, when a newly registered company only has a draft site AI Skill, CareerEng creates a `codex_draft` card with `metadata.task = "site_skill_bootstrap"` so Codex can draft the site-specific workflow from existing site patterns.
+
+Career memory is the next layer. After assistant messages are classified and saved, CareerEng can promote them into unified long-term job-search memory units:
+
+```bash
+python -m careereng career-memory promote
+python -m careereng career-memory list
+```
+
+When Codex can see a longer current thread, it can curate recent career-relevant messages into JSON/JSONL candidates and import them with:
+
+```bash
+python -m careereng career-memory import-candidates /path/to/memory_candidates.jsonl
+```
+
 Useful bridge commands:
 
 ```bash
@@ -286,6 +302,7 @@ CareerEng records structured local data so an assistant can debug runs from evid
 Important local signals include:
 
 - Assistant bridge events: `workspace/assistant_bridge/`
+- Action cards for Codex/user follow-up: `workspace/action_cards/`
 - Career memory signals: `workspace/memory/`
 - Interview records: `workspace/interviews/`
 - Metrics summaries and usage records: `workspace/metrics/`
@@ -303,6 +320,7 @@ These files are intentionally local-first. They can support later improvements s
 | `careereng resume export-pdf --file ./resume.md --output resume.cv.pdf` | Convert Markdown resume to the apply-ready PDF. |
 | `careereng profile generate` | Generate or update `persona.md`. |
 | `careereng site add "Microsoft" --url https://careers.microsoft.com` | Register a company career site directly. |
+| `careereng site bootstrap "Apple" --url https://jobs.apple.com` | Prepare a draft site AI Skill action card and evidence pack for a new site without running browser phases. |
 | `careereng site list --status active` | List active registered sites. |
 | `careereng site deactivate microsoft` | Disable a site without deleting local history. |
 | `careereng site activate microsoft` | Reactivate a registered site. |
@@ -310,11 +328,27 @@ These files are intentionally local-first. They can support later improvements s
 | `careereng report jobs --batch latest` | Generate or inspect the latest job report. |
 | `careereng jobs review-status` | Review application status for active registered sites and stop after reporting. |
 | `careereng application-summary build` | Build an application summary from local history and review data. |
+| `careereng interview create --company NVIDIA --title "SDET"` | Create an interview session linked to a company/job. |
+| `careereng interview create --created-reason ad_hoc_assist` | Start an ad-hoc interview assist session with unknown company/title. |
+| `careereng interview update <session_id> --company OpenAI --title "AI Infra"` | Enrich or correct an interview session after more context is known. |
+| `careereng interview candidates --company NVIDIA --title SDET` | Find local job/application candidates before binding an interview session. |
+| `careereng interview create-from-candidate --candidate-id <id>` | Create or reuse an interview session after confirming a candidate. |
+| `careereng interview add-prep-event <session_id> --summary "..."` | Attach structured interview-prep context without duplicating raw Codex chat. |
+| `careereng interview add-turn <session_id> --speaker interviewer --type question --text "..."` | Record an interview transcript turn from manual, Codex, Teams, or transcript input. |
+| `careereng interview add-evidence <session_id> --type skill_gap --summary "..."` | Store interview evidence and sync it into evolution evidence. |
+| `careereng interview audio-devices` | List local audio devices for interview capture. |
+| `careereng interview capture-audio <session_id> --device 4` | Record continuous local audio and use `q/a/n/s` to save question/answer/unknown/stop chunks. |
 | `careereng application-summary repair-history` | Apply safe history repairs for legacy unmatched review records. |
 | `careereng metrics summary` | Summarize runtime and usage metrics. |
 | `careereng assistant ingest --client codex --thread <id> -m "@career ..."` | Route an external assistant message through the local assistant bridge. |
 | `careereng assistant state --client codex --thread <id>` | Inspect assistant bridge thread scope. |
 | `careereng assistant end --client codex --thread <id>` | Close assistant bridge career scope for a thread. |
+| `careereng action-card list` | List open Codex/user review task cards. |
+| `careereng action-card show <card_id>` | Show one action card as Markdown. |
+| `careereng action-card close <card_id> --result "..."` | Mark an action card as done. |
+| `careereng career-memory promote` | Promote assistant bridge signals into unified career memory units. |
+| `careereng career-memory import-candidates <file>` | Import Codex-curated memory candidates from JSON or JSONL. |
+| `careereng career-memory list` | Inspect stored career memory units. |
 | `careereng batch-list` | List open job batches. |
 | `careereng batch-clear` | Mark stale open batches as cancelled. |
 | `careereng batch-stop` | Stop CareerEng manager/browser runtime processes owned by the current workspace. |

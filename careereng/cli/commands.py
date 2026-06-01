@@ -13,12 +13,21 @@ from typing import Any
 
 import typer
 import yaml
+from careereng.action_cards import ActionCardError, ActionCardStore
 from careereng.application_summary import (
     build_application_summary,
     inspect_history_repairs,
     save_application_summary,
     save_history_repair_plan,
 )
+from careereng.career_memory import (
+    CareerMemoryError,
+    import_memory_candidates,
+    list_memory_units,
+    promote_assistant_signals,
+    show_memory_unit,
+)
+from careereng.capture.audio import AudioCaptureDependencyError, capture_audio_chunks, list_audio_devices
 from careereng.cleanup import build_cleanup_plan, execute_cleanup_plan
 from careereng.config.loader import ensure_files
 from careereng.core.runtime import build_loop as runtime_build_loop
@@ -31,8 +40,31 @@ from careereng.core.workspace_manager import (
     shutdown_workspace_manager,
     start_manager_jobs_batch,
 )
-from careereng.evolution import build_evolution_review, save_evolution_review
+from careereng.evolution import (
+    CandidateSpecError,
+    EvolutionApplyError,
+    EvolutionEvaluationError,
+    EvolutionProposalError,
+    EvolutionRollbackError,
+    EvolutionTriggerError,
+    apply_evolution_run,
+    build_evolution_review,
+    create_evolution_run,
+    evaluate_evolution_run,
+    get_candidate_spec,
+    load_candidate_specs,
+    rollback_evolution_run,
+    save_evolution_review,
+    scan_evolution_triggers,
+)
 from careereng.integrations.assistant_bridge import AssistantThreadStateStore, ingest_assistant_message
+from careereng.interviews import (
+    InterviewStore,
+    InterviewStoreError,
+    build_interview_summary,
+    render_interview_summary,
+    save_interview_candidates,
+)
 from careereng.metrics import build_metrics_summary, save_metrics_summary
 from careereng.resume.export import ResumeExportError, export_resume_pdf as export_resume_pdf_file
 from careereng.reporting.job_report import generate_job_batch_report
@@ -41,23 +73,34 @@ from careereng.storage.jsonl import JSONLStore
 from careereng.storage.intent_store import IntentStore
 from careereng.storage.profile_store import ProfileStore
 from careereng.storage.router_store import RouterStore
+from careereng.tools.site_bootstrap import bootstrap_site as bootstrap_site_launcher
 from careereng.tools.batch_apply_debug import BatchApplyDebugRunner
 from careereng.utils import make_id, safe_file_stem
 
 app = typer.Typer(help="CareerEng CLI")
+action_card_app = typer.Typer(help="Action card review tasks")
 application_summary_app = typer.Typer(help="Application lifecycle summary commands")
 assistant_app = typer.Typer(help="External AI assistant bridge commands")
+career_memory_app = typer.Typer(help="Career memory commands")
+capture_app = typer.Typer(help="Local capture commands")
+capture_audio_app = typer.Typer(help="Audio capture commands")
 evolution_app = typer.Typer(help="Evolution review commands")
 jobs_app = typer.Typer(help="Registered-site job retrieval/apply commands")
+interview_app = typer.Typer(help="Interview preparation and transcript records")
 profile_app = typer.Typer(help="Profile/persona commands")
 metrics_app = typer.Typer(help="Metrics summary commands")
 report_app = typer.Typer(help="Report review commands")
 resume_app = typer.Typer(help="Resume commands")
 route_app = typer.Typer(help="Route feedback commands")
 site_app = typer.Typer(help="Site registry commands")
+app.add_typer(action_card_app, name="action-card")
 app.add_typer(application_summary_app, name="application-summary")
 app.add_typer(assistant_app, name="assistant")
+app.add_typer(career_memory_app, name="career-memory")
+app.add_typer(capture_app, name="capture")
+capture_app.add_typer(capture_audio_app, name="audio")
 app.add_typer(evolution_app, name="evolution")
+app.add_typer(interview_app, name="interview")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(metrics_app, name="metrics")
 app.add_typer(profile_app, name="profile")
@@ -79,6 +122,10 @@ def _project_root() -> Path:
 
 def _workspace_path() -> Path:
     return runtime_workspace_path(_project_root())
+
+
+def _csv_list(value: str) -> list[str]:
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
 
 
 def _ensure_project_templates(project_root: Path) -> list[dict[str, str]]:
@@ -668,6 +715,63 @@ def run(
     typer.echo(_dispatch_message_with_progress(message=message, session=session))
 
 
+@action_card_app.command("list")
+def action_card_list(
+    status: str = typer.Option("open", "--status", help="open/done/cancelled/all"),
+    limit: int = typer.Option(50, "--limit", min=1, help="Maximum cards to show"),
+):
+    """List action cards for Codex/user follow-up."""
+    try:
+        rows = ActionCardStore(_workspace_path()).list_cards(status=status, limit=limit)
+    except ActionCardError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if not rows:
+        typer.echo("No action cards found.")
+        return
+    for row in rows:
+        typer.echo(
+            f"{row.get('card_id')}\t{row.get('status')}\t{row.get('priority') or 'medium'}\t"
+            f"{row.get('card_type')}\t{row.get('title')}"
+        )
+
+
+@action_card_app.command("show")
+def action_card_show(
+    card_id: str = typer.Argument(..., help="Action card ID"),
+):
+    """Show one action card as Markdown."""
+    try:
+        typer.echo(ActionCardStore(_workspace_path()).markdown_text(card_id).rstrip())
+    except ActionCardError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@action_card_app.command("close")
+def action_card_close(
+    card_id: str = typer.Argument(..., help="Action card ID"),
+    result: str = typer.Option("", "--result", help="Review or execution result summary"),
+):
+    """Mark an action card as done."""
+    try:
+        card = ActionCardStore(_workspace_path()).close_card(card_id, result_summary=result)
+    except ActionCardError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"closed={card.get('card_id')} status={card.get('status')} markdown={_workspace_path() / str(card.get('markdown_path') or '')}")
+
+
+@action_card_app.command("cancel")
+def action_card_cancel(
+    card_id: str = typer.Argument(..., help="Action card ID"),
+    reason: str = typer.Option("", "--reason", help="Cancellation reason"),
+):
+    """Cancel an action card."""
+    try:
+        card = ActionCardStore(_workspace_path()).cancel_card(card_id, reason=reason)
+    except ActionCardError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"cancelled={card.get('card_id')} status={card.get('status')} markdown={_workspace_path() / str(card.get('markdown_path') or '')}")
+
+
 @assistant_app.command("ingest")
 def assistant_ingest(
     message: str = typer.Option(..., "--message", "-m", help="Assistant-side user message to classify and store"),
@@ -710,6 +814,405 @@ def assistant_end(
     """Close an active assistant bridge career scope."""
     payload = AssistantThreadStateStore(_workspace_path()).close_scope(client=client, thread_id=thread)
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@career_memory_app.command("promote")
+def career_memory_promote(
+    limit: int = typer.Option(0, "--limit", help="Maximum new memory units to create; 0 means no limit"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+):
+    """Promote assistant bridge signals into unified career memory units."""
+    result = promote_assistant_signals(workspace=_workspace_path(), limit=limit if limit > 0 else None)
+    if json_output:
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo(
+        f"career-memory promoted created={result.get('created')} "
+        f"skipped_existing={result.get('skipped_existing')} scanned={result.get('scanned')}"
+    )
+    typer.echo(f"memory_units={result.get('memory_units_path')}")
+
+
+@career_memory_app.command("import-candidates")
+def career_memory_import_candidates(
+    input_file: Path = typer.Argument(..., help="JSON or JSONL file of Codex-curated memory candidates"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+):
+    """Import Codex-curated career memory candidates after schema validation."""
+    try:
+        result = import_memory_candidates(workspace=_workspace_path(), input_path=input_file)
+    except CareerMemoryError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo(
+        f"career-memory imported created={result.get('created')} "
+        f"skipped_existing={result.get('skipped_existing')} read={result.get('read')}"
+    )
+    typer.echo(f"memory_units={result.get('memory_units_path')}")
+
+
+@career_memory_app.command("list")
+def career_memory_list(
+    category: str = typer.Option("", "--category", help="Filter by memory category"),
+    status: str = typer.Option("", "--status", help="Filter by memory status"),
+    limit: int = typer.Option(20, "--limit", help="Maximum rows to print"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+):
+    """List unified career memory units."""
+    rows = list_memory_units(workspace=_workspace_path(), category=category, status=status, limit=limit)
+    if json_output:
+        typer.echo(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if not rows:
+        typer.echo("No career memory units found.")
+        return
+    for row in rows:
+        typer.echo(
+            f"- {row.get('memory_id')} [{row.get('category')}/{row.get('status')}] "
+            f"{row.get('summary') or ''}"
+        )
+
+
+@career_memory_app.command("show")
+def career_memory_show(
+    memory_id: str = typer.Argument(..., help="Memory unit ID"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+):
+    """Show one unified career memory unit."""
+    try:
+        row = show_memory_unit(workspace=_workspace_path(), memory_id=memory_id)
+    except CareerMemoryError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        typer.echo(json.dumps(row, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo(f"{row.get('memory_id')} [{row.get('category')}/{row.get('status')}]")
+    typer.echo(str(row.get("summary") or ""))
+    tags = row.get("tags") if isinstance(row.get("tags"), list) else []
+    if tags:
+        typer.echo("tags: " + ", ".join(str(tag) for tag in tags))
+    if row.get("source_text"):
+        typer.echo("source:")
+        typer.echo(str(row.get("source_text") or ""))
+
+
+def _interview_store() -> InterviewStore:
+    return InterviewStore(_workspace_path())
+
+
+def _print_audio_devices() -> None:
+    try:
+        rows = list_audio_devices()
+    except AudioCaptureDependencyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if not rows:
+        typer.echo("No audio devices found.")
+        return
+    for row in rows:
+        marker = "input" if row.get("is_input") else "output"
+        typer.echo(
+            f"{row.get('index')}\t{marker}\t{row.get('name')}\t"
+            f"in={row.get('input_channels')} out={row.get('output_channels')} "
+            f"rate={row.get('default_samplerate')} host={row.get('hostapi')}"
+        )
+
+
+@capture_audio_app.command("devices")
+def capture_audio_devices():
+    """List local audio devices for capture."""
+    _print_audio_devices()
+
+
+@interview_app.command("create")
+def interview_create(
+    company: str = typer.Option("unknown", "--company", help="Company name"),
+    title: str = typer.Option("unknown", "--title", help="Job title"),
+    site: str = typer.Option("", "--site", help="Site key"),
+    url: str = typer.Option("", "--url", help="Job or application URL"),
+    site_job_id: str = typer.Option("", "--site-job-id", help="Site-native job ID"),
+    canonical_job_id: str = typer.Option("", "--canonical-job-id", help="CareerEng canonical job ID"),
+    application_status: str = typer.Option("", "--application-status", help="Current application status"),
+    application_stage: str = typer.Option("", "--application-stage", help="Current application stage"),
+    source_history_ref: str = typer.Option("", "--source-history-ref", help="History job reference"),
+    created_reason: str = typer.Option("manual_prep", "--created-reason", help="manual_prep/status_in_process/teams_meeting/codex_prep"),
+    source_ref: str = typer.Option("", "--source-ref", help="Comma-separated source refs"),
+):
+    """Create an interview session bound to a job/application."""
+    try:
+        row = _interview_store().create_session(
+            company=company,
+            title=title,
+            site_key=site,
+            url=url,
+            site_job_id=site_job_id,
+            canonical_job_id=canonical_job_id,
+            application_status=application_status,
+            application_stage=application_stage,
+            source_history_ref=source_history_ref,
+            created_reason=created_reason,
+            source_refs=_csv_list(source_ref),
+        )
+    except InterviewStoreError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"interview_session={row.get('session_id')} status={row.get('status')}")
+    typer.echo(f"company={row.get('company')} title={row.get('title') or '-'}")
+
+
+@interview_app.command("update")
+def interview_update(
+    session_id: str = typer.Argument(..., help="Interview session ID"),
+    company: str | None = typer.Option(None, "--company", help="Company name"),
+    title: str | None = typer.Option(None, "--title", help="Job title"),
+    site: str | None = typer.Option(None, "--site", help="Site key"),
+    url: str | None = typer.Option(None, "--url", help="Job or application URL"),
+    site_job_id: str | None = typer.Option(None, "--site-job-id", help="Site-native job ID"),
+    canonical_job_id: str | None = typer.Option(None, "--canonical-job-id", help="CareerEng canonical job ID"),
+    application_status: str | None = typer.Option(None, "--application-status", help="Current application status"),
+    application_stage: str | None = typer.Option(None, "--application-stage", help="Current application stage"),
+    source_history_ref: str | None = typer.Option(None, "--source-history-ref", help="History job reference"),
+    source_ref: str = typer.Option("", "--source-ref", help="Comma-separated source refs to append"),
+):
+    """Update or enrich an interview session after more context is known."""
+    try:
+        row = _interview_store().update_session(
+            session_id,
+            company=company,
+            title=title,
+            site_key=site,
+            url=url,
+            site_job_id=site_job_id,
+            canonical_job_id=canonical_job_id,
+            application_status=application_status,
+            application_stage=application_stage,
+            source_history_ref=source_history_ref,
+            source_refs=_csv_list(source_ref) if source_ref else None,
+        )
+    except InterviewStoreError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"interview_session={row.get('session_id')} updated")
+    typer.echo(f"company={row.get('company')} title={row.get('title') or '-'}")
+
+
+@interview_app.command("candidates")
+def interview_candidates(
+    company: str = typer.Option("", "--company", help="Company name or site alias"),
+    title: str = typer.Option("", "--title", help="Job title or role keywords"),
+    limit: int = typer.Option(10, "--limit", min=1, help="Maximum candidates to show"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+):
+    """Find local job/application candidates before creating an interview session."""
+    rows = save_interview_candidates(workspace=_workspace_path(), company=company, title=title, limit=limit)
+    if json_output:
+        typer.echo(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if not rows:
+        typer.echo("No interview candidates found.")
+        typer.echo("Use `careereng interview create --company ... --title ...` for a manual prep session.")
+        return
+    for row in rows:
+        typer.echo(
+            f"{row.get('candidate_id')}\tscore={row.get('match_score')}\t"
+            f"{row.get('company') or row.get('site_key')}\t{row.get('title') or '-'}"
+        )
+        typer.echo(
+            f"  site={row.get('site_key') or '-'} site_job_id={row.get('site_job_id') or '-'} "
+            f"stage={row.get('application_stage') or '-'} status={row.get('application_status') or '-'}"
+        )
+        if row.get("url"):
+            typer.echo(f"  url={row.get('url')}")
+        if row.get("match_reason"):
+            typer.echo(f"  reason={row.get('match_reason')}")
+
+
+@interview_app.command("create-from-candidate")
+def interview_create_from_candidate(
+    candidate_id: str = typer.Option(..., "--candidate-id", help="Candidate ID from `interview candidates`"),
+):
+    """Create or reuse an interview session after the user confirms a local candidate."""
+    try:
+        row, created = _interview_store().create_session_from_candidate(candidate_id)
+    except InterviewStoreError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    state = "created" if created else "existing"
+    typer.echo(f"interview_session={row.get('session_id')} {state}")
+    typer.echo(f"company={row.get('company')} title={row.get('title') or '-'}")
+    typer.echo(f"site={row.get('site_key') or '-'} site_job_id={row.get('site_job_id') or '-'}")
+
+
+@interview_app.command("add-prep-event")
+def interview_add_prep_event(
+    session_id: str = typer.Argument(..., help="Interview session ID"),
+    summary: str = typer.Option(..., "--summary", help="Structured preparation summary"),
+    event_type: str = typer.Option("note", "--type", help="predicted_question/answer_strategy/skill_gap/project_story/learning_plan/resume_signal/note"),
+    details: str = typer.Option("", "--details", help="Optional details"),
+    tags: str = typer.Option("", "--tags", help="Comma-separated topic tags"),
+    source_ref: str = typer.Option("", "--source-ref", help="Comma-separated assistant bridge or transcript refs"),
+    memory_ref: str = typer.Option("", "--memory-ref", help="Comma-separated career memory refs"),
+):
+    """Attach structured interview-prep information to a session."""
+    try:
+        row = _interview_store().add_prep_event(
+            session_id,
+            event_type=event_type,
+            summary=summary,
+            details=details,
+            topic_tags=_csv_list(tags),
+            source_refs=_csv_list(source_ref),
+            memory_refs=_csv_list(memory_ref),
+        )
+    except InterviewStoreError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"prep_event={row.get('prep_event_id')} session={row.get('session_id')}")
+
+
+@interview_app.command("add-question")
+def interview_add_question(
+    session_id: str = typer.Argument(..., help="Interview session ID"),
+    question: str = typer.Option(..., "--question", help="Predicted interview question"),
+    reason: str = typer.Option("", "--reason", help="Why this question is expected"),
+    topics: str = typer.Option("", "--topics", help="Comma-separated expected topics"),
+    answer_outline: str = typer.Option("", "--answer-outline", help="Suggested answer outline"),
+    source_ref: str = typer.Option("", "--source-ref", help="Comma-separated source refs"),
+):
+    """Add a predicted interview question for later hit/miss comparison."""
+    try:
+        row = _interview_store().add_predicted_question(
+            session_id,
+            question=question,
+            reason=reason,
+            expected_topics=_csv_list(topics),
+            suggested_answer_outline=answer_outline,
+            source_refs=_csv_list(source_ref),
+        )
+    except InterviewStoreError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"question={row.get('question_id')} session={row.get('session_id')}")
+
+
+@interview_app.command("add-turn")
+def interview_add_turn(
+    session_id: str = typer.Argument(..., help="Interview session ID"),
+    text: str = typer.Option(..., "--text", help="Transcript turn text"),
+    speaker: str = typer.Option("unknown", "--speaker", help="interviewer/candidate/assistant/unknown"),
+    text_type: str = typer.Option("note", "--type", help="question/answer/followup/note"),
+    source: str = typer.Option("manual", "--source", help="manual/codex/teams/transcript"),
+    tags: str = typer.Option("", "--tags", help="Comma-separated topic tags"),
+    linked_question_id: str = typer.Option("", "--linked-question-id", help="Predicted question ID"),
+):
+    """Add one real interview transcript turn."""
+    try:
+        row = _interview_store().add_turn(
+            session_id,
+            raw_text=text,
+            speaker=speaker,
+            text_type=text_type,
+            source=source,
+            topic_tags=_csv_list(tags),
+            linked_question_id=linked_question_id,
+        )
+    except InterviewStoreError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"turn={row.get('turn_id')} session={row.get('session_id')}")
+
+
+@interview_app.command("add-suggestion")
+def interview_add_suggestion(
+    session_id: str = typer.Argument(..., help="Interview session ID"),
+    suggested_answer: str = typer.Option(..., "--suggested-answer", help="LLM suggested answer or hint"),
+    linked_turn_id: str = typer.Option("", "--linked-turn-id", help="Question turn this suggestion responds to"),
+    strategy_notes: str = typer.Option("", "--strategy-notes", help="Optional strategy notes"),
+    adoption_status: str = typer.Option("unknown", "--adoption-status", help="adopted/partially_adopted/ignored/unknown"),
+    actual_answer_turn_id: str = typer.Option("", "--actual-answer-turn-id", help="Candidate answer turn ID"),
+    difference_notes: str = typer.Option("", "--difference-notes", help="Difference between suggestion and actual answer"),
+    source_ref: str = typer.Option("", "--source-ref", help="Comma-separated source refs"),
+):
+    """Record an LLM suggestion and whether the candidate used it."""
+    try:
+        row = _interview_store().add_suggestion(
+            session_id,
+            suggested_answer=suggested_answer,
+            linked_turn_id=linked_turn_id,
+            strategy_notes=strategy_notes,
+            adoption_status=adoption_status,
+            actual_answer_turn_id=actual_answer_turn_id,
+            difference_notes=difference_notes,
+            source_refs=_csv_list(source_ref),
+        )
+    except InterviewStoreError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"suggestion={row.get('suggestion_id')} session={row.get('session_id')}")
+
+
+@interview_app.command("add-evidence")
+def interview_add_evidence(
+    session_id: str = typer.Argument(..., help="Interview session ID"),
+    evidence_type: str = typer.Option(..., "--type", help="predicted_question_hit/unexpected_question/skill_gap/resume_signal/company_signal/answer_quality_signal/preparation_gap"),
+    summary: str = typer.Option(..., "--summary", help="Evidence summary"),
+    details: str = typer.Option("", "--details", help="Optional details"),
+    source_ref: str = typer.Option("", "--source-ref", help="Comma-separated source refs"),
+    confidence: float = typer.Option(0.0, "--confidence", help="Confidence score"),
+    severity: str = typer.Option("medium", "--severity", help="low/medium/high"),
+):
+    """Add interview evidence and sync it into evolution evidence."""
+    try:
+        row = _interview_store().add_evidence(
+            session_id,
+            evidence_type=evidence_type,
+            summary=summary,
+            details=details,
+            source_refs=_csv_list(source_ref),
+            confidence=confidence,
+            severity=severity,
+        )
+    except InterviewStoreError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"evidence={row.get('evidence_id')} session={row.get('session_id')}")
+
+
+@interview_app.command("show")
+def interview_show(
+    session_id: str = typer.Argument(..., help="Interview session ID"),
+    recent_limit: int = typer.Option(5, "--recent-limit", min=1, help="Recent records per section"),
+):
+    """Show one interview session summary."""
+    try:
+        summary = build_interview_summary(_interview_store(), session_id, recent_limit=recent_limit)
+    except InterviewStoreError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(render_interview_summary(summary).rstrip())
+
+
+@interview_app.command("audio-devices")
+def interview_audio_devices():
+    """List audio devices for interview capture."""
+    _print_audio_devices()
+
+
+@interview_app.command("capture-audio")
+def interview_capture_audio(
+    session_id: str = typer.Argument(..., help="Interview session ID"),
+    device: str = typer.Option("", "--device", help="Input device index or name"),
+    sample_rate: int = typer.Option(16000, "--sample-rate", help="Recording sample rate"),
+    channels: int = typer.Option(1, "--channels", min=1, help="Input channel count"),
+):
+    """Capture audio chunks for an interview session using q/a/n/s key markers."""
+    store = _interview_store()
+    try:
+        store.get_session(session_id)
+        output_dir = _workspace_path() / "interviews" / session_id / "audio" / "chunks"
+        chunks = capture_audio_chunks(
+            output_dir=output_dir,
+            device=device or None,
+            sample_rate=sample_rate,
+            channels=channels,
+        )
+        saved = [store.add_audio_chunk(session_id, chunk) for chunk in chunks]
+    except (InterviewStoreError, AudioCaptureDependencyError, ValueError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"audio_chunks={len(saved)} session={session_id}")
+    typer.echo(f"audio_dir={output_dir}")
 
 
 @profile_app.command("generate")
@@ -828,6 +1331,180 @@ def evolution_review(
         f"- context: {paths['context_markdown']}",
         f"- candidates: {paths['open_candidates_store']}",
     ]
+    typer.echo("\n".join(lines))
+
+
+@evolution_app.command("candidates")
+def evolution_candidates():
+    """List available evolution candidate specs."""
+    specs = load_candidate_specs(_project_root())
+    if not specs:
+        typer.echo("No evolution candidate specs found.")
+        return
+    for spec in specs:
+        typer.echo(f"{spec.id}\t{spec.risk_level}\t{spec.target_type}\t{spec.target_ref}")
+
+
+@evolution_app.command("candidate-show")
+def evolution_candidate_show(
+    candidate_id: str = typer.Argument(..., help="Evolution candidate ID"),
+    json_output: bool = typer.Option(False, "--json", help="Print structured JSON instead of Markdown body"),
+):
+    """Show one evolution candidate spec."""
+    try:
+        spec = get_candidate_spec(_project_root(), candidate_id)
+    except CandidateSpecError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        typer.echo(json.dumps(spec.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    lines = [
+        f"# {spec.name}",
+        "",
+        f"- id: `{spec.id}`",
+        f"- target_type: `{spec.target_type}`",
+        f"- target_ref: `{spec.target_ref}`",
+        f"- risk_level: `{spec.risk_level}`",
+        f"- apply_policy: `{spec.apply_policy}`",
+        f"- path: `{spec.path}`",
+        "",
+        spec.body,
+    ]
+    typer.echo("\n".join(lines).rstrip())
+
+
+@evolution_app.command("run")
+def evolution_run(
+    candidate: str = typer.Option(..., "--candidate", "-c", help="Evolution candidate ID"),
+):
+    """Create an archived evolution run and evidence pack for a candidate."""
+    try:
+        result = create_evolution_run(project_root=_project_root(), workspace=_workspace_path(), candidate_id=candidate)
+    except CandidateSpecError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    lines = [
+        f"run={result['run_id']} status={result['status']}",
+        f"candidate={result['candidate_id']}",
+        f"run_dir={result['run_dir']}",
+        f"run_json={result['run_json']}",
+        f"evidence_pack={result['evidence_pack']}",
+        f"summary={result['summary']}",
+    ]
+    typer.echo("\n".join(lines))
+
+
+@evolution_app.command("apply")
+def evolution_apply(
+    run: str = typer.Option(..., "--run", help="Evolution run ID"),
+):
+    """Apply a rollbackable proposal from an evolution run archive."""
+    try:
+        result = apply_evolution_run(workspace=_workspace_path(), project_root=_project_root(), run_id=run)
+    except (EvolutionApplyError, EvolutionProposalError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    lines = [
+        f"run={result['run_id']} status={result['status']}",
+        f"applied_count={result['applied_count']}",
+        f"applied_files={result['applied_files']}",
+        f"applied_patch={result['applied_patch']}",
+        f"summary={result['summary']}",
+    ]
+    typer.echo("\n".join(lines))
+
+
+@evolution_app.command("evaluate")
+def evolution_evaluate(
+    run: str = typer.Option(..., "--run", help="Evolution run ID"),
+    recent_limit: int = typer.Option(10, "--recent-limit", min=1, help="Recent rows to compare before/after apply"),
+):
+    """Evaluate an applied evolution run and write selection results."""
+    try:
+        result = evaluate_evolution_run(
+            workspace=_workspace_path(),
+            project_root=_project_root(),
+            run_id=run,
+            recent_limit=recent_limit,
+        )
+    except EvolutionEvaluationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    lines = [
+        f"run={result['run_id']} status={result['status']} selection={result['selection']}",
+        f"evaluation={result['evaluation']}",
+        f"evaluation_markdown={result['evaluation_markdown']}",
+        f"selection_json={result['selection_json']}",
+        f"summary={result['summary']}",
+    ]
+    if result.get("review_pack"):
+        lines.insert(4, f"review_pack={result['review_pack']}")
+    if result.get("action_card"):
+        lines.insert(5, f"action_card={result['action_card']}")
+    typer.echo("\n".join(lines))
+
+
+@evolution_app.command("rollback")
+def evolution_rollback(
+    run: str = typer.Option(..., "--run", help="Evolution run ID"),
+    reason: str = typer.Option("", "--reason", help="Optional rollback reason"),
+):
+    """Rollback an applied evolution run from archived snapshots."""
+    try:
+        result = rollback_evolution_run(
+            workspace=_workspace_path(),
+            project_root=_project_root(),
+            run_id=run,
+            reason=reason,
+        )
+    except EvolutionRollbackError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    lines = [
+        f"run={result['run_id']} status={result['status']}",
+        f"restored_count={result['restored_count']}",
+        f"skipped_count={result['skipped_count']}",
+        f"rollback={result['rollback']}",
+        f"summary={result['summary']}",
+    ]
+    typer.echo("\n".join(lines))
+
+
+@evolution_app.command("trigger-scan")
+def evolution_trigger_scan(
+    status: str = typer.Option("active", "--status", help="Site registry status to scan; use 'all' for all sites"),
+    create_runs: bool = typer.Option(True, "--create-runs/--no-create-runs", help="Create evolution run archives for triggered candidates"),
+):
+    """Scan local evidence and create evolution triggers."""
+    normalized_status = "" if str(status or "").strip().lower() == "all" else str(status or "").strip()
+    try:
+        result = scan_evolution_triggers(
+            project_root=_project_root(),
+            workspace=_workspace_path(),
+            status=normalized_status,
+            create_runs=create_runs,
+        )
+    except EvolutionTriggerError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    site_workflow = result.get("site_workflow") if isinstance(result.get("site_workflow"), dict) else {}
+    target_company = result.get("target_company_intelligence") if isinstance(result.get("target_company_intelligence"), dict) else {}
+    assistant_memory = result.get("assistant_router_memory_intake") if isinstance(result.get("assistant_router_memory_intake"), dict) else {}
+    lines = [f"triggered={result['triggered_count']}"]
+    for label, group in (
+        ("site_workflow", site_workflow),
+        ("target_company_intelligence", target_company),
+        ("assistant_router_memory_intake", assistant_memory),
+    ):
+        lines.append(
+            f"{label}: candidate={group.get('candidate_id')} triggered={group.get('triggered_count')} "
+            f"buckets={group.get('bucket_count')} sites={group.get('site_count')}"
+        )
+        lines.append(f"{label}: state={group.get('state_path')}")
+        lines.append(f"{label}: open_candidates={group.get('open_candidates_path')}")
+        for row in group.get("triggered") or []:
+            phase_or_area = row.get("phase") or row.get("area") or row.get("trigger_type")
+            count = row.get("phase_run_count") or row.get("job_count") or row.get("review_count") or row.get("rejected_count") or 0
+            subject = row.get("site_key") or row.get("area") or row.get("candidate_id") or label
+            lines.append(
+                f"- {subject}:{phase_or_area} trigger={row.get('trigger_type')} "
+                f"count={count} run={row.get('evolution_run_id') or '-'}"
+            )
     typer.echo("\n".join(lines))
 
 
@@ -1041,6 +1718,45 @@ def site_add(
     typer.echo(f"entry_url: {result.get('base_url') or '-'}")
     state = "created" if result.get("skill_template_created") else "existing"
     typer.echo(f"site_skill: {result.get('skill_path')} ({state})")
+    if result.get("action_card_id"):
+        typer.echo(f"action_card: {result.get('action_card_id')} {result.get('action_card_path') or ''}".rstrip())
+
+
+@site_app.command("bootstrap")
+def site_bootstrap(
+    name: str = typer.Argument(..., help="Company or site name"),
+    url: str = typer.Option("", "--url", help="Optional known entry URL"),
+    session: str = typer.Option("cli:site", "--session", "-s", help="Session ID for audit events"),
+):
+    """Prepare a draft site AI Skill action card without running browser phases."""
+    _, _, _, search_store, _, site_tools, locator = _build_site_services()
+    turn_id = make_id("turn")
+    try:
+        result = bootstrap_site_launcher(
+            site_name=name,
+            base_url=url,
+            session_id=session,
+            turn_id=turn_id,
+            search_store=search_store,
+            site_tools=site_tools,
+            channel_locator=locator,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"bootstrap: {result.get('site_name')} [{result.get('site_id')}] status={result.get('status')}")
+    typer.echo(f"entry_url: {result.get('base_url') or '-'}")
+    typer.echo(f"entry_url_source: {result.get('base_url_source') or '-'}")
+    state = "created" if result.get("skill_template_created") else "existing"
+    typer.echo(f"site_skill: {result.get('skill_path')} ({state})")
+    if result.get("action_card_id"):
+        typer.echo(f"action_card: {result.get('action_card_id')} {result.get('action_card_path') or ''}".rstrip())
+        if result.get("evolution_run_id"):
+            typer.echo(f"evolution_run: {result.get('evolution_run_id')}")
+        if result.get("evidence_pack"):
+            typer.echo(f"evidence_pack: {result.get('evidence_pack')}")
+        typer.echo(f"next: {result.get('next_action')}")
+    else:
+        typer.echo("action_card: -")
 
 
 @site_app.command("list")

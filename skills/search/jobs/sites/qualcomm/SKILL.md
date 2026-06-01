@@ -14,7 +14,7 @@ apply_enabled: true
 
 ### Goal
 
-- Complete Qualcomm candidate login, upload the staged resume into the candidate profile's resume manager, and leave the browser ready to continue into Qualcomm job search.
+- Complete Qualcomm candidate login, update the candidate profile resume only when the runtime resume freshness context says it is needed, and leave the browser ready to continue into Qualcomm job search.
 
 ### Site Facts
 
@@ -26,7 +26,9 @@ apply_enabled: true
 ### Workflow
 
 - If the current Qualcomm page still shows a visible Google sign-in continuation for the jobs or candidate flow, continue that sign-in path instead of declaring readiness.
-- After login, use the Qualcomm header avatar / account-name dropdown, then choose the dropdown's `Profile` path from there.
+- Read the runtime resume freshness context first.
+- If `resume_upload_needed = false`, do not open `Profile` or `Resume Manager` only to upload or re-check the resume. Continue toward the login-ready completion condition unless the live site clearly shows that the remote resume is missing, mismatched, or unusable.
+- If `resume_upload_needed = true`, after login use the Qualcomm header avatar / account-name dropdown, then choose the dropdown's `Profile` path from there.
 - On the dropdown-driven `Profile` page, the first required setup target is `Resume Manager`.
 - Before the Qualcomm resume step is satisfied, ignore the rest of `Profile`; do not inspect `About`, `Skills`, `Experience`, `Education`, or other profile sections first.
 - If `Resume Manager` is visible and the Qualcomm resume step is not yet satisfied in this run, click `Resume Manager` immediately.
@@ -41,7 +43,7 @@ apply_enabled: true
 
 ### Completion Or Blocked
 
-- End `Session Preparation` after Qualcomm is signed in, the current staged resume filename is visibly present in `Resume Manager`, and any resume dialog has been closed.
+- End `Session Preparation` after Qualcomm is signed in and either `resume_upload_needed = false` or the current staged resume filename is visibly present in `Resume Manager`; close any resume dialog before finishing.
 - If the flow reaches password entry, MFA, verification code, CAPTCHA, email confirmation, or another explicit human-only challenge with no visible one-click Google continuation left, stop with `blocked`.
 
 ### Don't
@@ -53,6 +55,7 @@ apply_enabled: true
 - Do not click `Export as resume` before `Resume Manager`.
 - Do not scroll through or inspect the rest of `Profile` before clicking `Resume Manager`.
 - Do not substitute another resume area, profile section, or settings page for `Resume Manager`.
+- Do not open or re-open `Resume Manager` when `resume_upload_needed = false` unless the live page clearly shows the remote resume is missing, mismatched, or unusable.
 - Do not upload a different file when the current staged resume filename is already visibly present in the Qualcomm resume manager.
 - Do not reopen `Resume Manager` after the current staged resume filename has already been confirmed there in the current `session_preparation` run.
 
