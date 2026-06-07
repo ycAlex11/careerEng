@@ -37,7 +37,7 @@ def _pending_apply_rows(
     else:
         run_rows = []
     terminal_decisions = {"filtered_out", "already_applied"}
-    terminal_applications = {"already_applied", "submitted", "apply_failed", "blocked"}
+    terminal_applications = {"already_applied", "filtered_out", "submitted", "apply_failed", "blocked"}
     pending_rows: list[dict[str, Any]] = []
     for row in run_rows:
         if not isinstance(row, dict):

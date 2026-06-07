@@ -571,6 +571,76 @@ def _list_workspace_browser_pids(workspace: Path) -> list[int]:
     return sorted(pids)
 
 
+def _list_careereng_long_task_pids() -> list[int]:
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    current_pid = os.getpid()
+    pids: set[int] = set()
+    long_task_markers = (
+        "careereng jobs apply",
+        "careereng jobs review-status",
+        "-m careereng jobs apply",
+        "-m careereng jobs review-status",
+    )
+    for line in str(proc.stdout or "").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        pid_text, _, command = raw.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        if any(marker in command for marker in long_task_markers):
+            pids.add(pid)
+    return sorted(pids)
+
+
+def _list_workspace_manager_pids(*, project_root: Path, workspace: Path) -> list[int]:
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    current_pid = os.getpid()
+    root_marker = str(Path(project_root).resolve())
+    workspace_marker = str(Path(workspace).resolve())
+    pids: set[int] = set()
+    for line in str(proc.stdout or "").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        pid_text, _, command = raw.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        if "manager-serve" in command and root_marker in command and workspace_marker in command:
+            pids.add(pid)
+    return sorted(pids)
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -591,8 +661,7 @@ def _wait_for_pids_exit(pids: set[int], *, timeout_seconds: float) -> set[int]:
     return {pid for pid in alive if _pid_alive(pid)}
 
 
-def _stop_workspace_browser_processes(workspace: Path) -> int:
-    pids = set(_list_workspace_browser_pids(workspace))
+def _stop_pids(pids: set[int], *, timeout_seconds: float = 3.0) -> int:
     if not pids:
         return 0
     for pid in sorted(pids):
@@ -602,7 +671,7 @@ def _stop_workspace_browser_processes(workspace: Path) -> int:
             pass
         except PermissionError:
             pass
-    survivors = _wait_for_pids_exit(pids, timeout_seconds=3.0)
+    survivors = _wait_for_pids_exit(pids, timeout_seconds=timeout_seconds)
     for pid in sorted(survivors):
         try:
             os.kill(pid, signal.SIGKILL)
@@ -611,6 +680,33 @@ def _stop_workspace_browser_processes(workspace: Path) -> int:
         except PermissionError:
             pass
     return len(pids)
+
+
+def _stop_workspace_browser_processes(workspace: Path) -> int:
+    pids = set(_list_workspace_browser_pids(workspace))
+    return _stop_pids(pids)
+
+
+def _stop_workspace_browser_processes_until_clean(workspace: Path, *, attempts: int = 3) -> int:
+    stopped: set[int] = set()
+    for _ in range(max(1, attempts)):
+        pids = set(_list_workspace_browser_pids(workspace))
+        if not pids:
+            break
+        stopped.update(pids)
+        _stop_pids(pids)
+        time.sleep(0.2)
+    return len(stopped)
+
+
+def _stop_workspace_manager_processes(*, project_root: Path, workspace: Path) -> int:
+    pids = set(_list_workspace_manager_pids(project_root=project_root, workspace=workspace))
+    return _stop_pids(pids, timeout_seconds=2.0)
+
+
+def _stop_careereng_long_task_processes() -> int:
+    pids = set(_list_careereng_long_task_pids())
+    return _stop_pids(pids)
 
 
 def _dispatch_jobs_batch_with_monitor(
@@ -816,6 +912,37 @@ def assistant_end(
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+@assistant_app.command("import-candidates")
+def assistant_import_candidates(
+    input_file: Path = typer.Argument(..., help="JSON or JSONL file of assistant-curated memory candidates"),
+    source_limit: int = typer.Option(0, "--source-limit", help="Number of recent assistant messages summarized; 0 means unspecified"),
+    source_thread: str = typer.Option("codex-current", "--source-thread", help="External assistant thread/conversation ID"),
+    source_client: str = typer.Option("codex", "--source-client", help="External assistant client name"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+):
+    """Import assistant-curated recent conversation candidates into career memory."""
+    try:
+        result = import_memory_candidates(
+            workspace=_workspace_path(),
+            input_path=input_file,
+            source_limit=source_limit,
+            source_thread=source_thread,
+            source_client=source_client,
+        )
+    except CareerMemoryError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    scope = f"recent_{source_limit}_messages" if source_limit > 0 else "recent_messages"
+    typer.echo(
+        f"assistant memory imported created={result.get('created')} "
+        f"skipped_existing={result.get('skipped_existing')} read={result.get('read')} "
+        f"thread={result.get('source_thread') or '-'} scope={scope}"
+    )
+    typer.echo(f"memory_units={result.get('memory_units_path')}")
+
+
 @career_memory_app.command("promote")
 def career_memory_promote(
     limit: int = typer.Option(0, "--limit", help="Maximum new memory units to create; 0 means no limit"),
@@ -836,11 +963,20 @@ def career_memory_promote(
 @career_memory_app.command("import-candidates")
 def career_memory_import_candidates(
     input_file: Path = typer.Argument(..., help="JSON or JSONL file of Codex-curated memory candidates"),
+    source_limit: int = typer.Option(0, "--source-limit", help="Number of recent assistant messages summarized; 0 means unspecified"),
+    source_thread: str = typer.Option("", "--source-thread", help="Optional external assistant thread/conversation ID"),
+    source_client: str = typer.Option("", "--source-client", help="Optional external assistant client name"),
     json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
 ):
     """Import Codex-curated career memory candidates after schema validation."""
     try:
-        result = import_memory_candidates(workspace=_workspace_path(), input_path=input_file)
+        result = import_memory_candidates(
+            workspace=_workspace_path(),
+            input_path=input_file,
+            source_limit=source_limit,
+            source_thread=source_thread,
+            source_client=source_client,
+        )
     except CareerMemoryError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
@@ -1549,6 +1685,7 @@ def batch_stop(
     root = _project_root()
     workspace = _workspace_path()
     session_filter = session or None
+    shutdown_error = ""
     try:
         response = shutdown_workspace_manager(
             project_root=root,
@@ -1558,16 +1695,31 @@ def batch_stop(
             wait_timeout_seconds=10.0,
         )
     except Exception as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    cancelled = int(response.get("cancelled") or 0)
-    stopped_browser_processes = _stop_workspace_browser_processes(workspace)
-    if not bool(response.get("running")):
-        rows = JobStore(workspace).clear_open_batches(session_id=session_filter)
-        cancelled = len(rows)
-        typer.echo(f"manager=not_running cancelled={cancelled} browser_processes_stopped={stopped_browser_processes}")
-        return
-    status = "stopped" if bool(response.get("stopped")) else "shutdown_pending"
-    typer.echo(f"manager={status} cancelled={cancelled} browser_processes_stopped={stopped_browser_processes}")
+        shutdown_error = str(exc)
+        response = {"ok": False, "running": False, "stopped": False, "cancelled": 0}
+    response_cancelled = int(response.get("cancelled") or 0)
+    stopped_manager_processes = _stop_workspace_manager_processes(project_root=root, workspace=workspace)
+    stopped_cli_processes = _stop_careereng_long_task_processes()
+    stopped_browser_processes = _stop_workspace_browser_processes_until_clean(workspace)
+    rows = JobStore(workspace).clear_open_batches(session_id=session_filter)
+    cancelled = max(response_cancelled, len(rows))
+    manager_left = _list_workspace_manager_pids(project_root=root, workspace=workspace)
+    if not bool(response.get("running")) and not stopped_manager_processes and not manager_left:
+        status = "not_running"
+    elif bool(response.get("stopped")) or stopped_manager_processes:
+        status = "stopped"
+    else:
+        status = "shutdown_pending"
+    parts = [
+        f"manager={status}",
+        f"cancelled={cancelled}",
+        f"manager_processes_stopped={stopped_manager_processes}",
+        f"cli_processes_stopped={stopped_cli_processes}",
+        f"browser_processes_stopped={stopped_browser_processes}",
+    ]
+    if shutdown_error:
+        parts.append(f"shutdown_error={shutdown_error}")
+    typer.echo(" ".join(parts))
 
 
 @app.command("cleanup")
@@ -1728,7 +1880,7 @@ def site_bootstrap(
     url: str = typer.Option("", "--url", help="Optional known entry URL"),
     session: str = typer.Option("cli:site", "--session", "-s", help="Session ID for audit events"),
 ):
-    """Prepare a draft site AI Skill action card without running browser phases."""
+    """Prepare a testable site AI Skill action card without running browser phases."""
     _, _, _, search_store, _, site_tools, locator = _build_site_services()
     turn_id = make_id("turn")
     try:

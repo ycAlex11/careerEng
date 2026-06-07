@@ -86,6 +86,8 @@ The action card should include:
 - `workspace/sites/<site>/site.json`
 - `workspace/sites/<site>/events/all.jsonl`
 - first-run browser/evolution evidence when available
+- `workspace/sites/<site>/evolution/workflow_memory.json` when available
+- latest failed batch, trace, and failure snapshot when a test run has already failed
 
 The launcher must not silently execute browser phases. It only prepares a task card and evidence path for Codex/user collaboration.
 
@@ -130,13 +132,13 @@ The LLM must not propose:
 
 Default safety behavior:
 
-- new site AI Skills remain `status: draft`
+- new site AI Skills should be `status: ready` so non-apply phases can be tested immediately
 - new site AI Skills keep `apply_enabled: false`
 - first tests should target non-apply phases
 - human login, MFA, CAPTCHA, verification codes, and ambiguous required answers remain user takeover points
 - final-submit behavior requires explicit user approval and site-specific apply instructions
 
-The phrase "apply to a new company" should not bypass this boundary. It should first create a bootstrap card unless a ready site AI Skill already exists and apply has been explicitly enabled for that site.
+The phrase "apply to a new company" should not bypass this boundary. It should first create a bootstrap/refinement card unless a testable site AI Skill already exists and apply has been explicitly enabled for that site.
 
 ## Runtime Boundary
 

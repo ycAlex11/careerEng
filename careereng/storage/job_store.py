@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from careereng.browser_context.workflow_memory import record_interrupted_batches
 from careereng.storage.jsonl import JSONLStore
 from careereng.utils import ensure_dir, make_id, now_iso, read_json, write_json
 
@@ -105,12 +106,40 @@ class JobStore:
         rows.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
         return rows
 
+    @staticmethod
+    def _mark_running_site_state_cancelled(payload: dict[str, Any], *, status: str) -> dict[str, Any]:
+        if status != "cancelled":
+            return payload
+        sites = payload.get("sites") if isinstance(payload.get("sites"), dict) else {}
+        updated_sites: dict[str, Any] = {}
+        for site_key, site_row in sites.items():
+            if not isinstance(site_row, dict):
+                updated_sites[site_key] = site_row
+                continue
+            row = dict(site_row)
+            if str(row.get("status") or "") == "running":
+                row["status"] = "cancelled"
+                row.setdefault("message", "Cancelled by batch-stop.")
+            for phase_key in ("retrieve", "apply"):
+                phase_row = row.get(phase_key)
+                if not isinstance(phase_row, dict):
+                    continue
+                phase_payload = dict(phase_row)
+                if str(phase_payload.get("status") or "") == "running":
+                    phase_payload["status"] = "cancelled"
+                    phase_payload.setdefault("reason_tag", "batch_cancelled")
+                row[phase_key] = phase_payload
+            updated_sites[site_key] = row
+        payload["sites"] = updated_sites
+        return payload
+
     def clear_open_batches(self, *, session_id: str | None = None, status: str = "cancelled") -> list[dict[str, Any]]:
         cleared: list[dict[str, Any]] = []
         for row in self.list_batches(session_id=session_id, include_terminal=False):
             payload = dict(row)
             payload["status"] = status
             payload["closed_at"] = now_iso()
+            payload = self._mark_running_site_state_cancelled(payload, status=status)
             saved = self.save_batch(payload)
             self.append_event(
                 "batch.cleared",
@@ -121,6 +150,8 @@ class JobStore:
                 },
             )
             cleared.append(saved)
+        if cleared:
+            record_interrupted_batches(workspace=self.workspace, batches=cleared, reason_tag=f"batch_{status}")
         return cleared
 
     def update_site(self, batch: dict[str, Any], site_key: str, patch: dict[str, Any]) -> dict[str, Any]:

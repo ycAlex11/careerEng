@@ -12,9 +12,15 @@ from careereng.config.schema import (
     AuthConfig,
     BrowserConfig,
     BrowserBudgetsConfig,
+    BrowserGuardsConfig,
+    BrowserRetrievalPolicyConfig,
+    EvolutionApplyProbeConfig,
+    EvolutionConfig,
     PathsConfig,
     ProviderConfig,
     ProvidersConfig,
+    RetrievalConfig,
+    RetrievalStopPolicyConfig,
 )
 from careereng.utils import write_json
 
@@ -70,6 +76,20 @@ apply_job_phase_timeout_seconds = 3600
 apply_job_timeout_ms = 180000
 apply_site_phase_budget_factor = 0.8
 debug_session_preparation_timeout_seconds = 600
+
+[browser.guards]
+same_url_no_progress_tool_call_limit = 5
+same_url_no_progress_token_limit = 60000
+apply_same_url_no_progress_tool_call_limit = 5
+apply_same_url_no_progress_token_limit = 180000
+
+[evolution.apply_probe]
+max_attempted = 8
+unsuccessful_threshold = 5
+
+[retrieval.stop_policy]
+history_stop_success_ratio = 0.4
+history_stop_min_page_jobs = 10
 
 # Optional LLM provider settings. Uncomment and edit these if you use a custom gateway.
 # [providers.openai]
@@ -158,6 +178,8 @@ def load_config(project_root: Path) -> AppConfig:
     payload = {
         "agent": AgentConfig().__dict__.copy(),
         "browser": asdict(BrowserConfig()),
+        "evolution": asdict(EvolutionConfig()),
+        "retrieval": asdict(RetrievalConfig()),
         "paths": PathsConfig().__dict__.copy(),
         "providers": {
             "openai": ProviderConfig(api_base="https://api.openai.com/v1", structured_output_mode="auto").__dict__.copy(),
@@ -165,6 +187,12 @@ def load_config(project_root: Path) -> AppConfig:
         },
     }
     budget_keys = set(asdict(BrowserBudgetsConfig()).keys())
+    guard_keys = set(asdict(BrowserGuardsConfig()).keys())
+    retrieval_policy_keys = set(asdict(BrowserRetrievalPolicyConfig()).keys())
+    apply_probe_keys = set(asdict(EvolutionApplyProbeConfig()).keys())
+    stop_policy_keys = set(asdict(RetrievalStopPolicyConfig()).keys())
+    loaded_apply_probe_config = False
+    loaded_retrieval_stop_policy_config = False
     try:
         text = cpath.read_text(encoding="utf-8")
         if tomllib is not None:
@@ -188,13 +216,56 @@ def load_config(project_root: Path) -> AppConfig:
                     for budget_key, budget_value in value.items():
                         if budget_key in budget_keys:
                             payload["browser"]["budgets"][budget_key] = budget_value
+                        elif budget_key in guard_keys:
+                            # Compatibility for guard values temporarily placed under [browser.budgets].
+                            payload["browser"]["guards"][budget_key] = budget_value
+                    continue
+                if key == "guards" and isinstance(value, dict):
+                    for guard_key, guard_value in value.items():
+                        if guard_key in guard_keys:
+                            payload["browser"]["guards"][guard_key] = guard_value
+                    continue
+                if key == "retrieval_policy" and isinstance(value, dict):
+                    for policy_key, policy_value in value.items():
+                        if policy_key in retrieval_policy_keys:
+                            payload["browser"]["retrieval_policy"][policy_key] = policy_value
+                            if policy_key in stop_policy_keys:
+                                payload["retrieval"]["stop_policy"][policy_key] = policy_value
                     continue
                 if key in budget_keys:
                     # Backward compatibility for older root-level [browser] budget keys.
                     payload["browser"]["budgets"][key] = value
                     continue
-                if key in payload["browser"] and key != "budgets":
+                if key in guard_keys:
+                    # Backward compatibility for older root-level [browser] guard keys.
+                    payload["browser"]["guards"][key] = value
+                    continue
+                if key in retrieval_policy_keys:
+                    # Backward compatibility for root-level [browser] retrieval policy keys.
+                    payload["browser"]["retrieval_policy"][key] = value
+                    if key in stop_policy_keys:
+                        payload["retrieval"]["stop_policy"][key] = value
+                    continue
+                if key in payload["browser"] and key not in {"budgets", "guards", "retrieval_policy"}:
                     payload["browser"][key] = value
+
+        evolution = loaded.get("evolution")
+        if isinstance(evolution, dict):
+            apply_probe = evolution.get("apply_probe")
+            if isinstance(apply_probe, dict):
+                loaded_apply_probe_config = True
+                for key, value in apply_probe.items():
+                    if key in apply_probe_keys:
+                        payload["evolution"]["apply_probe"][key] = value
+
+        retrieval = loaded.get("retrieval")
+        if isinstance(retrieval, dict):
+            stop_policy = retrieval.get("stop_policy")
+            if isinstance(stop_policy, dict):
+                loaded_retrieval_stop_policy_config = True
+                for key, value in stop_policy.items():
+                    if key in stop_policy_keys:
+                        payload["retrieval"]["stop_policy"][key] = value
 
         workspace = loaded.get("workspace")
         if isinstance(workspace, dict) and isinstance(workspace.get("path"), str):
@@ -218,13 +289,61 @@ def load_config(project_root: Path) -> AppConfig:
 
     browser_payload = dict(payload["browser"])
     browser_budgets_payload = browser_payload.pop("budgets", {})
+    browser_guards_payload = browser_payload.pop("guards", {})
+    browser_retrieval_policy_payload = browser_payload.pop("retrieval_policy", {})
+    evolution_payload = dict(payload["evolution"])
+    evolution_apply_probe_payload = dict(evolution_payload.get("apply_probe") or {})
+    retrieval_payload = dict(payload["retrieval"])
+    retrieval_stop_policy_payload = dict(retrieval_payload.get("stop_policy") or {})
+
+    # Keep older runtime wiring working while exposing clearer top-level config sections.
+    if not loaded_apply_probe_config:
+        evolution_apply_probe_payload["max_attempted"] = browser_budgets_payload.get(
+            "apply_probe_max_attempted",
+            EvolutionApplyProbeConfig().max_attempted,
+        )
+        evolution_apply_probe_payload["unsuccessful_threshold"] = browser_budgets_payload.get(
+            "apply_probe_unsuccessful_threshold",
+            EvolutionApplyProbeConfig().unsuccessful_threshold,
+        )
+    browser_budgets_payload["apply_probe_max_attempted"] = int(
+        evolution_apply_probe_payload.get(
+            "max_attempted",
+            browser_budgets_payload.get("apply_probe_max_attempted", BrowserBudgetsConfig().apply_probe_max_attempted),
+        )
+        or 0
+    )
+    browser_budgets_payload["apply_probe_unsuccessful_threshold"] = int(
+        evolution_apply_probe_payload.get(
+            "unsuccessful_threshold",
+            browser_budgets_payload.get(
+                "apply_probe_unsuccessful_threshold",
+                BrowserBudgetsConfig().apply_probe_unsuccessful_threshold,
+            ),
+        )
+        or 0
+    )
+    if not loaded_retrieval_stop_policy_config:
+        for key in stop_policy_keys:
+            retrieval_stop_policy_payload[key] = browser_retrieval_policy_payload.get(
+                key,
+                getattr(RetrievalStopPolicyConfig(), key),
+            )
+    for key in stop_policy_keys:
+        value = retrieval_stop_policy_payload.get(key, browser_retrieval_policy_payload.get(key))
+        if value is not None:
+            browser_retrieval_policy_payload[key] = value
 
     return AppConfig(
         agent=AgentConfig(**payload["agent"]),
         browser=BrowserConfig(
             **browser_payload,
             budgets=BrowserBudgetsConfig(**browser_budgets_payload),
+            guards=BrowserGuardsConfig(**browser_guards_payload),
+            retrieval_policy=BrowserRetrievalPolicyConfig(**browser_retrieval_policy_payload),
         ),
+        evolution=EvolutionConfig(apply_probe=EvolutionApplyProbeConfig(**evolution_apply_probe_payload)),
+        retrieval=RetrievalConfig(stop_policy=RetrievalStopPolicyConfig(**retrieval_stop_policy_payload)),
         paths=PathsConfig(**payload["paths"]),
         providers=ProvidersConfig(
             openai=ProviderConfig(**payload["providers"]["openai"]),

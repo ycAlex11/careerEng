@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 
 
-SUPPORTED_CHANGE_TYPES = {"skill_patch", "routing_example_append", "memory_unit_append"}
+ASSISTANT_CONTEXT_TARGET = "docs/assistant_bridge/CODEX_CONTEXT.md"
+SUPPORTED_CHANGE_TYPES = {"skill_patch", "routing_example_append", "memory_unit_append", "assistant_context_update"}
 FORBIDDEN_CHANGE_TYPES = {
     "python_code_patch",
     "config_patch",
@@ -73,6 +74,12 @@ def _validate_change(change: dict[str, Any], *, idx: int) -> None:
         row = change.get("row")
         if not isinstance(row, dict) or not row:
             raise EvolutionProposalError(f"Change #{idx} {change_type} requires non-empty row object.")
+    elif change_type == "assistant_context_update":
+        _require(change, idx=idx, fields=("target_file", "content_markdown"))
+        if str(change.get("target_file") or "").strip() != ASSISTANT_CONTEXT_TARGET:
+            raise EvolutionProposalError(
+                f"Change #{idx} assistant_context_update can only target {ASSISTANT_CONTEXT_TARGET}."
+            )
 
 
 def _require(change: dict[str, Any], *, idx: int, fields: tuple[str, ...]) -> None:

@@ -118,16 +118,27 @@ For sites with application tabs, sections, filters, or grouped areas such as `Ac
 
 Record only applications inside the review window.
 
-Before clicking `Next`, a page number, `Show more`, `Load more`, or any equivalent pagination control, inspect the current area's visible application dates.
+Classify each application area before deciding whether to paginate:
+- Realtime areas include `Active`, `Submitted`, `In Process`, `Application Received`, `Application in Review`, and similar current/live application sections.
+- Historical areas include `Inactive`, `Archived`, `Rejected`, `Closed`, `Withdrawn`, `No Longer Active`, and similar terminal or no-longer-current sections.
 
-If any visible application in the current area is older than the review window, treat the current area as complete immediately:
-- Record only the visible rows that are still inside the review window.
-- Do not click `Next`, another page number, `Show more`, or `Load more` for that area.
-- Do not return to that area later in the same phase.
+Realtime areas are the live source of current applications. Inspect and record every reachable page in a realtime area unless the site skill gives a stricter stop rule. Do not use history coverage as a stop signal for realtime areas.
 
-Use pagination, `Next`, `Show more`, or `Load more` only while the current visible records are still inside the review window, or while no reliable application date has been found yet.
+Historical areas may stop early using retrieval-like coverage:
+- Always inspect the current historical page before clicking `Next`, a page number, `Show more`, `Load more`, or any equivalent pagination control.
+- Record the current visible page before deciding whether to continue.
+- If the current historical page produces unmatched rows, changed statuses, missing status details, or rows that are not covered by local terminal history, continue to the next historical page when a real pagination control is available.
+- If the current historical page is mostly or entirely already matched to local terminal history, has no unmatched rows, and has no visible status changes, then treat later pages as already covered and stop that historical area.
+- "Covered" does not mean merely retrieved before. It means the local history/review data already has the same application or site job with a terminal/no-longer-current status such as `inactive`, `rejected`, `closed`, or `withdrawn`, or the just-recorded review matched existing terminal history without changes.
+- If the page order is not clearly newest-first, or the meaning of the visible date is unreliable, do not use date or coverage to stop early. Continue until pagination is exhausted or the site skill gives a safer stop rule.
 
-After all required visible areas have been reviewed, call `record_application_reviews` once. After that tool succeeds, immediately finish `Application Status Review`; do not revisit already-reviewed areas.
+Date-window stopping is still allowed for historical areas that are clearly sorted newest-first:
+- If any visible application in the current historical area is older than the review window, record only the visible rows that are still inside the review window, then stop that historical area.
+- Do not click `Next`, another page number, `Show more`, or `Load more` for that historical area after the older-than-window boundary is visible.
+
+Use pagination, `Next`, `Show more`, or `Load more` only after the current page has been inspected and recorded when needed.
+
+When a site skill says to record per page or per area, follow that site skill. Otherwise, after all required visible areas have been reviewed, call `record_application_reviews` once. After the final recording succeeds, immediately finish `Application Status Review`; do not revisit already-reviewed areas.
 
 ### Recording
 
@@ -225,7 +236,7 @@ Apply the same default narrowing goal on every supported jobs surface unless the
 - `Location = China`
 - `Role / Profession / Job Category = Software Engineering` or the closest visible software-engineering / engineering option
 - `Employment Type = Full-time`
-- Exclude `intern`, `internship`, `campus`, `graduate`, `new-grad`, `校招`
+- Exclude `intern`, `internship`, `campus`, `student`, `graduate`, `new-grad`, `new graduate`, `co-op`, `校招`, `实习`
 - Exclude `remote-only` roles when the page exposes a remote / work-site / work-location filter
 
 ### Filtering Rules
@@ -367,6 +378,8 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 
 - Work from the current batch's saved jobs, one job at a time.
 - Open each saved job URL, sync the current page's JD and application state, then decide what to do for that specific role.
+- Before starting any apply flow, re-check the live title and JD for excluded early-career signals: `intern`, `internship`, `campus`, `student`, `graduate program`, `new grad`, `new graduate`, `co-op`, `校招`, or `实习`.
+- If an excluded early-career signal is visible, record the job as `filtered_out` and do not click `Apply`, `Submit Resume`, or any equivalent apply entry. This exclusion is a hard gate and overrides otherwise good JD/persona matching.
 - `recommended_apply` means the current job is approved to continue its apply flow. It is not a terminal outcome by itself.
 - For every job, move on only after the current job reaches a true terminal run-state such as `filtered_out`, `already_applied`, `submitted`, or `blocked`.
 - Submit only the jobs that are judged `recommended_apply`.
@@ -444,13 +457,16 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 ### Form Filling
 
 - Fill only required fields in apply.
-- Prefer site skill rules and lightweight apply facts for routine form filling.
+- `workspace/profile/application_profile.md` is the canonical source for reusable application-form facts such as gender, address, postal code, work authorization, visa sponsorship, and routine compliance acknowledgements.
+- For standard application-form fields, use this priority order: current user instruction, then active site skill site-specific option mapping, then `workspace/profile/application_profile.md`, then currently attached `apply_facts`, then persona/CV context.
+- Prefer site skill rules for site-specific workflows and option labels, but prefer `application_profile.md` for reusable cross-site facts.
+- If multiple site skills repeat the same reusable form fact, treat that as evidence to keep or promote the fact in `application_profile.md`; do not copy the same fact into every new site skill.
 - For search-style comboboxes, typing a value does not by itself mean the field is selected.
 - If the dropdown is still expanded or candidate options are still visible, the current field is not complete yet.
 - Before moving to another field, finish selecting the current field's candidate option.
 - When the page changes, re-read the current live page instead of relying on previous candidate options or old refs.
 - Once one field establishes the right interaction path for this control style, reuse that same path for similar fields.
-- If a required field cannot be answered from the live page, active site skill, or lightweight apply facts, call `request_context` for the smallest needed bundle, usually `full_cv` for detailed experience or `full_persona` for background constraints.
+- If a required field cannot be answered from the live page, active site skill, `application_profile.md`, or lightweight apply facts, call `request_context` for the smallest needed bundle, usually `full_cv` for detailed experience or `full_persona` for background constraints.
 - If a required field already has a visible current value, selected option, checked state, or uploaded file, leave it as-is and move on.
 - A passive CAPTCHA or anti-bot attribution label alone is not a blocker if normal required fields and forward buttons are still visible and usable.
 - Do not spend time rewriting or re-answering fields that are already filled.

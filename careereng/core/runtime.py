@@ -96,6 +96,8 @@ def build_loop(*, project_root: Path, workspace: Path | None = None) -> tuple[Ag
         max_step_retries=int(config.browser.budgets.max_step_retries or 1),
         max_phase_steps=int(config.browser.budgets.max_phase_steps or 24),
         budgets=config.browser.budgets,
+        guards=config.browser.guards,
+        retrieval_policy=config.browser.retrieval_policy,
         browser_name=str(config.browser.browser_name or "chrome"),
     )
     loop = AgentLoop(

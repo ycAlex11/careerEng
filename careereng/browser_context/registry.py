@@ -8,6 +8,7 @@ from typing import Any
 
 from careereng.storage.cv_store import CVStore
 from careereng.storage.profile_store import ProfileStore
+from careereng.utils import parse_front_matter
 
 
 class BrowserContextRegistry:
@@ -16,6 +17,7 @@ class BrowserContextRegistry:
         self.profile_store = ProfileStore(self.workspace)
         self.cv_store = CVStore(self.workspace)
         self.persona_doc: dict[str, Any] = {}
+        self.application_profile_doc: dict[str, Any] = {}
         self.cv_text: str = ""
         self.apply_facts: dict[str, Any] = {}
         self.refresh()
@@ -27,11 +29,23 @@ class BrowserContextRegistry:
             persona = {}
         self.persona_doc = persona if isinstance(persona, dict) else {}
         try:
+            application_profile = self._load_application_profile()
+        except Exception:
+            application_profile = {}
+        self.application_profile_doc = application_profile if isinstance(application_profile, dict) else {}
+        try:
             cv_text = self.cv_store.load_current_text()
         except Exception:
             cv_text = ""
         self.cv_text = str(cv_text or "").strip()
-        self.apply_facts = self._build_apply_facts(self.persona_doc)
+        self.apply_facts = self._build_apply_facts(self.persona_doc, self.application_profile_doc)
+
+    def _load_application_profile(self) -> dict[str, Any]:
+        path = self.workspace / "profile" / "application_profile.md"
+        if not path.exists():
+            return {}
+        data, _body = parse_front_matter(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
 
     @staticmethod
     def _prune(value: Any) -> Any:
@@ -53,10 +67,13 @@ class BrowserContextRegistry:
         return value
 
     @classmethod
-    def _build_apply_facts(cls, persona_doc: dict[str, Any]) -> dict[str, Any]:
+    def _build_apply_facts(cls, persona_doc: dict[str, Any], application_profile_doc: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(persona_doc, dict):
             return {}
         facts: dict[str, Any] = {}
+        cleaned_application_profile = cls._prune(application_profile_doc)
+        if cleaned_application_profile not in ("", [], {}, None):
+            facts["application_profile"] = cleaned_application_profile
         for key in ("basic", "contact", "constraints", "summary"):
             raw = persona_doc.get(key)
             cleaned = cls._prune(raw)
@@ -104,7 +121,7 @@ class BrowserContextRegistry:
             "Additional context bundles are available through `request_context` when the current live page and currently attached context are insufficient.",
         ]
         if "apply_facts" in available:
-            lines.append("- `apply_facts`: current lightweight structured profile facts for routine form filling.")
+            lines.append("- `apply_facts`: current lightweight structured profile facts for routine form filling, including `workspace/profile/application_profile.md` when available.")
         if "full_cv" in available:
             lines.append("- `full_cv`: current full CV text for detailed experience or open-ended answers.")
         if "full_persona" in available:

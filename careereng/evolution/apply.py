@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 from typing import Any
 
-from careereng.evolution.proposals import EvolutionProposalError, load_proposal
+from careereng.evolution.proposals import ASSISTANT_CONTEXT_TARGET, EvolutionProposalError, load_proposal
 from careereng.storage.jsonl import JSONLStore
 from careereng.utils import ensure_dir, make_id, now_iso, read_json, write_json
 
@@ -59,6 +59,10 @@ def apply_evolution_run(*, workspace: Path | str, run_id: str, project_root: Pat
                 change=change,
             )
             applied_files.append(result)
+        elif change_type == "assistant_context_update":
+            result = _apply_assistant_context_update(change=change, root=root, run_dir=run_dir)
+            applied_files.append(result["file_record"])
+            diff_chunks.append(result["diff"])
         else:
             raise EvolutionApplyError(f"Unsupported change_type at apply time: {change_type}")
 
@@ -125,6 +129,41 @@ def _apply_skill_patch(*, change: dict[str, Any], root: Path, run_dir: Path) -> 
         "file_record": {
             "change_id": str(change.get("change_id") or ""),
             "change_type": "skill_patch",
+            "target_file": str(target),
+            "relative_path": str(relative_target),
+            "snapshot_path": str(snapshot),
+            "summary": str(change.get("summary") or ""),
+        },
+        "diff": diff,
+    }
+
+
+def _apply_assistant_context_update(*, change: dict[str, Any], root: Path, run_dir: Path) -> dict[str, Any]:
+    target_text = str(change.get("target_file") or "").strip()
+    if target_text != ASSISTANT_CONTEXT_TARGET:
+        raise EvolutionApplyError(f"assistant_context_update can only target {ASSISTANT_CONTEXT_TARGET}.")
+    target = _safe_project_path(root, target_text)
+    relative_target = target.resolve().relative_to(root.resolve())
+    if target.suffix.lower() not in {".md", ".markdown"}:
+        raise EvolutionApplyError(f"assistant_context_update target must be Markdown: {target}")
+    original = target.read_text(encoding="utf-8")
+    updated = str(change.get("content_markdown") or "").rstrip() + "\n"
+    if updated == original:
+        raise EvolutionApplyError(f"assistant_context_update produced no change: {target}")
+    snapshot = _snapshot_file(target=target, root=root, run_dir=run_dir)
+    target.write_text(updated, encoding="utf-8")
+    diff = "".join(
+        difflib.unified_diff(
+            original.splitlines(keepends=True),
+            updated.splitlines(keepends=True),
+            fromfile=f"a/{relative_target}",
+            tofile=f"b/{relative_target}",
+        )
+    )
+    return {
+        "file_record": {
+            "change_id": str(change.get("change_id") or ""),
+            "change_type": "assistant_context_update",
             "target_file": str(target),
             "relative_path": str(relative_target),
             "snapshot_path": str(snapshot),

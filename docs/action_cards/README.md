@@ -47,7 +47,7 @@ The card tells Codex what to inspect and how to close the review.
 
 Site registration is the second integration.
 
-When a newly registered site only has a draft site AI Skill, CareerEng creates a `codex_draft` action card with `metadata.task = "site_skill_bootstrap"`. Codex can then inspect mature site AI Skills and draft the new site's site-specific workflow without adding Python browser-action logic.
+When a newly registered site has only a new site AI Skill, CareerEng creates a `codex_draft` action card with `metadata.task = "site_skill_bootstrap"`. Codex can then inspect mature site AI Skills and refine the new site's site-specific workflow without adding Python browser-action logic. The Skill should be testable with `apply_enabled=false`; apply behavior remains disabled until explicitly approved.
 
 ## Type Boundary
 
@@ -73,9 +73,9 @@ Use these fields this way:
 
 Examples:
 
-- New site AI Skill draft: `card_type = "codex_draft"`, `metadata.task = "site_skill_bootstrap"`.
+- New site AI Skill refinement: `card_type = "codex_draft"`, `metadata.task = "site_skill_bootstrap"`.
 - Application summary review: `card_type = "codex_review"`, `metadata.task = "application_summary_review"`.
-- Failed batch diagnosis: `card_type = "codex_debug"`, `metadata.task = "failed_batch_diagnosis"`.
+- Failed site workflow diagnosis: `card_type = "codex_debug"`, `metadata.task = "site_skill_refinement"`.
 
 Do not add a new Python action-card type for every business scenario. Add a new `metadata.task` value, richer card content, and semantic tags first. Python should only grow when a reusable storage, lifecycle, or evidence-linking capability is missing.
 
@@ -88,6 +88,7 @@ Action cards do not execute browser actions and do not replace Skills.
 They are a collaboration layer for local review and follow-up work:
 
 - Codex reads the card and evidence.
+- For site Skill refinement, Codex should inspect workflow memory, latest failed batch, trace, and failure snapshot before editing a site Skill when those files are linked.
 - The user or Codex records the result.
 - CareerEng stores the lifecycle locally.
 

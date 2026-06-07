@@ -83,6 +83,7 @@ apply_enabled: true
 - If the current page contains any row before `2026-04-10`, the current area is complete after any in-window rows on that page have been recorded. Do not paginate that area.
 - If all visible rows on the current page are on or after `2026-04-10`, the current page has been recorded, and a real `Next`, `Show more`, or `Load more` control is available for the current area, use it once to inspect the next page.
 - After `Submitted` is complete, open `Inactive` exactly once.
+- Treat Microsoft `Inactive` as a historical area: after recording a visible Inactive page, stop paging Inactive when the page is already covered by matched terminal local history, has no unmatched rows, and shows no status changes.
 - After `Inactive` is complete, immediately finish `Application Status Review` with `phase_result done`.
 
 ### Recording

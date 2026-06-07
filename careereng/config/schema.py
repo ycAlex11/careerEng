@@ -39,7 +39,45 @@ class BrowserBudgetsConfig:
     apply_job_phase_timeout_seconds: int = 3600
     apply_job_timeout_ms: int = 180000
     apply_site_phase_budget_factor: float = 0.8
+    apply_probe_max_attempted: int = 8
+    apply_probe_unsuccessful_threshold: int = 5
     debug_session_preparation_timeout_seconds: int = 600
+
+
+@dataclass
+class BrowserGuardsConfig:
+    same_url_no_progress_tool_call_limit: int = 5
+    same_url_no_progress_token_limit: int = 60000
+    apply_same_url_no_progress_tool_call_limit: int = 5
+    apply_same_url_no_progress_token_limit: int = 180000
+
+
+@dataclass
+class BrowserRetrievalPolicyConfig:
+    history_stop_success_ratio: float = 0.4
+    history_stop_min_page_jobs: int = 10
+
+
+@dataclass
+class EvolutionApplyProbeConfig:
+    max_attempted: int = 8
+    unsuccessful_threshold: int = 5
+
+
+@dataclass
+class EvolutionConfig:
+    apply_probe: EvolutionApplyProbeConfig = field(default_factory=EvolutionApplyProbeConfig)
+
+
+@dataclass
+class RetrievalStopPolicyConfig:
+    history_stop_success_ratio: float = 0.4
+    history_stop_min_page_jobs: int = 10
+
+
+@dataclass
+class RetrievalConfig:
+    stop_policy: RetrievalStopPolicyConfig = field(default_factory=RetrievalStopPolicyConfig)
 
 
 @dataclass
@@ -53,6 +91,8 @@ class BrowserConfig:
     browser_name: str = "chrome"
     mcp_port_start: int = 8931
     budgets: BrowserBudgetsConfig = field(default_factory=BrowserBudgetsConfig)
+    guards: BrowserGuardsConfig = field(default_factory=BrowserGuardsConfig)
+    retrieval_policy: BrowserRetrievalPolicyConfig = field(default_factory=BrowserRetrievalPolicyConfig)
 
 
 @dataclass
@@ -86,6 +126,8 @@ class ProvidersConfig:
 class AppConfig:
     agent: AgentConfig
     browser: BrowserConfig
+    evolution: EvolutionConfig
+    retrieval: RetrievalConfig
     paths: PathsConfig
     providers: ProvidersConfig
 

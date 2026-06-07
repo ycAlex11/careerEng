@@ -16,6 +16,14 @@ DEFAULT_PERSONA = {
         "current_city": "Taiyuan",
         "languages": ["中文", "English"],
     },
+    "contact": {
+        "address": {
+            "country": "China",
+            "state_province": "Shanxi",
+            "city_town": "Taiyuan",
+            "postal_code": "030000",
+        },
+    },
     "education": [],
     "experience": [],
     "projects": [],

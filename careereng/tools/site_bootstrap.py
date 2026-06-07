@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from careereng.action_cards import ActionCardStore, NEW_SITE_WORKFLOW_TRANSFER_CANDIDATE_ID
+from careereng.action_cards import ActionCardStore, NEW_SITE_WORKFLOW_TRANSFER_CANDIDATE_ID, create_site_skill_bootstrap_card
 from careereng.evolution import create_evolution_run
 
 
@@ -72,6 +72,19 @@ def bootstrap_site(
     project_root = Path(site_tools.project_root or site_tools.site_store.project_root)
     workspace = Path(site_tools.site_store.workspace)
     action_card_id = str(result.get("action_card_id") or "")
+    if not action_card_id and site_id:
+        action_card = create_site_skill_bootstrap_card(
+            workspace=workspace,
+            project_root=project_root,
+            site_key=site_id,
+            site_name=str(result.get("site_name") or name),
+            base_url=resolved_url,
+            skill_path=str(result.get("skill_path") or ""),
+            registry_id=str(result.get("registry_id") or ""),
+        )
+        action_card_id = str(action_card.get("card_id") or "")
+        result["action_card_id"] = action_card_id
+        result["action_card_path"] = str(action_card.get("markdown_path") or "")
     evolution_run: dict[str, Any] = {}
     if action_card_id:
         evolution_run = create_evolution_run(

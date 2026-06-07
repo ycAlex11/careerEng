@@ -30,6 +30,22 @@ class SiteStore:
         "applications",
         "profile",
     }
+    DURABLE_APPLICATION_STATUSES = {
+        "already_applied",
+        "filtered_out",
+        "submitted",
+        "rejected",
+        "closed",
+        "withdrawn",
+    }
+    RUNTIME_STOP_ERROR_MARKERS = (
+        "cannot schedule new futures after shutdown",
+        "cannot schedule new futures after interpreter shutdown",
+        "interpreter shutdown",
+        "batch_cancelled",
+        "batch cancelled",
+        "cancelled by batch-stop",
+    )
 
     RUN_JOB_STRING_FIELDS = (
         "batch_id",
@@ -59,6 +75,7 @@ class SiteStore:
         "fit_source",
         "application_status",
         "last_apply_error",
+        "decision_context_hash",
     )
     RUN_JOB_NUMERIC_FIELDS = (
         "match_score_initial",
@@ -145,7 +162,7 @@ class SiteStore:
                 "updated_at": now_iso()[:10],
                 "scope": "site",
                 "site_key": site_id,
-                "status": "draft",
+                "status": "ready",
                 "apply_enabled": False,
             },
             body,
@@ -405,6 +422,29 @@ class SiteStore:
         write_json(path, current)
         return current
 
+    def decision_context_hash(self, site_id: str) -> str:
+        paths = [
+            self.workspace / "cv" / "current" / "cv.md",
+            self.workspace / "profile" / "persona.md",
+            self.workspace / "profile" / "application_profile.md",
+            self.project_root / "skills" / "search" / "jobs" / "SKILL.md",
+            self.site_skill_path(site_id),
+        ]
+        digest = hashlib.sha256()
+        for path in paths:
+            label = str(path.relative_to(self.project_root) if path.is_relative_to(self.project_root) else path)
+            digest.update(label.encode("utf-8"))
+            digest.update(b"\0")
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError:
+                data = b"<missing>"
+            except Exception:
+                data = b"<unreadable>"
+            digest.update(data)
+            digest.update(b"\0")
+        return digest.hexdigest()
+
     def _load_history_jobs(self, site_id: str) -> list[dict[str, Any]]:
         path = self._history_jobs_path(site_id)
         if not path.exists():
@@ -423,17 +463,52 @@ class SiteStore:
         return {
             "submitted": "terminal_submitted",
             "already_applied": "terminal_already_applied",
+            "filtered_out": "terminal_filtered_out",
             "apply_failed": "terminal_apply_failed",
             "blocked": "terminal_blocked",
         }.get(status, "")
 
     @classmethod
-    def _normalize_history_row_for_write(cls, row: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_filtered_out_decision(cls, row: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(row)
+        application_status = str(normalized.get("application_status") or "").strip().lower()
+        decision_status = str(normalized.get("decision_status") or "").strip().lower()
+        match_label = str(normalized.get("match_label") or "").strip().lower()
+        apply_state = str(normalized.get("apply_state") or "").strip().lower()
+        filtered_signal = (
+            application_status == "filtered_out"
+            or decision_status == "filtered_out"
+            or match_label == "filtered_out"
+            or apply_state in {"filtered_out", "filtered_out_before_apply", "terminal_filtered_out", "not_started_filtered_out"}
+        )
+        if not filtered_signal:
+            return normalized
+        if decision_status in {"", "decided", "not_needed", "not_applicable"}:
+            normalized["decision_status"] = "filtered_out"
+        if application_status == "filtered_out" and apply_state in {
+            "",
+            "filtered_out",
+            "filtered_out_before_apply",
+            "not_started",
+            "not_started_filtered_out",
+        }:
+            normalized["apply_state"] = "terminal_filtered_out"
+        return normalized
+
+    @classmethod
+    def _normalize_history_row_for_write(cls, row: dict[str, Any]) -> dict[str, Any]:
+        normalized = cls._normalize_filtered_out_decision(row)
         apply_state = cls._history_apply_state_for_application_status(normalized.get("application_status"))
         if apply_state:
             normalized["apply_state"] = apply_state
         return normalized
+
+    @classmethod
+    def _is_runtime_stop_apply_failed(cls, *, status: str, error_text: str) -> bool:
+        if str(status or "").strip().lower() != "apply_failed":
+            return False
+        lowered = str(error_text or "").strip().lower()
+        return bool(lowered) and any(marker in lowered for marker in cls.RUNTIME_STOP_ERROR_MARKERS)
 
     def _write_history_jobs(self, site_id: str, rows: list[dict[str, Any]]) -> None:
         path = self._history_jobs_path(site_id)
@@ -1073,6 +1148,7 @@ class SiteStore:
             "site_job_id",
             "description_ref",
             "jd_sync_status",
+            "decision_context_hash",
         ):
             value = str(incoming.get(field) or "").strip()
             if value:
@@ -1109,6 +1185,14 @@ class SiteStore:
             inferred_site_job_id = self._infer_site_job_id_from_url(incoming.get("url") or base.get("url") or "")
             if inferred_site_job_id:
                 incoming["site_job_id"] = inferred_site_job_id
+        incoming = self._normalize_filtered_out_decision(incoming)
+        incoming_application_status = str(incoming.get("application_status") or "").strip().lower()
+        incoming_decision_status = str(incoming.get("decision_status") or "").strip().lower()
+        if (
+            (incoming_application_status == "filtered_out" or incoming_decision_status == "filtered_out")
+            and not str(incoming.get("decision_context_hash") or "").strip()
+        ):
+            incoming["decision_context_hash"] = self.decision_context_hash(str(incoming.get("site_id") or root.name))
 
         merged = dict(base)
         merged["job_id"] = job_id
@@ -1228,6 +1312,8 @@ class SiteStore:
                     "matched_canonical_job_id": str(matched.get("canonical_job_id") or ""),
                     "matched_title": str(matched.get("title") or ""),
                     "matched_url": str(matched.get("url") or ""),
+                    "decision_status": str(matched.get("decision_status") or ""),
+                    "apply_state": str(matched.get("apply_state") or ""),
                     "application_status": str(matched.get("application_status") or ""),
                     "application_review_status": str(matched.get("application_review_status") or ""),
                     "application_review_status_raw": str(matched.get("application_review_status_raw") or ""),
@@ -1542,6 +1628,9 @@ class SiteStore:
             current["decision_status"] = str(
                 job.get("decision_status") or ("recommended_apply" if current["fit_apply"] else "filtered_out")
             )
+            decision_context_hash = str(job.get("decision_context_hash") or "").strip()
+            if decision_context_hash:
+                current["decision_context_hash"] = decision_context_hash
             current["decision_updated_at"] = now_iso()
             changed = True
         if changed:
@@ -1565,14 +1654,27 @@ class SiteStore:
                 continue
             current = rows[match_idx]
             status = str(app.get("status") or ("submitted" if app.get("submitted") else "apply_failed"))
+            error_text = str(app.get("detail", {}).get("error") if isinstance(app.get("detail"), dict) else "")
+            current_status = str(current.get("application_status") or "").strip().lower()
+            current_decision_status = str(current.get("decision_status") or "").strip().lower()
+            if (
+                (current_status in self.DURABLE_APPLICATION_STATUSES or current_decision_status == "filtered_out")
+                and self._is_runtime_stop_apply_failed(status=status, error_text=error_text)
+            ):
+                current["last_runtime_apply_error"] = error_text
+                changed = True
+                continue
             current["application_status"] = status
+            if str(status or "").strip().lower() == "filtered_out":
+                current["decision_status"] = "filtered_out"
+            decision_context_hash = str(app.get("decision_context_hash") or "").strip()
+            if decision_context_hash:
+                current["decision_context_hash"] = decision_context_hash
             apply_state = self._history_apply_state_for_application_status(status)
             if apply_state:
                 current["apply_state"] = apply_state
             current["application_updated_at"] = now_iso()
-            current["last_apply_error"] = str(
-                app.get("detail", {}).get("error") if isinstance(app.get("detail"), dict) else ""
-            )
+            current["last_apply_error"] = error_text
             if status == "submitted":
                 current["last_submitted_at"] = now_iso()
             changed = True

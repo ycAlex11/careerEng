@@ -25,7 +25,7 @@ def create_site_skill_bootstrap_card(
     skill_path: Path | str,
     registry_id: str = "",
 ) -> dict[str, Any]:
-    """Create a generic codex_draft card for drafting a new site AI Skill."""
+    """Create a generic Codex card for making a new site AI Skill testable."""
     workspace_path = Path(workspace)
     root = Path(project_root)
     normalized_site_key = safe_file_stem(site_key)
@@ -39,15 +39,15 @@ def create_site_skill_bootstrap_card(
     reference_site_keys = _reference_site_keys(root=root, target_site_key=normalized_site_key)
     return ActionCardStore(workspace_path).create_card(
         card_type=ACTION_CARD_CODEX_DRAFT,
-        title=f"Draft site AI Skill for {site_name or normalized_site_key}",
+        title=f"Make site AI Skill testable for {site_name or normalized_site_key}",
         goal=(
             "Draft or refine the target site AI Skill so the site can be tested through "
             "session_preparation, application_status_review, channel_discovery, job_filtering, "
             "and job_retrieval before apply is enabled."
         ),
         reason=(
-            "A registered site has only a draft site AI Skill. Codex should use existing site "
-            "patterns and local project rules to make the draft testable without adding Python "
+            "A registered site has only a new site AI Skill. Codex should use existing site "
+            "patterns and local project rules to make it testable without adding Python "
             "browser-action semantics."
         ),
         source_type="site_registration",
@@ -57,9 +57,10 @@ def create_site_skill_bootstrap_card(
         related_files=related_files,
         suggested_actions=[
             "Read the linked evidence pack before editing the target site AI Skill.",
-            "Read the target site AI Skill template first.",
+            "Read the target site AI Skill first.",
             "Read the New Site Workflow Transfer candidate spec for the completion and safety boundary.",
             "Use the project jobs Skill and mature site AI Skills as examples, not as code to copy blindly.",
+            "Use `workspace/profile/application_profile.md` as the canonical source for reusable application-form facts.",
             "Keep site-specific navigation, filtering, login, review, and retrieval behavior in the site AI Skill.",
             "Define success and stop conditions for session preparation, application-status review, and job retrieval.",
             "Keep apply_enabled false until the user explicitly approves apply behavior for this site.",
@@ -72,7 +73,7 @@ def create_site_skill_bootstrap_card(
         done_when=[
             "The target site AI Skill has concrete instructions for login readiness, status review, and retrieval.",
             "The first test target is retrieval/status review, not automatic apply.",
-            "The action card is closed with the drafted changes or a reason it cannot be drafted yet.",
+            "The action card is closed with the refined changes or a reason it cannot be refined yet.",
         ],
         metadata={
             "task": SITE_SKILL_BOOTSTRAP_TASK,
@@ -117,6 +118,7 @@ def _related_files(*, root: Path, workspace: Path, site_key: str, target_skill_p
     files: list[Path] = [
         target_skill_path,
         root / "skills" / "search" / "jobs" / "SKILL.md",
+        workspace / "profile" / "application_profile.md",
         root / "docs" / "action_cards" / "README.md",
         root / "docs" / "evolution" / "candidates" / "new_site_workflow_transfer.md",
         workspace / "sites" / site_key / "site.json",

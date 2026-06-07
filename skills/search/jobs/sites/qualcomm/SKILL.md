@@ -88,6 +88,7 @@ apply_enabled: true
 - After all visible in-window `Submitted` rows have been recorded, treat `Submitted` as complete and do not switch back to it.
 - Then inspect `Inactive` once. If `Inactive` is empty, treat it as complete without recording an empty payload.
 - If `Inactive` has visible in-window rows, call `record_application_reviews` immediately after reading the current visible page of `Inactive`.
+- Treat Qualcomm `Inactive` as a historical area: after recording a visible Inactive page, stop paging Inactive when the page is already covered by matched terminal local history, has no unmatched rows, and shows no status changes.
 - After both `Submitted` and `Inactive` are complete, immediately finish `Application Status Review` with `phase_result done`.
 
 ### Status Mapping

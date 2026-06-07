@@ -44,6 +44,7 @@ V1 supports only rollbackable local changes:
 - `skill_patch`
 - `routing_example_append`
 - `memory_unit_append`
+- `assistant_context_update`
 
 V1 rejects:
 
@@ -138,6 +139,32 @@ workspace/evolution/memory/units.jsonl
 ```
 
 The apply layer adds missing IDs and timestamps when needed.
+
+## assistant_context_update
+
+Replace the assistant-readable Codex context overlay:
+
+```text
+docs/assistant_bridge/CODEX_CONTEXT.md
+```
+
+```json
+{
+  "change_id": "change_4",
+  "change_type": "assistant_context_update",
+  "summary": "Clarify current memory-intake confirmation policy for Codex.",
+  "target_file": "docs/assistant_bridge/CODEX_CONTEXT.md",
+  "content_markdown": "# CareerEng Codex Context\n\n..."
+}
+```
+
+Rules:
+
+- `target_file` must be exactly `docs/assistant_bridge/CODEX_CONTEXT.md`.
+- The change replaces the whole file.
+- Apply snapshots the previous file and records a diff.
+- Use this for concise assistant-facing lessons, not durable user facts.
+- Do not use this to bypass `ASSISTANT_GUIDE.md` or `AGENTS.md`.
 
 ## Archive Outputs
 

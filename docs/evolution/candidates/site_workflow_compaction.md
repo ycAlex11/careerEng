@@ -27,6 +27,8 @@ Use these local sources:
 
 - `workspace/jobs/batches/*.json`
 - `workspace/evolution/browser_control/phase_events.jsonl`
+- `workspace/sites/<site>/evolution/workflow_memory.json`
+- `workspace/sites/<site>/evolution/failure_snapshots/*.md`
 - `workspace/metrics/llm_usage.jsonl`
 - `workspace/sites/<site>/jobs/runs/*.jsonl`
 - `workspace/sites/<site>/applications/reviews/*.jsonl`
@@ -45,14 +47,30 @@ Useful evidence includes:
 - unmatched review records after review phases
 - phase duration and usage trends
 - site-specific carry-forward memory that repeatedly worked
+- failure snapshots that show the live page state when a phase failed
 
 ## Allowed Proposals
+
+Default boundary:
+
+- If a workflow fails because the LLM chose the wrong site-specific operation, filter option, selector path, page route, or stop condition, refine the site skill or workflow memory first.
+- Do not propose Python runtime changes before exhausting site skill / workflow memory refinement for site-specific behavior.
+- Runtime changes are reserved for generic cross-site infrastructure problems such as protocol handling, timeout accounting, persistence, safety guards, or tool transport failures.
+
+Inference requirement:
+
+- Use traces, failure snapshots, workflow memory, and successful runs to infer missing site-specific workflow steps.
+- Do not only summarize that a phase failed. Identify the concrete missing or wrong website operation when evidence supports it.
+- If the live page exposes stable options that map to the project goal, such as role family, team, location, sorting, application status tabs, or apply-state labels, propose explicit site skill steps for those options.
+- Prefer a concrete site skill patch that tells the LLM what to do next time, including entry point, exact site-visible labels, stop condition, and what not to repeat.
+- If evidence is insufficient to infer a stable step, write a workflow-memory caveat and keep observing instead of inventing a brittle rule.
 
 The LLM may propose:
 
 - rewriting a site skill section for clarity
 - compacting stable site workflow steps into the site skill
 - adding caveats about repeated failure modes
+- updating workflow memory when evidence is not stable enough for the site skill
 - extracting a reusable workflow pattern for future site skill drafting
 - suggesting a project-level generalization when the same pattern appears across multiple sites
 - suggesting evidence that a workflow should keep observing instead of changing
@@ -61,6 +79,7 @@ The LLM must not propose:
 
 - adding Python browser-action semantics
 - hard-coding selectors into Python
+- changing Python runtime just because one site skill under-specifies a page-specific workflow
 - changing provider, MCP, or browser protocol behavior
 - changing login security, MFA, CAPTCHA, or account-safety handling
 - weakening final-submit safety
@@ -173,6 +192,7 @@ Archive each evolution run with:
 A proposal should include:
 
 - `site_skill_patch_proposal`
+- `inferred_missing_workflow_steps`
 - `workflow_pattern_summary`
 - `site_variations`
 - `failure_caveats`

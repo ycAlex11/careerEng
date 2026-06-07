@@ -56,4 +56,4 @@ Prefer `assistant ingest` first when the user uses natural language. It records 
 
 Only execute the suggested command when the user clearly requested execution or confirms the assistant suggestion.
 
-`site bootstrap` prepares the local handoff only: site registry, draft site AI Skill, action card, and evidence pack. It does not start browser phases or enable apply.
+`site bootstrap` prepares the local handoff only: site registry, testable site AI Skill with apply disabled, action card, and evidence pack. It does not start browser phases or enable apply.

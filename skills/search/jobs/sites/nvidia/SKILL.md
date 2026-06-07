@@ -62,6 +62,7 @@ apply_enabled: true
 - If the current page contains any row before `2026-04-10`, the current area is complete after any in-window rows on that page have been recorded. Do not paginate that area.
 - If all visible rows on the current page are on or after `2026-04-10`, the current page has been recorded, and a `Next` control is available for the current area, use `Next` once to inspect the next page.
 - When `Active` is complete, click `Inactive` exactly once.
+- Treat NVIDIA `Inactive` as a historical area: after recording a visible Inactive page, stop paging Inactive when the page is already covered by matched terminal local history, has no unmatched rows, and shows no status changes.
 - When `Inactive` is complete, immediately finish `Application Status Review` with `phase_result done`.
 - An empty NVIDIA tab, such as `Active (0)` or `Inactive (0)`, counts as complete.
 - For each recorded NVIDIA row, include the job title, the best available job or application URL, the visible Workday requisition/job id such as `JR...` as `site_job_id`, and the normalized `application_review_status`.

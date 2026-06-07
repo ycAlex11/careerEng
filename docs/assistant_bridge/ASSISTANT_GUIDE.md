@@ -24,6 +24,8 @@ python -m careereng assistant ingest --client codex --thread <thread_id> -m "<me
 
 Replace `codex` with the active assistant client if needed, for example `claude-code`, `cursor`, or `other`.
 
+After reading this guide, also read `docs/assistant_bridge/CODEX_CONTEXT.md` when it exists. That file is the lightweight assistant-facing overlay that evolution runs may update with current routing lessons and memory-intake guidance.
+
 ## Explicit Trigger
 
 `@career` is the explicit trigger.
@@ -117,6 +119,14 @@ CareerEng local files are the source of truth.
 
 Adapter backends may classify, summarize, or retrieve long-context memory, but they must write results back into CareerEng local storage.
 
+For user-facing analysis, prefer this read order:
+
+- Summary JSON/JSONL first: machine-readable facts and lifecycle state.
+- Markdown reports second: quick human-readable views rendered from facts.
+- Evidence last: events, traces, snapshots, metrics rows, and action cards for root-cause inspection.
+
+Do not treat Markdown reports as a separate source of business truth. If a report and summary disagree, inspect the summary and evidence before answering.
+
 Primary paths:
 
 - `workspace/assistant_bridge/intake_events.jsonl`
@@ -127,6 +137,10 @@ Primary paths:
 - `workspace/memory/profile_signals.jsonl`
 - `workspace/memory/intent_signals.jsonl`
 - `workspace/memory/application_feedback_signals.jsonl`
+- `workspace/application_summary/application_summary.json`
+- `workspace/metrics/`
+- `workspace/reports/`
+- `workspace/sites/<site>/events/`
 - `workspace/interviews/events.jsonl`
 
 ## Career Memory Promotion
@@ -153,6 +167,26 @@ python -m careereng career-memory import-candidates /path/to/memory_candidates.j
 
 This keeps Codex responsible for thread-level understanding, while CareerEng validates, deduplicates, and persists local memory.
 
+When the user asks to summarize or persist a dynamic number of recent assistant messages, keep that number as explicit evidence metadata instead of hard-coding a fixed window:
+
+```bash
+python -m careereng assistant import-candidates /path/to/memory_candidates.jsonl \
+  --source-client codex \
+  --source-thread <thread_id> \
+  --source-limit 100
+```
+
+Use the requested number directly. For example, `总结最近 30 条对话` should use `--source-limit 30`; `总结最近 100 条对话` should use `--source-limit 100`.
+
+The imported memory units should preserve:
+
+- `facts.source_message_limit`
+- `facts.source_client`
+- `facts.source_thread_id`
+- `evidence_refs[].scope`, such as `recent_100_messages`
+
+First version rule: CareerEng does not automatically read Codex thread history. Codex curates the visible/recent thread context into candidates; CareerEng validates, deduplicates, and stores them.
+
 ## Adapter Boundary
 
 Processor adapters are pluggable.
@@ -169,3 +203,12 @@ The adapter may help with:
 - thread summarization
 
 The adapter must not own CareerEng storage, command execution, or business history.
+
+## Evolution Outputs For Assistants
+
+Assistant-router evolution may update:
+
+- `workspace/assistant_bridge/routing_examples.jsonl`
+- `docs/assistant_bridge/CODEX_CONTEXT.md`
+
+Assistant-router evolution should only propose changes to this guide or `AGENTS.md`; it should not automatically rewrite those stable policy files.

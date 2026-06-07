@@ -48,17 +48,21 @@ The LLM may propose:
 
 - new routing examples
 - positive/negative examples for implicit career memory intake
+- updates to `docs/assistant_bridge/CODEX_CONTEXT.md`
 - classifier rule changes
 - thread-scope policy clarifications
 - memory category refinements
 - prompts that ask the user whether to save ambiguous career-related content
 - consolidation rules for raw assistant signals
+- review-only updates to `docs/assistant_bridge/ASSISTANT_GUIDE.md`
 
 The LLM must not propose:
 
 - automatically executing high-impact commands without user confirmation
 - saving unrelated development conversations as CareerEng memory
 - changing provider, MCP, browser protocol, or security behavior
+- automatically rewriting `AGENTS.md`
+- automatically rewriting `docs/assistant_bridge/ASSISTANT_GUIDE.md`
 
 ## Evaluators
 
@@ -184,9 +188,11 @@ A proposal should include:
 
 - `routing_examples_to_add`
 - `routing_examples_to_suppress`
+- `assistant_context_update`
 - `classifier_rule_suggestions`
 - `thread_scope_policy_suggestions`
 - `memory_category_suggestions`
+- `assistant_guide_review_proposal`
 - `evaluation_plan`
 - `risk_notes`
 

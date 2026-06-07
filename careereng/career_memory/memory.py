@@ -106,13 +106,23 @@ def promote_assistant_signals(*, workspace: Path | str, limit: int | None = None
     }
 
 
-def import_memory_candidates(*, workspace: Path | str, input_path: Path | str) -> dict[str, Any]:
+def import_memory_candidates(
+    *,
+    workspace: Path | str,
+    input_path: Path | str,
+    source_limit: int | None = None,
+    source_thread: str = "",
+    source_client: str = "",
+) -> dict[str, Any]:
     """Import Codex-curated memory candidates after schema validation."""
 
     workspace_path = Path(workspace)
     path = Path(input_path)
     if not path.exists():
         raise CareerMemoryError(f"candidate input file not found: {path}")
+    normalized_source_limit = _normalize_source_limit(source_limit)
+    normalized_source_thread = str(source_thread or "").strip()
+    normalized_source_client = str(source_client or "").strip()
 
     candidates = _read_candidate_file(path)
     store = CareerMemoryStore(workspace_path)
@@ -122,7 +132,14 @@ def import_memory_candidates(*, workspace: Path | str, input_path: Path | str) -
     created: list[dict[str, Any]] = []
     skipped = 0
     for idx, candidate in enumerate(candidates, 1):
-        unit = _unit_from_candidate(candidate, source_path=str(path), index=idx)
+        enriched_candidate = _candidate_with_import_metadata(
+            candidate,
+            source_path=str(path),
+            source_limit=normalized_source_limit,
+            source_thread=normalized_source_thread,
+            source_client=normalized_source_client,
+        )
+        unit = _unit_from_candidate(enriched_candidate, source_path=str(path), index=idx)
         key = _dedupe_key(unit)
         if not key or key in existing_keys:
             skipped += 1
@@ -135,6 +152,9 @@ def import_memory_candidates(*, workspace: Path | str, input_path: Path | str) -
         "workspace": str(workspace_path),
         "memory_units_path": str(store.units.path),
         "input_path": str(path),
+        "source_client": normalized_source_client,
+        "source_thread": normalized_source_thread,
+        "source_limit": normalized_source_limit,
         "read": len(candidates),
         "created": len(created),
         "skipped_existing": skipped,
@@ -261,6 +281,64 @@ def _unit_from_candidate(candidate: dict[str, Any], *, source_path: str, index: 
             evidence_text,
         ),
     }
+
+
+def _normalize_source_limit(source_limit: int | None) -> int:
+    try:
+        value = int(source_limit or 0)
+    except Exception as exc:
+        raise CareerMemoryError("source_limit must be an integer") from exc
+    if value < 0:
+        raise CareerMemoryError("source_limit must be >= 0")
+    return value
+
+
+def _candidate_with_import_metadata(
+    candidate: dict[str, Any],
+    *,
+    source_path: str,
+    source_limit: int,
+    source_thread: str,
+    source_client: str,
+) -> dict[str, Any]:
+    if not any((source_limit, source_thread, source_client)):
+        return candidate
+
+    enriched = dict(candidate)
+    if source_thread:
+        enriched["source_thread_id"] = source_thread
+
+    facts = _dict(enriched.get("facts"))
+    if source_limit:
+        facts["source_message_limit"] = source_limit
+    if source_thread:
+        facts["source_thread_id"] = source_thread
+    if source_client:
+        facts["source_client"] = source_client
+    if facts:
+        enriched["facts"] = facts
+
+    refs = [dict(ref) for ref in enriched.get("evidence_refs", []) if isinstance(ref, dict)]
+    import_ref: dict[str, Any] = {"source_path": source_path}
+    if source_limit:
+        import_ref["scope"] = f"recent_{source_limit}_messages"
+    if source_thread:
+        import_ref["source_thread_id"] = source_thread
+    if source_client:
+        import_ref["source_client"] = source_client
+    import_ref["note"] = "Imported from assistant-curated recent conversation candidates."
+    if import_ref not in refs:
+        refs.append(import_ref)
+    enriched["evidence_refs"] = refs
+
+    tags = set(_string_list(enriched.get("tags")))
+    if source_client:
+        tags.add(f"{safe_tag(source_client)}_curated")
+    if source_limit:
+        tags.add("recent_thread_import")
+    if tags:
+        enriched["tags"] = sorted(tags)
+    return enriched
 
 
 def _read_candidate_file(path: Path) -> list[dict[str, Any]]:
@@ -414,6 +492,10 @@ def _clip(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def safe_tag(value: str) -> str:
+    return "_".join(str(value or "").strip().lower().replace("-", "_").split())
 
 
 def validate_memory_category(category: str) -> None:

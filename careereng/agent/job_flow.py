@@ -10,9 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from careereng.config.schema import BrowserBudgetsConfig
+from careereng.evolution.apply_probe import apply_probe_counters
+from careereng.evolution.capabilities import EvolutionCapabilityStore
+from careereng.evolution.reports import create_apply_probe_report
 from careereng.reporting.job_report import generate_job_batch_report
 from careereng.storage.application_store import ApplicationStore
 from careereng.storage.job_store import JobStore
+from careereng.storage.job_planning import JobPlanningStore
 from careereng.tools.site_tools import SiteTools
 
 
@@ -82,6 +86,8 @@ class JobFlow:
         self.intent_store = intent_store
         self.site_parallelism = max(1, int(site_parallelism or 1))
         self.browser_budgets = browser_budgets or BrowserBudgetsConfig()
+        self.job_planning_store = JobPlanningStore(job_store.workspace)
+        self.capability_store = EvolutionCapabilityStore(job_store.workspace)
 
     @property
     def APPLY_JOB_PHASE_TIMEOUT_SECONDS(self) -> int:
@@ -94,6 +100,14 @@ class JobFlow:
     @property
     def APPLY_SITE_PHASE_BUDGET_FACTOR(self) -> float:
         return float(self.browser_budgets.apply_site_phase_budget_factor)
+
+    @property
+    def APPLY_PROBE_MAX_ATTEMPTED(self) -> int:
+        return int(self.browser_budgets.apply_probe_max_attempted)
+
+    @property
+    def APPLY_PROBE_UNSUCCESSFUL_THRESHOLD(self) -> int:
+        return int(self.browser_budgets.apply_probe_unsuccessful_threshold)
 
     def close(self) -> None:
         closer = getattr(self.browser_runner, "close", None)
@@ -119,6 +133,8 @@ class JobFlow:
         return phases[-1] if phases else ""
 
     def _compute_batch_status(self, batch: dict[str, Any]) -> str:
+        if str(batch.get("status") or "") == "cancelled":
+            return "cancelled"
         sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
         rows = [row for row in sites.values() if isinstance(row, dict)]
         operation = self._normalize_operation(str(batch.get("operation") or ""))
@@ -148,6 +164,35 @@ class JobFlow:
         if rows:
             return "completed"
         return "failed"
+
+    def _is_batch_cancelled(self, batch_id: str) -> bool:
+        if not str(batch_id or "").strip():
+            return False
+        try:
+            batch = self.job_store.load_batch(batch_id)
+        except Exception:
+            return False
+        return str(batch.get("status") or "") == "cancelled"
+
+    @staticmethod
+    def _cancelled_site_row(existing: dict[str, Any], *, current_phase: str = "") -> dict[str, Any]:
+        retrieve = dict(existing.get("retrieve") or {})
+        apply = dict(existing.get("apply") or {})
+        if str(retrieve.get("status") or "") == "running":
+            retrieve["status"] = "cancelled"
+            retrieve.setdefault("reason_tag", "batch_cancelled")
+        if current_phase == "apply" or str(apply.get("status") or "") in {"pending", "running"}:
+            apply["status"] = "cancelled"
+            apply.setdefault("reason_tag", "batch_cancelled")
+        return {
+            **existing,
+            "status": "cancelled",
+            "reason_tag": "batch_cancelled",
+            "message": "Cancelled by batch-stop.",
+            "current_phase": current_phase or str(existing.get("current_phase") or ""),
+            "retrieve": retrieve,
+            "apply": apply,
+        }
 
     def _format_site_line(self, row: dict[str, Any]) -> str:
         site_key = str(row.get("site_key") or "site")
@@ -183,7 +228,7 @@ class JobFlow:
         retrieve_count = int(retrieve.get("count") or 0)
         if str(apply.get("status") or "") == "done":
             submitted = int(apply.get("submitted") or 0)
-            attempted = int(apply.get("attempted") or 0)
+            attempted = int(apply.get("form_sampled") or apply.get("attempted") or 0)
             already_applied = int(apply.get("already_applied") or 0)
             filtered_out = int(apply.get("filtered_out") or 0)
             failed = int(apply.get("failed") or 0)
@@ -198,7 +243,23 @@ class JobFlow:
             if blocked:
                 suffix_parts.append(f"阻塞 {blocked} 个")
             suffix = f"，{'，'.join(suffix_parts)}" if suffix_parts else ""
-            return f"- {site_name} [{site_key}]: 已检索 {retrieve_count} 个岗位，尝试投递 {attempted} 个，成功 {submitted} 个{suffix}。"
+            return f"- {site_name} [{site_key}]: 已检索 {retrieve_count} 个岗位，表单样本 {attempted} 个，成功 {submitted} 个{suffix}。"
+        if str(apply.get("status") or "") in {"probe_completed", "probe_failed"}:
+            attempted = int(apply.get("form_sampled") or apply.get("attempted") or 0)
+            submitted = int(apply.get("submitted") or 0)
+            failed = int(apply.get("form_unsuccessful") or apply.get("failed") or 0)
+            blocked = int(apply.get("blocked") or 0)
+            probe = apply.get("probe") if isinstance(apply.get("probe"), dict) else {}
+            auto_accept = probe.get("auto_accept") if isinstance(probe.get("auto_accept"), dict) else {}
+            report_md = str(probe.get("report_md") or "")
+            status_label = "探测完成" if str(apply.get("status") or "") == "probe_completed" else "探测停止"
+            report_suffix = f"，report={report_md}" if report_md else ""
+            accept_suffix = "，已自动接受" if str(auto_accept.get("status") or "") == "accepted" else ""
+            return (
+                f"- {site_name} [{site_key}]: apply {status_label}，"
+                f"表单样本 {attempted} 个，成功 {submitted} 个，失败样本 {failed} 个，阻塞 {blocked} 个"
+                f"{accept_suffix}{report_suffix}。"
+            )
         if str(apply.get("status") or "") == "failed":
             return f"- {site_name} [{site_key}]: 已检索 {retrieve_count} 个岗位，投递阶段失败（{reason or 'apply_failed'}）。"
         if str(apply.get("status") or "") == "blocked":
@@ -634,7 +695,16 @@ class JobFlow:
     @staticmethod
     def _terminal_application_status(row: dict[str, Any]) -> str:
         application_status = str(row.get("application_status") or "").strip().lower()
-        if application_status in {"already_applied", "submitted", "apply_failed", "blocked"}:
+        if application_status in {
+            "already_applied",
+            "filtered_out",
+            "submitted",
+            "apply_failed",
+            "blocked",
+            "rejected",
+            "closed",
+            "withdrawn",
+        }:
             return application_status
         decision_status = str(row.get("decision_status") or "").strip().lower()
         if decision_status == "already_applied":
@@ -643,31 +713,23 @@ class JobFlow:
 
     def _apply_counters_from_run(self, site_key: str, batch_id: str) -> dict[str, int]:
         rows = self._merged_run_job_rows_for_batch(site_key, batch_id)
-        counts = {
-            "retrieved": len(rows),
-            "attempted": 0,
-            "submitted": 0,
-            "already_applied": 0,
-            "filtered_out": 0,
-            "failed": 0,
-            "blocked": 0,
+        return apply_probe_counters(rows)
+
+    @staticmethod
+    def _apply_counter_payload(counters: dict[str, int]) -> dict[str, int]:
+        return {
+            "attempted": int(counters.get("attempted") or 0),
+            "form_sampled": int(counters.get("form_sampled") or 0),
+            "form_successful": int(counters.get("form_successful") or 0),
+            "form_unsuccessful": int(counters.get("form_unsuccessful") or 0),
+            "apply_path_attempted": int(counters.get("apply_path_attempted") or 0),
+            "submitted": int(counters.get("submitted") or 0),
+            "already_applied": int(counters.get("already_applied") or 0),
+            "filtered_out": int(counters.get("filtered_out") or 0),
+            "failed": int(counters.get("failed") or 0),
+            "blocked": int(counters.get("blocked") or 0),
+            "excluded_role_violations": int(counters.get("excluded_role_violations") or 0),
         }
-        for row in rows:
-            decision_status = str(row.get("decision_status") or "").strip().lower()
-            application_status = self._terminal_application_status(row)
-            if application_status == "already_applied":
-                counts["already_applied"] += 1
-            if decision_status == "filtered_out":
-                counts["filtered_out"] += 1
-            if application_status in {"submitted", "apply_failed", "blocked"}:
-                counts["attempted"] += 1
-            if application_status == "submitted":
-                counts["submitted"] += 1
-            elif application_status == "apply_failed":
-                counts["failed"] += 1
-            elif application_status == "blocked":
-                counts["blocked"] += 1
-        return counts
 
     @staticmethod
     def _is_apply_row_terminal(row: dict[str, Any]) -> bool:
@@ -675,10 +737,127 @@ class JobFlow:
         application_status = JobFlow._terminal_application_status(row)
         return decision_status in {"filtered_out", "already_applied"} or application_status in {
             "already_applied",
+            "filtered_out",
             "submitted",
             "apply_failed",
             "blocked",
+            "rejected",
+            "closed",
+            "withdrawn",
         }
+
+    def _write_retrieval_snapshot(self, *, site_key: str, batch_id: str, current: dict[str, Any]) -> dict[str, Any]:
+        rows = self._merged_run_job_rows_for_batch(site_key, batch_id)
+        if not rows:
+            return {}
+        retrieve = current.get("retrieve") if isinstance(current.get("retrieve"), dict) else {}
+        snapshot = self.job_planning_store.write_snapshot(
+            site_key=site_key,
+            batch_id=batch_id,
+            jobs=rows,
+            current_url=str(current.get("current_url") or current.get("entry_url") or ""),
+            retrieval_complete=str(retrieve.get("status") or "") == "done",
+            result_count=int(retrieve.get("count") or len(rows)),
+            filters_summary={
+                "current_url": str(current.get("current_url") or ""),
+                "skill_path": str(current.get("skill_path") or ""),
+            },
+            stop_reason=str(current.get("reason_tag") or ""),
+        )
+        save_run_context = getattr(self.site_tools.site_store, "save_run_context", None)
+        if callable(save_run_context):
+            save_run_context(
+                site_key,
+                batch_id,
+                {
+                    "latest_search_snapshot": {
+                        "snapshot_id": str(snapshot.get("snapshot_id") or ""),
+                        "search_fingerprint": str(snapshot.get("search_fingerprint") or ""),
+                        "path": str(snapshot.get("path") or ""),
+                    }
+                },
+            )
+        self.job_store.append_event(
+            "job_search_snapshot.written",
+            {
+                "batch_id": batch_id,
+                "site_key": site_key,
+                "snapshot_id": str(snapshot.get("snapshot_id") or ""),
+                "search_fingerprint": str(snapshot.get("search_fingerprint") or ""),
+                "retrieval_complete": bool(snapshot.get("retrieval_complete")),
+                "result_count": int(snapshot.get("result_count") or 0),
+            },
+        )
+        return snapshot
+
+    def _latest_search_snapshot_id(self, *, site_key: str, batch_id: str) -> str:
+        load_run_context = getattr(self.site_tools.site_store, "load_run_context", None)
+        context = load_run_context(site_key, batch_id) if callable(load_run_context) else {}
+        latest = context.get("latest_search_snapshot") if isinstance(context, dict) else {}
+        return str(latest.get("snapshot_id") or "") if isinstance(latest, dict) else ""
+
+    def _decision_context_hash(self, site_key: str) -> str:
+        context_hash = getattr(self.site_tools.site_store, "decision_context_hash", None)
+        if not callable(context_hash):
+            return ""
+        try:
+            return str(context_hash(site_key) or "")
+        except Exception:
+            return ""
+
+    def _ensure_apply_plan(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        session_id: str,
+        turn_id: str,
+    ) -> dict[str, Any]:
+        plan = self.job_planning_store.load_apply_plan(batch_id=batch_id, site_key=site_key)
+        if not plan.get("plan_items"):
+            rows = self._merged_run_job_rows_for_batch(site_key, batch_id)
+            match_history_rows = getattr(self.site_tools.site_store, "match_history_rows", None)
+            history_matches = match_history_rows(site_key, rows) if callable(match_history_rows) else []
+            plan = self.job_planning_store.write_apply_plan(
+                site_key=site_key,
+                batch_id=batch_id,
+                jobs=rows,
+                history_matches=history_matches,
+                snapshot_id=self._latest_search_snapshot_id(site_key=site_key, batch_id=batch_id),
+                apply_requested=True,
+                decision_context_hash=self._decision_context_hash(site_key),
+            )
+            self.job_store.append_event(
+                "job_apply_plan.written",
+                {
+                    "batch_id": batch_id,
+                    "site_key": site_key,
+                    "plan_id": str(plan.get("plan_id") or ""),
+                    "snapshot_id": str(plan.get("snapshot_id") or ""),
+                    "counts": plan.get("counts") if isinstance(plan.get("counts"), dict) else {},
+                },
+            )
+        terminal_updates = [
+            update
+            for item in plan.get("plan_items", [])
+            if isinstance(item, dict)
+            for update in [self.job_planning_store.terminal_update_for_plan_item(item)]
+            if update
+        ]
+        if terminal_updates:
+            self.site_tools.site_store.update_run_jobs(site_key, terminal_updates, session_id, turn_id, batch_id)
+        return plan
+
+    @staticmethod
+    def _apply_plan_counts(plan: dict[str, Any]) -> dict[str, int]:
+        counts = plan.get("counts") if isinstance(plan.get("counts"), dict) else {}
+        normalized: dict[str, int] = {}
+        for key, value in counts.items():
+            try:
+                normalized[str(key)] = int(value or 0)
+            except Exception:
+                normalized[str(key)] = 0
+        return normalized
 
     @staticmethod
     def _aggregate_apply_status(counters: dict[str, int]) -> str:
@@ -732,12 +911,7 @@ class JobFlow:
         apply.update(
             {
                 "status": apply_status,
-                "attempted": counters["attempted"],
-                "submitted": counters["submitted"],
-                "already_applied": counters["already_applied"],
-                "filtered_out": counters["filtered_out"],
-                "failed": counters["failed"],
-                "blocked": counters["blocked"],
+                **self._apply_counter_payload(counters),
             }
         )
         retrieve["count"] = max(int(retrieve.get("count") or 0), counters["retrieved"])
@@ -783,12 +957,7 @@ class JobFlow:
         apply.update(
             {
                 "status": "running",
-                "attempted": counters["attempted"],
-                "submitted": counters["submitted"],
-                "already_applied": counters["already_applied"],
-                "filtered_out": counters["filtered_out"],
-                "failed": counters["failed"],
-                "blocked": counters["blocked"],
+                **self._apply_counter_payload(counters),
             }
         )
         retrieve["count"] = max(int(retrieve.get("count") or 0), counters["retrieved"])
@@ -831,12 +1000,7 @@ class JobFlow:
         apply.update(
             {
                 "status": "failed",
-                "attempted": counters["attempted"],
-                "submitted": counters["submitted"],
-                "already_applied": counters["already_applied"],
-                "filtered_out": counters["filtered_out"],
-                "failed": counters["failed"],
-                "blocked": counters["blocked"],
+                **self._apply_counter_payload(counters),
             }
         )
         retrieve["count"] = max(int(retrieve.get("count") or 0), counters["retrieved"])
@@ -850,6 +1014,132 @@ class JobFlow:
             "status": "completed" if counters["retrieved"] else "failed",
             "reason_tag": "apply_budget_exhausted",
             "message": message,
+            "current_phase": "apply",
+            "current_url": current_url,
+            "trace_ref": trace_ref,
+            "step_count": step_count,
+            "retrieve": retrieve,
+            "apply": apply,
+        }
+
+    def _apply_probe_capability(self, site_key: str) -> dict[str, Any]:
+        return self.capability_store.get(
+            site_key=site_key,
+            phase="apply",
+            candidate_id="apply_form_workflow",
+        )
+
+    def _apply_probe_is_accepted(self, site_key: str) -> bool:
+        return self.capability_store.is_accepted(
+            site_key=site_key,
+            phase="apply",
+            candidate_id="apply_form_workflow",
+        )
+
+    def _apply_probe_stop_reason(self, site_key: str, counters: dict[str, int]) -> str:
+        if self._apply_probe_is_accepted(site_key):
+            return ""
+        unsuccessful = int(counters.get("form_unsuccessful") or 0)
+        attempted = int(counters.get("form_sampled") or 0)
+        unsuccessful_threshold = max(0, self.APPLY_PROBE_UNSUCCESSFUL_THRESHOLD)
+        max_attempted = max(0, self.APPLY_PROBE_MAX_ATTEMPTED)
+        if unsuccessful_threshold and unsuccessful >= unsuccessful_threshold:
+            return "unsuccessful_threshold_reached"
+        if max_attempted and attempted >= max_attempted:
+            return "max_attempted_reached"
+        return ""
+
+    def _apply_probe_stop_site_row(
+        self,
+        *,
+        site_key: str,
+        existing: dict[str, Any],
+        batch_id: str,
+        last_result: Any | None,
+        stop_reason: str,
+    ) -> dict[str, Any]:
+        retrieve = dict(existing.get("retrieve") or {})
+        apply = dict(existing.get("apply") or {})
+        counters = self._apply_counters_from_run(site_key, batch_id)
+        run_rows = self._merged_run_job_rows_for_batch(site_key, batch_id)
+        report = create_apply_probe_report(
+            workspace=self.job_store.workspace,
+            project_root=self.project_root,
+            batch_id=batch_id,
+            site_key=site_key,
+            site_name=str(existing.get("site_name") or site_key),
+            site_row=existing,
+            counters=counters,
+            run_rows=run_rows,
+            stop_reason=stop_reason,
+            max_attempted=self.APPLY_PROBE_MAX_ATTEMPTED,
+            unsuccessful_threshold=self.APPLY_PROBE_UNSUCCESSFUL_THRESHOLD,
+        )
+        report_status = str(report.get("status") or "")
+        auto_accept = report.get("auto_accept") if isinstance(report.get("auto_accept"), dict) else {}
+        next_action = report.get("next_action") if isinstance(report.get("next_action"), dict) else {}
+        report_paths = report.get("paths") if isinstance(report.get("paths"), dict) else {}
+        capability: dict[str, Any] = {}
+        if bool(auto_accept.get("eligible")):
+            capability = self.capability_store.accept(
+                site_key=site_key,
+                phase="apply",
+                candidate_id="apply_form_workflow",
+                source_run_id=str(report.get("run_id") or ""),
+                source_batch_id=batch_id,
+                report_json=str(report_paths.get("report_json") or ""),
+                report_md=str(report_paths.get("report_md") or ""),
+                metrics=report.get("metrics") if isinstance(report.get("metrics"), dict) else {},
+                reason=str(auto_accept.get("reason") or ""),
+            )
+        self.job_store.append_event(
+            "evolution.apply_probe_report.generated",
+            {
+                "batch_id": batch_id,
+                "site_key": site_key,
+                "run_id": str(report.get("run_id") or ""),
+                "status": report_status,
+                "stop_reason": stop_reason,
+                "report_json": str(report_paths.get("report_json") or ""),
+                "report_md": str(report_paths.get("report_md") or ""),
+                "auto_accept_status": str(auto_accept.get("status") or ""),
+                "capability_id": str(capability.get("capability_id") or ""),
+            },
+        )
+        apply_status = "probe_failed" if stop_reason == "unsuccessful_threshold_reached" else "probe_completed"
+        apply.update(
+            {
+                "status": apply_status,
+                **self._apply_counter_payload(counters),
+                "probe": {
+                    "candidate_id": "apply_form_workflow",
+                    "status": report_status,
+                    "stop_reason": stop_reason,
+                    "next_action": next_action,
+                    "auto_accept": auto_accept,
+                    "capability": capability,
+                    "report_json": str(report_paths.get("report_json") or ""),
+                    "report_md": str(report_paths.get("report_md") or ""),
+                },
+            }
+        )
+        retrieve["count"] = max(int(retrieve.get("count") or 0), counters["retrieved"])
+        current_url = str(
+            getattr(last_result, "current_url", "") or existing.get("current_url") or existing.get("entry_url") or ""
+        )
+        trace_ref = str(getattr(last_result, "trace_ref", "") or existing.get("trace_ref") or "")
+        step_count = int(getattr(last_result, "step_count", 0) or existing.get("step_count") or 0)
+        if report_status == "needs_user_fact":
+            site_status = "blocked"
+        elif report_status in {"success", "keep_observing"}:
+            site_status = "completed"
+        else:
+            site_status = "failed"
+        return {
+            **existing,
+            "status": site_status,
+            "reason_tag": f"apply_probe_{stop_reason}",
+            "message": str(next_action.get("reason") or "Apply probe stopped and generated an evolution report."),
             "current_phase": "apply",
             "current_url": current_url,
             "trace_ref": trace_ref,
@@ -883,10 +1173,27 @@ class JobFlow:
             return updated
 
         last_result: Any | None = None
+        apply_plan = self._ensure_apply_plan(
+            site_key=site_key,
+            batch_id=batch_id,
+            session_id=session_id,
+            turn_id=turn_id,
+        )
+        if apply_plan:
+            apply_payload = dict(current.get("apply") or {})
+            apply_payload["plan"] = {
+                "plan_id": str(apply_plan.get("plan_id") or ""),
+                "snapshot_id": str(apply_plan.get("snapshot_id") or ""),
+                "path": str(apply_plan.get("path") or ""),
+                "counts": self._apply_plan_counts(apply_plan),
+            }
+            current = {**current, "apply": apply_payload}
         initial_pending_rows = self._pending_apply_rows(site_key, batch_id)
         site_phase_budget_seconds = self._apply_site_phase_budget_seconds(job_count=len(initial_pending_rows))
         site_phase_deadline = time.monotonic() + float(site_phase_budget_seconds or 0)
         while True:
+            if self._is_batch_cancelled(batch_id):
+                return self._cancelled_site_row(current, current_phase="apply")
             pending_rows = self._pending_apply_rows(site_key, batch_id)
             if not pending_rows:
                 break
@@ -933,6 +1240,8 @@ class JobFlow:
                 phase_timeout_seconds_override=phase_timeout_seconds_override,
                 timeout_ms_override=self.APPLY_JOB_TIMEOUT_MS,
             )
+            if self._is_batch_cancelled(batch_id):
+                return self._cancelled_site_row(current, current_phase="apply")
 
             latest_rows = {str(row.get("job_id") or ""): row for row in self._run_job_rows(site_key, batch_id)}
             latest_row = latest_rows.get(job_id) or {}
@@ -945,6 +1254,15 @@ class JobFlow:
                             batch_id=batch_id,
                             last_result=last_result,
                         )
+                    )
+                stop_reason = self._apply_probe_stop_reason(site_key, self._apply_counters_from_run(site_key, batch_id))
+                if stop_reason:
+                    return self._apply_probe_stop_site_row(
+                        site_key=site_key,
+                        existing=current,
+                        batch_id=batch_id,
+                        last_result=last_result,
+                        stop_reason=stop_reason,
                     )
                 continue
             status = "blocked" if str(getattr(last_result, "status", "") or "") == "blocked" else "apply_failed"
@@ -966,6 +1284,15 @@ class JobFlow:
                         batch_id=batch_id,
                         last_result=last_result,
                     )
+                )
+            stop_reason = self._apply_probe_stop_reason(site_key, self._apply_counters_from_run(site_key, batch_id))
+            if stop_reason:
+                return self._apply_probe_stop_site_row(
+                    site_key=site_key,
+                    existing=current,
+                    batch_id=batch_id,
+                    last_result=last_result,
+                    stop_reason=stop_reason,
                 )
 
         if not self._pending_apply_rows(site_key, batch_id):
@@ -1018,6 +1345,7 @@ class JobFlow:
                     "batch_id": batch_id,
                     "title": str(row.get("title") or ""),
                     "url": str(row.get("url") or ""),
+                    "decision_context_hash": str(row.get("decision_context_hash") or ""),
                     "detail": detail,
                 }
             )
@@ -1062,12 +1390,7 @@ class JobFlow:
             apply.update(
                 {
                     "status": apply_status,
-                    "attempted": counters["attempted"],
-                    "submitted": counters["submitted"],
-                    "already_applied": counters["already_applied"],
-                    "filtered_out": counters["filtered_out"],
-                    "failed": counters["failed"],
-                    "blocked": counters["blocked"],
+                    **self._apply_counter_payload(counters),
                 }
             )
             retrieve["count"] = max(int(retrieve.get("count") or 0), counters["retrieved"])
@@ -1091,12 +1414,7 @@ class JobFlow:
             }
 
         apply["status"] = "blocked" if str(getattr(result, "status", "") or "") == "blocked" else "failed"
-        apply["attempted"] = counters["attempted"]
-        apply["submitted"] = counters["submitted"]
-        apply["already_applied"] = counters["already_applied"]
-        apply["filtered_out"] = counters["filtered_out"]
-        apply["failed"] = counters["failed"]
-        apply["blocked"] = counters["blocked"]
+        apply.update(self._apply_counter_payload(counters))
         retrieve["count"] = max(int(retrieve.get("count") or 0), counters["retrieved"])
         return {
             **existing,
@@ -1248,6 +1566,11 @@ class JobFlow:
             nonlocal batch
             with batch_lock:
                 latest = self.job_store.load_batch(batch_id) if batch_id else batch
+                if str((latest or {}).get("status") or "") == "cancelled":
+                    batch = latest or batch
+                    latest_sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+                    latest_row = latest_sites.get(site_key)
+                    return dict(latest_row) if isinstance(latest_row, dict) else self._cancelled_site_row(updated)
                 batch = self.job_store.update_site(latest or batch, site_key, updated)
                 batch["status"] = self._compute_batch_status(batch)
                 batch = self.job_store.save_batch(batch)
@@ -1258,6 +1581,8 @@ class JobFlow:
                 return dict(latest_row) if isinstance(latest_row, dict) else dict(updated)
 
         def _job(site_key: str, current: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+            if self._is_batch_cancelled(batch_id):
+                return site_key, self._cancelled_site_row(current)
             allow_apply = (
                 normalized_operation == self.OPERATION_JOB_SEARCH
                 and str((current.get("apply") or {}).get("status") or "") != "skipped"
@@ -1271,6 +1596,8 @@ class JobFlow:
                 batch_id=batch_id,
                 phase_slugs=phase_slugs,
             )
+            if self._is_batch_cancelled(batch_id):
+                return site_key, self._cancelled_site_row(current)
             updated = self._browser_result_to_site_row(
                 result=result,
                 existing=current,
@@ -1287,7 +1614,16 @@ class JobFlow:
             retrieval_done = str((updated.get("retrieve") or {}).get("status") or "") == "done"
             if retrieval_done:
                 self._promote_retrieved_run_to_history(site_key=site_key, batch_id=batch_id)
+                snapshot = self._write_retrieval_snapshot(site_key=site_key, batch_id=batch_id, current=updated)
+                if snapshot:
+                    retrieve_payload = dict(updated.get("retrieve") or {})
+                    retrieve_payload["snapshot_id"] = str(snapshot.get("snapshot_id") or "")
+                    retrieve_payload["search_fingerprint"] = str(snapshot.get("search_fingerprint") or "")
+                    retrieve_payload["snapshot_path"] = str(snapshot.get("path") or "")
+                    updated = {**updated, "retrieve": retrieve_payload}
                 _save_site_snapshot(site_key, updated, generate_report=True)
+            if self._is_batch_cancelled(batch_id):
+                return site_key, self._cancelled_site_row(updated, current_phase=str(updated.get("current_phase") or ""))
             if (
                 effective_apply_requested
                 and allow_apply
@@ -1317,6 +1653,11 @@ class JobFlow:
                     site_key, updated = future.result()
                     _save_site_snapshot(site_key, updated, generate_report=True)
 
+        latest_batch = self.job_store.load_batch(batch_id) if batch_id else batch
+        if str((latest_batch or {}).get("status") or "") == "cancelled":
+            batch = latest_batch or batch
+            self._generate_batch_report_if_possible(batch)
+            return self._format_batch_summary(batch)
         batch["status"] = self._compute_batch_status(batch)
         batch = self.job_store.save_batch(batch)
         self._generate_batch_report_if_possible(batch)

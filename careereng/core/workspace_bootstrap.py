@@ -44,6 +44,40 @@ When this file conflicts with `intent.md`, this file should win.
 - Use role preferences mainly when narrowing concrete jobs inside already selected companies.
 """
 
+APPLICATION_PROFILE = {
+    "version": 1,
+    "updated_at": "2026-06-05",
+    "scope": "application_profile",
+    "personal_information": {
+        "gender": "Male",
+        "country": "China",
+        "state_province": "Shanxi",
+        "city_town": "Taiyuan",
+        "postal_code": "030000",
+    },
+    "work_authorization": {
+        "default_country": "China",
+        "legally_authorized_to_work": "Yes",
+        "requires_visa_sponsorship": "No",
+    },
+    "compliance_defaults": {
+        "standard_policy_acknowledgement": "Yes",
+        "standard_rules_acknowledgement": "Yes",
+    },
+    "answer_policy": {
+        "unknown_required_fact": "block_or_request_context",
+    },
+}
+
+APPLICATION_PROFILE_BODY = """# Application Profile
+
+Reusable facts for routine job-application forms.
+
+This file is the canonical workspace-level source for standard application-form answers such as gender, address, work authorization, visa sponsorship, and routine compliance acknowledgements.
+
+Keep career narrative, skills, projects, and experience in `persona.md`. Keep site-specific option labels and workflows in each site `SKILL.md`.
+"""
+
 
 WorkspaceEntry = dict[str, str]
 
@@ -100,6 +134,12 @@ def bootstrap_workspace(workspace: Path) -> list[WorkspaceEntry]:
     _ensure_dir(workspace / "profile" / "reports", rows, workspace)
     _ensure_dir(workspace / "profile" / "sources", rows, workspace)
     _ensure_text_file(workspace / "profile" / "persona.md", dump_front_matter(DEFAULT_PERSONA), rows, workspace)
+    _ensure_text_file(
+        workspace / "profile" / "application_profile.md",
+        dump_front_matter(APPLICATION_PROFILE, APPLICATION_PROFILE_BODY),
+        rows,
+        workspace,
+    )
     _ensure_empty_file(workspace / "profile" / "profile_events.jsonl", rows, workspace)
 
     _ensure_dir(workspace / "cv", rows, workspace)

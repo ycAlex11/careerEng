@@ -31,7 +31,7 @@ def create_evolution_run(
     for child in ("snapshots", "proposals", "evaluations", "retention"):
         ensure_dir(run_dir / child)
 
-    inputs = _run_inputs(workspace_path)
+    inputs = _run_inputs(workspace_path, root=root)
     context_payload = _normalize_context(context)
     evidence_pack_path = run_dir / "evidence_pack.md"
     summary_path = run_dir / "summary.md"
@@ -83,7 +83,13 @@ def create_evolution_run(
     }
 
     evidence_pack_path.write_text(
-        _render_evidence_pack(spec=spec, run_payload=run_payload, workspace=workspace_path, context=context_payload),
+        _render_evidence_pack(
+            spec=spec,
+            run_payload=run_payload,
+            workspace=workspace_path,
+            project_root=root,
+            context=context_payload,
+        ),
         encoding="utf-8",
     )
     summary_path.write_text(_render_summary(run_payload), encoding="utf-8")
@@ -99,8 +105,11 @@ def create_evolution_run(
     }
 
 
-def _run_inputs(workspace: Path) -> dict[str, Path]:
+def _run_inputs(workspace: Path, *, root: Path | None = None) -> dict[str, Path]:
+    project_root = root or workspace.parent
     return {
+        "assistant_guide": project_root / "docs" / "assistant_bridge" / "ASSISTANT_GUIDE.md",
+        "assistant_codex_context": project_root / "docs" / "assistant_bridge" / "CODEX_CONTEXT.md",
         "context_pack": workspace / "evolution" / "context" / "latest.md",
         "open_candidates": workspace / "evolution" / "candidates" / "open.jsonl",
         "evidence": workspace / "evolution" / "evidence" / "all.jsonl",
@@ -151,9 +160,10 @@ def _render_evidence_pack(
     spec: CandidateSpec,
     run_payload: dict[str, Any],
     workspace: Path,
+    project_root: Path,
     context: dict[str, Any],
 ) -> str:
-    inputs = _run_inputs(workspace)
+    inputs = _run_inputs(workspace, root=project_root)
     lines = [
         "# Evolution Run Evidence Pack",
         "",

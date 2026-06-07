@@ -18,8 +18,15 @@ from careereng.browser_controls.backends.playwright_mcp import (
 from careereng.browser_controls.bridge import MCPToolBridge
 from careereng.browser_controls.prompting import build_phase_prompts, load_text
 from careereng.browser_controls.runtime import BrowserPhaseResult, BrowserPhaseRuntime, BrowserRuntimeConfig
-from careereng.browser_context import BrowserContextRegistry, BrowserContextSession, BrowserPhaseMemory
-from careereng.config.schema import BrowserBudgetsConfig
+from careereng.action_cards import create_site_skill_refinement_card
+from careereng.browser_context import (
+    BrowserContextRegistry,
+    BrowserContextSession,
+    BrowserPhaseMemory,
+    WorkflowMemoryStore,
+    extract_failure_snapshot_from_trace,
+)
+from careereng.config.schema import BrowserBudgetsConfig, BrowserGuardsConfig, BrowserRetrievalPolicyConfig
 from careereng.resume.export import default_apply_resume_pdf_path
 from careereng.storage.jsonl import JSONLStore
 from careereng.utils import now_iso
@@ -86,6 +93,8 @@ class BrowserAutomationService:
         max_phase_steps: int,
         browser_name: str,
         budgets: BrowserBudgetsConfig | None = None,
+        guards: BrowserGuardsConfig | None = None,
+        retrieval_policy: BrowserRetrievalPolicyConfig | None = None,
     ):
         self.project_root = Path(project_root).resolve()
         self.workspace = Path(workspace).resolve()
@@ -94,6 +103,8 @@ class BrowserAutomationService:
         self.keep_open = bool(keep_open)
         self.timeout_ms = int(timeout_ms or 45000)
         self.browser_name = browser_name or "chrome"
+        self.guards = guards or BrowserGuardsConfig()
+        self.retrieval_policy = retrieval_policy or BrowserRetrievalPolicyConfig()
         self.budgets = budgets or BrowserBudgetsConfig(
             phase_timeout_seconds=int(phase_timeout_seconds or 180),
             step_timeout_seconds=int(step_timeout_seconds or 30),
@@ -115,6 +126,24 @@ class BrowserAutomationService:
             max_step_retries=int(self.budgets.max_step_retries or max_step_retries or 1),
             max_phase_steps=self.max_phase_steps,
             metrics_workspace=str(self.workspace),
+            retrieval_history_stop_success_ratio=float(
+                self.retrieval_policy.history_stop_success_ratio
+            ),
+            retrieval_history_stop_min_page_jobs=int(
+                self.retrieval_policy.history_stop_min_page_jobs
+            ),
+            same_url_no_progress_tool_call_limit=int(
+                self.guards.same_url_no_progress_tool_call_limit
+            ),
+            same_url_no_progress_token_limit=int(
+                self.guards.same_url_no_progress_token_limit
+            ),
+            apply_same_url_no_progress_tool_call_limit=int(
+                self.guards.apply_same_url_no_progress_tool_call_limit
+            ),
+            apply_same_url_no_progress_token_limit=int(
+                self.guards.apply_same_url_no_progress_token_limit
+            ),
         )
         self.phase_runtime: BrowserPhaseRuntime | Any | None = None
 
@@ -324,6 +353,77 @@ class BrowserAutomationService:
                 ),
             }
         ]
+
+    def _workflow_memory_context_items(self, *, site_key: str, phase_slug: str) -> list[dict[str, str]]:
+        text = WorkflowMemoryStore(self.workspace).context_text(site_key=site_key, phase=phase_slug)
+        if not text:
+            return []
+        return [{"role": "user", "content": text}]
+
+    def _update_workflow_memory_from_phase_result(
+        self,
+        *,
+        site_key: str,
+        phase_slug: str,
+        batch_id: str,
+        turn_id: str,
+        phase_result: BrowserPhaseResult,
+    ) -> None:
+        if str(phase_result.status or "").strip().lower() not in {"done", "blocked", "failed"}:
+            return
+        try:
+            WorkflowMemoryStore(self.workspace).update_phase(
+                site_key=site_key,
+                phase=phase_slug,
+                status=phase_result.status,
+                batch_id=batch_id,
+                turn_id=turn_id,
+                current_url=phase_result.current_url,
+                trace_ref=phase_result.trace_ref,
+                reason_tag=phase_result.reason_tag,
+                summary=phase_result.summary,
+                step_count=phase_result.step_count,
+                recorded_count=phase_result.recorded_count,
+                new_count=phase_result.new_count,
+            )
+        except Exception:
+            return
+
+    def _create_failed_phase_refinement_card(
+        self,
+        *,
+        site_key: str,
+        site_name: str,
+        phase_slug: str,
+        batch_id: str,
+        phase_result: BrowserPhaseResult,
+    ) -> dict[str, Any]:
+        workflow_memory_path = WorkflowMemoryStore(self.workspace).path(site_key)
+        failure_snapshot = extract_failure_snapshot_from_trace(
+            workspace=self.workspace,
+            site_key=site_key,
+            batch_id=batch_id,
+            phase=phase_slug,
+            trace_ref=phase_result.trace_ref,
+        )
+        try:
+            return create_site_skill_refinement_card(
+                workspace=self.workspace,
+                project_root=self.project_root,
+                site_key=site_key,
+                site_name=site_name,
+                phase=phase_slug,
+                batch_id=batch_id,
+                reason_tag=phase_result.reason_tag,
+                summary=phase_result.summary,
+                current_url=phase_result.current_url,
+                trace_ref=phase_result.trace_ref,
+                skill_path=self._site_skill_path(site_key),
+                workflow_memory_path=workflow_memory_path,
+                failure_snapshot_path=failure_snapshot,
+            )
+        except Exception:
+            return {}
 
     def _latest_current_resume_markdown_updated_at(self) -> str:
         current_dir = self.workspace / "cv" / "current"
@@ -638,6 +738,9 @@ class BrowserAutomationService:
                             extra_context_items = []
                             if phase.slug == "session_preparation":
                                 extra_context_items.extend(self._session_preparation_context_items(site_key))
+                            extra_context_items.extend(
+                                self._workflow_memory_context_items(site_key=site_key, phase_slug=phase.slug)
+                            )
                             override_seconds = int(phase_timeout_seconds_override or 0)
                             effective_phase_timeout_seconds = phase_timeout_seconds
                             if override_seconds > 0:
@@ -678,6 +781,13 @@ class BrowserAutomationService:
                                     await self._aclose_phase_runtime(phase_runtime)
                             last_result = phase_result
                             current_url = str(phase_result.current_url or current_url or target_url)
+                            self._update_workflow_memory_from_phase_result(
+                                site_key=site_key,
+                                phase_slug=phase.slug,
+                                batch_id=batch_id,
+                                turn_id=turn_id,
+                                phase_result=phase_result,
+                            )
                             if phase_result.status == "done":
                                 if phase.slug == "apply":
                                     self._persist_apply_carry_forward(
@@ -785,6 +895,26 @@ class BrowserAutomationService:
                                     "trace_ref": phase_result.trace_ref,
                                 },
                             )
+                            refinement_card = self._create_failed_phase_refinement_card(
+                                site_key=site_key,
+                                site_name=site_name,
+                                phase_slug=phase.slug,
+                                batch_id=batch_id,
+                                phase_result=phase_result,
+                            )
+                            if refinement_card.get("card_id"):
+                                self.site_store.append_event(
+                                    site_key,
+                                    "browser.phase.refinement_card",
+                                    {
+                                        "turn_id": turn_id,
+                                        "batch_id": batch_id,
+                                        "phase": phase.slug,
+                                        "reason_tag": phase_result.reason_tag,
+                                        "action_card_id": refinement_card.get("card_id") or "",
+                                        "action_card_path": refinement_card.get("markdown_path") or "",
+                                    },
+                                )
                             result = BrowserAutomationResult(
                                 site_key=site_key,
                                 site_name=site_name,

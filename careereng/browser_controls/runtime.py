@@ -33,6 +33,12 @@ class BrowserRuntimeConfig:
     max_step_retries: int = 1
     max_phase_steps: int = 24
     metrics_workspace: str = ""
+    retrieval_history_stop_success_ratio: float = 0.4
+    retrieval_history_stop_min_page_jobs: int = 10
+    same_url_no_progress_tool_call_limit: int = 0
+    same_url_no_progress_token_limit: int = 0
+    apply_same_url_no_progress_tool_call_limit: int = 0
+    apply_same_url_no_progress_token_limit: int = 0
 
 
 @dataclass(frozen=True)
@@ -389,6 +395,12 @@ class BrowserPhaseRuntime:
         "browser_select_option",
         "browser_navigate",
     )
+    FORM_STATE_ACTION_TOOLS = (
+        "browser_fill_form",
+        "browser_type",
+        "browser_select_option",
+        "browser_file_upload",
+    )
     OBSERVATION_ONLY_TOOLS = (
         "browser_snapshot",
         "browser_console_messages",
@@ -438,6 +450,18 @@ class BrowserPhaseRuntime:
         result = self.sleep_fn(seconds)
         if inspect.isawaitable(result):
             await result
+
+    def _same_url_no_progress_tool_call_limit(self, phase: PhasePrompt) -> int:
+        base = int(self.config.same_url_no_progress_tool_call_limit or self.SAME_URL_NO_PROGRESS_TOOL_CALL_LIMIT)
+        if phase.slug == "apply":
+            return int(self.config.apply_same_url_no_progress_tool_call_limit or base)
+        return base
+
+    def _same_url_no_progress_token_limit(self, phase: PhasePrompt) -> int:
+        base = int(self.config.same_url_no_progress_token_limit or self.SAME_URL_NO_PROGRESS_TOKEN_LIMIT)
+        if phase.slug == "apply":
+            return int(self.config.apply_same_url_no_progress_token_limit or base)
+        return base
 
     @staticmethod
     def _is_observation_tool(name: str) -> bool:
@@ -1223,6 +1247,18 @@ class BrowserPhaseRuntime:
             return cls._structured_positive_count(structured, "recorded_count", "matched_count", "unmatched_count")
         if tool_name == "request_context" and isinstance(structured, dict):
             return str(structured.get("status") or "").strip().lower() == "attached"
+        if tool_name == "update_phase_memory" and isinstance(structured, dict):
+            return cls._structured_positive_count(
+                structured,
+                "completed_count",
+                "confirmed_count",
+                "pending_count",
+                "do_not_repeat_count",
+                "metrics_count",
+                "cleared_count",
+            )
+        if tool_name in cls.FORM_STATE_ACTION_TOOLS:
+            return True
         return False
 
     def _record_browser_control_event(
@@ -1677,10 +1713,68 @@ class BrowserPhaseRuntime:
         application_status = str(row.get("application_status") or "").strip().lower()
         return decision_status in {"filtered_out", "already_applied"} or application_status in {
             "already_applied",
+            "filtered_out",
             "submitted",
             "apply_failed",
             "blocked",
         }
+
+    @staticmethod
+    def _is_history_operation_success(row: dict[str, Any] | None) -> bool:
+        if not isinstance(row, dict):
+            return False
+        decision_status = str(row.get("decision_status") or "").strip().lower()
+        application_status = str(row.get("application_status") or "").strip().lower()
+        application_review_status = str(row.get("application_review_status") or "").strip().lower()
+        apply_state = str(row.get("apply_state") or "").strip().lower()
+        successful_decisions = {"filtered_out", "skipped_as_not_fit", "not_fit", "already_applied", "submitted"}
+        successful_application_statuses = {
+            "filtered_out",
+            "skipped_as_not_fit",
+            "not_fit",
+            "active",
+            "in_process",
+            "in_review",
+            "resume_review",
+            "assessment",
+            "interview",
+            "offer",
+            "submitted",
+            "already_applied",
+            "application_received",
+            "received",
+            "rejected",
+            "closed",
+            "withdrawn",
+        }
+        successful_review_statuses = {
+            "active",
+            "in_process",
+            "in_review",
+            "resume_review",
+            "assessment",
+            "interview",
+            "offer",
+            "submitted",
+            "application_received",
+            "received",
+            "rejected",
+            "closed",
+            "withdrawn",
+        }
+        successful_apply_states = {
+            "filtered_out",
+            "terminal_filtered_out",
+            "terminal_submitted",
+            "terminal_already_applied",
+            "terminal_application_received",
+        }
+        return (
+            decision_status in successful_decisions
+            or application_status in successful_application_statuses
+            or application_review_status in successful_review_statuses
+            or apply_state in successful_apply_states
+        )
 
     @classmethod
     def _terminal_job_ids_from_update_payload(cls, payload: dict[str, Any] | None) -> list[str]:
@@ -2046,6 +2140,53 @@ class BrowserPhaseRuntime:
         return f"{str(name or '').strip().lower()}::{normalized_arguments}"
 
     @classmethod
+    def _phase_memory_do_not_repeat_violation(
+        cls,
+        *,
+        phase_memory: BrowserPhaseMemory,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        current_url: str,
+    ) -> str:
+        if not isinstance(phase_memory, BrowserPhaseMemory):
+            return ""
+        if not cls._is_page_settle_action(tool_name):
+            return ""
+        if not isinstance(arguments, dict):
+            arguments = {}
+        action_text = " ".join(
+            str(arguments.get(key) or "")
+            for key in ("element", "key", "keys", "text", "button", "url")
+        ).strip().lower()
+        if not action_text:
+            return ""
+        current_url_lower = str(current_url or "").strip().lower()
+        for rule_text in phase_memory.do_not_repeat.values():
+            rule = str(rule_text or "").strip()
+            rule_lower = rule.lower()
+            if not rule_lower:
+                continue
+            if "newest" in rule_lower and "newest" not in current_url_lower:
+                continue
+            if "relevance" in rule_lower and "relevance" not in current_url_lower:
+                continue
+            if "china" in rule_lower and "china" not in current_url_lower and "chnc" not in current_url_lower:
+                continue
+            if ("filter" in rule_lower and "filter" in action_text) or (
+                "sort" in rule_lower and "sort" in action_text
+            ) or ("location" in rule_lower and "location" in action_text):
+                return rule
+            rule_tokens = {
+                token
+                for token in re.findall(r"[a-z0-9]+", rule_lower)
+                if len(token) >= 4 and token not in {"from", "this", "that", "with", "page", "button"}
+            }
+            action_tokens = set(re.findall(r"[a-z0-9]+", action_text))
+            if rule_tokens.intersection(action_tokens):
+                return rule
+        return ""
+
+    @classmethod
     def _looks_like_pagination_action(cls, name: str, arguments: dict[str, Any] | None) -> bool:
         normalized = str(name or "").strip().lower()
         if normalized not in cls.PAGE_SETTLE_ACTION_TOOLS or not isinstance(arguments, dict):
@@ -2224,11 +2365,16 @@ class BrowserPhaseRuntime:
                     "site_job_id": str(row.get("site_job_id") or ""),
                     "history_match_status": status,
                     "matched_job_id": str(classification.get("matched_job_id") or ""),
+                    "decision_status": str(classification.get("decision_status") or ""),
+                    "apply_state": str(classification.get("apply_state") or ""),
                     "application_status": str(classification.get("application_status") or ""),
                     "application_review_status": str(classification.get("application_review_status") or ""),
                     "application_review_status_raw": str(classification.get("application_review_status_raw") or ""),
                     "enrichment_reasons": [str(reason) for reason in reasons if str(reason).strip()],
                 }
+            )
+            history_match_results[-1]["operation_success"] = self._is_history_operation_success(
+                history_match_results[-1]
             )
         recorded_count = len(saved_ids)
         new_count = len(new_ids)
@@ -2242,18 +2388,30 @@ class BrowserPhaseRuntime:
             1 for item in history_match_results if item.get("history_match_status") == "existing_complete"
         )
         enrichment_needed_count = len(enrichment_needed)
-        stop_recommended = bool(existing_count >= 3 and enrichment_needed_count == 0)
+        operation_success_count = sum(1 for item in history_match_results if bool(item.get("operation_success")))
+        operation_success_ratio = operation_success_count / recorded_count if recorded_count else 0.0
+        stop_success_ratio_threshold = max(0.0, float(self.config.retrieval_history_stop_success_ratio or 0.0))
+        stop_min_page_jobs = max(1, int(self.config.retrieval_history_stop_min_page_jobs or 1))
+        stop_recommended = bool(
+            recorded_count >= stop_min_page_jobs
+            and operation_success_ratio >= stop_success_ratio_threshold
+            and enrichment_needed_count == 0
+        )
         stop_reason = (
-            "current page contains at least 3 existing complete jobs and no enrichment targets"
+            "current page reached the operation-success ratio threshold and has no enrichment targets"
             if stop_recommended
             else ""
         )
         summary = (
             f"Recorded {recorded_count} jobs from the current page "
-            f"({new_count} new, {existing_count} existing, {enrichment_needed_count} need enrichment)."
+            f"({new_count} new, {existing_count} existing, {enrichment_needed_count} need enrichment, "
+            f"{operation_success_count} operation-success, success_ratio={operation_success_ratio:.2f})."
         )
         if stop_recommended:
-            summary += " Stop pagination is recommended by history match policy."
+            summary += (
+                " Stop pagination is recommended by operation-success history policy "
+                f"(threshold={stop_success_ratio_threshold:.2f}, min_page_jobs={stop_min_page_jobs})."
+            )
         return {
             "isError": False,
             "current_url": current_url,
@@ -2264,6 +2422,10 @@ class BrowserPhaseRuntime:
                 "existing_count": existing_count,
                 "existing_complete_count": existing_complete_count,
                 "enrichment_needed_count": enrichment_needed_count,
+                "operation_success_count": operation_success_count,
+                "operation_success_ratio": operation_success_ratio,
+                "history_stop_success_ratio_threshold": stop_success_ratio_threshold,
+                "history_stop_min_page_jobs": stop_min_page_jobs,
                 "stop_recommended": stop_recommended,
                 "stop_reason": stop_reason,
                 "job_ids": saved_ids,
@@ -2573,6 +2735,7 @@ class BrowserPhaseRuntime:
         same_url_no_progress_key = ""
         same_url_no_progress_tool_calls = 0
         same_url_no_progress_tokens = 0
+        do_not_repeat_violation_count = 0
 
         def track_same_url_no_progress(
             *,
@@ -2607,7 +2770,11 @@ class BrowserPhaseRuntime:
                 "same_url_no_progress_tool_calls": same_url_no_progress_tool_calls,
                 "same_url_no_progress_tokens": same_url_no_progress_tokens,
             }
-            if same_url_no_progress_tokens >= self.SAME_URL_NO_PROGRESS_TOKEN_LIMIT:
+            token_limit = self._same_url_no_progress_token_limit(phase)
+            tool_call_limit = self._same_url_no_progress_tool_call_limit(phase)
+            trigger_values["same_url_no_progress_token_limit"] = token_limit
+            trigger_values["same_url_no_progress_tool_call_limit"] = tool_call_limit
+            if token_limit > 0 and same_url_no_progress_tokens >= token_limit:
                 summary = self._same_url_no_progress_message(
                     phase=phase,
                     current_url=current_url,
@@ -2639,7 +2806,7 @@ class BrowserPhaseRuntime:
                     recorded_count=len(recorded_job_ids),
                     new_count=len(new_job_ids),
                 )
-            if same_url_no_progress_tool_calls >= self.SAME_URL_NO_PROGRESS_TOOL_CALL_LIMIT:
+            if tool_call_limit > 0 and same_url_no_progress_tool_calls >= tool_call_limit:
                 summary = self._same_url_no_progress_message(
                     phase=phase,
                     current_url=current_url,
@@ -3181,10 +3348,13 @@ class BrowserPhaseRuntime:
                     )
                 ):
                     if bool(last_record_jobs_policy.get("stop_recommended")):
-                        summary = "Job retrieval stopped because the current page already matched the history stop policy."
+                        summary = (
+                            "Job retrieval history policy recommended stopping, but pagination is allowed to continue; "
+                            "history ratio is advisory and not a hard stop."
+                        )
                         self._record_browser_control_event(
                             site_store=site_store,
-                            event_type="ignored_stop_recommended",
+                            event_type="advisory_stop_recommended",
                             batch_id=batch_id,
                             site_key=site_key,
                             phase=phase,
@@ -3200,16 +3370,12 @@ class BrowserPhaseRuntime:
                             trace_ref=trace_ref,
                             summary=summary,
                         )
-                        return BrowserPhaseResult(
-                            status="done",
-                            reason_tag="retrieval_stop_recommended",
-                            summary=summary,
-                            current_url=current_url,
-                            step_count=step_count,
-                            trace_ref=trace_ref,
-                            raw_text=output_text,
-                            recorded_count=len(recorded_job_ids),
-                            new_count=len(new_job_ids),
+                        history_items.append(
+                            self._context_item(
+                                "Runtime note: history ratio is advisory only. Do not use it as a hard pagination stop. "
+                                "Continue retrieval unless the page reaches a strong stop condition such as date window, "
+                                "no next page, no more results, or a site-specific stop rule."
+                            )
                         )
                     enrichment_needed_count = int(last_record_jobs_policy.get("enrichment_needed_count") or 0)
                     if enrichment_needed_count > 0:
@@ -3262,6 +3428,53 @@ class BrowserPhaseRuntime:
                         ]
                         retry_requested = True
                         break
+                do_not_repeat_reason = self._phase_memory_do_not_repeat_violation(
+                    phase_memory=phase_memory,
+                    tool_name=name,
+                    arguments=arguments if isinstance(arguments, dict) else None,
+                    current_url=current_url,
+                )
+                if do_not_repeat_reason:
+                    do_not_repeat_violation_count += 1
+                    summary = "Runtime blocked a repeated action from phase memory do-not-repeat guidance."
+                    self._record_browser_control_event(
+                        site_store=site_store,
+                        event_type="do_not_repeat_violation",
+                        batch_id=batch_id,
+                        site_key=site_key,
+                        phase=phase,
+                        turn_id=turn_id,
+                        current_url=current_url,
+                        guard_name="do_not_repeat_violation",
+                        trigger_values={
+                            "attempted_tool": name,
+                            "attempted_arguments": arguments,
+                            "violation_count": do_not_repeat_violation_count,
+                            "rule": do_not_repeat_reason,
+                        },
+                        last_record_jobs_policy=last_record_jobs_policy,
+                        trace_ref=trace_ref,
+                        summary=summary,
+                    )
+                    if do_not_repeat_violation_count >= 2:
+                        return BrowserPhaseResult(
+                            status="failed",
+                            reason_tag="do_not_repeat_violation",
+                            summary=summary,
+                            current_url=current_url,
+                            step_count=step_count,
+                            trace_ref=trace_ref,
+                            raw_text=output_text,
+                            recorded_count=len(recorded_job_ids),
+                            new_count=len(new_job_ids),
+                        )
+                    history_items = [
+                        self._context_item(
+                            f"{summary}\nRule: {do_not_repeat_reason}\nChoose a different action or finish with phase_result."
+                        )
+                    ]
+                    retry_requested = True
+                    break
                 step_count += 1
                 for attempt in range(1, max(1, int(self.config.max_step_retries or 0)) + 2):
                     site_store.save_browser_session(
