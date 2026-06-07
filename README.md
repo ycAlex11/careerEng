@@ -182,6 +182,12 @@ careereng site add "Microsoft" --url https://careers.microsoft.com
 
 CareerEng is designed to be operated with Codex or another AI assistant. The main entry point is simple: start a message with `@career`.
 
+If you are a new user, start with the Codex checklist:
+
+```text
+CODEX_QUICKSTART.md
+```
+
 Use `@career` when you want the assistant to operate CareerEng instead of only chatting about the project. The assistant sends the message into CareerEng, CareerEng classifies it, records it, and returns the suggested local action.
 
 Examples:
