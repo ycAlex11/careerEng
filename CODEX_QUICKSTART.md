@@ -66,7 +66,7 @@ careereng resume upload --file ./resume.md
 Then export the apply-ready PDF:
 
 ```bash
-careereng resume export-pdf --file ./resume.md --output resume.cv.pdf
+careereng resume export-pdf --file ./resume.md
 ```
 
 The apply-ready PDF should be the only PDF under:
@@ -76,6 +76,7 @@ workspace/cv/exports/
 ```
 
 If there are multiple PDFs there, site apply flows may treat the resume as ambiguous.
+By default, the PDF filename includes a timestamp and content hash. Keep that default unless you have a specific reason to force a fixed filename; changing filenames helps career sites distinguish newer resume versions.
 
 ## 4. Let Codex Inspect Readiness
 

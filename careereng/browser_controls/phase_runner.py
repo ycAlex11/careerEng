@@ -325,7 +325,8 @@ class BrowserAutomationService:
         return BrowserContextSession.for_phase(phase_memory=phase_memory)
 
     def _session_preparation_context_items(self, site_key: str) -> list[dict[str, str]]:
-        resume_updated_at = self._latest_current_resume_markdown_updated_at()
+        resume_pdf_path = default_apply_resume_pdf_path(self.workspace)
+        resume_updated_at = self._current_apply_resume_pdf_updated_at(resume_pdf_path)
         if not resume_updated_at:
             return []
         last_preparation_at = self._last_successful_session_preparation_at(site_key)
@@ -336,15 +337,16 @@ class BrowserAutomationService:
         if not last_preparation_at:
             reason = "No previous successful session_preparation was found for this site."
         elif upload_needed:
-            reason = "The current Markdown resume is newer than the last successful session_preparation for this site."
+            reason = "The current apply resume PDF is newer than the last successful session_preparation for this site."
         else:
-            reason = "The current Markdown resume is not newer than the last successful session_preparation for this site."
+            reason = "The current apply resume PDF is not newer than the last successful session_preparation for this site."
         return [
             {
                 "role": "user",
                 "content": (
                     "Resume freshness context for this session_preparation phase:\n"
-                    f"- current_resume_markdown_updated_at: {resume_updated_at or '(missing)'}\n"
+                    f"- current_apply_resume_pdf_filename: {resume_pdf_path.name}\n"
+                    f"- current_apply_resume_pdf_updated_at: {resume_updated_at or '(missing)'}\n"
                     f"- last_successful_session_preparation_at: {last_preparation_at or '(none)'}\n"
                     f"- resume_upload_needed: {'true' if upload_needed else 'false'}\n"
                     f"- reason: {reason}\n"
@@ -425,15 +427,11 @@ class BrowserAutomationService:
         except Exception:
             return {}
 
-    def _latest_current_resume_markdown_updated_at(self) -> str:
-        current_dir = self.workspace / "cv" / "current"
-        if not current_dir.exists():
+    def _current_apply_resume_pdf_updated_at(self, resume_pdf_path: Path) -> str:
+        path = Path(resume_pdf_path)
+        if not path.is_file():
             return ""
-        candidates = [path for path in current_dir.glob("*.md") if path.is_file()]
-        if not candidates:
-            return ""
-        latest = max(candidates, key=lambda path: path.stat().st_mtime)
-        return datetime.fromtimestamp(latest.stat().st_mtime).isoformat(timespec="seconds")
+        return datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
 
     def _last_successful_session_preparation_at(self, site_key: str) -> str:
         path = self.site_store.site_dir(site_key) / "events" / "all.jsonl"

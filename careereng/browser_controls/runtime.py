@@ -1228,6 +1228,7 @@ class BrowserPhaseRuntime:
     def _tool_call_made_runtime_progress(
         cls,
         *,
+        phase: PhasePrompt,
         tool_name: str,
         error_text: str,
         pre_progress_key: str,
@@ -1257,6 +1258,8 @@ class BrowserPhaseRuntime:
                 "metrics_count",
                 "cleared_count",
             )
+        if phase.slug == "apply" and tool_name == "browser_click":
+            return True
         if tool_name in cls.FORM_STATE_ACTION_TOOLS:
             return True
         return False
@@ -3639,6 +3642,7 @@ class BrowserPhaseRuntime:
                         )
                         no_progress_result = track_same_url_no_progress(
                             made_progress=self._tool_call_made_runtime_progress(
+                                phase=phase,
                                 tool_name=name,
                                 error_text=error_text,
                                 pre_progress_key=pre_tool_progress_key,
@@ -3997,6 +4001,7 @@ class BrowserPhaseRuntime:
                     )
                     no_progress_result = track_same_url_no_progress(
                         made_progress=self._tool_call_made_runtime_progress(
+                            phase=phase,
                             tool_name=name,
                             error_text=error_text,
                             pre_progress_key=pre_tool_progress_key,

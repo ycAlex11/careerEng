@@ -36,6 +36,7 @@ apply_enabled: true
 - In `Resume Manager`, compare the visible Qualcomm resume filename against the current staged resume filename from the run context.
 - If the current staged resume filename is not visibly present, upload the current staged resume PDF there.
 - Treat the Qualcomm resume step as satisfied only when the current staged resume filename is visibly present in `Resume Manager`.
+- After the current staged resume filename is visibly present, treat it as the latest resume version.
 - As soon as that Qualcomm resume step is satisfied, write it into `update_phase_memory` and mark `Resume Manager` as do-not-repeat for the current unchanged setup state.
 - Once the Qualcomm resume step is satisfied, stop treating `Resume Manager` as the next target.
 - If the resume dialog is still open after the Qualcomm resume step is satisfied, close it.
@@ -57,6 +58,7 @@ apply_enabled: true
 - Do not substitute another resume area, profile section, or settings page for `Resume Manager`.
 - Do not open or re-open `Resume Manager` when `resume_upload_needed = false` unless the live page clearly shows the remote resume is missing, mismatched, or unusable.
 - Do not upload a different file when the current staged resume filename is already visibly present in the Qualcomm resume manager.
+- Do not delete old resume files during `Session Preparation`; old remote resume cleanup is non-blocking and should not delay login/session readiness.
 - Do not reopen `Resume Manager` after the current staged resume filename has already been confirmed there in the current `session_preparation` run.
 
 ## Application Status Review

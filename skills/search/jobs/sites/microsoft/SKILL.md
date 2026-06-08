@@ -37,6 +37,7 @@ apply_enabled: true
 - In `Resume Manager`, compare the visible Microsoft resume filename against the current staged resume filename from the run context.
 - If the current staged resume filename is not visibly present, upload the current staged resume PDF there.
 - Treat the Microsoft resume step as satisfied only when the current staged resume filename is visibly present in `Resume Manager`.
+- After the current staged resume filename is visibly present, treat it as the latest resume version.
 - As soon as that Microsoft resume step is satisfied, write it into `update_phase_memory` and mark `Resume Manager` as do-not-repeat for the current unchanged setup state.
 - Once the Microsoft resume step is satisfied, stop treating `Resume Manager` as the next target.
 - If the resume dialog is still open after the Microsoft resume step is satisfied, close it.
@@ -62,6 +63,7 @@ apply_enabled: true
 - Do not substitute another resume area, profile section, or settings page for `Resume Manager`.
 - Do not open or re-open `Resume Manager` when `resume_upload_needed = false` unless the live page clearly shows the remote resume is missing, mismatched, or unusable.
 - Do not upload a different file when the current staged resume filename is already visibly present in Microsoft `Resume Manager`.
+- Do not delete old resume files during `Session Preparation`; old remote resume cleanup is non-blocking and should not delay login/session readiness.
 - Do not reopen `Resume Manager` after the current staged resume filename has already been confirmed there in the current `session_preparation` run.
 
 ## Application Status Review
@@ -167,9 +169,14 @@ apply_enabled: true
 - After moving to another Microsoft results page, discard assumptions from the previous page and re-read only the current visible page.
 - Record the current Microsoft results page before any stop decision.
 - Prefer reading the current Microsoft results page as-is before opening any single job detail.
+- Microsoft result cards can expose enough retrieval data directly: title, role URL, location, posted label, and Microsoft match label such as `Strong match` or `Good match`.
+- If the visible result cards expose role `href` values such as `/careers/job/...`, record all visible current-page cards immediately with one `record_jobs` call. Do not keep evaluating DOM selectors after those card fields are available.
+- If the page shows a small complete results set such as `4 jobs` and pagination `1 of 1`, and the visible cards have concrete role URLs, call `record_jobs` before any additional card clicks, detail-pane exploration, or DOM probing.
+- Treat each visible card anchor with id shaped like `job-card-...-job-list` or aria label `View job: ...` as the current-page job URL source when its `href` is present.
 - Treat the current Microsoft search or results-page address as page state only, not as the role link for the visible jobs on that page.
 - If the current Microsoft page still leaves some list-level fields or role links unclear, stay on that same results page, do one same-page supplemental read, and then record that page.
 - If Microsoft only reveals a missing link or list field after selecting one current-page result card, stay on that same results page, select that current-page result, refresh the current-page read, and continue filling only the still-missing roles for that same page.
+- Selecting a result card is a fallback for missing data only. After a card click or one supplemental same-page read reveals the missing field, record the current page; do not inspect every card one-by-one when the list cards already contain usable URLs and labels.
 - Use a selected-role link only for that matching visible role. Do not reuse one selected-role link for other roles on the page.
 - Treat `Apply now` or `/careers/apply?pid=...` as an application-entry link, not as the preferred job-detail URL for the current visible results page.
 - Do not treat Microsoft `Similar jobs`, recommendations, or related-role links as members of the current paginated results set.
@@ -197,8 +204,13 @@ apply_enabled: true
 - Compare the current live page's selected Microsoft resume name against the staged resume basename from the apply context.
 - If the selected Microsoft resume name already matches that staged basename, treat the `Resume` section as satisfied and continue without uploading again.
 - Only if the selected Microsoft resume name is different from the staged basename or the page clearly shows no usable selected resume, click `Upload new`, then upload the staged PDF, then re-read the same page and confirm the staged basename is now selected before moving on.
+- For Microsoft application-location selection, if a `Select All` button is visible, click it once. If the click fails because the element ref is stale, take a fresh snapshot and click the current visible `Select All` control once; do not retry stale refs.
+- Microsoft yes/no dropdowns often appear as custom `role=combobox` text inputs with placeholder `Select`, not native HTML `<select>` elements.
+- Do not use select-option style form filling on Microsoft custom combobox inputs. If the target field is a `role=combobox` input, click the input, wait for the listbox/options to open, then click the visible `Yes` or `No` option matching the rule below.
+- After choosing a Microsoft combobox option, re-read the same field or page section and confirm the selected value is visible before moving to the next required field.
 - For gender questions, answer `Male`.
 - For policy, compliance, code-of-conduct, or similar acknowledgement questions, select `Yes`.
+- For Microsoft acknowledgement checkboxes, click the visible `Yes` checkbox directly. If the checkbox state is still unchecked after reading it, click it once more only after taking a fresh snapshot.
 - For legal right-to-work or authorization questions, select `Yes`.
 - For sponsorship, visa-transfer, or future-visa-requirement questions, select `No`.
 - For routine identity, eligibility, and acknowledgement fields, use the fixed rules above and lightweight apply facts without requesting full CV/persona.

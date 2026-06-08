@@ -141,11 +141,11 @@ Recommended flow:
 
 ```bash
 careereng resume upload --file ./resume.md
-careereng resume export-pdf --file ./resume.md --output resume.cv.pdf
+careereng resume export-pdf --file ./resume.md
 careereng profile generate
 ```
 
-`resume upload` syncs the resume into the workspace and updates profile context. `resume export-pdf` converts Markdown to PDF through Typst, archives changed Markdown into history, and keeps `workspace/cv/exports/` focused on the current apply PDF.
+`resume upload` syncs the resume into the workspace and updates profile context. `resume export-pdf` converts Markdown to PDF through Typst, archives changed Markdown into history, and keeps `workspace/cv/exports/` focused on the current apply PDF. By default, the exported PDF filename includes a timestamp and content hash, which helps career sites detect that a newer resume should be uploaded.
 
 ## Quick Start
 
@@ -156,7 +156,7 @@ careereng onboard
 
 # 1. Add resume and generate persona
 careereng resume upload --file ./resume.md
-careereng resume export-pdf --file ./resume.md --output resume.cv.pdf
+careereng resume export-pdf --file ./resume.md
 careereng profile generate
 
 # 2. Ask for target companies
@@ -350,7 +350,7 @@ These files are intentionally local-first. They can support later improvements s
 | `careereng onboard` | Create local config and workspace scaffolding. |
 | `careereng run -m "..."` | Send a normal chat/search/site-management instruction. |
 | `careereng resume upload --file ./resume.md` | Import resume text into the workspace. |
-| `careereng resume export-pdf --file ./resume.md --output resume.cv.pdf` | Convert Markdown resume to the apply-ready PDF. |
+| `careereng resume export-pdf --file ./resume.md` | Convert Markdown resume to the apply-ready PDF with a timestamp/hash filename. |
 | `careereng profile generate` | Generate or update `persona.md`. |
 | `careereng site add "Microsoft" --url https://careers.microsoft.com` | Register a company career site directly. |
 | `careereng site bootstrap "Apple" --url https://jobs.apple.com` | Prepare a draft site AI Skill action card and evidence pack for a new site without running browser phases. |
@@ -406,6 +406,7 @@ CareerEng is designed as a human-in-the-loop local assistant, not a blind auto-s
 - Keep `browser.headless = false` while developing or debugging site skills.
 - Review generated site skills before enabling `apply_enabled: true`.
 - Do not store multiple apply PDFs in `workspace/cv/exports/`.
+- Prefer the default timestamp/hash resume PDF filename; avoid fixed names such as `resume.cv.pdf` unless you have a specific reason.
 - Use `careereng batch-clear` to mark stale open batches as cancelled; it does not kill OS browser processes.
 - If a site gets stuck after network instability or page reloads, stop the run and restart from the CLI rather than editing browser state manually.
 

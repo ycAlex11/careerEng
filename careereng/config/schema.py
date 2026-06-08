@@ -48,8 +48,8 @@ class BrowserBudgetsConfig:
 class BrowserGuardsConfig:
     same_url_no_progress_tool_call_limit: int = 5
     same_url_no_progress_token_limit: int = 60000
-    apply_same_url_no_progress_tool_call_limit: int = 5
-    apply_same_url_no_progress_token_limit: int = 180000
+    apply_same_url_no_progress_tool_call_limit: int = 15
+    apply_same_url_no_progress_token_limit: int = 260000
 
 
 @dataclass

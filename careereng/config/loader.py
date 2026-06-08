@@ -80,8 +80,8 @@ debug_session_preparation_timeout_seconds = 600
 [browser.guards]
 same_url_no_progress_tool_call_limit = 5
 same_url_no_progress_token_limit = 60000
-apply_same_url_no_progress_tool_call_limit = 5
-apply_same_url_no_progress_token_limit = 180000
+apply_same_url_no_progress_tool_call_limit = 15
+apply_same_url_no_progress_token_limit = 260000
 
 [evolution.apply_probe]
 max_attempted = 8
