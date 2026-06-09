@@ -26,7 +26,12 @@ from careereng.browser_context import (
     WorkflowMemoryStore,
     extract_failure_snapshot_from_trace,
 )
-from careereng.config.schema import BrowserBudgetsConfig, BrowserGuardsConfig, BrowserRetrievalPolicyConfig
+from careereng.config.schema import (
+    BrowserBudgetsConfig,
+    BrowserGuardsConfig,
+    BrowserRecoveryConfig,
+    BrowserRetrievalPolicyConfig,
+)
 from careereng.resume.export import default_apply_resume_pdf_path
 from careereng.storage.jsonl import JSONLStore
 from careereng.utils import now_iso
@@ -94,6 +99,7 @@ class BrowserAutomationService:
         browser_name: str,
         budgets: BrowserBudgetsConfig | None = None,
         guards: BrowserGuardsConfig | None = None,
+        recovery: BrowserRecoveryConfig | None = None,
         retrieval_policy: BrowserRetrievalPolicyConfig | None = None,
     ):
         self.project_root = Path(project_root).resolve()
@@ -104,6 +110,7 @@ class BrowserAutomationService:
         self.timeout_ms = int(timeout_ms or 45000)
         self.browser_name = browser_name or "chrome"
         self.guards = guards or BrowserGuardsConfig()
+        self.recovery = recovery or BrowserRecoveryConfig()
         self.retrieval_policy = retrieval_policy or BrowserRetrievalPolicyConfig()
         self.budgets = budgets or BrowserBudgetsConfig(
             phase_timeout_seconds=int(phase_timeout_seconds or 180),
@@ -143,6 +150,12 @@ class BrowserAutomationService:
             ),
             apply_same_url_no_progress_token_limit=int(
                 self.guards.apply_same_url_no_progress_token_limit
+            ),
+            recovery_snapshot_timeout_seconds=int(
+                self.recovery.snapshot_timeout_seconds
+            ),
+            recovery_max_attempts=int(
+                self.recovery.max_attempts
             ),
         )
         self.phase_runtime: BrowserPhaseRuntime | Any | None = None

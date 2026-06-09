@@ -158,7 +158,7 @@ apply_enabled: true
 ## Job Retrieval
 
 - Record Qualcomm jobs from the current filtered live jobs surface.
-- Record results page by page until Qualcomm shows no further real next-page or load-more action.
+- Record results page by page until a site/project retrieval stop condition is met or Qualcomm shows no further real next-page or load-more action.
 - Read each job from the job card shown on the current results page.
 - Required fields are `title` and `url`.
 - If the same job card also shows them, include `location` and `posted_label`.
@@ -172,6 +172,11 @@ apply_enabled: true
 - Once the current page's job cards have usable `title + url` records, call `record_jobs`.
 - After a Qualcomm page is recorded, write concise `retrieval_carry_forward` memory for that successful job-card-link read before moving to the next page.
 - On the next Qualcomm results page, first reuse that remembered job-card-link read on the current live page before trying a different route.
+- Treat posted-date or posted-age filters as apply-candidate eligibility first, not as an immediate pagination stop.
+- Do not stop Qualcomm retrieval only because one or a few visible jobs on the current page are outside the preferred posted window.
+- After `record_jobs` succeeds for the current Qualcomm page, continue to the next page when the current page contains any in-window role, any `new` history match, or any `existing_needs_enrichment` result and a real next-page / load-more control is available.
+- Stop Qualcomm retrieval only after the current page has been recorded and one of these is true: the current visible page is entirely outside the preferred posted window on a clearly newest-first listing; `record_jobs` returns `stop_recommended = true` with no enrichment needed; or there is no real next-page / load-more control.
+- If the current page mixes in-window and older roles, record the full page and then continue pagination when a real next-page / load-more control is available.
 
 ## Apply
 

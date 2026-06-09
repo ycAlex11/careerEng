@@ -39,6 +39,8 @@ class BrowserRuntimeConfig:
     same_url_no_progress_token_limit: int = 0
     apply_same_url_no_progress_tool_call_limit: int = 0
     apply_same_url_no_progress_token_limit: int = 0
+    recovery_snapshot_timeout_seconds: int = 90
+    recovery_max_attempts: int = 3
 
 
 @dataclass(frozen=True)
@@ -828,17 +830,43 @@ class BrowserPhaseRuntime:
     def _response_turn_timeout_seconds(self, *, deadline: float) -> float:
         remaining = max(0.1, float(deadline - time.monotonic()))
         step_timeout = max(1.0, float(self.config.step_timeout_seconds or 30))
-        return max(0.1, min(remaining, step_timeout))
+        recovery_timeout = max(1.0, float(self.config.recovery_snapshot_timeout_seconds or step_timeout))
+        return max(0.1, min(remaining, step_timeout, recovery_timeout))
 
     @staticmethod
-    def _response_turn_timeout_message(*, current_url: str, timeout_seconds: float) -> str:
+    def _browser_recovery_message(
+        *,
+        phase: PhasePrompt,
+        reason: str,
+        current_url: str,
+        previous_url: str = "",
+        attempt: int = 1,
+        max_attempts: int = 3,
+        timeout_seconds: float = 0.0,
+        detail: str = "",
+    ) -> str:
         url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        previous_line = f"Previous page URL before recovery snapshot: {previous_url}\n" if previous_url else ""
+        changed_line = ""
+        if previous_url and current_url:
+            changed_line = f"Page URL changed during recovery: {'yes' if previous_url != current_url else 'no'}\n"
+        timeout_line = f"Recovery timeout budget: {timeout_seconds:.1f}s\n" if timeout_seconds > 0 else ""
+        detail_line = f"Recovery detail: {detail}\n" if detail else ""
         return (
-            "The previous model response turn timed out before producing any tool call.\n"
+            "Runtime recovery: a fresh live browser snapshot was captured after an interrupted or stale browser-control turn.\n"
+            f"Phase: {phase.slug}\n"
+            f"Reason: {reason}\n"
+            f"Recovery attempt: {max(1, int(attempt or 1))}/{max(1, int(max_attempts or 1))}\n"
+            f"{timeout_line}"
+            f"{previous_line}"
             f"{url_line}"
-            f"Turn timeout budget: {timeout_seconds:.1f}s\n"
-            "Continue from the current live page and issue the next concrete browser action or phase_result now. "
-            "Do not treat the timed-out turn as completion."
+            f"{changed_line}"
+            f"{detail_line}"
+            "Treat the attached fresh snapshot as the only source of truth for the current page. "
+            "Treat old refs, previous tool arguments, and pre-recovery page observations as stale history. "
+            "Do not repeat stale refs. "
+            "If the current page shows a terminal state for this phase, call the phase-specific state update tool or phase_result now. "
+            "If it is not terminal, continue from the current page with one concrete next action."
         )
 
     @classmethod
@@ -1641,21 +1669,6 @@ class BrowserPhaseRuntime:
             r"\belement is not attached to the dom\b",
         )
         return any(re.search(pattern, normalized) for pattern in patterns)
-
-    @staticmethod
-    def _stale_context_recovery_message(*, current_url: str, tool_name: str, error_text: str) -> str:
-        url_line = f"Current page URL: {current_url}\n" if current_url else ""
-        tool_line = f"Failed tool: {tool_name}\n" if tool_name else ""
-        error_line = f"Observed stale-context error: {error_text}\n" if error_text else ""
-        return (
-            "Runtime note: the previous tool call used stale page context for the current live page.\n"
-            f"{url_line}"
-            f"{tool_line}"
-            f"{error_line}"
-            "A fresh live browser snapshot of the current page is attached separately. "
-            "Treat the failed call and any remaining tool calls from that same response as stale history. "
-            "Continue only from the fresh current live page."
-        )
 
     @classmethod
     def _is_unresolved_job_url(cls, *, job_url: str, current_url: str) -> bool:
@@ -2732,7 +2745,7 @@ class BrowserPhaseRuntime:
         failed_page_action_signature = ""
         failed_page_action_name = ""
         response_turn_timeout_count = 0
-        max_response_turn_timeouts = max(1, int(self.config.max_step_retries or 0)) + 1
+        max_response_turn_timeouts = max(1, int(self.config.recovery_max_attempts or 0))
         last_record_jobs_policy: dict[str, Any] = {}
         retrieval_policy_pagination_violation_count = 0
         same_url_no_progress_key = ""
@@ -2946,6 +2959,7 @@ class BrowserPhaseRuntime:
                     response = await self._create_response_with_retry(response_payload)
             except TimeoutError:
                 response_turn_timeout_count += 1
+                previous_url = current_url
                 snapshot_payload = await self._capture_snapshot_payload(
                     bridge=bridge,
                     session=session,
@@ -2961,27 +2975,34 @@ class BrowserPhaseRuntime:
                     snapshot_url = MCPToolBridge.extract_current_url(snapshot_payload)
                     if snapshot_url:
                         current_url = snapshot_url
-                history_items = [
-                    self._context_item(
-                        self._response_turn_timeout_message(
-                            current_url=current_url,
-                            timeout_seconds=turn_timeout_seconds,
-                        )
-                    )
-                ]
+                history_items = []
                 if (
                     isinstance(latest_snapshot_payload, dict)
                     and latest_snapshot_payload
                     and not bool(latest_snapshot_payload.get("isError"))
                 ):
                     history_items.append(self._context_item(self._live_snapshot_primary_message()))
+                history_items.append(
+                    self._context_item(
+                        self._browser_recovery_message(
+                            phase=phase,
+                            reason="response_turn_timeout",
+                            current_url=current_url,
+                            previous_url=previous_url,
+                            attempt=response_turn_timeout_count,
+                            max_attempts=max_response_turn_timeouts,
+                            timeout_seconds=turn_timeout_seconds,
+                            detail="The previous model response turn timed out before producing any tool call.",
+                        )
+                    )
+                )
                 if response_turn_timeout_count >= max_response_turn_timeouts:
                     return BrowserPhaseResult(
                         status="failed",
-                        reason_tag="response_turn_timeout",
+                        reason_tag="recovery_exhausted",
                         summary=(
-                            f"model response turn timed out {response_turn_timeout_count} times "
-                            "without producing a tool call"
+                            f"browser recovery exhausted after {response_turn_timeout_count} response timeout attempt(s) "
+                            "without model tool progress"
                         ),
                         current_url=current_url,
                         step_count=step_count,
@@ -4078,6 +4099,7 @@ class BrowserPhaseRuntime:
                         failed_page_action_name = str(name or "").strip()
                         if phase_memory.has_recent_actions():
                             phase_memory.keep_last_recent_action()
+                    previous_url = current_url
                     await self._sleep(min(2.0, max(0.25, float(self.config.step_timeout_seconds or 1) / 10.0)))
                     snapshot_payload = await self._capture_snapshot_payload(
                         bridge=bridge,
@@ -4105,34 +4127,44 @@ class BrowserPhaseRuntime:
                             history_items.append(self._context_item(self._live_snapshot_primary_message()))
                         history_items.append(
                             self._context_item(
-                                self._stale_context_recovery_message(
+                                self._browser_recovery_message(
+                                    phase=phase,
+                                    reason="stale_context",
                                     current_url=current_url,
-                                    tool_name=name,
-                                    error_text=error_text,
+                                    previous_url=previous_url,
+                                    detail=(
+                                        "The previous tool call used stale page context for the current live page. "
+                                        f"Failed tool: {name}. Observed stale-context error: {error_text}"
+                                    ),
                                 )
                             )
                         )
                     else:
-                        history_items = [
-                            tool_feedback,
-                            self._context_item(
-                                self._page_action_failure_recovery_message(
-                                    current_url=current_url,
-                                    tool_name=failed_page_action_name or name,
-                                )
-                                if page_action_failed
-                                else (
-                                    f"The previous tool call {name} failed with: {error_text}. "
-                                    "Wait briefly if needed, then continue from the current page state with the official tools."
-                                )
-                            )
-                        ]
+                        history_items = [tool_feedback]
                         if (
                             isinstance(snapshot_payload, dict)
                             and snapshot_payload
                             and not bool(snapshot_payload.get("isError"))
                         ):
                             history_items.append(self._context_item(self._live_snapshot_primary_message()))
+                        history_items.append(
+                            self._context_item(
+                                self._browser_recovery_message(
+                                    phase=phase,
+                                    reason="page_action_failed" if page_action_failed else "tool_call_failed",
+                                    current_url=current_url,
+                                    previous_url=previous_url,
+                                    detail=(
+                                        self._page_action_failure_recovery_message(
+                                            current_url=current_url,
+                                            tool_name=failed_page_action_name or name,
+                                        )
+                                        if page_action_failed
+                                        else f"The previous tool call {name} failed with: {error_text}."
+                                    ),
+                                )
+                            )
+                        )
                     retry_requested = True
                     break
                 if not error_text and self._is_page_settle_action(name):

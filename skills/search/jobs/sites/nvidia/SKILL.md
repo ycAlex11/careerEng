@@ -134,11 +134,14 @@ apply_enabled: true
 - Do not open a single NVIDIA job detail before the current NVIDIA results page has been recorded.
 - Retrieve NVIDIA jobs from the current live listing and keep the retrieved results for later filtering and decision-making.
 - For NVIDIA, only keep roles posted within the last 10 days for application consideration.
-- If a visible NVIDIA role is marked older than 10 days, do not keep it as an apply candidate.
-- If the current NVIDIA results page is sorted newest first and the visible page contains any role older than 10 days, finish recording only the within-window roles from that page, then stop retrieval without opening the next page.
+- Treat the 10-day posted-age rule as apply-candidate eligibility, not as an immediate pagination stop.
+- If a visible NVIDIA role is marked older than 10 days, record it when it is part of the current visible page, but do not keep it as an apply candidate.
+- Do not stop retrieval only because one or a few visible roles on the current page are older than 10 days.
 - If the live NVIDIA page still shows result signals such as page labels, visible job cards, or pagination but the current attempt returns zero jobs, capture a fresh snapshot and retry the same current results page once before stopping or paginating.
 - Treat `Posted 10+ Days Ago` or any larger age signal as an old-role signal.
-- If the current visible NVIDIA page contains any roles marked older than 10 days, finish recording that full page and then stop retrieval without opening the next page.
+- After `record_jobs` succeeds for the current NVIDIA page, continue to the next page when the current page contains any role within the last 10 days, any `new` history match, or any `existing_needs_enrichment` result and a real next-page control is available.
+- Stop NVIDIA retrieval only after the current page has been recorded and one of these is true: the current visible page has no roles within the last 10 days on a clearly newest-first listing; `record_jobs` returns `stop_recommended = true` with no enrichment needed; or there is no real next-page / load-more control.
+- If the current page mixes within-window and older roles, record the full page and then continue pagination when a real next-page control is available.
 
 ## Apply
 

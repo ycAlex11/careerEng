@@ -53,6 +53,12 @@ class BrowserGuardsConfig:
 
 
 @dataclass
+class BrowserRecoveryConfig:
+    snapshot_timeout_seconds: int = 90
+    max_attempts: int = 3
+
+
+@dataclass
 class BrowserRetrievalPolicyConfig:
     history_stop_success_ratio: float = 0.4
     history_stop_min_page_jobs: int = 10
@@ -92,6 +98,7 @@ class BrowserConfig:
     mcp_port_start: int = 8931
     budgets: BrowserBudgetsConfig = field(default_factory=BrowserBudgetsConfig)
     guards: BrowserGuardsConfig = field(default_factory=BrowserGuardsConfig)
+    recovery: BrowserRecoveryConfig = field(default_factory=BrowserRecoveryConfig)
     retrieval_policy: BrowserRetrievalPolicyConfig = field(default_factory=BrowserRetrievalPolicyConfig)
 
 

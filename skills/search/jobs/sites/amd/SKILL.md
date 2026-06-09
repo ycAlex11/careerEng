@@ -74,7 +74,7 @@ apply_enabled: true
 
 - Record all reachable AMD jobs from the current filtered live jobs surface.
 - Record the full current AMD results page before deciding whether to stop or paginate.
-- Keep recording AMD results page by page until the final reachable results page has been recorded.
+- Keep recording AMD results page by page until a site/project retrieval stop condition is met or the final reachable results page has been recorded.
 - Do not stop early just because one current page contains enough jobs.
 - Do not open individual job detail pages just to retrieve the current visible page list.
 
@@ -93,6 +93,11 @@ apply_enabled: true
 
 - After recording the current page, use a real visible next-page, numbered-page, or load-more control when available.
 - Move sequentially page by page.
+- Treat posted-date or posted-age filters as apply-candidate eligibility first, not as an immediate pagination stop.
+- Do not stop AMD retrieval only because one or a few visible jobs on the current page are outside the preferred posted window.
+- After `record_jobs` succeeds for the current AMD page, continue to the next page when the current page contains any in-window role, any `new` history match, or any `existing_needs_enrichment` result and a real next-page / load-more control is available.
+- Stop AMD retrieval only after the current page has been recorded and one of these is true: the current visible page is entirely outside the preferred posted window on a clearly newest-first listing; `record_jobs` returns `stop_recommended = true` with no enrichment needed; or there is no real next-page / load-more control.
+- If the current page mixes in-window and older roles, record the full page and then continue pagination when a real next-page / load-more control is available.
 - If AMD shows a total count or page label that implies more results, re-check the jobs pagination/footer area before declaring retrieval complete.
 - Finish only when the current page is recorded and no further real AMD next-page or load-more action is available.
 

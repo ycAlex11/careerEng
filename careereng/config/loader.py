@@ -13,6 +13,7 @@ from careereng.config.schema import (
     BrowserConfig,
     BrowserBudgetsConfig,
     BrowserGuardsConfig,
+    BrowserRecoveryConfig,
     BrowserRetrievalPolicyConfig,
     EvolutionApplyProbeConfig,
     EvolutionConfig,
@@ -82,6 +83,10 @@ same_url_no_progress_tool_call_limit = 5
 same_url_no_progress_token_limit = 60000
 apply_same_url_no_progress_tool_call_limit = 15
 apply_same_url_no_progress_token_limit = 260000
+
+[browser.recovery]
+snapshot_timeout_seconds = 90
+max_attempts = 3
 
 [evolution.apply_probe]
 max_attempted = 8
@@ -188,6 +193,7 @@ def load_config(project_root: Path) -> AppConfig:
     }
     budget_keys = set(asdict(BrowserBudgetsConfig()).keys())
     guard_keys = set(asdict(BrowserGuardsConfig()).keys())
+    recovery_keys = set(asdict(BrowserRecoveryConfig()).keys())
     retrieval_policy_keys = set(asdict(BrowserRetrievalPolicyConfig()).keys())
     apply_probe_keys = set(asdict(EvolutionApplyProbeConfig()).keys())
     stop_policy_keys = set(asdict(RetrievalStopPolicyConfig()).keys())
@@ -225,6 +231,11 @@ def load_config(project_root: Path) -> AppConfig:
                         if guard_key in guard_keys:
                             payload["browser"]["guards"][guard_key] = guard_value
                     continue
+                if key == "recovery" and isinstance(value, dict):
+                    for recovery_key, recovery_value in value.items():
+                        if recovery_key in recovery_keys:
+                            payload["browser"]["recovery"][recovery_key] = recovery_value
+                    continue
                 if key == "retrieval_policy" and isinstance(value, dict):
                     for policy_key, policy_value in value.items():
                         if policy_key in retrieval_policy_keys:
@@ -239,6 +250,10 @@ def load_config(project_root: Path) -> AppConfig:
                 if key in guard_keys:
                     # Backward compatibility for older root-level [browser] guard keys.
                     payload["browser"]["guards"][key] = value
+                    continue
+                if key in recovery_keys:
+                    # Backward compatibility for root-level [browser] recovery keys.
+                    payload["browser"]["recovery"][key] = value
                     continue
                 if key in retrieval_policy_keys:
                     # Backward compatibility for root-level [browser] retrieval policy keys.
@@ -290,6 +305,7 @@ def load_config(project_root: Path) -> AppConfig:
     browser_payload = dict(payload["browser"])
     browser_budgets_payload = browser_payload.pop("budgets", {})
     browser_guards_payload = browser_payload.pop("guards", {})
+    browser_recovery_payload = browser_payload.pop("recovery", {})
     browser_retrieval_policy_payload = browser_payload.pop("retrieval_policy", {})
     evolution_payload = dict(payload["evolution"])
     evolution_apply_probe_payload = dict(evolution_payload.get("apply_probe") or {})
@@ -340,6 +356,7 @@ def load_config(project_root: Path) -> AppConfig:
             **browser_payload,
             budgets=BrowserBudgetsConfig(**browser_budgets_payload),
             guards=BrowserGuardsConfig(**browser_guards_payload),
+            recovery=BrowserRecoveryConfig(**browser_recovery_payload),
             retrieval_policy=BrowserRetrievalPolicyConfig(**browser_retrieval_policy_payload),
         ),
         evolution=EvolutionConfig(apply_probe=EvolutionApplyProbeConfig(**evolution_apply_probe_payload)),

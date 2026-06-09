@@ -171,6 +171,10 @@ apply_enabled: true
 - Prefer reading the current Microsoft results page as-is before opening any single job detail.
 - Microsoft result cards can expose enough retrieval data directly: title, role URL, location, posted label, and Microsoft match label such as `Strong match` or `Good match`.
 - If the visible result cards expose role `href` values such as `/careers/job/...`, record all visible current-page cards immediately with one `record_jobs` call. Do not keep evaluating DOM selectors after those card fields are available.
+- If a current-page card read returns visible text containing title, location, posted label, and match label plus an `href` or card id containing the Microsoft PID, treat retrieval data as sufficient and call `record_jobs` immediately.
+- Do not perform repeated `browser_evaluate` calls on the same Microsoft result card after title, location, posted label, match label, and role URL/PID are already known.
+- Do not request or inspect large `outerHTML`, `cardHtml`, or full DOM fragments during Microsoft retrieval when the visible card text and `href` already contain enough fields to record the job.
+- If the current result set has only a small complete page such as 1-3 visible jobs, record those visible jobs immediately from the cards; do not spend additional steps trying to reconstruct richer metadata.
 - If the page shows a small complete results set such as `4 jobs` and pagination `1 of 1`, and the visible cards have concrete role URLs, call `record_jobs` before any additional card clicks, detail-pane exploration, or DOM probing.
 - Treat each visible card anchor with id shaped like `job-card-...-job-list` or aria label `View job: ...` as the current-page job URL source when its `href` is present.
 - Treat the current Microsoft search or results-page address as page state only, not as the role link for the visible jobs on that page.
