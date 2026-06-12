@@ -7,8 +7,44 @@ scope: site
 site_key: nvidia
 status: ready
 apply_enabled: true
+retrieval_policy:
+  preferred_sort: newest_first
+  posted_window_days: 30
+  posted_window_comparison: strictly_less_than
+  date_window_stop_enabled: true
+  history_fast_stop_enabled: true
+  unknown_posted_age: review
+apply_candidate_policy:
+  posted_window_days: 30
+  posted_window_comparison: strictly_less_than
+  unknown_posted_age: review
 ---
 # NVIDIA Site Skill
+
+## Site Policy
+
+### Retrieval Policy
+
+- NVIDIA roles should be retrieved from the current filtered Workday listing before any stop decision.
+- NVIDIA's preferred apply-candidate window is roles posted within the last 30 days, interpreted as posted age `0-29`.
+- Treat the 30-day posted-age rule as apply-candidate eligibility, not as an immediate pagination stop.
+- Stop retrieval only after the current page has been recorded and a safe newest-first, no-next-page, or no-results stop condition is met.
+
+### Application Review Policy
+
+- Review the signed-in Workday `Candidate Home` / `My Applications` surface before new job discovery.
+- Treat `Active` as realtime and inspect it fully inside the review window.
+- Treat `Inactive` as historical and stop early only when the current page is already covered by matched terminal local history, has no unmatched rows, and shows no status changes.
+- Record visible raw statuses such as `Application Received`, `Application in Review`, `In Process`, or `Declined` when available.
+
+## Matching Policy
+
+### Application Gate
+
+- Use the project common matching rule unless NVIDIA exposes a clearer site-native decision signal for the current role.
+- Do not apply to NVIDIA roles posted 30 days ago, `30+ Days Ago`, or older.
+- If posted timing cannot be confirmed as within the last 30 days after checking the live job page, mark the role `filtered_out`.
+- Hard-exclude intern, campus, student, new-grad, co-op, 校招, and 实习 roles before opening any apply flow.
 
 ## Session Preparation
 
@@ -133,14 +169,14 @@ apply_enabled: true
 - Record the full current NVIDIA results page before any stop decision.
 - Do not open a single NVIDIA job detail before the current NVIDIA results page has been recorded.
 - Retrieve NVIDIA jobs from the current live listing and keep the retrieved results for later filtering and decision-making.
-- For NVIDIA, only keep roles posted within the last 10 days for application consideration.
-- Treat the 10-day posted-age rule as apply-candidate eligibility, not as an immediate pagination stop.
-- If a visible NVIDIA role is marked older than 10 days, record it when it is part of the current visible page, but do not keep it as an apply candidate.
-- Do not stop retrieval only because one or a few visible roles on the current page are older than 10 days.
+- For NVIDIA, only keep roles posted within the last 30 days for application consideration, interpreted as posted age `0-29`.
+- Treat the 30-day posted-age rule as apply-candidate eligibility, not as an immediate pagination stop.
+- If a visible NVIDIA role is marked 30 days old, `30+ Days Ago`, or older, record it when it is part of the current visible page, but do not keep it as an apply candidate.
+- Do not stop retrieval only because one or a few visible roles on the current page are older than 30 days.
 - If the live NVIDIA page still shows result signals such as page labels, visible job cards, or pagination but the current attempt returns zero jobs, capture a fresh snapshot and retry the same current results page once before stopping or paginating.
-- Treat `Posted 10+ Days Ago` or any larger age signal as an old-role signal.
-- After `record_jobs` succeeds for the current NVIDIA page, continue to the next page when the current page contains any role within the last 10 days, any `new` history match, or any `existing_needs_enrichment` result and a real next-page control is available.
-- Stop NVIDIA retrieval only after the current page has been recorded and one of these is true: the current visible page has no roles within the last 10 days on a clearly newest-first listing; `record_jobs` returns `stop_recommended = true` with no enrichment needed; or there is no real next-page / load-more control.
+- Treat `Posted 30 Days Ago`, `Posted 30+ Days Ago`, or any larger age signal as an old-role signal.
+- After `record_jobs` succeeds for the current NVIDIA page, continue to the next page when the current page contains any role within the last 30 days, any `new` history match, or any `existing_needs_enrichment` result and a real next-page control is available.
+- Stop NVIDIA retrieval only after the current page has been recorded and one of these is true: the current visible page has no roles within the last 30 days on a clearly newest-first listing, or there is no real next-page / load-more control.
 - If the current page mixes within-window and older roles, record the full page and then continue pagination when a real next-page control is available.
 
 ## Apply
@@ -149,8 +185,8 @@ apply_enabled: true
 
 - NVIDIA does not add a stronger fit rule here by default.
 - Use the common matching rule from the project jobs skill unless the live page exposes a clearer site-native decision signal for the current role.
-- Do not apply to NVIDIA roles posted more than 10 days ago.
-- If the saved NVIDIA job lacks a reliable posted age or date, re-check the live job page before applying. If the posted timing still cannot be confirmed as within the last 10 days, mark the job as `filtered_out` instead of applying.
+- Do not apply to NVIDIA roles posted 30 days ago, `30+ Days Ago`, or older.
+- If the saved NVIDIA job lacks a reliable posted age or date, re-check the live job page before applying. If the posted timing still cannot be confirmed as within the last 30 days, mark the job as `filtered_out` instead of applying.
 
 ### Form Filling
 

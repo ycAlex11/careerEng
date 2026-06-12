@@ -10,6 +10,29 @@ apply_enabled: true
 ---
 # AMD Site Skill
 
+## Site Policy
+
+### Retrieval Policy
+
+- Retrieve AMD jobs from the current filtered live jobs surface before any stop decision.
+- Treat posted-date / posted-age rules as apply-candidate eligibility first, not as an immediate pagination stop.
+- Stop retrieval only after the current page has been recorded and a safe site/project stop condition is met.
+- Preserve successful retrieval carry-forward guidance for the current AMD result-card link shape.
+
+### Application Review Policy
+
+- Review AMD submitted applications only after login is confirmed.
+- AMD may land directly on a dashboard or past-submittals surface after login; use the visible application table as the review source.
+- Record visible raw statuses when AMD shows them, and use the table/section label when row-level status text is not visible.
+
+## Matching Policy
+
+### Application Gate
+
+- AMD uses the shared project matching rule unless a live page exposes a clearer site-native application state.
+- Re-check the live JD and application state before opening the apply flow.
+- Hard-exclude intern, campus, student, new-grad, co-op, 校招, and 实习 roles before opening any apply flow.
+
 ## Session Preparation
 
 ### Goal

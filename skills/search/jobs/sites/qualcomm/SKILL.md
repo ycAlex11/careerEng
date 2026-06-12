@@ -10,6 +10,31 @@ apply_enabled: true
 ---
 # Qualcomm Site Skill
 
+## Site Policy
+
+### Retrieval Policy
+
+- Retrieve Qualcomm roles from the current filtered Qualcomm job-card listing before any stop decision.
+- Treat posted-date / posted-age rules as apply-candidate eligibility first, not as an immediate pagination stop.
+- Stop retrieval only after the current page has been recorded and a safe site/project stop condition is met.
+- Preserve successful retrieval carry-forward guidance for the current result-card link shape.
+
+### Application Review Policy
+
+- Review Qualcomm `Dashboard` -> `Applications` after login and before new job discovery.
+- Inspect `Submitted` first, then `Inactive`, and inspect each area once.
+- Treat `Submitted` as current/active unless a row shows a clearer status.
+- Treat `Inactive` as historical and stop early only when the current page is already covered by matched terminal local history, has no unmatched rows, and shows no status changes.
+
+## Matching Policy
+
+### Application Gate
+
+- Qualcomm's visible match label is mandatory and overrides the shared project scoring rule.
+- Only `Strong Match` or `Good Match` allows the role to continue toward apply.
+- Missing, hidden, unclear, or weaker Qualcomm match labels mean `filtered_out`.
+- Hard-exclude intern, campus, student, new-grad, co-op, 校招, and 实习 roles before opening any apply flow.
+
 ## Session Preparation
 
 ### Goal

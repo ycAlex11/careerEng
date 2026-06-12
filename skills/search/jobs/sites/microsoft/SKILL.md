@@ -10,6 +10,32 @@ apply_enabled: true
 ---
 # Microsoft Site Skill
 
+## Site Policy
+
+### Retrieval Policy
+
+- Retrieve Microsoft roles from the current live Microsoft results page before any stop decision.
+- Microsoft often removes jobs that are no longer open, so keep the jobs returned by the current live listing for later filtering and decision-making.
+- Do not use time-based early-stop logic on Microsoft search results unless the active site skill is explicitly changed.
+- Move through visible Microsoft pagination sequentially and record each reachable page.
+
+### Application Review Policy
+
+- Review Microsoft `Action Center` -> `Applications` after login and before new job discovery.
+- Inspect `Submitted` first, then `Inactive`, and inspect each area once.
+- Treat `Submitted` as current/active unless a row shows a clearer status.
+- Treat `Inactive` as historical and stop early only when the current page is already covered by matched terminal local history, has no unmatched rows, and shows no status changes.
+
+## Matching Policy
+
+### Application Gate
+
+- Microsoft's own match signal is the highest-priority application gate.
+- Only roles labeled `Strong Match` or `Good Match` can continue toward apply.
+- If the live page does not show a clear Microsoft `Strong Match` or `Good Match`, mark the role `filtered_out`.
+- Do not fall back to the common project matching rule when the site-native Microsoft signal is absent, unclear, or weaker than `Good Match`.
+- Hard-exclude intern, campus, student, new-grad, co-op, 校招, and 实习 roles before opening any apply flow.
+
 ## Session Preparation
 
 ### Goal

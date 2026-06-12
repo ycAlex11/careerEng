@@ -10,6 +10,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from careereng.skill_schema import (
+    MATCHING_POLICY_SECTION,
+    SITE_POLICY_SECTION,
+    context_hash,
+    hash_text,
+    load_job_skill_policies,
+    policy_hash,
+    section_hash,
+    section_text,
+)
+from careereng.skill_schema.schema import file_hash
 from careereng.storage.jsonl import JSONLStore
 from careereng.utils import dump_front_matter, ensure_dir, make_id, now_iso, parse_front_matter, read_json, safe_file_stem, today_str, write_json
 
@@ -75,14 +86,16 @@ class SiteStore:
         "fit_source",
         "application_status",
         "last_apply_error",
+        "decision_reason_type",
         "decision_context_hash",
     )
     RUN_JOB_NUMERIC_FIELDS = (
         "match_score_initial",
         "match_score_final",
         "fit_confidence",
+        "observed_posted_age_days",
     )
-    RUN_JOB_BOOL_FIELDS = ("fit_apply",)
+    RUN_JOB_BOOL_FIELDS = ("fit_apply", "observed_posted_age_is_lower_bound")
 
     def __init__(self, workspace: Path, project_root: Path | None = None):
         self.workspace = Path(workspace)
@@ -132,6 +145,14 @@ class SiteStore:
         body = (
             "# Site Skill\n\n"
             "Use this file to describe how this site should be handled.\n\n"
+            "## Site Policy\n\n"
+            "### Retrieval Policy\n\n"
+            "- Describe site-specific posted-window rules, pagination stop rules, and whether old roles should still be recorded.\n\n"
+            "### Application Review Policy\n\n"
+            "- Describe how this site exposes submitted, active, inactive, rejected, closed, or withdrawn applications.\n\n"
+            "## Matching Policy\n\n"
+            "### Application Gate\n\n"
+            "- Describe site-native match labels, hard exclusions, and when the shared project matching rule should be used.\n\n"
             "## Session Preparation\n\n"
             "### Authentication\n\n"
             "- Describe whether manual login is needed and where the login flow begins.\n"
@@ -422,28 +443,53 @@ class SiteStore:
         write_json(path, current)
         return current
 
+    @staticmethod
+    def _safe_read_text(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+        except Exception:
+            return "<unreadable>"
+
+    @staticmethod
+    def _section_hash_with_fallback(markdown: str, section_title: str, fallback_title: str = "") -> str:
+        text = section_text(markdown, section_title)
+        if not text and fallback_title:
+            text = section_text(markdown, fallback_title)
+        return hash_text(text)
+
+    def decision_context_versions(self, site_id: str) -> dict[str, str]:
+        project_skill_path = self.project_root / "skills" / "search" / "jobs" / "SKILL.md"
+        site_skill_path = self.site_skill_path(site_id)
+        project_skill_text = self._safe_read_text(project_skill_path)
+        site_skill_text = self._safe_read_text(site_skill_path)
+        skill_policies = load_job_skill_policies(self.project_root, site_id)
+        retrieval_policy_hash = policy_hash(skill_policies.get("retrieval_policy", {}))
+        apply_candidate_policy_hash = policy_hash(skill_policies.get("apply_candidate_policy", {}))
+        profile_hash = context_hash(
+            {
+                "persona": file_hash(self.workspace / "profile" / "persona.md"),
+                "application_profile": file_hash(self.workspace / "profile" / "application_profile.md"),
+            }
+        )
+        return {
+            "cv_hash": file_hash(self.workspace / "cv" / "current" / "cv.md"),
+            "profile_hash": profile_hash,
+            "project_matching_policy_hash": self._section_hash_with_fallback(
+                project_skill_text,
+                MATCHING_POLICY_SECTION,
+                "Apply",
+            ),
+            "site_policy_hash": section_hash(site_skill_text, SITE_POLICY_SECTION),
+            "site_matching_policy_hash": self._section_hash_with_fallback(site_skill_text, MATCHING_POLICY_SECTION, "Apply"),
+            "site_apply_workflow_hash": section_hash(site_skill_text, "Apply"),
+            "retrieval_policy_hash": retrieval_policy_hash,
+            "apply_candidate_policy_hash": apply_candidate_policy_hash,
+        }
+
     def decision_context_hash(self, site_id: str) -> str:
-        paths = [
-            self.workspace / "cv" / "current" / "cv.md",
-            self.workspace / "profile" / "persona.md",
-            self.workspace / "profile" / "application_profile.md",
-            self.project_root / "skills" / "search" / "jobs" / "SKILL.md",
-            self.site_skill_path(site_id),
-        ]
-        digest = hashlib.sha256()
-        for path in paths:
-            label = str(path.relative_to(self.project_root) if path.is_relative_to(self.project_root) else path)
-            digest.update(label.encode("utf-8"))
-            digest.update(b"\0")
-            try:
-                data = path.read_bytes()
-            except FileNotFoundError:
-                data = b"<missing>"
-            except Exception:
-                data = b"<unreadable>"
-            digest.update(data)
-            digest.update(b"\0")
-        return digest.hexdigest()
+        return context_hash(self.decision_context_versions(site_id))
 
     def _load_history_jobs(self, site_id: str) -> list[dict[str, Any]]:
         path = self._history_jobs_path(site_id)
@@ -493,7 +539,68 @@ class SiteStore:
             "not_started_filtered_out",
         }:
             normalized["apply_state"] = "terminal_filtered_out"
+        if not str(normalized.get("decision_reason_type") or "").strip():
+            normalized["decision_reason_type"] = cls._infer_decision_reason_type(normalized)
+        posted_age = cls._infer_posted_age(normalized)
+        posted_age_days = posted_age.get("days")
+        if posted_age_days is not None and normalized.get("observed_posted_age_days") in (None, ""):
+            normalized["observed_posted_age_days"] = posted_age_days
+        if posted_age.get("is_lower_bound") and normalized.get("observed_posted_age_is_lower_bound") in (None, ""):
+            normalized["observed_posted_age_is_lower_bound"] = True
         return normalized
+
+    @staticmethod
+    def _normalize_decision_reason_type(value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        return normalized if normalized in {"time", "cv", "matching_policy", "hard_excluded", "unknown"} else ""
+
+    @classmethod
+    def _infer_decision_reason_type(cls, row: dict[str, Any]) -> str:
+        existing = cls._normalize_decision_reason_type(row.get("decision_reason_type"))
+        if existing:
+            return existing
+        text = " ".join(
+            str(row.get(field) or "")
+            for field in (
+                "title",
+                "posted_label",
+                "fit_reason",
+                "match_reason_initial",
+                "match_reason_final",
+                "last_apply_error",
+                "application_status",
+                "decision_status",
+            )
+        ).lower()
+        if any(token in text for token in ("intern", "internship", "new grad", "campus", "graduate program", "校招")):
+            return "hard_excluded"
+        if any(token in text for token in ("posted", "days ago", "older than", "time window", "date posted", "发布时间")):
+            return "time"
+        if any(token in text for token in ("cv", "resume", "persona", "profile", "full cv", "experience", "缺少", "不符合简历")):
+            return "cv"
+        if any(token in text for token in ("match", "matching", "threshold", "score", "strong match", "good match", "rule")):
+            return "matching_policy"
+        return "unknown"
+
+    @staticmethod
+    def _infer_posted_age_days(row: dict[str, Any]) -> int | None:
+        posted_age = SiteStore._infer_posted_age(row)
+        days = posted_age.get("days")
+        return int(days) if days is not None else None
+
+    @staticmethod
+    def _infer_posted_age(row: dict[str, Any]) -> dict[str, Any]:
+        text = " ".join(
+            str(row.get(field) or "")
+            for field in ("posted_label", "posted_at", "fit_reason", "match_reason_initial", "match_reason_final")
+        )
+        match = re.search(r"\b(\d{1,4})\s*(\+)?\s*days?\b", text, flags=re.IGNORECASE)
+        if not match:
+            return {"days": None, "is_lower_bound": False}
+        try:
+            return {"days": int(match.group(1)), "is_lower_bound": bool(match.group(2))}
+        except Exception:
+            return {"days": None, "is_lower_bound": False}
 
     @classmethod
     def _normalize_history_row_for_write(cls, row: dict[str, Any]) -> dict[str, Any]:
@@ -848,6 +955,15 @@ class SiteStore:
         norm = parsed._replace(query=urlencode(sorted(kept_qs)), fragment="")
         return urlunparse(norm)
 
+    @staticmethod
+    def _coerce_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        if text in {"", "0", "false", "no", "off", "none", "null"}:
+            return False
+        return True
+
     def _job_ids(self, site_id: str, title: str, employer: str, url: str) -> tuple[str, str]:
         canonical_source = "|".join(
             [
@@ -1148,11 +1264,21 @@ class SiteStore:
             "site_job_id",
             "description_ref",
             "jd_sync_status",
+            "decision_reason_type",
             "decision_context_hash",
         ):
             value = str(incoming.get(field) or "").strip()
             if value:
                 merged[field] = value
+        if isinstance(incoming.get("context_versions"), dict):
+            merged["context_versions"] = dict(incoming["context_versions"])
+        if incoming.get("observed_posted_age_days") not in (None, ""):
+            try:
+                merged["observed_posted_age_days"] = int(float(incoming.get("observed_posted_age_days")))
+            except Exception:
+                pass
+        if incoming.get("observed_posted_age_is_lower_bound") not in (None, ""):
+            merged["observed_posted_age_is_lower_bound"] = self._coerce_bool(incoming.get("observed_posted_age_is_lower_bound"))
         ts = str(incoming.get("ts") or "").strip()
         if ts:
             merged["ts"] = ts
@@ -1192,7 +1318,15 @@ class SiteStore:
             (incoming_application_status == "filtered_out" or incoming_decision_status == "filtered_out")
             and not str(incoming.get("decision_context_hash") or "").strip()
         ):
-            incoming["decision_context_hash"] = self.decision_context_hash(str(incoming.get("site_id") or root.name))
+            site_key = str(incoming.get("site_id") or root.name)
+            context_versions = self.decision_context_versions(site_key)
+            incoming["context_versions"] = context_versions
+            incoming["decision_context_hash"] = context_hash(context_versions)
+        elif (
+            (incoming_application_status == "filtered_out" or incoming_decision_status == "filtered_out")
+            and not isinstance(incoming.get("context_versions"), dict)
+        ):
+            incoming["context_versions"] = self.decision_context_versions(str(incoming.get("site_id") or root.name))
 
         merged = dict(base)
         merged["job_id"] = job_id
@@ -1224,7 +1358,9 @@ class SiteStore:
                 continue
         for field in self.RUN_JOB_BOOL_FIELDS:
             if field in incoming:
-                merged[field] = bool(incoming.get(field))
+                merged[field] = self._coerce_bool(incoming.get(field))
+        if isinstance(incoming.get("context_versions"), dict):
+            merged["context_versions"] = dict(incoming["context_versions"])
 
         description = str(incoming.get("description") or "").strip()
         if description:
@@ -1404,6 +1540,166 @@ class SiteStore:
 
     def list_jobs(self, site_id: str) -> list[dict[str, Any]]:
         return self._load_history_jobs(site_id)
+
+    @classmethod
+    def _needs_decision_metadata_normalization(cls, row: dict[str, Any]) -> bool:
+        if not isinstance(row, dict):
+            return False
+        application_status = str(row.get("application_status") or "").strip().lower()
+        decision_status = str(row.get("decision_status") or "").strip().lower()
+        if application_status != "filtered_out" and decision_status != "filtered_out":
+            return False
+        if not cls._normalize_decision_reason_type(row.get("decision_reason_type")):
+            return True
+        if not isinstance(row.get("context_versions"), dict):
+            return True
+        if not str(row.get("decision_context_hash") or "").strip():
+            return True
+        return False
+
+    def history_normalization_candidates(self, site_id: str) -> list[dict[str, Any]]:
+        rows = self._load_history_jobs(site_id)
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            if not self._needs_decision_metadata_normalization(row):
+                continue
+            candidates.append(
+                {
+                    "job_id": str(row.get("job_id") or ""),
+                    "canonical_job_id": str(row.get("canonical_job_id") or ""),
+                    "site_job_id": str(row.get("site_job_id") or ""),
+                    "title": str(row.get("title") or ""),
+                    "url": str(row.get("url") or ""),
+                    "application_status": str(row.get("application_status") or ""),
+                    "decision_status": str(row.get("decision_status") or ""),
+                    "decision_reason_type": str(row.get("decision_reason_type") or ""),
+                    "decision_context_hash": str(row.get("decision_context_hash") or ""),
+                }
+            )
+        return candidates
+
+    def normalize_history_decision_metadata(self, site_id: str, *, max_rows: int = 10) -> dict[str, Any]:
+        rows = self._load_history_jobs(site_id)
+        candidate_indexes = [
+            idx for idx, row in enumerate(rows) if self._needs_decision_metadata_normalization(row)
+        ]
+        if not candidate_indexes:
+            return {"status": "none", "count": 0, "updated": 0}
+        if len(candidate_indexes) > max_rows:
+            return {"status": "needs_review", "count": len(candidate_indexes), "updated": 0}
+
+        updated = 0
+        for idx in candidate_indexes:
+            row = dict(rows[idx])
+            reason_type = self._infer_decision_reason_type(row)
+            if reason_type:
+                row["decision_reason_type"] = reason_type
+            if not isinstance(row.get("context_versions"), dict):
+                legacy_context = str(row.get("decision_context_hash") or "").strip()
+                row["context_versions"] = (
+                    {"legacy_decision_context_hash": legacy_context}
+                    if legacy_context
+                    else {"legacy_context": "unknown"}
+                )
+            if not str(row.get("decision_context_hash") or "").strip():
+                row["decision_context_hash"] = context_hash(row["context_versions"])
+            posted_age = self._infer_posted_age(row)
+            posted_age_days = posted_age.get("days")
+            if posted_age_days is not None and row.get("observed_posted_age_days") in (None, ""):
+                row["observed_posted_age_days"] = posted_age_days
+            if posted_age.get("is_lower_bound") and row.get("observed_posted_age_is_lower_bound") in (None, ""):
+                row["observed_posted_age_is_lower_bound"] = True
+            rows[idx] = row
+            updated += 1
+        self._write_history_jobs(site_id, rows)
+        return {"status": "updated", "count": len(candidate_indexes), "updated": updated}
+
+    @classmethod
+    def _context_changed_for_decision_reason(
+        cls,
+        *,
+        reason_type: str,
+        current_context_versions: dict[str, Any],
+        history_context_versions: dict[str, Any],
+        current_decision_context_hash: str,
+        history_decision_context_hash: str,
+    ) -> bool:
+        if not history_context_versions:
+            return bool(
+                current_decision_context_hash
+                and history_decision_context_hash
+                and current_decision_context_hash != history_decision_context_hash
+            )
+        if "legacy_context" in history_context_versions or "legacy_decision_context_hash" in history_context_versions:
+            return True
+        normalized_reason = cls._normalize_decision_reason_type(reason_type) or "unknown"
+        keys_by_reason = {
+            "time": ("site_policy_hash",),
+            "hard_excluded": ("site_policy_hash", "project_matching_policy_hash", "site_matching_policy_hash"),
+            "cv": ("cv_hash", "profile_hash"),
+            "matching_policy": ("project_matching_policy_hash", "site_matching_policy_hash"),
+        }
+        keys = keys_by_reason.get(normalized_reason)
+        if not keys:
+            return bool(
+                current_decision_context_hash
+                and history_decision_context_hash
+                and current_decision_context_hash != history_decision_context_hash
+            )
+        return any(
+            str(current_context_versions.get(key) or "") != str(history_context_versions.get(key) or "")
+            for key in keys
+        )
+
+    def apply_list_history_candidates(
+        self,
+        site_id: str,
+        *,
+        current_context_versions: dict[str, Any],
+        current_decision_context_hash: str,
+    ) -> list[dict[str, Any]]:
+        rows = self._load_history_jobs(site_id)
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            application_status = str(row.get("application_status") or "").strip().lower()
+            decision_status = str(row.get("decision_status") or "").strip().lower()
+            if application_status in {"already_applied", "submitted", "rejected", "closed", "withdrawn"}:
+                continue
+            include = False
+            reason = ""
+            if application_status in {"apply_failed", "blocked"}:
+                include = True
+                reason = f"retry previous {application_status}"
+            elif application_status == "filtered_out" or decision_status == "filtered_out":
+                reason_type = self._normalize_decision_reason_type(row.get("decision_reason_type")) or "unknown"
+                include = self._context_changed_for_decision_reason(
+                    reason_type=reason_type,
+                    current_context_versions=current_context_versions,
+                    history_context_versions=row.get("context_versions") if isinstance(row.get("context_versions"), dict) else {},
+                    current_decision_context_hash=current_decision_context_hash,
+                    history_decision_context_hash=str(row.get("decision_context_hash") or ""),
+                )
+                if include:
+                    reason = f"history filtered_out requeued because {reason_type} context changed"
+            if not include:
+                continue
+            candidate = dict(row)
+            for key in (
+                "application_status",
+                "decision_status",
+                "apply_state",
+                "last_apply_error",
+                "decision_context_hash",
+                "context_versions",
+            ):
+                candidate.pop(key, None)
+            candidate["requeued_from_history_job_id"] = str(row.get("job_id") or "")
+            candidate["requeue_reason"] = reason
+            candidate["site_id"] = site_id
+            candidates.append(candidate)
+        return candidates
 
     def list_run_jobs(self, site_id: str, batch_id: str) -> list[dict[str, Any]]:
         rows = JSONLStore(self._job_run_path(site_id, batch_id)).read_all()
@@ -1631,6 +1927,19 @@ class SiteStore:
             decision_context_hash = str(job.get("decision_context_hash") or "").strip()
             if decision_context_hash:
                 current["decision_context_hash"] = decision_context_hash
+            if isinstance(job.get("context_versions"), dict):
+                current["context_versions"] = dict(job["context_versions"])
+            reason_type = self._normalize_decision_reason_type(job.get("decision_reason_type"))
+            if reason_type:
+                current["decision_reason_type"] = reason_type
+            elif current["decision_status"] == "filtered_out" and not str(current.get("decision_reason_type") or "").strip():
+                current["decision_reason_type"] = self._infer_decision_reason_type(current)
+            posted_age = self._infer_posted_age(job)
+            posted_age_days = posted_age.get("days")
+            if posted_age_days is not None and current.get("observed_posted_age_days") in (None, ""):
+                current["observed_posted_age_days"] = posted_age_days
+            if posted_age.get("is_lower_bound") and current.get("observed_posted_age_is_lower_bound") in (None, ""):
+                current["observed_posted_age_is_lower_bound"] = True
             current["decision_updated_at"] = now_iso()
             changed = True
         if changed:
@@ -1670,6 +1979,13 @@ class SiteStore:
             decision_context_hash = str(app.get("decision_context_hash") or "").strip()
             if decision_context_hash:
                 current["decision_context_hash"] = decision_context_hash
+            if isinstance(app.get("context_versions"), dict):
+                current["context_versions"] = dict(app["context_versions"])
+            reason_type = self._normalize_decision_reason_type(app.get("decision_reason_type"))
+            if reason_type:
+                current["decision_reason_type"] = reason_type
+            elif str(status or "").strip().lower() == "filtered_out" and not str(current.get("decision_reason_type") or "").strip():
+                current["decision_reason_type"] = self._infer_decision_reason_type(current)
             apply_state = self._history_apply_state_for_application_status(status)
             if apply_state:
                 current["apply_state"] = apply_state

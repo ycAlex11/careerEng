@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import re
 from pathlib import Path
 
+from careereng.skill_schema import GLOBAL_SECTION_INJECTIONS
+
 
 @dataclass(frozen=True)
 class PhasePrompt:
@@ -34,6 +36,8 @@ def load_text(path: Path) -> str:
 
 def normalize_phase_name(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    if slug == "apply_workflow":
+        return "apply"
     return slug or "phase"
 
 
@@ -102,6 +106,22 @@ def extract_phase_sections(markdown: str) -> dict[str, str]:
     return sections
 
 
+def _global_section_texts(sections: dict[str, str], slug: str) -> list[str]:
+    parts: list[str] = []
+    for title, target_slugs in GLOBAL_SECTION_INJECTIONS.items():
+        if slug not in target_slugs:
+            continue
+        text = str(sections.get(title) or "").strip()
+        if text:
+            parts.append(f"### {title} (global)\n\n{text}")
+    return parts
+
+
+def _with_global_sections(section_text: str, global_sections: list[str]) -> str:
+    parts = [str(section_text or "").strip(), *[part.strip() for part in global_sections if part.strip()]]
+    return "\n\n".join(part for part in parts if part).strip()
+
+
 def build_phase_prompts(
     project_markdown: str,
     site_markdown: str,
@@ -124,20 +144,23 @@ def build_phase_prompts(
         site_ignore_by_slug[normalize_phase_name(title)] = ignore_phrases
     site_by_slug = {normalize_phase_name(title): text for title, text in site_sections.items()}
     project_titles_by_slug = {normalize_phase_name(title): title for title in project_sections.keys()}
+    global_section_slugs = {normalize_phase_name(title) for title in GLOBAL_SECTION_INJECTIONS.keys()}
 
     prompts: list[PhasePrompt] = []
     seen: set[str] = set()
 
     for title, project_text in project_sections.items():
         slug = normalize_phase_name(title)
+        if slug in global_section_slugs:
+            continue
         if allowed_slugs and slug not in allowed_slugs:
             continue
         prompts.append(
             PhasePrompt(
                 title=project_titles_by_slug.get(slug, title),
                 slug=slug,
-                project_text=project_text,
-                site_text=site_by_slug.get(slug, ""),
+                project_text=_with_global_sections(project_text, _global_section_texts(project_sections, slug)),
+                site_text=_with_global_sections(site_by_slug.get(slug, ""), _global_section_texts(site_sections, slug)),
                 ignore_phrases=_dedupe_phrases(
                     list(project_ignore_by_slug.get(slug, ())) + list(site_ignore_by_slug.get(slug, ()))
                 ),
@@ -147,6 +170,8 @@ def build_phase_prompts(
 
     for title, site_text in site_sections.items():
         slug = normalize_phase_name(title)
+        if slug in global_section_slugs:
+            continue
         if slug in seen:
             continue
         if allowed_slugs and slug not in allowed_slugs:
@@ -155,8 +180,8 @@ def build_phase_prompts(
             PhasePrompt(
                 title=title,
                 slug=slug,
-                project_text="",
-                site_text=site_text,
+                project_text=_with_global_sections("", _global_section_texts(project_sections, slug)),
+                site_text=_with_global_sections(site_text, _global_section_texts(site_sections, slug)),
                 ignore_phrases=site_ignore_by_slug.get(slug, ()),
             )
         )

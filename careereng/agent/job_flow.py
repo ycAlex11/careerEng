@@ -9,11 +9,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+from careereng.action_cards import ActionCardStore
+from careereng.action_cards.schema import ACTION_CARD_CODEX_REVIEW
 from careereng.config.schema import BrowserBudgetsConfig
 from careereng.evolution.apply_probe import apply_probe_counters
 from careereng.evolution.capabilities import EvolutionCapabilityStore
 from careereng.evolution.reports import create_apply_probe_report
 from careereng.reporting.job_report import generate_job_batch_report
+from careereng.skill_schema import load_job_skill_policies
 from careereng.storage.application_store import ApplicationStore
 from careereng.storage.job_store import JobStore
 from careereng.storage.job_planning import JobPlanningStore
@@ -805,6 +808,63 @@ class JobFlow:
         except Exception:
             return ""
 
+    def _decision_context_versions(self, site_key: str) -> dict[str, str]:
+        context_versions = getattr(self.site_tools.site_store, "decision_context_versions", None)
+        if not callable(context_versions):
+            return {}
+        try:
+            payload = context_versions(site_key)
+        except Exception:
+            return {}
+        return {str(key): str(value) for key, value in payload.items()} if isinstance(payload, dict) else {}
+
+    def _normalize_history_for_apply_plan(self, *, site_key: str, batch_id: str) -> dict[str, Any]:
+        site_store = self.site_tools.site_store
+        normalize = getattr(site_store, "normalize_history_decision_metadata", None)
+        if not callable(normalize):
+            return {}
+        try:
+            result = normalize(site_key, max_rows=10)
+        except Exception as exc:
+            return {"status": "failed", "error": str(exc)}
+        if not isinstance(result, dict):
+            return {}
+        if str(result.get("status") or "") == "needs_review":
+            card = self._create_history_normalization_card(site_key=site_key, batch_id=batch_id, count=int(result.get("count") or 0))
+            result["action_card_id"] = str(card.get("card_id") or "") if isinstance(card, dict) else ""
+        return result
+
+    def _create_history_normalization_card(self, *, site_key: str, batch_id: str, count: int) -> dict[str, Any]:
+        return ActionCardStore(self.job_store.workspace).create_card(
+            card_type=ACTION_CARD_CODEX_REVIEW,
+            title=f"Normalize {site_key} filtered-out job history",
+            goal=(
+                "Review legacy filtered_out history rows and add decision_reason_type/context_versions "
+                "before apply-list generation relies on them."
+            ),
+            reason=f"{site_key} has {count} legacy filtered_out rows that need normalization.",
+            source_type="job_apply_plan",
+            source_id=f"{site_key}:{batch_id}:history_normalization",
+            source_ref=f"workspace/sites/{site_key}/jobs/history_jobs.json",
+            priority="medium",
+            related_files=[
+                f"workspace/sites/{site_key}/jobs/history_jobs.json",
+                f"skills/search/jobs/sites/{site_key}/SKILL.md",
+            ],
+            suggested_actions=[
+                "Inspect filtered_out rows missing decision_reason_type or context_versions.",
+                "Normalize reason types as time, cv, matching_policy, hard_excluded, or unknown.",
+                "Keep title, url, status, and original reason text unchanged.",
+            ],
+            commands=[
+                f"careereng action-card show <card_id>",
+                f"python -m careereng jobs apply -m \"continue {site_key} after history normalization\"",
+            ],
+            semantic_tags=["history_normalization", "apply_list", site_key],
+            dedupe_key=f"history_normalization:{site_key}",
+            metadata={"site_key": site_key, "batch_id": batch_id, "legacy_filtered_out_count": count},
+        )
+
     def _ensure_apply_plan(
         self,
         *,
@@ -815,7 +875,41 @@ class JobFlow:
     ) -> dict[str, Any]:
         plan = self.job_planning_store.load_apply_plan(batch_id=batch_id, site_key=site_key)
         if not plan.get("plan_items"):
+            normalization = self._normalize_history_for_apply_plan(site_key=site_key, batch_id=batch_id)
             rows = self._merged_run_job_rows_for_batch(site_key, batch_id)
+            context_versions = self._decision_context_versions(site_key)
+            decision_context_hash = self._decision_context_hash(site_key)
+            skill_policies = load_job_skill_policies(self.project_root, site_key)
+            apply_candidate_policy = skill_policies.get("apply_candidate_policy", {})
+            requeued_rows: list[dict[str, Any]] = []
+            history_candidates_for_apply = getattr(self.site_tools.site_store, "apply_list_history_candidates", None)
+            if callable(history_candidates_for_apply):
+                try:
+                    history_candidates = history_candidates_for_apply(
+                        site_key,
+                        current_context_versions=context_versions,
+                        current_decision_context_hash=decision_context_hash,
+                    )
+                except Exception:
+                    history_candidates = []
+                existing_job_ids = {str(row.get("job_id") or "") for row in rows if isinstance(row, dict)}
+                existing_urls = {str(row.get("url") or "") for row in rows if isinstance(row, dict) and str(row.get("url") or "")}
+                existing_site_job_ids = {
+                    str(row.get("site_job_id") or "")
+                    for row in rows
+                    if isinstance(row, dict) and str(row.get("site_job_id") or "")
+                }
+                requeued_rows = [
+                    row
+                    for row in history_candidates
+                    if isinstance(row, dict)
+                    and str(row.get("job_id") or "") not in existing_job_ids
+                    and (not str(row.get("url") or "") or str(row.get("url") or "") not in existing_urls)
+                    and (not str(row.get("site_job_id") or "") or str(row.get("site_job_id") or "") not in existing_site_job_ids)
+                ]
+                if requeued_rows:
+                    self.site_tools.site_store.update_run_jobs(site_key, requeued_rows, session_id, turn_id, batch_id)
+                    rows = self._merged_run_job_rows_for_batch(site_key, batch_id)
             match_history_rows = getattr(self.site_tools.site_store, "match_history_rows", None)
             history_matches = match_history_rows(site_key, rows) if callable(match_history_rows) else []
             plan = self.job_planning_store.write_apply_plan(
@@ -825,8 +919,14 @@ class JobFlow:
                 history_matches=history_matches,
                 snapshot_id=self._latest_search_snapshot_id(site_key=site_key, batch_id=batch_id),
                 apply_requested=True,
-                decision_context_hash=self._decision_context_hash(site_key),
+                decision_context_hash=decision_context_hash,
+                context_versions=context_versions,
+                apply_candidate_policy=apply_candidate_policy,
             )
+            if normalization:
+                plan["normalization"] = normalization
+            if requeued_rows:
+                plan["requeued_from_history"] = len(requeued_rows)
             self.job_store.append_event(
                 "job_apply_plan.written",
                 {
@@ -835,6 +935,8 @@ class JobFlow:
                     "plan_id": str(plan.get("plan_id") or ""),
                     "snapshot_id": str(plan.get("snapshot_id") or ""),
                     "counts": plan.get("counts") if isinstance(plan.get("counts"), dict) else {},
+                    "normalization": normalization if isinstance(normalization, dict) else {},
+                    "requeued_from_history": int(plan.get("requeued_from_history") or 0),
                 },
             )
         terminal_updates = [
@@ -868,7 +970,19 @@ class JobFlow:
         return "done"
 
     def _pending_apply_rows(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
-        return [row for row in self._merged_run_job_rows_for_batch(site_key, batch_id) if not self._is_apply_row_terminal(row)]
+        rows = [row for row in self._merged_run_job_rows_for_batch(site_key, batch_id) if not self._is_apply_row_terminal(row)]
+        plan = self.job_planning_store.load_apply_plan(batch_id=batch_id, site_key=site_key)
+        items = plan.get("plan_items") if isinstance(plan.get("plan_items"), list) else []
+        actionable_ids = {
+            str(item.get("job_id") or "")
+            for item in items
+            if isinstance(item, dict)
+            and str(item.get("action") or "") in {"open_for_match_review", "retry_blocked", "enrich_jd"}
+            and str(item.get("job_id") or "")
+        }
+        if not actionable_ids:
+            return rows
+        return [row for row in rows if str(row.get("job_id") or "") in actionable_ids]
 
     def _seal_apply_row_terminal(
         self,
@@ -1186,6 +1300,8 @@ class JobFlow:
                 "snapshot_id": str(apply_plan.get("snapshot_id") or ""),
                 "path": str(apply_plan.get("path") or ""),
                 "counts": self._apply_plan_counts(apply_plan),
+                "normalization": apply_plan.get("normalization") if isinstance(apply_plan.get("normalization"), dict) else {},
+                "requeued_from_history": int(apply_plan.get("requeued_from_history") or 0),
             }
             current = {**current, "apply": apply_payload}
         initial_pending_rows = self._pending_apply_rows(site_key, batch_id)
@@ -1346,6 +1462,8 @@ class JobFlow:
                     "title": str(row.get("title") or ""),
                     "url": str(row.get("url") or ""),
                     "decision_context_hash": str(row.get("decision_context_hash") or ""),
+                    "decision_reason_type": str(row.get("decision_reason_type") or ""),
+                    "context_versions": row.get("context_versions") if isinstance(row.get("context_versions"), dict) else {},
                     "detail": detail,
                 }
             )

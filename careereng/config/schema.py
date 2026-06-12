@@ -45,11 +45,30 @@ class BrowserBudgetsConfig:
 
 
 @dataclass
+class SameUrlNoProgressGuardConfig:
+    tool_call_limit: int = 5
+    token_limit: int = 60000
+    phase_overrides: dict[str, dict[str, int]] = field(
+        default_factory=lambda: {
+            "job_retrieval": {
+                "tool_call_limit": 8,
+                "token_limit": 160000,
+            },
+            "apply": {
+                "tool_call_limit": 15,
+                "token_limit": 260000,
+            },
+        }
+    )
+
+
+@dataclass
 class BrowserGuardsConfig:
     same_url_no_progress_tool_call_limit: int = 5
     same_url_no_progress_token_limit: int = 60000
     apply_same_url_no_progress_tool_call_limit: int = 15
     apply_same_url_no_progress_token_limit: int = 260000
+    same_url_no_progress: SameUrlNoProgressGuardConfig = field(default_factory=SameUrlNoProgressGuardConfig)
 
 
 @dataclass

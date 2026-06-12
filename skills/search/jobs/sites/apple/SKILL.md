@@ -10,6 +10,30 @@ apply_enabled: true
 ---
 # Apple Site Skill
 
+## Site Policy
+
+### Retrieval Policy
+
+- Apple retrieval should use the accepted China/software/newest/team-filter strategy unless a later accepted evolution run replaces it.
+- Record the current visible Apple results page before opening job details or deciding whether to stop.
+- Use project-level pagination/history stop policy after the current page is recorded.
+- Treat Apple internships and new-grad roles as hard exclusions even when they appear inside otherwise valid result pages.
+
+### Application Review Policy
+
+- Apple application review requires a signed-in Apple Careers profile surface.
+- Treat `Submissions -> Active` as realtime and inspect every reachable Active page.
+- Treat `Submissions -> Archived` as historical and stop early only when the current page is already covered by matched terminal local history, has no unmatched rows, and shows no status changes.
+
+## Matching Policy
+
+### Application Gate
+
+- Use the project common matching rule unless Apple exposes a clearer site-native application state.
+- Do not apply to Apple internships, campus, student, 2026 New Grad, new-grad, co-op, 校招, or 实习 roles.
+- Before clicking `Submit Resume`, re-check the live title, role page, JD, and Apple role number.
+- If a required application fact is not available from local profile/persona/CV context, mark the job `blocked` instead of guessing.
+
 ## Session Preparation
 
 ### Goal

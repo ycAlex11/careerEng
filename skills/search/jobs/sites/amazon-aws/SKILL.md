@@ -12,6 +12,22 @@ apply_enabled: false
 
 Use this file to describe how this site should be handled.
 
+## Site Policy
+
+### Retrieval Policy
+
+- Describe site-specific posted-window, pagination, and retrieval stop rules.
+
+### Application Review Policy
+
+- Describe where submitted, active, inactive, rejected, closed, or withdrawn applications are visible.
+
+## Matching Policy
+
+### Application Gate
+
+- Describe site-native match labels, hard exclusions, and when to use the shared project matching rule.
+
 ## Session Preparation
 
 - Describe the login intent for this site in semantic terms instead of hard-coding button text.
@@ -29,7 +45,7 @@ Use this file to describe how this site should be handled.
 - Describe how the agent should narrow roles once the jobs surface is already visible.
 - Prefer describing the page state and filtering goal, not fixed button labels.
 
-## Apply Workflow
+## Apply
 
 - Describe how to find relevant jobs and which pages are safe to skip.
 - Describe when the agent should stop and ask the user to take over.

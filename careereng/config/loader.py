@@ -15,6 +15,7 @@ from careereng.config.schema import (
     BrowserGuardsConfig,
     BrowserRecoveryConfig,
     BrowserRetrievalPolicyConfig,
+    SameUrlNoProgressGuardConfig,
     EvolutionApplyProbeConfig,
     EvolutionConfig,
     PathsConfig,
@@ -78,11 +79,17 @@ apply_job_timeout_ms = 180000
 apply_site_phase_budget_factor = 0.8
 debug_session_preparation_timeout_seconds = 600
 
-[browser.guards]
-same_url_no_progress_tool_call_limit = 5
-same_url_no_progress_token_limit = 60000
-apply_same_url_no_progress_tool_call_limit = 15
-apply_same_url_no_progress_token_limit = 260000
+[browser.guards.same_url_no_progress]
+tool_call_limit = 5
+token_limit = 60000
+
+[browser.guards.same_url_no_progress.phase_overrides.job_retrieval]
+tool_call_limit = 8
+token_limit = 160000
+
+[browser.guards.same_url_no_progress.phase_overrides.apply]
+tool_call_limit = 15
+token_limit = 260000
 
 [browser.recovery]
 snapshot_timeout_seconds = 90
@@ -158,6 +165,100 @@ def _parse_toml_minimal(text: str) -> dict:
         current[key] = parsed
 
     return data
+
+
+def _coerce_int(value: object, default: int) -> int:
+    try:
+        return int(value if value is not None else default)
+    except Exception:
+        return int(default)
+
+
+def _normalize_same_url_no_progress_guard(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        payload = {}
+    default_policy = SameUrlNoProgressGuardConfig()
+    nested = payload.get("same_url_no_progress")
+    nested_payload = dict(nested) if isinstance(nested, dict) else {}
+
+    legacy_tool_limit = payload.get("same_url_no_progress_tool_call_limit")
+    legacy_token_limit = payload.get("same_url_no_progress_token_limit")
+    nested_tool_limit = nested_payload.get("tool_call_limit")
+    nested_token_limit = nested_payload.get("token_limit")
+    if (
+        legacy_tool_limit is not None
+        and _coerce_int(legacy_tool_limit, default_policy.tool_call_limit) != default_policy.tool_call_limit
+        and _coerce_int(nested_tool_limit, default_policy.tool_call_limit) == default_policy.tool_call_limit
+    ):
+        nested_tool_limit = legacy_tool_limit
+    if (
+        legacy_token_limit is not None
+        and _coerce_int(legacy_token_limit, default_policy.token_limit) != default_policy.token_limit
+        and _coerce_int(nested_token_limit, default_policy.token_limit) == default_policy.token_limit
+    ):
+        nested_token_limit = legacy_token_limit
+
+    tool_call_limit = _coerce_int(nested_tool_limit, default_policy.tool_call_limit)
+    token_limit = _coerce_int(nested_token_limit, default_policy.token_limit)
+    raw_overrides = nested_payload.get("phase_overrides")
+    phase_overrides: dict[str, dict[str, int]] = {}
+    if isinstance(raw_overrides, dict):
+        for phase, override in raw_overrides.items():
+            if not isinstance(override, dict):
+                continue
+            phase_key = str(phase or "").strip()
+            if not phase_key:
+                continue
+            phase_overrides[phase_key] = {
+                "tool_call_limit": _coerce_int(override.get("tool_call_limit"), tool_call_limit),
+                "token_limit": _coerce_int(override.get("token_limit"), token_limit),
+            }
+
+    legacy_apply_tool_limit = payload.get("apply_same_url_no_progress_tool_call_limit")
+    legacy_apply_token_limit = payload.get("apply_same_url_no_progress_token_limit")
+    default_apply_override = default_policy.phase_overrides["apply"]
+    apply_override_is_default = phase_overrides.get("apply") == default_apply_override
+    legacy_apply_differs = (
+        legacy_apply_tool_limit is not None
+        and _coerce_int(legacy_apply_tool_limit, default_apply_override["tool_call_limit"])
+        != default_apply_override["tool_call_limit"]
+    ) or (
+        legacy_apply_token_limit is not None
+        and _coerce_int(legacy_apply_token_limit, default_apply_override["token_limit"])
+        != default_apply_override["token_limit"]
+    )
+    if ("apply" not in phase_overrides or apply_override_is_default) and legacy_apply_differs:
+        phase_overrides["apply"] = {
+            "tool_call_limit": _coerce_int(legacy_apply_tool_limit, tool_call_limit),
+            "token_limit": _coerce_int(legacy_apply_token_limit, token_limit),
+        }
+
+    for phase, override in default_policy.phase_overrides.items():
+        phase_overrides.setdefault(
+            phase,
+            {
+                "tool_call_limit": _coerce_int(override.get("tool_call_limit"), tool_call_limit),
+                "token_limit": _coerce_int(override.get("token_limit"), token_limit),
+            },
+        )
+
+    payload["same_url_no_progress_tool_call_limit"] = tool_call_limit
+    payload["same_url_no_progress_token_limit"] = token_limit
+    apply_override = phase_overrides.get("apply", {})
+    payload["apply_same_url_no_progress_tool_call_limit"] = _coerce_int(
+        apply_override.get("tool_call_limit"),
+        SameUrlNoProgressGuardConfig().phase_overrides["apply"]["tool_call_limit"],
+    )
+    payload["apply_same_url_no_progress_token_limit"] = _coerce_int(
+        apply_override.get("token_limit"),
+        SameUrlNoProgressGuardConfig().phase_overrides["apply"]["token_limit"],
+    )
+    payload["same_url_no_progress"] = SameUrlNoProgressGuardConfig(
+        tool_call_limit=tool_call_limit,
+        token_limit=token_limit,
+        phase_overrides=phase_overrides,
+    )
+    return payload
 
 
 def config_path(project_root: Path) -> Path:
@@ -305,6 +406,7 @@ def load_config(project_root: Path) -> AppConfig:
     browser_payload = dict(payload["browser"])
     browser_budgets_payload = browser_payload.pop("budgets", {})
     browser_guards_payload = browser_payload.pop("guards", {})
+    browser_guards_payload = _normalize_same_url_no_progress_guard(browser_guards_payload)
     browser_recovery_payload = browser_payload.pop("recovery", {})
     browser_retrieval_policy_payload = browser_payload.pop("retrieval_policy", {})
     evolution_payload = dict(payload["evolution"])

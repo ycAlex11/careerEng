@@ -123,6 +123,27 @@ class BrowserAutomationService:
         self._lock = threading.Lock()
         self._active: dict[str, ActiveSiteRuntime] = {}
         self._browser_context_registry = BrowserContextRegistry(self.workspace)
+        same_url_policy = getattr(self.guards, "same_url_no_progress", None)
+        if isinstance(same_url_policy, dict):
+            same_url_tool_limit = int(
+                same_url_policy.get("tool_call_limit")
+                or self.guards.same_url_no_progress_tool_call_limit
+            )
+            same_url_token_limit = int(
+                same_url_policy.get("token_limit")
+                or self.guards.same_url_no_progress_token_limit
+            )
+            same_url_phase_overrides = same_url_policy.get("phase_overrides") or {}
+        else:
+            same_url_tool_limit = int(
+                getattr(same_url_policy, "tool_call_limit", self.guards.same_url_no_progress_tool_call_limit)
+                or self.guards.same_url_no_progress_tool_call_limit
+            )
+            same_url_token_limit = int(
+                getattr(same_url_policy, "token_limit", self.guards.same_url_no_progress_token_limit)
+                or self.guards.same_url_no_progress_token_limit
+            )
+            same_url_phase_overrides = getattr(same_url_policy, "phase_overrides", {}) or {}
         self._phase_runtime_config = BrowserRuntimeConfig(
             api_base=api_base,
             api_key=api_key,
@@ -139,18 +160,15 @@ class BrowserAutomationService:
             retrieval_history_stop_min_page_jobs=int(
                 self.retrieval_policy.history_stop_min_page_jobs
             ),
-            same_url_no_progress_tool_call_limit=int(
-                self.guards.same_url_no_progress_tool_call_limit
-            ),
-            same_url_no_progress_token_limit=int(
-                self.guards.same_url_no_progress_token_limit
-            ),
+            same_url_no_progress_tool_call_limit=same_url_tool_limit,
+            same_url_no_progress_token_limit=same_url_token_limit,
             apply_same_url_no_progress_tool_call_limit=int(
                 self.guards.apply_same_url_no_progress_tool_call_limit
             ),
             apply_same_url_no_progress_token_limit=int(
                 self.guards.apply_same_url_no_progress_token_limit
             ),
+            same_url_no_progress_phase_overrides=dict(same_url_phase_overrides),
             recovery_snapshot_timeout_seconds=int(
                 self.recovery.snapshot_timeout_seconds
             ),

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from careereng.skill_schema import normalize_posted_window_policy
 from careereng.utils import ensure_dir, make_id, now_iso, safe_file_stem, write_json
 
 
@@ -123,9 +125,12 @@ class JobPlanningStore:
         snapshot_id: str = "",
         apply_requested: bool = True,
         decision_context_hash: str = "",
+        context_versions: dict[str, str] | None = None,
+        apply_candidate_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
         counts: dict[str, int] = {}
+        current_context_versions = dict(context_versions or {})
         for idx, row in enumerate(jobs):
             if not isinstance(row, dict):
                 continue
@@ -135,6 +140,8 @@ class JobPlanningStore:
                 row=row,
                 history=history if isinstance(history, dict) else None,
                 decision_context_hash=decision_context_hash,
+                context_versions=current_context_versions,
+                apply_candidate_policy=apply_candidate_policy,
             )
             items.append(item)
             action = str(item.get("action") or "unknown")
@@ -148,6 +155,8 @@ class JobPlanningStore:
             "generated_at": now_iso(),
             "apply_requested": bool(apply_requested),
             "decision_context_hash": str(decision_context_hash or ""),
+            "context_versions": current_context_versions,
+            "apply_candidate_policy": normalize_posted_window_policy(apply_candidate_policy),
             "plan_items": items,
             "counts": counts,
         }
@@ -193,7 +202,11 @@ class JobPlanningStore:
                 "application_status": "filtered_out",
                 "decision_status": "filtered_out",
                 "apply_state": "terminal_filtered_out",
+                "decision_reason_type": str(item.get("decision_reason_type") or ""),
                 "decision_context_hash": str(item.get("decision_context_hash") or ""),
+                "context_versions": item.get("context_versions") if isinstance(item.get("context_versions"), dict) else {},
+                "observed_posted_age_days": item.get("observed_posted_age_days"),
+                "observed_posted_age_is_lower_bound": bool(item.get("observed_posted_age_is_lower_bound")),
             }
         if action in {"skip_rejected", "skip_closed", "skip_withdrawn"}:
             status = action.replace("skip_", "")
@@ -258,6 +271,8 @@ class JobPlanningStore:
         row: dict[str, Any],
         history: dict[str, Any] | None,
         decision_context_hash: str = "",
+        context_versions: dict[str, str] | None = None,
+        apply_candidate_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         history = history if isinstance(history, dict) else {}
         application_status = str(history.get("application_status") or row.get("application_status") or "").strip().lower()
@@ -265,6 +280,14 @@ class JobPlanningStore:
         apply_state = str(history.get("apply_state") or row.get("apply_state") or "").strip().lower()
         current_context_hash = str(decision_context_hash or "").strip()
         history_context_hash = str(history.get("decision_context_hash") or "").strip()
+        current_context_versions = dict(context_versions or {})
+        history_context_versions = history.get("context_versions") if isinstance(history.get("context_versions"), dict) else {}
+        decision_reason_type = str(
+            history.get("decision_reason_type") or row.get("decision_reason_type") or "unknown"
+        ).strip().lower()
+        posted_age = cls._posted_age_observation(row)
+        posted_policy = normalize_posted_window_policy(apply_candidate_policy)
+        posted_exclusion = cls._posted_window_exclusion(posted_age=posted_age, policy=posted_policy)
         action = "open_for_match_review"
         operation_state = "needs_review"
         reason = "no terminal local state"
@@ -276,8 +299,18 @@ class JobPlanningStore:
             action, operation_state, reason = f"skip_{application_status}", f"terminal_{application_status}", f"history {application_status}"
         elif decision_status == "already_applied":
             action, operation_state, reason = "skip_already_applied", "terminal_already_applied", "history decision already_applied"
+        elif posted_exclusion:
+            action, operation_state, reason = "skip_filtered_out", "terminal_filtered_out", str(posted_exclusion.get("reason") or "")
+            decision_reason_type = "time"
         elif decision_status == "filtered_out" or application_status == "filtered_out":
-            if history_context_hash and current_context_hash and history_context_hash != current_context_hash:
+            context_changed = cls._filtered_out_context_changed(
+                decision_reason_type=decision_reason_type,
+                current_context_hash=current_context_hash,
+                history_context_hash=history_context_hash,
+                current_context_versions=current_context_versions,
+                history_context_versions=history_context_versions,
+            )
+            if context_changed:
                 action, operation_state, reason = "open_for_match_review", "needs_review", "history filtered_out but decision context changed"
             else:
                 action, operation_state, reason = "skip_filtered_out", "terminal_filtered_out", "history filtered_out"
@@ -296,7 +329,102 @@ class JobPlanningStore:
             "history_apply_state": apply_state,
             "history_decision_context_hash": history_context_hash,
             "decision_context_hash": current_context_hash,
+            "decision_reason_type": decision_reason_type,
+            "context_versions": current_context_versions,
+            "history_context_versions": history_context_versions,
+            "observed_posted_age_days": posted_age.get("days") if posted_age.get("days") is not None else "",
+            "observed_posted_age_is_lower_bound": bool(posted_age.get("is_lower_bound")),
+            "apply_candidate_policy": posted_policy,
         }
+
+    @classmethod
+    def _posted_age_observation(cls, row: dict[str, Any]) -> dict[str, Any]:
+        observed = row.get("observed_posted_age_days")
+        try:
+            if observed not in (None, ""):
+                return {
+                    "days": int(float(observed)),
+                    "is_lower_bound": bool(row.get("observed_posted_age_is_lower_bound")),
+                }
+        except Exception:
+            pass
+        text = " ".join(
+            str(row.get(field) or "")
+            for field in (
+                "posted_label",
+                "posted_at",
+                "fit_reason",
+                "match_reason_initial",
+                "match_reason_final",
+                "reason",
+            )
+        )
+        match = re.search(r"\b(\d{1,4})\s*(\+)?\s*days?\b", text, flags=re.IGNORECASE)
+        if not match:
+            return {"days": None, "is_lower_bound": False}
+        try:
+            days = int(match.group(1))
+        except Exception:
+            return {"days": None, "is_lower_bound": False}
+        return {"days": days, "is_lower_bound": bool(match.group(2))}
+
+    @classmethod
+    def _posted_window_exclusion(cls, *, posted_age: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+        window_days = int(policy.get("posted_window_days") or 0)
+        if window_days <= 0:
+            return {}
+        days = posted_age.get("days")
+        if days is None:
+            if str(policy.get("unknown_posted_age") or "review") == "filtered_out":
+                return {
+                    "reason": f"posted age is unknown and policy requires a confirmed < {window_days} day window",
+                    "window_days": window_days,
+                }
+            return {}
+        try:
+            age_days = int(days)
+        except Exception:
+            return {}
+        comparison = str(policy.get("posted_window_comparison") or "strictly_less_than")
+        outside = age_days > window_days if comparison == "less_than_or_equal" else age_days >= window_days
+        if not outside:
+            return {}
+        operator = "<=" if comparison == "less_than_or_equal" else "<"
+        return {
+            "reason": f"posted age {age_days} days is outside apply candidate policy ({operator} {window_days} days)",
+            "window_days": window_days,
+            "age_days": age_days,
+            "is_lower_bound": bool(posted_age.get("is_lower_bound")),
+        }
+
+    @classmethod
+    def _filtered_out_context_changed(
+        cls,
+        *,
+        decision_reason_type: str,
+        current_context_hash: str,
+        history_context_hash: str,
+        current_context_versions: dict[str, Any],
+        history_context_versions: dict[str, Any],
+    ) -> bool:
+        if not history_context_versions:
+            return bool(history_context_hash and current_context_hash and history_context_hash != current_context_hash)
+        if "legacy_context" in history_context_versions or "legacy_decision_context_hash" in history_context_versions:
+            return True
+        reason_type = str(decision_reason_type or "unknown").strip().lower()
+        keys_by_reason = {
+            "time": ("site_policy_hash", "apply_candidate_policy_hash"),
+            "hard_excluded": ("site_policy_hash", "project_matching_policy_hash", "site_matching_policy_hash"),
+            "cv": ("cv_hash", "profile_hash"),
+            "matching_policy": ("project_matching_policy_hash", "site_matching_policy_hash"),
+        }
+        keys = keys_by_reason.get(reason_type)
+        if not keys:
+            return bool(history_context_hash and current_context_hash and history_context_hash != current_context_hash)
+        return any(
+            str(current_context_versions.get(key) or "") != str(history_context_versions.get(key) or "")
+            for key in keys
+        )
 
     @staticmethod
     def _norm(value: str) -> str:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import inspect
 import json
 from pathlib import Path
@@ -39,6 +39,7 @@ class BrowserRuntimeConfig:
     same_url_no_progress_token_limit: int = 0
     apply_same_url_no_progress_tool_call_limit: int = 0
     apply_same_url_no_progress_token_limit: int = 0
+    same_url_no_progress_phase_overrides: dict[str, dict[str, int]] = field(default_factory=dict)
     recovery_snapshot_timeout_seconds: int = 90
     recovery_max_attempts: int = 3
 
@@ -454,16 +455,28 @@ class BrowserPhaseRuntime:
             await result
 
     def _same_url_no_progress_tool_call_limit(self, phase: PhasePrompt) -> int:
-        base = int(self.config.same_url_no_progress_tool_call_limit or self.SAME_URL_NO_PROGRESS_TOOL_CALL_LIMIT)
-        if phase.slug == "apply":
-            return int(self.config.apply_same_url_no_progress_tool_call_limit or base)
-        return base
+        return self._same_url_no_progress_limits(phase)[0]
 
     def _same_url_no_progress_token_limit(self, phase: PhasePrompt) -> int:
-        base = int(self.config.same_url_no_progress_token_limit or self.SAME_URL_NO_PROGRESS_TOKEN_LIMIT)
-        if phase.slug == "apply":
-            return int(self.config.apply_same_url_no_progress_token_limit or base)
-        return base
+        return self._same_url_no_progress_limits(phase)[1]
+
+    def _same_url_no_progress_limits(self, phase: PhasePrompt) -> tuple[int, int]:
+        base_tool_limit = int(self.config.same_url_no_progress_tool_call_limit or self.SAME_URL_NO_PROGRESS_TOOL_CALL_LIMIT)
+        base_token_limit = int(self.config.same_url_no_progress_token_limit or self.SAME_URL_NO_PROGRESS_TOKEN_LIMIT)
+        phase_key = str(getattr(phase, "slug", "") or "").strip()
+        overrides = self.config.same_url_no_progress_phase_overrides
+        override = overrides.get(phase_key) if isinstance(overrides, dict) else None
+        if isinstance(override, dict):
+            return (
+                int(override.get("tool_call_limit") or base_tool_limit),
+                int(override.get("token_limit") or base_token_limit),
+            )
+        if phase_key == "apply":
+            return (
+                int(self.config.apply_same_url_no_progress_tool_call_limit or base_tool_limit),
+                int(self.config.apply_same_url_no_progress_token_limit or base_token_limit),
+            )
+        return base_tool_limit, base_token_limit
 
     @staticmethod
     def _is_observation_tool(name: str) -> bool:
@@ -715,6 +728,38 @@ class BrowserPhaseRuntime:
         )
 
     @staticmethod
+    def _job_retrieval_history_stop_confirmation_message(
+        *,
+        current_url: str,
+        history_stop_streak: int,
+        required_streak: int,
+    ) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        return (
+            "Runtime note: the current retrieval page reached the operation-success history stop condition.\n"
+            f"{url_line}"
+            f"Consecutive history-stop pages: {max(1, int(history_stop_streak or 0))}/{max(2, int(required_streak or 2))}\n"
+            "This is the first confirmation page, so one more pagination step is allowed. If the next recorded page also reaches this condition, "
+            "finish job_retrieval instead of paginating again."
+        )
+
+    @staticmethod
+    def _job_retrieval_history_stop_required_message(
+        *,
+        current_url: str,
+        history_stop_streak: int,
+        required_streak: int,
+    ) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        return (
+            "Runtime note: consecutive retrieval pages reached the operation-success history stop condition.\n"
+            f"{url_line}"
+            f"Consecutive history-stop pages: {max(2, int(history_stop_streak or 0))}/{max(2, int(required_streak or 2))}\n"
+            "Do not paginate again for history-based stopping. Finish job_retrieval with phase_result as done, unless the active skill has a stronger "
+            "current-page reason to continue that must be recorded first."
+        )
+
+    @staticmethod
     def _same_url_no_progress_message(*, phase: PhasePrompt, current_url: str, tool_calls: int, tokens: int) -> str:
         url_line = f"Current page URL: {current_url}\n" if current_url else ""
         token_line = f"Same-page no-progress tokens: {tokens}\n" if tokens > 0 else ""
@@ -879,6 +924,8 @@ class BrowserPhaseRuntime:
         if any(
             phrase in text
             for phrase in (
+                "codex.rate_limits",
+                "expected to have received",
                 "gateway timeout",
                 "bad gateway",
                 "service unavailable",
@@ -1286,9 +1333,7 @@ class BrowserPhaseRuntime:
                 "metrics_count",
                 "cleared_count",
             )
-        if phase.slug == "apply" and tool_name == "browser_click":
-            return True
-        if tool_name in cls.FORM_STATE_ACTION_TOOLS:
+        if tool_name in cls.PAGE_SETTLE_ACTION_TOOLS or tool_name in cls.FORM_STATE_ACTION_TOOLS:
             return True
         return False
 
@@ -2408,11 +2453,12 @@ class BrowserPhaseRuntime:
         operation_success_ratio = operation_success_count / recorded_count if recorded_count else 0.0
         stop_success_ratio_threshold = max(0.0, float(self.config.retrieval_history_stop_success_ratio or 0.0))
         stop_min_page_jobs = max(1, int(self.config.retrieval_history_stop_min_page_jobs or 1))
-        stop_recommended = bool(
+        history_stop_recommended = bool(
             recorded_count >= stop_min_page_jobs
             and operation_success_ratio >= stop_success_ratio_threshold
             and enrichment_needed_count == 0
         )
+        stop_recommended = bool(history_stop_recommended)
         stop_reason = (
             "current page reached the operation-success ratio threshold and has no enrichment targets"
             if stop_recommended
@@ -2745,13 +2791,19 @@ class BrowserPhaseRuntime:
         failed_page_action_signature = ""
         failed_page_action_name = ""
         response_turn_timeout_count = 0
+        response_runtime_error_count = 0
         max_response_turn_timeouts = max(1, int(self.config.recovery_max_attempts or 0))
         last_record_jobs_policy: dict[str, Any] = {}
         retrieval_policy_pagination_violation_count = 0
+        retrieval_history_stop_streak = 0
+        retrieval_history_stop_pagination_violation_count = 0
         same_url_no_progress_key = ""
         same_url_no_progress_tool_calls = 0
         same_url_no_progress_tokens = 0
         do_not_repeat_violation_count = 0
+        pre_execution_retry_count = 0
+        pre_execution_retry_last_tool = ""
+        pre_execution_retry_limit = max(1, int(self.config.recovery_max_attempts or 3))
 
         def track_same_url_no_progress(
             *,
@@ -3012,7 +3064,65 @@ class BrowserPhaseRuntime:
                     )
                 await self._sleep(min(1.0, max(0.1, turn_timeout_seconds / 2.0)))
                 continue
+            except RuntimeError as exc:
+                if not self._is_retryable_response_runtime_error(exc):
+                    raise
+                response_runtime_error_count += 1
+                previous_url = current_url
+                snapshot_payload = await self._capture_snapshot_payload(
+                    bridge=bridge,
+                    session=session,
+                    tool_names=tool_names,
+                )
+                if (
+                    isinstance(snapshot_payload, dict)
+                    and snapshot_payload
+                    and not bool(snapshot_payload.get("isError"))
+                ):
+                    latest_snapshot_payload = snapshot_payload
+                    last_payload = snapshot_payload
+                    snapshot_url = MCPToolBridge.extract_current_url(snapshot_payload)
+                    if snapshot_url:
+                        current_url = snapshot_url
+                history_items = []
+                if (
+                    isinstance(latest_snapshot_payload, dict)
+                    and latest_snapshot_payload
+                    and not bool(latest_snapshot_payload.get("isError"))
+                ):
+                    history_items.append(self._context_item(self._live_snapshot_primary_message()))
+                history_items.append(
+                    self._context_item(
+                        self._browser_recovery_message(
+                            phase=phase,
+                            reason="response_runtime_error",
+                            current_url=current_url,
+                            previous_url=previous_url,
+                            attempt=response_runtime_error_count,
+                            max_attempts=max_response_turn_timeouts,
+                            timeout_seconds=turn_timeout_seconds,
+                            detail=str(exc),
+                        )
+                    )
+                )
+                if response_runtime_error_count >= max_response_turn_timeouts:
+                    return BrowserPhaseResult(
+                        status="failed",
+                        reason_tag="response_runtime_error_recovery_exhausted",
+                        summary=(
+                            f"browser recovery exhausted after {response_runtime_error_count} retryable response runtime error(s) "
+                            f"without model tool progress: {exc}"
+                        ),
+                        current_url=current_url,
+                        step_count=step_count,
+                        trace_ref=trace_ref,
+                        recorded_count=len(recorded_job_ids),
+                        new_count=len(new_job_ids),
+                    )
+                await self._sleep(min(1.0, max(0.1, turn_timeout_seconds / 2.0)))
+                continue
             response_turn_timeout_count = 0
+            response_runtime_error_count = 0
             output_items = self._extract_output_items(response)
             output_text = self._extract_output_text(response)
             response_total_tokens = self._response_total_tokens(response)
@@ -3051,11 +3161,17 @@ class BrowserPhaseRuntime:
 
             retry_requested = False
             handled_tool = False
-            for item in output_items:
+            executed_tool_this_turn = False
+            for item_index, item in enumerate(output_items):
                 if str(item.get("type") or "") != "function_call":
                     continue
                 handled_tool = True
                 name = str(item.get("name") or "")
+                terminal_call_pending = any(
+                    str(output_item.get("type") or "") == "function_call"
+                    and str(output_item.get("name") or "") == "phase_result"
+                    for output_item in output_items[item_index + 1 :]
+                )
                 raw_arguments = str(item.get("arguments") or "{}")
                 try:
                     arguments = json.loads(raw_arguments)
@@ -3126,6 +3242,13 @@ class BrowserPhaseRuntime:
                     )
 
                 if observation_guard_active and is_observation_tool and name not in active_tool_names:
+                    if terminal_call_pending:
+                        history_items.append(
+                            self._context_item(
+                                f"Runtime skipped non-terminal guarded tool `{name}` because a phase_result is present later in the same response."
+                            )
+                        )
+                        continue
                     return BrowserPhaseResult(
                         status="failed",
                         reason_tag="observation_limit",
@@ -3139,6 +3262,13 @@ class BrowserPhaseRuntime:
                     )
 
                 if same_page_evaluate_guard_active and name == "browser_evaluate" and name not in active_tool_names:
+                    if terminal_call_pending:
+                        history_items.append(
+                            self._context_item(
+                                f"Runtime skipped non-terminal guarded tool `{name}` because a phase_result is present later in the same response."
+                            )
+                        )
+                        continue
                     return BrowserPhaseResult(
                         status="failed",
                         reason_tag="same_page_evaluate_limit",
@@ -3152,6 +3282,13 @@ class BrowserPhaseRuntime:
                     )
 
                 if no_progress_internal_guard_active and self._is_no_progress_internal_tool(name) and name not in active_tool_names:
+                    if terminal_call_pending:
+                        history_items.append(
+                            self._context_item(
+                                f"Runtime skipped non-terminal guarded tool `{name}` because a phase_result is present later in the same response."
+                            )
+                        )
+                        continue
                     return BrowserPhaseResult(
                         status="failed",
                         reason_tag="no_progress_internal_limit",
@@ -3165,6 +3302,13 @@ class BrowserPhaseRuntime:
                     )
 
                 if name not in active_tool_names:
+                    if terminal_call_pending:
+                        history_items.append(
+                            self._context_item(
+                                f"Runtime skipped unavailable non-terminal tool `{name}` because a phase_result is present later in the same response."
+                            )
+                        )
+                        continue
                     history_items = [
                         self._context_item(
                             self._tool_unavailable_message(
@@ -3372,23 +3516,78 @@ class BrowserPhaseRuntime:
                     )
                 ):
                     if bool(last_record_jobs_policy.get("stop_recommended")):
+                        history_stop_streak = max(1, int(last_record_jobs_policy.get("history_stop_streak") or 1))
+                        required_history_stop_streak = 2
+                        if history_stop_streak >= required_history_stop_streak:
+                            retrieval_history_stop_pagination_violation_count += 1
+                            summary = (
+                                "Job retrieval blocked pagination because two consecutive pages reached the "
+                                "operation-success history stop condition."
+                            )
+                            self._record_browser_control_event(
+                                site_store=site_store,
+                                event_type="ignored_history_stop_required",
+                                batch_id=batch_id,
+                                site_key=site_key,
+                                phase=phase,
+                                turn_id=turn_id,
+                                current_url=current_url,
+                                guard_name="retrieval_history_stop_required",
+                                trigger_values={
+                                    "attempted_tool": name,
+                                    "attempted_arguments": arguments,
+                                    "history_stop_streak": history_stop_streak,
+                                    "required_history_stop_streak": required_history_stop_streak,
+                                    "violation_count": retrieval_history_stop_pagination_violation_count,
+                                },
+                                last_record_jobs_policy=last_record_jobs_policy,
+                                trace_ref=trace_ref,
+                                summary=summary,
+                            )
+                            if (
+                                retrieval_history_stop_pagination_violation_count
+                                >= self.RETRIEVAL_POLICY_PAGINATION_VIOLATION_LIMIT
+                            ):
+                                return BrowserPhaseResult(
+                                    status="failed",
+                                    reason_tag="retrieval_history_stop_required",
+                                    summary=summary,
+                                    current_url=current_url,
+                                    step_count=step_count,
+                                    trace_ref=trace_ref,
+                                    raw_text=output_text,
+                                    recorded_count=len(recorded_job_ids),
+                                    new_count=len(new_job_ids),
+                                )
+                            history_items = [
+                                self._context_item(
+                                    self._job_retrieval_history_stop_required_message(
+                                        current_url=current_url,
+                                        history_stop_streak=history_stop_streak,
+                                        required_streak=required_history_stop_streak,
+                                    )
+                                )
+                            ]
+                            retry_requested = True
+                            break
                         summary = (
-                            "Job retrieval history policy recommended stopping, but pagination is allowed to continue; "
-                            "history ratio is advisory and not a hard stop."
+                            "Job retrieval history policy recommended stopping on one page; pagination is allowed once "
+                            "to confirm the condition on the next recorded page."
                         )
                         self._record_browser_control_event(
                             site_store=site_store,
-                            event_type="advisory_stop_recommended",
+                            event_type="history_stop_confirmation_required",
                             batch_id=batch_id,
                             site_key=site_key,
                             phase=phase,
                             turn_id=turn_id,
                             current_url=current_url,
-                            guard_name="retrieval_stop_recommended",
+                            guard_name="retrieval_history_stop_confirmation",
                             trigger_values={
                                 "attempted_tool": name,
                                 "attempted_arguments": arguments,
-                                "stop_recommended": True,
+                                "history_stop_streak": history_stop_streak,
+                                "required_history_stop_streak": required_history_stop_streak,
                             },
                             last_record_jobs_policy=last_record_jobs_policy,
                             trace_ref=trace_ref,
@@ -3396,9 +3595,11 @@ class BrowserPhaseRuntime:
                         )
                         history_items.append(
                             self._context_item(
-                                "Runtime note: history ratio is advisory only. Do not use it as a hard pagination stop. "
-                                "Continue retrieval unless the page reaches a strong stop condition such as date window, "
-                                "no next page, no more results, or a site-specific stop rule."
+                                self._job_retrieval_history_stop_confirmation_message(
+                                    current_url=current_url,
+                                    history_stop_streak=history_stop_streak,
+                                    required_streak=required_history_stop_streak,
+                                )
                             )
                         )
                     enrichment_needed_count = int(last_record_jobs_policy.get("enrichment_needed_count") or 0)
@@ -3499,6 +3700,7 @@ class BrowserPhaseRuntime:
                     ]
                     retry_requested = True
                     break
+                executed_tool_this_turn = True
                 step_count += 1
                 for attempt in range(1, max(1, int(self.config.max_step_retries or 0)) + 2):
                     site_store.save_browser_session(
@@ -3584,7 +3786,13 @@ class BrowserPhaseRuntime:
                             current_url=current_url,
                             page_key=recorded_page_key,
                         )
+                        if bool(last_record_jobs_policy.get("stop_recommended")):
+                            retrieval_history_stop_streak += 1
+                        else:
+                            retrieval_history_stop_streak = 0
+                        last_record_jobs_policy["history_stop_streak"] = retrieval_history_stop_streak
                         retrieval_policy_pagination_violation_count = 0
+                        retrieval_history_stop_pagination_violation_count = 0
                     current_url = MCPToolBridge.extract_current_url(payload) or current_url or str(entry_url or "")
 
                     trace_ref = site_store.append_step_trace(
@@ -3648,6 +3856,9 @@ class BrowserPhaseRuntime:
                             latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
                             staged_resume_pdf_path=staged_resume_pdf_path,
                         )
+                        if terminal_call_pending:
+                            history_items = [tool_feedback]
+                            continue
                         if no_progress_internal_streak > 0 and (
                             not last_no_progress_internal_url or current_url == last_no_progress_internal_url
                         ):
@@ -4173,7 +4384,49 @@ class BrowserPhaseRuntime:
                 if retry_requested:
                     break
             if retry_requested:
+                if executed_tool_this_turn:
+                    pre_execution_retry_count = 0
+                    pre_execution_retry_last_tool = ""
+                else:
+                    pre_execution_retry_count += 1
+                    pre_execution_retry_last_tool = str(name or pre_execution_retry_last_tool or "")
+                    if pre_execution_retry_count >= pre_execution_retry_limit:
+                        summary = (
+                            "runtime recovery repeated without executing any tool progress; "
+                            f"last blocked tool: {pre_execution_retry_last_tool or 'unknown'}"
+                        )
+                        self._record_browser_control_event(
+                            site_store=site_store,
+                            event_type="pre_execution_recovery_exhausted",
+                            batch_id=batch_id,
+                            site_key=site_key,
+                            phase=phase,
+                            turn_id=turn_id,
+                            current_url=current_url,
+                            guard_name="pre_execution_recovery",
+                            trigger_values={
+                                "pre_execution_retry_count": pre_execution_retry_count,
+                                "pre_execution_retry_limit": pre_execution_retry_limit,
+                                "last_tool": pre_execution_retry_last_tool,
+                            },
+                            last_record_jobs_policy=last_record_jobs_policy,
+                            trace_ref=trace_ref,
+                            summary=summary,
+                        )
+                        return BrowserPhaseResult(
+                            status="failed",
+                            reason_tag="pre_execution_recovery_exhausted",
+                            summary=summary,
+                            current_url=current_url,
+                            step_count=step_count,
+                            trace_ref=trace_ref,
+                            raw_text=output_text,
+                            recorded_count=len(recorded_job_ids),
+                            new_count=len(new_job_ids),
+                        )
                 continue
+            pre_execution_retry_count = 0
+            pre_execution_retry_last_tool = ""
             if not handled_tool:
                 return BrowserPhaseResult(
                     status="failed",

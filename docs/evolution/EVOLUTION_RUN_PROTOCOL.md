@@ -36,6 +36,19 @@ Skills are responsible for:
 
 Python should not encode site-specific click paths, selectors, or ATS-specific application behavior.
 
+## Skill Section Ownership
+
+Evolution proposals should target the narrowest stable skill section:
+
+- Posted-window rules, retrieval date windows, and historical-area stop policy belong in `## Site Policy`.
+- JD/persona/CV matching rules, site-native match labels, hard role exclusions, and application gates belong in `## Matching Policy`.
+- Search surface navigation belongs in `## Channel Discovery`.
+- Filter selection and filter completion criteria belong in `## Job Filtering`.
+- Result extraction, pagination, and retrieval stop mechanics belong in `## Job Retrieval`.
+- Form filling, upload behavior, submit criteria, already-applied signals, and apply recovery belong in `## Apply`.
+
+Do not propose Python code patches for site-behavior learning unless the evidence shows a framework/runtime bug. Site behavior should first be corrected through skill sections.
+
 ## Required Run Fields
 
 Each evolution run should identify:

@@ -4,9 +4,47 @@ name: Search Jobs Skill
 version: v1
 updated_at: "2026-03-17"
 scope: jobs
+retrieval_policy:
+  preferred_sort: newest_first
+  posted_window_days: 30
+  posted_window_comparison: strictly_less_than
+  date_window_stop_enabled: true
+  history_fast_stop_enabled: true
+  unknown_posted_age: review
+apply_candidate_policy:
+  posted_window_days: 30
+  posted_window_comparison: strictly_less_than
+  unknown_posted_age: review
 ---
 
 # Search Jobs Skill
+
+## Site Policy
+
+### Retrieval Policy
+
+- Retrieve jobs page by page from the current live results surface.
+- Record the full current page before any pagination stop decision.
+- Interpret the structured `posted_window_days` policy as a strict upper bound: within `30` days means posted age `0-29`; `30 days`, `30+ days`, or older is outside the apply-candidate window.
+- Treat posted-date / posted-age rules as apply-candidate eligibility first unless the active site skill defines a stronger newest-first stop rule.
+- Combine project retrieval stop conditions and site retrieval stop conditions with OR: stop retrieval when any safe stop condition is met.
+- If a page contains existing history matches, still preserve any new or enrichment-needed jobs from that page before stopping.
+
+### Hard Exclusions
+
+- Exclude `intern`, `internship`, `campus`, `student`, `graduate`, `new-grad`, `new graduate`, `co-op`, `校招`, and `实习`.
+- Exclude remote-only roles when the site exposes a reliable work-site or remote filter.
+
+## Matching Policy
+
+### Common Application Gate
+
+- If the active site skill defines a stronger site-native matching rule, use that site rule first.
+- Otherwise use the current live JD, site-native signals, persona evidence, and CV evidence to decide whether to apply.
+- If lightweight persona evidence scores the JD between 70 and 100, treat it as `recommended_apply`.
+- If the score is below 40, treat it as `filtered_out`.
+- If the score is between 40 and 70, request `full_cv` before making the final decision; after full CV review, apply only if the updated score is above 50.
+- Never invent unsupported experience. If a required answer or match decision needs missing evidence, request the smallest relevant context bundle.
 
 ## Input Priority
 
