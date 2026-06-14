@@ -105,9 +105,11 @@ apply_candidate_policy:
 
 ### Status Mapping
 
+- Follow the project-level canonical/raw status schema.
 - Use `active` for NVIDIA applications that still appear open, in progress, submitted, under review, or active with no clearer terminal status.
 - Use `inactive` for NVIDIA applications shown under inactive/archived/no-longer-active surfaces with no clearer terminal status.
 - Use `rejected` for rows that say `Declined`, including `Declined. Thank you for applying`.
+- Preserve NVIDIA's exact visible status text such as `Application Received`, `Application in Review`, `In Process`, or `Declined. Thank you for applying` in `application_review_status_raw`.
 - Use `rejected`, `closed`, or `withdrawn` only when NVIDIA clearly shows that exact meaning on the row or detail page.
 - Use `unknown` if a visible application row is inside the review window but the status cannot be interpreted safely.
 
@@ -175,7 +177,7 @@ apply_candidate_policy:
 - Do not stop retrieval only because one or a few visible roles on the current page are older than 30 days.
 - If the live NVIDIA page still shows result signals such as page labels, visible job cards, or pagination but the current attempt returns zero jobs, capture a fresh snapshot and retry the same current results page once before stopping or paginating.
 - Treat `Posted 30 Days Ago`, `Posted 30+ Days Ago`, or any larger age signal as an old-role signal.
-- After `record_jobs` succeeds for the current NVIDIA page, continue to the next page when the current page contains any role within the last 30 days, any `new` history match, or any `existing_needs_enrichment` result and a real next-page control is available.
+- After `record_jobs` succeeds for the current NVIDIA page, continue to the next page when the current page contains any role within the last 30 days or any `new` history match and a real next-page control is available.
 - Stop NVIDIA retrieval only after the current page has been recorded and one of these is true: the current visible page has no roles within the last 30 days on a clearly newest-first listing, or there is no real next-page / load-more control.
 - If the current page mixes within-window and older roles, record the full page and then continue pagination when a real next-page control is available.
 
@@ -187,6 +189,7 @@ apply_candidate_policy:
 - Use the common matching rule from the project jobs skill unless the live page exposes a clearer site-native decision signal for the current role.
 - Do not apply to NVIDIA roles posted 30 days ago, `30+ Days Ago`, or older.
 - If the saved NVIDIA job lacks a reliable posted age or date, re-check the live job page before applying. If the posted timing still cannot be confirmed as within the last 30 days, mark the job as `filtered_out` instead of applying.
+- Follow the project-level closed/unavailable rule. NVIDIA/Workday examples include a direct job URL resolving to a missing page, `0 JOBS FOUND`, no openings, or no longer available; record those as `application_status = closed`, `apply_state = terminal_closed`, `decision_reason_type = closed`, and preserve the exact NVIDIA text in `application_status_raw` or `last_apply_error`.
 
 ### Form Filling
 
@@ -212,6 +215,9 @@ apply_candidate_policy:
 - If a role shows `View Application`, treat it as already applied and record that state instead of submitting again.
 - On NVIDIA final review, if the live page clearly shows the current job's review step, no blocking validation errors, and a visible `Submit` button, click `Submit` directly.
 - Treat the job as submitted only after NVIDIA shows an explicit final application-success confirmation on the live page.
+- If NVIDIA shows `Application Received` or another explicit successful-submission confirmation after final submit, record `application_status = submitted`, `apply_state = terminal_submitted`, `decision_status = recommended_apply`, and put the exact NVIDIA text in `application_status_raw`.
+- Do not write NVIDIA raw phrases such as `Application Received` into `application_status`.
+- If NVIDIA shows a missing or closed job page during apply, apply the project-level closed/unavailable rule, then move to the next apply target.
 
 ### Escalation
 

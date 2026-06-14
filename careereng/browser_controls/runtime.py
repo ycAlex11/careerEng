@@ -715,19 +715,6 @@ class BrowserPhaseRuntime:
         )
 
     @staticmethod
-    def _job_retrieval_enrichment_required_message(*, current_url: str, enrichment_needed_count: int, enrichment_job_ids: list[str]) -> str:
-        url_line = f"Current page URL: {current_url}\n" if current_url else ""
-        ids_line = f"Jobs needing enrichment: {', '.join(enrichment_job_ids[:5])}\n" if enrichment_job_ids else ""
-        return (
-            "Runtime note: the last record_jobs call found existing jobs on this same results page that still need enrichment.\n"
-            f"{url_line}"
-            f"Enrichment-needed count: {max(1, int(enrichment_needed_count or 0))}\n"
-            f"{ids_line}"
-            "Do not paginate away from this results page yet. Open or inspect the needed current-page job(s), fill missing JD/URL/posted/location with update_jobs, "
-            "or finish job_retrieval as blocked if the site prevents enrichment."
-        )
-
-    @staticmethod
     def _job_retrieval_history_stop_confirmation_message(
         *,
         current_url: str,
@@ -1017,6 +1004,9 @@ class BrowserPhaseRuntime:
             "fit_reason": {"type": "string"},
             "fit_source": {"type": "string"},
             "application_status": {"type": "string"},
+            "application_status_raw": {"type": "string"},
+            "decision_reason_type": {"type": "string"},
+            "decision_context_hash": {"type": "string"},
             "last_apply_error": {"type": "string"},
         }
         return {
@@ -1772,13 +1762,29 @@ class BrowserPhaseRuntime:
             return False
         decision_status = str(row.get("decision_status") or "").strip().lower()
         application_status = str(row.get("application_status") or "").strip().lower()
-        return decision_status in {"filtered_out", "already_applied"} or application_status in {
+        apply_state = str(row.get("apply_state") or "").strip().lower()
+        terminal_apply_states = {
+            "submitted",
             "already_applied",
             "filtered_out",
-            "submitted",
-            "apply_failed",
             "blocked",
+            "apply_failed",
+            "terminal_submitted",
+            "terminal_application_received",
+            "terminal_already_applied",
+            "terminal_filtered_out",
+            "terminal_blocked",
+            "terminal_apply_failed",
+            "terminal_rejected",
+            "terminal_closed",
+            "terminal_withdrawn",
         }
+        return (
+            decision_status in {"filtered_out", "already_applied"}
+            or application_status
+            in {"already_applied", "filtered_out", "submitted", "apply_failed", "blocked", "rejected", "closed", "withdrawn"}
+            or apply_state in terminal_apply_states
+        )
 
     @staticmethod
     def _is_history_operation_success(row: dict[str, Any] | None) -> bool:
@@ -1829,6 +1835,9 @@ class BrowserPhaseRuntime:
             "terminal_submitted",
             "terminal_already_applied",
             "terminal_application_received",
+            "terminal_rejected",
+            "terminal_closed",
+            "terminal_withdrawn",
         }
         return (
             decision_status in successful_decisions
@@ -2456,11 +2465,10 @@ class BrowserPhaseRuntime:
         history_stop_recommended = bool(
             recorded_count >= stop_min_page_jobs
             and operation_success_ratio >= stop_success_ratio_threshold
-            and enrichment_needed_count == 0
         )
         stop_recommended = bool(history_stop_recommended)
         stop_reason = (
-            "current page reached the operation-success ratio threshold and has no enrichment targets"
+            "current page reached the operation-success ratio threshold"
             if stop_recommended
             else ""
         )
@@ -2794,7 +2802,6 @@ class BrowserPhaseRuntime:
         response_runtime_error_count = 0
         max_response_turn_timeouts = max(1, int(self.config.recovery_max_attempts or 0))
         last_record_jobs_policy: dict[str, Any] = {}
-        retrieval_policy_pagination_violation_count = 0
         retrieval_history_stop_streak = 0
         retrieval_history_stop_pagination_violation_count = 0
         same_url_no_progress_key = ""
@@ -3602,57 +3609,6 @@ class BrowserPhaseRuntime:
                                 )
                             )
                         )
-                    enrichment_needed_count = int(last_record_jobs_policy.get("enrichment_needed_count") or 0)
-                    if enrichment_needed_count > 0:
-                        retrieval_policy_pagination_violation_count += 1
-                        enrichment_job_ids = [
-                            str(job_id).strip()
-                            for job_id in last_record_jobs_policy.get("enrichment_job_ids") or []
-                            if str(job_id).strip()
-                        ]
-                        summary = "Job retrieval blocked pagination because current-page history matches still need enrichment."
-                        self._record_browser_control_event(
-                            site_store=site_store,
-                            event_type="ignored_enrichment_required",
-                            batch_id=batch_id,
-                            site_key=site_key,
-                            phase=phase,
-                            turn_id=turn_id,
-                            current_url=current_url,
-                            guard_name="retrieval_enrichment_required",
-                            trigger_values={
-                                "attempted_tool": name,
-                                "attempted_arguments": arguments,
-                                "enrichment_needed_count": enrichment_needed_count,
-                                "violation_count": retrieval_policy_pagination_violation_count,
-                            },
-                            last_record_jobs_policy=last_record_jobs_policy,
-                            trace_ref=trace_ref,
-                            summary=summary,
-                        )
-                        if retrieval_policy_pagination_violation_count >= self.RETRIEVAL_POLICY_PAGINATION_VIOLATION_LIMIT:
-                            return BrowserPhaseResult(
-                                status="failed",
-                                reason_tag="retrieval_enrichment_required",
-                                summary=summary,
-                                current_url=current_url,
-                                step_count=step_count,
-                                trace_ref=trace_ref,
-                                raw_text=output_text,
-                                recorded_count=len(recorded_job_ids),
-                                new_count=len(new_job_ids),
-                            )
-                        history_items = [
-                            self._context_item(
-                                self._job_retrieval_enrichment_required_message(
-                                    current_url=current_url,
-                                    enrichment_needed_count=enrichment_needed_count,
-                                    enrichment_job_ids=enrichment_job_ids,
-                                )
-                            )
-                        ]
-                        retry_requested = True
-                        break
                 do_not_repeat_reason = self._phase_memory_do_not_repeat_violation(
                     phase_memory=phase_memory,
                     tool_name=name,
@@ -3791,7 +3747,6 @@ class BrowserPhaseRuntime:
                         else:
                             retrieval_history_stop_streak = 0
                         last_record_jobs_policy["history_stop_streak"] = retrieval_history_stop_streak
-                        retrieval_policy_pagination_violation_count = 0
                         retrieval_history_stop_pagination_violation_count = 0
                     current_url = MCPToolBridge.extract_current_url(payload) or current_url or str(entry_url or "")
 

@@ -62,6 +62,7 @@ def create_site_skill_refinement_card(
         "target_skill": str(target_skill_path),
         "workflow_memory": str(_display_path(workspace_path, workflow_memory_path)),
         "failure_snapshot": str(_display_path(workspace_path, failure_snapshot_path)),
+        "browser_control_lessons": _related_lessons_file(workspace_path),
         "expected_outcome": (
             "Codex inspects the Skill, workflow memory, failed batch, trace, and failure snapshot, infers the missing "
             "site-specific workflow step, then refines the site Skill without adding Python browser-action semantics."
@@ -96,6 +97,7 @@ def create_site_skill_refinement_card(
         related_files=related_files,
         suggested_actions=[
             "Read the workflow memory first to understand previous successful and failed strategies.",
+            "Read accepted browser-control lessons before editing; treat them as durable evolution knowledge.",
             "Inspect the failed batch, latest trace, and failure snapshot before editing the site Skill.",
             "Infer the missing or wrong site-specific workflow step from the evidence instead of only summarizing the failure.",
             "When stable site-visible labels or options are present, write them explicitly into the site Skill.",
@@ -149,6 +151,9 @@ def _related_files(
         workspace / "sites" / site_key / "events" / "all.jsonl",
         workspace / "evolution" / "browser_control" / "phase_events.jsonl",
     ]
+    lessons = _related_lessons_file(workspace)
+    if lessons:
+        files.append(Path(lessons))
     if batch_id:
         files.append(workspace / "jobs" / "batches" / f"{batch_id}.json")
     if trace_ref:
@@ -185,3 +190,9 @@ def _display_path(workspace: Path, path: Path | str) -> str:
         return str(resolved.relative_to(workspace))
     except ValueError:
         return str(resolved)
+
+
+def _related_lessons_file(workspace: Path | str) -> str:
+    from careereng.evolution.browser_control.lessons import related_lessons_file
+
+    return related_lessons_file(workspace)

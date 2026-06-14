@@ -57,6 +57,7 @@ from careereng.evolution import (
     save_evolution_review,
     scan_evolution_triggers,
 )
+from careereng.evolution.browser_control.lessons import BrowserControlLessonStore, render_lessons_markdown
 from careereng.integrations.assistant_bridge import AssistantThreadStateStore, ingest_assistant_message
 from careereng.interviews import (
     InterviewStore,
@@ -937,6 +938,8 @@ def assistant_import_candidates(
     scope = f"recent_{source_limit}_messages" if source_limit > 0 else "recent_messages"
     typer.echo(
         f"assistant memory imported created={result.get('created')} "
+        f"lessons={result.get('created_lessons', 0)} "
+        f"evidence={result.get('created_evolution_evidence', 0)} "
         f"skipped_existing={result.get('skipped_existing')} read={result.get('read')} "
         f"thread={result.get('source_thread') or '-'} scope={scope}"
     )
@@ -984,6 +987,8 @@ def career_memory_import_candidates(
         return
     typer.echo(
         f"career-memory imported created={result.get('created')} "
+        f"lessons={result.get('created_lessons', 0)} "
+        f"evidence={result.get('created_evolution_evidence', 0)} "
         f"skipped_existing={result.get('skipped_existing')} read={result.get('read')}"
     )
     typer.echo(f"memory_units={result.get('memory_units_path')}")
@@ -1479,6 +1484,23 @@ def evolution_candidates():
         return
     for spec in specs:
         typer.echo(f"{spec.id}\t{spec.risk_level}\t{spec.target_type}\t{spec.target_ref}")
+
+
+@evolution_app.command("lessons")
+def evolution_lessons(
+    status: str = typer.Option("accepted", "--status", help="Lesson status to show; empty means all"),
+    site: str = typer.Option("", "--site", help="Optional site key filter"),
+    phase: str = typer.Option("", "--phase", help="Optional browser phase filter"),
+    limit: int = typer.Option(20, "--limit", min=1, help="Maximum lessons to show"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON rows instead of Markdown"),
+):
+    """List durable browser-control lessons used by evolution."""
+    store = BrowserControlLessonStore(_workspace_path())
+    rows = store.list(status=status, site_key=site, phase=phase, limit=limit)
+    if json_output:
+        typer.echo(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo(render_lessons_markdown(rows, limit=limit).rstrip())
 
 
 @evolution_app.command("candidate-show")

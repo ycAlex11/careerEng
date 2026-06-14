@@ -40,6 +40,7 @@ def build_evolution_review(
     evidence = _dedupe_evidence(
         [
             *_browser_control_evidence(workspace_path),
+            *_browser_control_lesson_evidence(workspace_path),
             *_assistant_bridge_evidence(workspace_path),
             *_metrics_evidence(workspace_path),
             *_application_summary_evidence(workspace_path, project_root=root),
@@ -224,6 +225,42 @@ def _browser_control_evidence(workspace: Path) -> list[dict[str, Any]]:
                 },
                 entities={"site_key": site_key, "phase": phase, "guard_name": guard_name},
                 tags=["browser_control", event_type, guard_name],
+            )
+        )
+    return rows
+
+
+def _browser_control_lesson_evidence(workspace: Path) -> list[dict[str, Any]]:
+    path = workspace / "evolution" / "browser_control" / "lessons.jsonl"
+    rows: list[dict[str, Any]] = []
+    for idx, row in _read_jsonl_with_refs(path):
+        if str(row.get("status") or "").strip().lower() != "accepted":
+            continue
+        origin = row.get("evidence_origin") if isinstance(row.get("evidence_origin"), dict) else {}
+        site_key = _text(origin.get("site_key") or row.get("site_key"))
+        phase = _text(row.get("phase") or origin.get("phase"))
+        summary = _text(row.get("summary"))
+        if not summary:
+            continue
+        rows.append(
+            _evidence(
+                created_at=_text(row.get("created_at")),
+                source_type="evolution_lesson",
+                source_ref=_source_ref(workspace, path, idx),
+                area="browser_control",
+                site_key=site_key,
+                phase=phase,
+                event_type="accepted_lesson",
+                severity="info",
+                summary=summary,
+                details={
+                    "lesson_id": _text(row.get("lesson_id")),
+                    "applicability_scope": _text(row.get("applicability_scope") or row.get("scope")),
+                    "applicability_tags": row.get("applicability_tags") or row.get("applies_to") or [],
+                    "evidence_origin": origin,
+                },
+                entities={"lesson_id": _text(row.get("lesson_id")), "origin_site_key": site_key},
+                tags=["evolution_lesson", "browser_control", _text(row.get("applicability_scope") or row.get("scope"))],
             )
         )
     return rows

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from careereng.evolution.candidate_specs import CandidateSpec, get_candidate_spec
+from careereng.evolution.browser_control.lessons import BrowserControlLessonStore, render_lessons_markdown
 from careereng.storage.jsonl import JSONLStore
 from careereng.utils import ensure_dir, make_id, now_iso, read_json, write_json
 
@@ -114,6 +115,7 @@ def _run_inputs(workspace: Path, *, root: Path | None = None) -> dict[str, Path]
         "open_candidates": workspace / "evolution" / "candidates" / "open.jsonl",
         "evidence": workspace / "evolution" / "evidence" / "all.jsonl",
         "memory_units": workspace / "evolution" / "memory" / "units.jsonl",
+        "browser_control_lessons": workspace / "evolution" / "browser_control" / "lessons.jsonl",
         "application_summary": workspace / "application_summary" / "application_summary.json",
         "metrics_usage": workspace / "metrics" / "llm_usage.jsonl",
         "browser_phase_events": workspace / "evolution" / "browser_control" / "phase_events.jsonl",
@@ -203,6 +205,8 @@ def _render_evidence_pack(
         "",
         *_format_jsonl_rows(inputs["evidence"], limit=RECENT_EVIDENCE_LIMIT, fields=("evidence_id", "area", "site_key", "phase", "event_type", "severity", "summary")),
         "",
+        _render_related_lessons(workspace=workspace, context=context),
+        "",
         "## Application Summary Snapshot",
         "",
         *_format_json_object(inputs["application_summary"], keys=("generated_at", "totals", "stage_distribution", "status_distribution")),
@@ -249,6 +253,12 @@ def _render_summary(run_payload: dict[str, Any]) -> str:
         "## Next Expected Stage\n\n"
         "Generate a proposal, snapshot rollbackable targets before applying, then evaluate and select accepted/rejected/keep_observing.\n"
     )
+
+
+def _render_related_lessons(*, workspace: Path, context: dict[str, Any]) -> str:
+    phase = str(context.get("phase") or "").strip()
+    lessons = BrowserControlLessonStore(workspace).accepted(phase=phase, scope="site_skill_evolution", limit=12)
+    return render_lessons_markdown(lessons, title="Accepted Browser-Control Lessons", limit=12).rstrip()
 
 
 def _read_text_or_note(path: Path, note: str) -> str:

@@ -243,7 +243,7 @@ class SearchStrategyEngine:
     ) -> dict[str, Any]:
         prompt = (
             "Build a job-search query spec JSON.\n"
-            "Priority order for conflicts: current user message > workspace user job skill > project search skills > intent > defaults.\n"
+            "Priority order for conflicts: current user message > workspace job preferences > project search skills > intent > defaults.\n"
             "Return JSON only with keys: query_text,target_roles,target_locations,company_preferences,"
             "industry_preferences,date_posted_after,must_have,nice_to_have,google_queries,resolved_by,source_note."
         )
@@ -306,7 +306,7 @@ class SearchStrategyEngine:
                     "Filter company candidates by search constraints. "
                     "Return strict JSON only: {\"companies\":[{\"company\",\"reason\",\"confidence\",\"base_url\"}]}. "
                     "Keep only companies that satisfy the resolved search constraints. "
-                    "Use priority order: current user message > workspace user job skill > project search skills > intent. "
+                    "Use priority order: current user message > workspace job preferences > project search skills > intent. "
                     "If a company clearly violates the higher-priority constraints, remove it."
                 ),
             }
@@ -346,8 +346,8 @@ class SearchStrategyEngine:
     ) -> list[dict[str, Any]]:
         limit = max(1, min(int(top_k or 10), 30))
         prompt = (
-            "Recommend target companies for job applications based on the current user request, workspace user job skill, project search skills, and intent.\n"
-            "Priority order for conflicts: current user message > workspace user job skill > project search skills > intent.\n"
+            "Recommend target companies for job applications based on the current user request, workspace job preferences, project search skills, and intent.\n"
+            "Priority order for conflicts: current user message > workspace job preferences > project search skills > intent.\n"
             "Return JSON only: {\"companies\":[{\"company\",\"reason\",\"confidence\",\"base_url\"}]}.\n"
             "company must be a real employer name.\n"
             "Do not return categories, industries, company types, or abstract labels.\n"
@@ -393,7 +393,7 @@ class SearchStrategyEngine:
                     "role": "system",
                     "content": (
                         "Retry company recommendation with a stricter reading of the current request and skill constraints. "
-                        "Use priority order: current user message > workspace user job skill > project search skills > intent. "
+                        "Use priority order: current user message > workspace job preferences > project search skills > intent. "
                         "If uncertain, return fewer companies rather than broad matches."
                     ),
                 }

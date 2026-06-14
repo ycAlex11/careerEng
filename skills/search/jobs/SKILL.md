@@ -26,9 +26,12 @@ apply_candidate_policy:
 - Retrieve jobs page by page from the current live results surface.
 - Record the full current page before any pagination stop decision.
 - Interpret the structured `posted_window_days` policy as a strict upper bound: within `30` days means posted age `0-29`; `30 days`, `30+ days`, or older is outside the apply-candidate window.
+- When a site exposes relative posting age such as `Posted 13 Days Ago`, record the exact visible label and treat it as an observation made at the current run time; future runs should recompute the current posting age from the observation time instead of assuming the old label is still current.
+- When a site exposes an absolute posting date, record the absolute date and still preserve the visible label when available.
+- Treat `Posted 30+ Days Ago` or similar `+` labels as lower-bound ages, not exact dates.
 - Treat posted-date / posted-age rules as apply-candidate eligibility first unless the active site skill defines a stronger newest-first stop rule.
 - Combine project retrieval stop conditions and site retrieval stop conditions with OR: stop retrieval when any safe stop condition is met.
-- If a page contains existing history matches, still preserve any new or enrichment-needed jobs from that page before stopping.
+- If a page contains existing history matches, still preserve any new or incomplete-history jobs from that page before stopping.
 
 ### Hard Exclusions
 
@@ -44,6 +47,9 @@ apply_candidate_policy:
 - If lightweight persona evidence scores the JD between 70 and 100, treat it as `recommended_apply`.
 - If the score is below 40, treat it as `filtered_out`.
 - If the score is between 40 and 70, request `full_cv` before making the final decision; after full CV review, apply only if the updated score is above 50.
+- If the JD's core work explicitly involves AI applications, LLM applications, RAG, agents, AI workflow automation, model integration, AI productization, AI platform/application engineering, or similar applied-AI delivery, weight the candidate's applied-AI, agent, RAG, Codex/Claude Code, and LLM application experience strongly.
+- For mixed roles that combine applied AI, LLM/generative AI, AI agents, ML/deep-learning frameworks, or AI platform/application delivery with GPU, performance, system architecture, or kernel-adjacent work, do not immediately score the job below 40 only because low-level GPU/performance evidence is incomplete. Put the role in the 40-70 range and request `full_cv` before the final decision unless the JD is clearly dominated by unsupported low-level hard requirements.
+- Do not let applied-AI experience override missing hard requirements when the JD is mainly CUDA/GPU kernel, compiler, ASIC/SoC, hardware architecture, low-level systems, or performance-modeling work and the AI/agent/LLM content is only incidental or weakly related.
 - Never invent unsupported experience. If a required answer or match decision needs missing evidence, request the smallest relevant context bundle.
 
 ## Input Priority
@@ -67,7 +73,7 @@ Use stage-aware priority when multiple sources overlap.
 
 Use this default order unless the current stage says otherwise:
 1. current user request
-2. workspace user job preference skill
+2. workspace job preferences
 3. project jobs skill
 4. `intent.md`
 
@@ -77,7 +83,7 @@ When the current stage is tied to one registered site, treat that site's skill a
 For site-specific stages, use this order:
 1. current user request
 2. site skill for the active site
-3. workspace user job preference skill
+3. workspace job preferences
 4. project jobs skill
 5. `intent.md`
 
@@ -131,6 +137,27 @@ Do not keep exploring once the current phase goal is already satisfied.
 - video section
 
 ## Application Status Review
+
+### Status Schema
+
+Use canonical machine statuses for durable control fields and preserve site wording separately.
+
+- `application_status` is a canonical machine status. Use only `submitted`, `already_applied`, `rejected`, `closed`, `withdrawn`, `filtered_out`, `apply_failed`, or `blocked`.
+- `application_status_raw` is the exact website-visible status or confirmation text observed during apply, such as `Application Received`.
+- `application_review_status` is the canonical status recorded during application-status review. Use only the values allowed by `record_application_reviews`.
+- `application_review_status_raw` is the exact website-visible review status, such as `Application in Review`, `In Process`, or `Declined. Thank you for applying`.
+- Do not write website-specific wording into canonical status fields. If the website says `Application Received`, write `application_status = submitted` and `application_status_raw = Application Received`.
+- Runtime control and apply-list planning use canonical statuses and structured `apply_state`; raw fields are evidence for reports, analysis, and future skill evolution.
+
+### Decision Reason Types
+
+When a job reaches `filtered_out`, write the most specific `decision_reason_type`:
+
+- `time`: the job is outside the active posted-age/date window.
+- `cv`: the JD appears relevant, but the current CV/persona does not support the required experience strongly enough.
+- `matching_policy`: the role does not fit the active target-role or site/project matching policy.
+- `hard_excluded`: the role hits a hard exclusion such as intern, campus, student, new-grad, co-op, or remote-only when disallowed.
+- `closed`: the job page is missing, the role is no longer available, the site shows zero jobs for the direct job URL, or the position is closed.
 
 ### Review Window
 
@@ -358,13 +385,13 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - After `record_jobs` succeeds, read the tool result before deciding whether to paginate.
 - Treat each returned `history_match_status` as the local history verdict for that current-page job:
   - `new`: not found in this site's local history yet.
-  - `existing_complete`: already present in this site's local history and no retrieval enrichment is needed.
-  - `existing_needs_enrichment`: already present, but local history still needs a real job URL, JD/description, or cleanup from an application-review-only record.
-- If `record_jobs` returns any `existing_needs_enrichment` jobs, prioritize those current-page jobs for enrichment before paginating when the live site allows opening their details from the current page.
-- Enrichment means opening the matching job detail, collecting the real job URL, visible site job id, location, posted label/date, and JD/description when available, then calling `update_jobs` for the returned run `job_id`.
-- Do not apply to enrichment jobs during retrieval. Only update the stored job data and return to the results page.
+  - `existing_complete`: already present in this site's local history with enough terminal operation state for retrieval stopping.
+  - `existing_needs_enrichment`: already present, but local history still lacks details that may be resolved later.
+- Treat `existing_needs_enrichment` as feedback only in retrieval. Do not open job detail pages just to enrich JD text, decide fit, or compensate for incomplete history.
+- If the current list page exposes missing lightweight fields such as a visible job id, location, or posted label, include them in `record_jobs`; otherwise continue retrieval with the stable URL and title.
+- JD/description enrichment, fit scoring, and application decisions belong to `apply`, not `job_retrieval`.
 - If `record_jobs` returns `stop_recommended = true`, finish retrieval after updating phase memory unless the current site skill has a stricter still-unmet stop condition.
-- If `record_jobs` returns `stop_recommended = false` because enrichment is needed, do not stop merely because existing jobs were found; handle the enrichment targets first.
+- If `record_jobs` returns `stop_recommended = false`, continue or stop only according to the active site/project retrieval stop conditions.
 
 ### Carry-Forward Usage
 
@@ -395,7 +422,7 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 ### Pagination
 
 - After recording the current page, check the current site-specific stop condition.
-- Also check the project history match stop condition from the `record_jobs` result: if at least 3 jobs on the current page already exist in local history and none need enrichment, stop pagination.
+- Also check the project history match stop condition from the `record_jobs` result: if the current page reaches the configured operation-success history threshold, stop pagination after the required confirmation behavior.
 - If the current site skill defines a date, page, posted-age, or other retrieval stop condition, combine it with the project history match stop condition using OR: stop when any one stop condition is satisfied.
 - If no stop condition is triggered and a real next-page / next-results / load-more action is available, continue to the next results page and repeat.
 - Use only a real visible pagination control, next-page control, or load-more action from the live page. Do not guess or synthesize pagination URLs.
@@ -424,6 +451,11 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - Record JD sync, decision, and application progress when it helps preserve information without interrupting the visible live-page flow.
 - Use `update_jobs` whenever the current job gains new JD data, decision state, apply state, submission result, or blocking reason.
 - Treat `update_jobs` as a progress checkpoint, not as completion, unless that update writes a true terminal outcome for the current job.
+- On a confirmed successful submission, write `application_status = submitted`, `apply_state = terminal_submitted`, `decision_status = recommended_apply`, and preserve the exact website confirmation in `application_status_raw`.
+- On a confirmed already-applied state, write `application_status = already_applied`, `apply_state = terminal_already_applied`, and preserve the exact website wording in `application_status_raw` when visible.
+- On a confirmed hard exclusion or final not-fit decision, write `application_status = filtered_out`, `decision_status = filtered_out`, and `apply_state = terminal_filtered_out`.
+- On any site, a confirmed unavailable or closed job page is a cross-site terminal state: write `application_status = closed`, `apply_state = terminal_closed`, and `decision_reason_type = closed`.
+- On a confirmed blocking condition, write `application_status = blocked` and a structured blocking `apply_state` such as `terminal_blocked` or `blocked_login_password_required`.
 - Treat apply as a page-by-page workflow on the current live page.
 - At the start of each apply page, read the current live page first before taking the next action.
 - Before making the final apply decision for a job, sync the current live JD, apply state, and any site-native match signal that the current page exposes for that job.
@@ -480,6 +512,8 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - If the score is below 40, treat it as `filtered_out`.
 - If the score is between 40 and 70, call `request_context` for `full_cv` before making the final decision.
 - After the full CV review, use `recommended_apply` only if the updated score is above 50; otherwise use `filtered_out`.
+- Treat explicit JD requirements for LLMs, generative AI, AI agents, AI workflow automation, applied-AI delivery, or ML/deep-learning frameworks as strong positive evidence for this user's profile.
+- For mixed AI plus GPU/performance/system-architecture roles, avoid a direct below-40 rejection when the applied-AI side is explicit and material. Use the 40-70 path and request `full_cv` unless the JD is clearly a low-level CUDA/kernel/compiler/ASIC/hardware/performance role with only incidental AI wording.
 - Do not invent unsupported experience. If needed evidence is not attached yet, request the relevant context bundle instead of guessing.
 
 ### Resume Source

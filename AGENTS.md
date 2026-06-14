@@ -43,3 +43,13 @@ Before answering from memory, inspect local evidence when relevant:
 CareerEng owns durable state, command execution, reports, metrics, history, and safety gates. Codex can inspect files, explain behavior, propose changes, and make targeted edits with user approval.
 
 Keep Python focused on orchestration, persistence, safety, metrics, and rollback. Keep site behavior and business policy in Markdown Skills where practical.
+
+Do not generalize from one company's career site into Python runtime behavior. A single NVIDIA, Workday, Microsoft, Qualcomm, AMD, Apple, or other site observation is not enough reason to hard-code browser semantics, selectors, business rules, matching logic, or phase behavior in Python.
+
+For job workflows, preserve these phase boundaries:
+
+- `job_retrieval` records the job list with the smallest stable fields available, such as title, URL, site job ID when visible, location, and posted label.
+- `job_retrieval` must not open job detail pages just to enrich JD text, decide fit, or compensate for incomplete history.
+- Missing JD or missing site job ID should not block retrieval pagination when a stable job URL exists.
+- JD reading, fit scoring, application decisions, form filling, and submission belong in `apply` and site/project Skills.
+- Python may provide generic storage, deduplication, URL normalization, safety guards, and recovery prompts. Python must not encode site-specific navigation or business policy unless explicitly approved.

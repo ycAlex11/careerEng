@@ -19,13 +19,13 @@ This directory stores AI Skills (policy/procedure docs), not runtime code.
 
 - `search/SKILL.md`: shared search chain for all domains.
 - `search/jobs/SKILL.md`: project-level job-search policy and retrieval method.
-- `workspace/skills/jobs/SKILL.md`: user-level job preference overlay created by `careereng onboard`.
+- `workspace/profile/job_preferences.md`: user-level job preference overlay created by `careereng onboard`.
 - `search/people/SKILL.md`: people-search specific policy.
 
 ## Priority order
 
 1. Current user message
-2. Workspace user job skill
+2. Workspace job preferences
 3. Project domain skill
 4. `intent.md`
 5. Code defaults/fallbacks

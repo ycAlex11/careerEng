@@ -57,6 +57,7 @@ def create_site_skill_bootstrap_card(
         related_files=related_files,
         suggested_actions=[
             "Read the linked evidence pack before editing the target site AI Skill.",
+            "Read accepted browser-control lessons before drafting; reuse durable lessons instead of reinventing site-control rules.",
             "Read the target site AI Skill first.",
             "Read the New Site Workflow Transfer candidate spec for the completion and safety boundary.",
             "Use the project jobs Skill and mature site AI Skills as examples, not as code to copy blindly.",
@@ -85,6 +86,7 @@ def create_site_skill_bootstrap_card(
             "target_skill": str(target_skill_path),
             "evolution_run_id": "",
             "evidence_pack": "",
+            "browser_control_lessons": _related_lessons_file(workspace_path),
             "reference_site_keys": reference_site_keys,
             "initial_test_scope": [
                 "session_preparation",
@@ -124,6 +126,9 @@ def _related_files(*, root: Path, workspace: Path, site_key: str, target_skill_p
         workspace / "sites" / site_key / "site.json",
         workspace / "sites" / site_key / "events" / "all.jsonl",
     ]
+    lessons = _related_lessons_file(workspace)
+    if lessons:
+        files.append(Path(lessons))
     for ref_path in _reference_site_skill_paths(root=root, target_site_key=site_key):
         files.append(ref_path)
     return [str(path) for path in files if path.exists()]
@@ -150,3 +155,9 @@ def _reference_site_skill_paths(*, root: Path, target_site_key: str) -> list[Pat
             ordered.append(path)
     ordered.extend(path for _key, path in sorted(found.items()))
     return ordered[:8]
+
+
+def _related_lessons_file(workspace: Path | str) -> str:
+    from careereng.evolution.browser_control.lessons import related_lessons_file
+
+    return related_lessons_file(workspace)

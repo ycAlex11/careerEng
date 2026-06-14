@@ -11,14 +11,14 @@ from careereng.utils import dump_front_matter, ensure_dir, now_iso
 
 
 USER_JOB_SKILL_FRONT_MATTER = {
-    "id": "search-jobs",
-    "name": "Search Jobs Skill",
+    "id": "job-preferences",
+    "name": "Job Preferences",
     "version": "v1",
     "updated_at": "",
-    "scope": "jobs",
+    "scope": "job_preferences",
 }
 
-USER_JOB_SKILL_BODY = """# Search Jobs Skill
+USER_JOB_SKILL_BODY = """# Job Preferences
 
 Use this file for user-owned job search preferences.
 When this file conflicts with `intent.md`, this file should win.
@@ -161,15 +161,20 @@ def bootstrap_workspace(workspace: Path) -> list[WorkspaceEntry]:
     _ensure_text_file(workspace / "intent" / "intent.md", dump_front_matter(DEFAULT_INTENT), rows, workspace)
     _ensure_empty_file(workspace / "intent" / "intent_events.jsonl", rows, workspace)
 
-    _ensure_dir(workspace / "skills", rows, workspace)
-    _ensure_dir(workspace / "skills" / "jobs", rows, workspace)
-    canonical_skill = workspace / "skills" / "jobs" / "SKILL.md"
-    legacy_skill = workspace / "jobs" / "SKILL.md"
-    if not canonical_skill.exists() and legacy_skill.exists():
-        skill_text = legacy_skill.read_text(encoding="utf-8")
+    canonical_preferences = workspace / "profile" / "job_preferences.md"
+    legacy_skills = [
+        workspace / "skills" / "jobs" / "SKILL.md",
+        workspace / "jobs" / "SKILL.md",
+    ]
+    skill_text = default_user_job_skill_text()
+    if not canonical_preferences.exists():
+        for legacy_skill in legacy_skills:
+            if legacy_skill.exists():
+                skill_text = legacy_skill.read_text(encoding="utf-8")
+                break
     else:
-        skill_text = default_user_job_skill_text()
-    _ensure_text_file(canonical_skill, skill_text, rows, workspace)
+        skill_text = canonical_preferences.read_text(encoding="utf-8")
+    _ensure_text_file(canonical_preferences, skill_text, rows, workspace)
 
     _ensure_dir(workspace / "search", rows, workspace)
     _ensure_empty_file(workspace / "search" / "queries.jsonl", rows, workspace)
@@ -217,6 +222,7 @@ def bootstrap_workspace(workspace: Path) -> list[WorkspaceEntry]:
     _ensure_dir(workspace / "evolution", rows, workspace)
     _ensure_dir(workspace / "evolution" / "browser_control", rows, workspace)
     _ensure_empty_file(workspace / "evolution" / "browser_control" / "phase_events.jsonl", rows, workspace)
+    _ensure_empty_file(workspace / "evolution" / "browser_control" / "lessons.jsonl", rows, workspace)
     _ensure_dir(workspace / "evolution" / "evidence", rows, workspace)
     _ensure_empty_file(workspace / "evolution" / "evidence" / "all.jsonl", rows, workspace)
     _ensure_dir(workspace / "evolution" / "candidates", rows, workspace)

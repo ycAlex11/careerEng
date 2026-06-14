@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from careereng.skill_schema import normalize_posted_window_policy
+from careereng.storage.job_identity import infer_site_job_id_from_url, primary_job_identity_key
+from careereng.storage.posted_time import current_posted_age_observation, normalize_posted_fields
 from careereng.utils import ensure_dir, make_id, now_iso, safe_file_stem, write_json
 
 
@@ -146,6 +147,11 @@ class JobPlanningStore:
             items.append(item)
             action = str(item.get("action") or "unknown")
             counts[action] = int(counts.get(action) or 0) + 1
+        items = self._dedupe_plan_items(site_key=site_key, items=items)
+        counts = {}
+        for item in items:
+            action = str(item.get("action") or "unknown")
+            counts[action] = int(counts.get(action) or 0) + 1
         plan_id = make_id("apply_plan")
         payload = {
             "plan_id": plan_id,
@@ -206,7 +212,10 @@ class JobPlanningStore:
                 "decision_context_hash": str(item.get("decision_context_hash") or ""),
                 "context_versions": item.get("context_versions") if isinstance(item.get("context_versions"), dict) else {},
                 "observed_posted_age_days": item.get("observed_posted_age_days"),
+                "current_posted_age_days": item.get("current_posted_age_days"),
                 "observed_posted_age_is_lower_bound": bool(item.get("observed_posted_age_is_lower_bound")),
+                "posted_observed_at": str(item.get("posted_observed_at") or ""),
+                "inferred_posted_date": str(item.get("inferred_posted_date") or ""),
             }
         if action in {"skip_rejected", "skip_closed", "skip_withdrawn"}:
             status = action.replace("skip_", "")
@@ -216,6 +225,57 @@ class JobPlanningStore:
                 "apply_state": f"terminal_{status}",
             }
         return {}
+
+    @classmethod
+    def _dedupe_plan_items(cls, *, site_key: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_key: dict[str, dict[str, Any]] = {}
+        ordered_keys: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = primary_job_identity_key(site_key, item) or str(item.get("job_key") or "")
+            if not key:
+                continue
+            current = by_key.get(key)
+            if current is None:
+                by_key[key] = dict(item)
+                ordered_keys.append(key)
+                continue
+            by_key[key] = cls._merge_plan_items(current, item)
+        return [by_key[key] for key in ordered_keys if key in by_key]
+
+    @classmethod
+    def _merge_plan_items(cls, current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        winner, other = (incoming, current) if cls._plan_item_priority(incoming) > cls._plan_item_priority(current) else (current, incoming)
+        merged = dict(winner)
+        for field, value in other.items():
+            if value is None or value == "":
+                continue
+            if not merged.get(field):
+                merged[field] = value
+        if not str(merged.get("site_job_id") or "").strip():
+            inferred = infer_site_job_id_from_url(merged.get("url") or other.get("url") or "")
+            if inferred:
+                merged["site_job_id"] = inferred
+        return merged
+
+    @staticmethod
+    def _plan_item_priority(item: dict[str, Any]) -> int:
+        action = str(item.get("action") or "").strip().lower()
+        application_status = str(
+            item.get("history_application_status") or item.get("application_status") or ""
+        ).strip().lower()
+        if action in {"skip_submitted", "skip_already_applied", "skip_rejected", "skip_closed", "skip_withdrawn"}:
+            return 100
+        if application_status in TERMINAL_APPLICATION_STATUSES:
+            return 100
+        if action in {"retry_blocked"}:
+            return 80
+        if action in {"open_for_match_review", "enrich_jd"}:
+            return 70
+        if action == "skip_filtered_out":
+            return 60
+        return 50
 
     @staticmethod
     def _normalize_search_url(url: str) -> str:
@@ -240,6 +300,11 @@ class JobPlanningStore:
     @classmethod
     def _job_key(cls, *, site_key: str, row: dict[str, Any]) -> str:
         site = safe_file_stem(site_key or str(row.get("site_id") or "site"))
+        site_job_id = str(row.get("site_job_id") or row.get("source_job_id") or "").strip()
+        if not site_job_id:
+            site_job_id = infer_site_job_id_from_url(row.get("url"))
+        if site_job_id:
+            return f"site_job_id|{site}|{site_job_id.lower()}"
         for field in ("site_job_id", "canonical_job_id", "job_id", "url"):
             value = str(row.get(field) or "").strip()
             if value:
@@ -251,6 +316,7 @@ class JobPlanningStore:
 
     @classmethod
     def _snapshot_job_item(cls, *, site_key: str, row: dict[str, Any]) -> dict[str, Any]:
+        row = normalize_posted_fields(dict(row))
         return {
             "job_key": cls._job_key(site_key=site_key, row=row),
             "job_id": str(row.get("job_id") or ""),
@@ -261,6 +327,10 @@ class JobPlanningStore:
             "location": str(row.get("location") or ""),
             "posted_at": str(row.get("posted_at") or ""),
             "posted_label": str(row.get("posted_label") or ""),
+            "posted_observed_at": str(row.get("posted_observed_at") or ""),
+            "inferred_posted_date": str(row.get("inferred_posted_date") or ""),
+            "observed_posted_age_days": row.get("observed_posted_age_days", ""),
+            "observed_posted_age_is_lower_bound": bool(row.get("observed_posted_age_is_lower_bound")),
         }
 
     @classmethod
@@ -275,6 +345,7 @@ class JobPlanningStore:
         apply_candidate_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         history = history if isinstance(history, dict) else {}
+        row = normalize_posted_fields(dict(row))
         application_status = str(history.get("application_status") or row.get("application_status") or "").strip().lower()
         decision_status = str(history.get("decision_status") or row.get("decision_status") or "").strip().lower()
         apply_state = str(history.get("apply_state") or row.get("apply_state") or "").strip().lower()
@@ -332,41 +403,17 @@ class JobPlanningStore:
             "decision_reason_type": decision_reason_type,
             "context_versions": current_context_versions,
             "history_context_versions": history_context_versions,
-            "observed_posted_age_days": posted_age.get("days") if posted_age.get("days") is not None else "",
+            "observed_posted_age_days": row.get("observed_posted_age_days", ""),
+            "current_posted_age_days": posted_age.get("days") if posted_age.get("days") is not None else "",
             "observed_posted_age_is_lower_bound": bool(posted_age.get("is_lower_bound")),
+            "posted_observed_at": str(row.get("posted_observed_at") or ""),
+            "inferred_posted_date": str(row.get("inferred_posted_date") or ""),
             "apply_candidate_policy": posted_policy,
         }
 
     @classmethod
     def _posted_age_observation(cls, row: dict[str, Any]) -> dict[str, Any]:
-        observed = row.get("observed_posted_age_days")
-        try:
-            if observed not in (None, ""):
-                return {
-                    "days": int(float(observed)),
-                    "is_lower_bound": bool(row.get("observed_posted_age_is_lower_bound")),
-                }
-        except Exception:
-            pass
-        text = " ".join(
-            str(row.get(field) or "")
-            for field in (
-                "posted_label",
-                "posted_at",
-                "fit_reason",
-                "match_reason_initial",
-                "match_reason_final",
-                "reason",
-            )
-        )
-        match = re.search(r"\b(\d{1,4})\s*(\+)?\s*days?\b", text, flags=re.IGNORECASE)
-        if not match:
-            return {"days": None, "is_lower_bound": False}
-        try:
-            days = int(match.group(1))
-        except Exception:
-            return {"days": None, "is_lower_bound": False}
-        return {"days": days, "is_lower_bound": bool(match.group(2))}
+        return current_posted_age_observation(normalize_posted_fields(dict(row)))
 
     @classmethod
     def _posted_window_exclusion(cls, *, posted_age: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
@@ -415,8 +462,8 @@ class JobPlanningStore:
         keys_by_reason = {
             "time": ("site_policy_hash", "apply_candidate_policy_hash"),
             "hard_excluded": ("site_policy_hash", "project_matching_policy_hash", "site_matching_policy_hash"),
-            "cv": ("cv_hash", "profile_hash"),
-            "matching_policy": ("project_matching_policy_hash", "site_matching_policy_hash"),
+            "cv": ("cv_hash", "profile_hash", "project_matching_policy_hash", "site_matching_policy_hash"),
+            "matching_policy": ("cv_hash", "profile_hash", "project_matching_policy_hash", "site_matching_policy_hash"),
         }
         keys = keys_by_reason.get(reason_type)
         if not keys:

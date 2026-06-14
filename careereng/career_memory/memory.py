@@ -11,6 +11,7 @@ from careereng.integrations.assistant_bridge.schema import (
     DATA_CATEGORY_APPLICATION_FEEDBACK,
     DATA_CATEGORY_CAREER_INTENT_STRATEGY,
     DATA_CATEGORY_CORRECTION,
+    DATA_CATEGORY_EVOLUTION_LESSON,
     DATA_CATEGORY_INTERVIEW_RECORD,
     DATA_CATEGORY_PROFILE_RESUME_SIGNAL,
     DATA_CATEGORIES,
@@ -26,6 +27,7 @@ PROMOTABLE_CATEGORIES = {
     DATA_CATEGORY_INTERVIEW_RECORD,
     DATA_CATEGORY_CORRECTION,
 }
+IMPORTABLE_CANDIDATE_CATEGORIES = {*PROMOTABLE_CATEGORIES, DATA_CATEGORY_EVOLUTION_LESSON}
 
 SIGNAL_SPECS = (
     (DATA_CATEGORY_PROFILE_RESUME_SIGNAL, Path("memory/profile_signals.jsonl"), "signal_id"),
@@ -130,6 +132,8 @@ def import_memory_candidates(
     existing_keys = {_dedupe_key(row) for row in existing if _dedupe_key(row)}
 
     created: list[dict[str, Any]] = []
+    created_lessons: list[dict[str, Any]] = []
+    created_evidence: list[dict[str, Any]] = []
     skipped = 0
     for idx, candidate in enumerate(candidates, 1):
         enriched_candidate = _candidate_with_import_metadata(
@@ -139,6 +143,25 @@ def import_memory_candidates(
             source_thread=normalized_source_thread,
             source_client=normalized_source_client,
         )
+        category = str(enriched_candidate.get("category") or "").strip()
+        if category not in IMPORTABLE_CANDIDATE_CATEGORIES:
+            raise CareerMemoryError(f"candidate #{idx} has unsupported category: {category or '<empty>'}")
+        if category == DATA_CATEGORY_EVOLUTION_LESSON:
+            lesson, created_flag = _append_evolution_lesson_from_candidate(
+                workspace=workspace_path,
+                candidate=enriched_candidate,
+                source_path=str(path),
+                index=idx,
+            )
+            if not created_flag:
+                skipped += 1
+                continue
+            lesson_row = lesson.to_dict()
+            created_lessons.append(lesson_row)
+            evidence = _evolution_evidence_from_lesson(lesson_row, source_path=str(path), index=idx)
+            if _append_unique_evolution_evidence(workspace_path, evidence):
+                created_evidence.append(evidence)
+            continue
         unit = _unit_from_candidate(enriched_candidate, source_path=str(path), index=idx)
         key = _dedupe_key(unit)
         if not key or key in existing_keys:
@@ -157,8 +180,12 @@ def import_memory_candidates(
         "source_limit": normalized_source_limit,
         "read": len(candidates),
         "created": len(created),
+        "created_lessons": len(created_lessons),
+        "created_evolution_evidence": len(created_evidence),
         "skipped_existing": skipped,
         "memory_ids": [str(row.get("memory_id") or "") for row in created],
+        "lesson_ids": [str(row.get("lesson_id") or "") for row in created_lessons],
+        "evidence_ids": [str(row.get("evidence_id") or "") for row in created_evidence],
     }
 
 
@@ -339,6 +366,106 @@ def _candidate_with_import_metadata(
     if tags:
         enriched["tags"] = sorted(tags)
     return enriched
+
+
+def _append_evolution_lesson_from_candidate(
+    *,
+    workspace: Path,
+    candidate: dict[str, Any],
+    source_path: str,
+    index: int,
+) -> tuple[Any, bool]:
+    from careereng.evolution.browser_control.lessons import BrowserControlLessonStore
+
+    summary = str(candidate.get("summary") or "").strip()
+    evidence_text = str(candidate.get("evidence_text") or candidate.get("source_text") or "").strip()
+    if not summary:
+        summary = _clip(evidence_text, MAX_SUMMARY_CHARS)
+    if not summary:
+        raise CareerMemoryError(f"candidate #{index} must include summary or evidence_text")
+
+    facts = _dict(candidate.get("facts"))
+    evidence_origin = _dict(candidate.get("evidence_origin"))
+    if not evidence_origin:
+        evidence_origin = _dict(facts.get("evidence_origin"))
+    source_thread_id = str(candidate.get("source_thread_id") or facts.get("source_thread_id") or "").strip()
+    source_client = str(facts.get("source_client") or "").strip()
+    if source_thread_id and "source_thread_id" not in evidence_origin:
+        evidence_origin["source_thread_id"] = source_thread_id
+    if source_client and "source_client" not in evidence_origin:
+        evidence_origin["source_client"] = source_client
+
+    payload = {
+        "lesson_id": str(candidate.get("lesson_id") or "").strip(),
+        "created_at": str(candidate.get("created_at") or "").strip(),
+        "status": str(candidate.get("status") or "accepted").strip() or "accepted",
+        "phase": str(candidate.get("phase") or facts.get("phase") or "").strip(),
+        "lesson_type": str(candidate.get("lesson_type") or facts.get("lesson_type") or "conversation_curated").strip(),
+        "summary": summary,
+        "rationale": str(candidate.get("rationale") or evidence_text or "").strip(),
+        "evidence_origin": evidence_origin,
+        "applicability_scope": str(candidate.get("applicability_scope") or facts.get("applicability_scope") or "site_skill_evolution").strip(),
+        "applicability_tags": _string_list(
+            candidate.get("applicability_tags")
+            or facts.get("applicability_tags")
+            or candidate.get("applies_to")
+            or candidate.get("future_use")
+        ),
+        "source_evidence_ids": _string_list(candidate.get("source_evidence_ids")),
+        "source_candidate_ids": _string_list(candidate.get("source_candidate_ids")),
+        "source_run_ids": _string_list(candidate.get("source_run_ids")),
+        "evidence_refs": _candidate_evidence_refs(candidate, source_path=source_path),
+        "avoid_patterns": _string_list(candidate.get("avoid_patterns") or facts.get("avoid_patterns")),
+        "recommended_patterns": _string_list(candidate.get("recommended_patterns") or facts.get("recommended_patterns")),
+        "dedupe_key": str(candidate.get("dedupe_key") or "").strip(),
+    }
+    return BrowserControlLessonStore(workspace).append_unique(payload)
+
+
+def _evolution_evidence_from_lesson(lesson: dict[str, Any], *, source_path: str, index: int) -> dict[str, Any]:
+    origin = lesson.get("evidence_origin") if isinstance(lesson.get("evidence_origin"), dict) else {}
+    evidence_id = "evidence_" + _stable_key(
+        "evolution_lesson",
+        lesson.get("lesson_id"),
+        lesson.get("dedupe_key"),
+        source_path,
+        index,
+    )
+    return {
+        "evidence_id": evidence_id,
+        "created_at": now_iso(),
+        "source_type": "evolution_lesson",
+        "source_ref": str(lesson.get("lesson_id") or source_path),
+        "area": "browser_control",
+        "site_key": str(origin.get("site_key") or ""),
+        "phase": str(lesson.get("phase") or origin.get("phase") or ""),
+        "event_type": "accepted_lesson",
+        "severity": "info",
+        "summary": str(lesson.get("summary") or ""),
+        "details": {
+            "lesson_id": lesson.get("lesson_id"),
+            "applicability_scope": lesson.get("applicability_scope") or lesson.get("scope"),
+            "applicability_tags": lesson.get("applicability_tags") or lesson.get("applies_to") or [],
+            "evidence_origin": origin,
+            "source_path": source_path,
+        },
+        "entities": {
+            "lesson_id": lesson.get("lesson_id"),
+            "origin_site_key": origin.get("site_key") or "",
+        },
+        "tags": ["evolution_lesson", "browser_control", str(lesson.get("applicability_scope") or "site_skill_evolution")],
+        "fingerprint": str(lesson.get("dedupe_key") or ""),
+    }
+
+
+def _append_unique_evolution_evidence(workspace: Path, row: dict[str, Any]) -> bool:
+    path = workspace / "evolution" / "evidence" / "all.jsonl"
+    store = JSONLStore(path)
+    wanted = str(row.get("evidence_id") or "").strip()
+    if wanted and any(str(existing.get("evidence_id") or "").strip() == wanted for existing in store.read_all()):
+        return False
+    store.append(row)
+    return True
 
 
 def _read_candidate_file(path: Path) -> list[dict[str, Any]]:

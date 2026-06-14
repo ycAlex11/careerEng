@@ -659,7 +659,7 @@ class JobFlow:
         return [row for row in rows if isinstance(row, dict)]
 
     @staticmethod
-    def _run_job_identity(row: dict[str, Any]) -> str:
+    def _fallback_run_job_identity(row: dict[str, Any]) -> str:
         for field in ("job_id", "canonical_job_id", "url"):
             value = str(row.get(field) or "").strip()
             if value:
@@ -669,14 +669,21 @@ class JobFlow:
         posted_label = str(row.get("posted_label") or "").strip()
         return f"fallback:{title}|{location}|{posted_label}" if title else ""
 
-    @classmethod
-    def _merged_run_job_rows(cls, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _run_job_identity(self, site_key: str, row: dict[str, Any]) -> str:
+        identity_keys = getattr(self.site_tools.site_store, "job_identity_keys", None)
+        if callable(identity_keys):
+            keys = identity_keys(site_key, row)
+            if keys:
+                return str(keys[0])
+        return self._fallback_run_job_identity(row)
+
+    def _merged_run_job_rows(self, site_key: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         merged_by_key: dict[str, dict[str, Any]] = {}
         ordered_keys: list[str] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            key = cls._run_job_identity(row)
+            key = self._run_job_identity(site_key, row)
             if not key:
                 continue
             current = merged_by_key.get(key)
@@ -693,7 +700,7 @@ class JobFlow:
         return [merged_by_key[key] for key in ordered_keys if key in merged_by_key]
 
     def _merged_run_job_rows_for_batch(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
-        return self._merged_run_job_rows(self._run_job_rows(site_key, batch_id))
+        return self._merged_run_job_rows(site_key, self._run_job_rows(site_key, batch_id))
 
     @staticmethod
     def _terminal_application_status(row: dict[str, Any]) -> str:
@@ -889,24 +896,30 @@ class JobFlow:
                         site_key,
                         current_context_versions=context_versions,
                         current_decision_context_hash=decision_context_hash,
+                        apply_candidate_policy=apply_candidate_policy,
                     )
                 except Exception:
                     history_candidates = []
-                existing_job_ids = {str(row.get("job_id") or "") for row in rows if isinstance(row, dict)}
-                existing_urls = {str(row.get("url") or "") for row in rows if isinstance(row, dict) and str(row.get("url") or "")}
-                existing_site_job_ids = {
-                    str(row.get("site_job_id") or "")
-                    for row in rows
-                    if isinstance(row, dict) and str(row.get("site_job_id") or "")
-                }
-                requeued_rows = [
-                    row
-                    for row in history_candidates
-                    if isinstance(row, dict)
-                    and str(row.get("job_id") or "") not in existing_job_ids
-                    and (not str(row.get("url") or "") or str(row.get("url") or "") not in existing_urls)
-                    and (not str(row.get("site_job_id") or "") or str(row.get("site_job_id") or "") not in existing_site_job_ids)
-                ]
+                identity_keys = getattr(self.site_tools.site_store, "job_identity_keys", None)
+
+                def row_identity_key_set(row: dict[str, Any]) -> set[str]:
+                    if callable(identity_keys):
+                        return {str(key) for key in identity_keys(site_key, row) if str(key)}
+                    fallback = self._fallback_run_job_identity(row)
+                    return {fallback} if fallback else set()
+
+                existing_identity_keys: set[str] = set()
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    existing_identity_keys.update(row_identity_key_set(row))
+                requeued_rows = []
+                for row in history_candidates:
+                    if not isinstance(row, dict):
+                        continue
+                    if row_identity_key_set(row) & existing_identity_keys:
+                        continue
+                    requeued_rows.append(row)
                 if requeued_rows:
                     self.site_tools.site_store.update_run_jobs(site_key, requeued_rows, session_id, turn_id, batch_id)
                     rows = self._merged_run_job_rows_for_batch(site_key, batch_id)

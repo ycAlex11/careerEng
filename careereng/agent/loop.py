@@ -162,6 +162,7 @@ class AgentLoop:
 
     def _load_user_job_skill_text(self) -> str:
         candidates = [
+            self.workspace / "profile" / "job_preferences.md",
             self.workspace / "skills" / "jobs" / "SKILL.md",
             self.workspace / "jobs" / "SKILL.md",
         ]

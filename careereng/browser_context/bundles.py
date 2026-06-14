@@ -61,6 +61,7 @@ def _pending_apply_rows(
                 "apply_state": str(row.get("apply_state") or ""),
                 "decision_status": str(row.get("decision_status") or ""),
                 "application_status": str(row.get("application_status") or ""),
+                "application_status_raw": str(row.get("application_status_raw") or ""),
             }
         )
     return pending_rows
