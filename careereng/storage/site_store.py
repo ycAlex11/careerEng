@@ -703,6 +703,30 @@ class SiteStore:
                 normalized.pop("decision_reason_type", None)
             return normalized
 
+        if application_status == "already_applied":
+            normalized["application_status"] = "already_applied"
+            normalized["apply_state"] = "terminal_already_applied"
+            normalized["decision_status"] = "already_applied"
+            if match_label in {"filtered_out", "posted_too_old", "not_recommended", "underfit", "low_fit"}:
+                normalized.pop("match_label", None)
+            if cls._has_filtered_out_conflict_text(normalized):
+                for field in ("fit_reason", "match_reason_initial", "match_reason_final"):
+                    value = str(normalized.get(field) or "").strip().lower()
+                    if any(marker in value for marker in cls.FILTERED_OUT_CONFLICT_MARKERS):
+                        normalized.pop(field, None)
+            if cls._normalize_decision_reason_type(normalized.get("decision_reason_type")) in {
+                "time",
+                "cv",
+                "matching_policy",
+                "hard_excluded",
+                "closed",
+                "unknown",
+            }:
+                normalized.pop("decision_reason_type", None)
+            normalized.pop("decision_context_hash", None)
+            normalized.pop("context_versions", None)
+            return normalized
+
         if application_status in {"rejected", "withdrawn"}:
             normalized["apply_state"] = f"terminal_{application_status}"
             if decision_status == "filtered_out":
@@ -853,6 +877,204 @@ class SiteStore:
             normalized["apply_state"] = apply_state
         return normalized
 
+    def _history_strong_merge_keys(self, site_id: str, row: dict[str, Any]) -> list[str]:
+        return [
+            key
+            for key in self.job_identity_keys(site_id, row)
+            if key.startswith(("source-value|", "source|"))
+        ]
+
+    @classmethod
+    def _history_latest_timestamp(cls, row: dict[str, Any]) -> str:
+        for field in (
+            "application_review_checked_at",
+            "application_updated_at",
+            "decision_updated_at",
+            "last_seen_at",
+            "posted_observed_at",
+            "ts",
+            "first_seen_at",
+        ):
+            value = str(row.get(field) or "").strip()
+            if value:
+                return value
+        return ""
+
+    @classmethod
+    def _history_status_rank(cls, row: dict[str, Any]) -> int:
+        status = str(row.get("application_status") or "").strip().lower()
+        decision_status = str(row.get("decision_status") or "").strip().lower()
+        apply_state = str(row.get("apply_state") or "").strip().lower()
+        if status in {"rejected", "withdrawn", "closed"}:
+            return 90
+        if status == "submitted" or apply_state == "terminal_submitted":
+            return 85
+        if status == "already_applied" or apply_state == "terminal_already_applied":
+            return 80
+        if status in {"blocked", "apply_failed"} or apply_state in {"terminal_blocked", "terminal_apply_failed"}:
+            return 60
+        if status == "filtered_out" or decision_status == "filtered_out" or apply_state == "terminal_filtered_out":
+            return 20
+        return 10
+
+    @classmethod
+    def _history_primary_row(cls, left: dict[str, Any], right: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        left_review_ts = str(left.get("application_review_checked_at") or "").strip()
+        right_review_ts = str(right.get("application_review_checked_at") or "").strip()
+        if left_review_ts or right_review_ts:
+            if right_review_ts > left_review_ts:
+                return right, left
+            if left_review_ts > right_review_ts:
+                return left, right
+        left_rank = cls._history_status_rank(left)
+        right_rank = cls._history_status_rank(right)
+        if right_rank > left_rank:
+            return right, left
+        if left_rank > right_rank:
+            return left, right
+        if cls._history_latest_timestamp(right) > cls._history_latest_timestamp(left):
+            return right, left
+        return left, right
+
+    @staticmethod
+    def _merge_earliest(*values: Any) -> str:
+        candidates = sorted(str(value or "").strip() for value in values if str(value or "").strip())
+        return candidates[0] if candidates else ""
+
+    @staticmethod
+    def _merge_latest(*values: Any) -> str:
+        candidates = sorted(str(value or "").strip() for value in values if str(value or "").strip())
+        return candidates[-1] if candidates else ""
+
+    @classmethod
+    def _merge_duplicate_history_rows(cls, primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(primary)
+        primary_non_terminal_review = cls._review_indicates_non_terminal_application(
+            status=primary.get("application_review_status"),
+            raw=primary.get("application_review_status_raw"),
+            stage=primary.get("application_review_stage"),
+        )
+        status_fields = {"application_status", "decision_status", "apply_state"}
+        fill_fields = (
+            "batch_id",
+            "session_id",
+            "turn_id",
+            "canonical_job_id",
+            "site_id",
+            "employer",
+            "title",
+            "url",
+            "location",
+            "posted_at",
+            "posted_label",
+            "posted_observed_at",
+            "inferred_posted_date",
+            "employment_type",
+            "match_label",
+            "apply_state",
+            "site_job_id",
+            "description_ref",
+            "jd_sync_status",
+            "decision_status",
+            "decision_rule_source",
+            "decision_rule_name",
+            "site_match_signal_raw",
+            "match_reason_initial",
+            "match_reason_final",
+            "fit_reason",
+            "fit_source",
+            "application_status",
+            "application_status_raw",
+            "last_apply_error",
+            "decision_reason_type",
+            "application_review_status",
+            "application_review_status_raw",
+            "application_review_stage",
+            "application_review_url",
+            "application_review_batch_id",
+            "application_review_checked_at",
+            "previous_application_review_status",
+            "previous_application_review_status_raw",
+            "previous_application_review_stage",
+            "history_source",
+            "application_origin",
+            "features_ref",
+        )
+        for field in fill_fields:
+            if primary_non_terminal_review and field in status_fields:
+                continue
+            if str(merged.get(field) or "").strip():
+                continue
+            value = secondary.get(field)
+            if value not in (None, ""):
+                merged[field] = value
+
+        first_seen = cls._merge_earliest(primary.get("first_seen_at"), secondary.get("first_seen_at"))
+        if first_seen:
+            merged["first_seen_at"] = first_seen
+        for field in (
+            "last_seen_at",
+            "ts",
+            "posted_observed_at",
+            "application_review_checked_at",
+            "application_updated_at",
+            "decision_updated_at",
+        ):
+            latest = cls._merge_latest(primary.get(field), secondary.get(field))
+            if latest:
+                merged[field] = latest
+
+        try:
+            merged["seen_count"] = max(int(primary.get("seen_count") or 0), int(secondary.get("seen_count") or 0))
+        except Exception:
+            pass
+        for field in ("observed_posted_age_days",):
+            if merged.get(field) in (None, "") and secondary.get(field) not in (None, ""):
+                try:
+                    merged[field] = int(float(secondary.get(field)))
+                except Exception:
+                    pass
+        for field in ("observed_posted_age_is_lower_bound", "fit_apply", "is_active", "application_review_status_changed"):
+            if field not in merged and field in secondary:
+                merged[field] = secondary[field]
+        if isinstance(primary.get("context_versions"), dict):
+            merged["context_versions"] = dict(primary["context_versions"])
+        elif str(merged.get("application_status") or "").strip().lower() == "filtered_out" and isinstance(
+            secondary.get("context_versions"), dict
+        ):
+            merged["context_versions"] = dict(secondary["context_versions"])
+        if (
+            not str(merged.get("decision_context_hash") or "").strip()
+            and str(merged.get("application_status") or "").strip().lower() == "filtered_out"
+        ):
+            value = str(secondary.get("decision_context_hash") or "").strip()
+            if value:
+                merged["decision_context_hash"] = value
+        return cls._normalize_history_row_for_write(merged)
+
+    def _compact_history_jobs_for_write(self, site_id: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        compacted: list[dict[str, Any]] = []
+        key_to_index: dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            normalized = self._normalize_history_row_for_write(row)
+            strong_keys = self._history_strong_merge_keys(site_id, normalized)
+            target_idx: int | None = None
+            for key in strong_keys:
+                if key in key_to_index:
+                    target_idx = key_to_index[key]
+                    break
+            if target_idx is None:
+                target_idx = len(compacted)
+                compacted.append(normalized)
+            else:
+                primary, secondary = self._history_primary_row(compacted[target_idx], normalized)
+                compacted[target_idx] = self._merge_duplicate_history_rows(primary, secondary)
+            for key in self._history_strong_merge_keys(site_id, compacted[target_idx]):
+                key_to_index[key] = target_idx
+        return compacted
+
     @classmethod
     def _is_runtime_stop_apply_failed(cls, *, status: str, error_text: str) -> bool:
         if str(status or "").strip().lower() != "apply_failed":
@@ -863,9 +1085,10 @@ class SiteStore:
     def _write_history_jobs(self, site_id: str, rows: list[dict[str, Any]]) -> None:
         path = self._history_jobs_path(site_id)
         ensure_dir(path.parent)
+        compacted_rows = self._compact_history_jobs_for_write(site_id, rows)
         path.write_text(
             json.dumps(
-                [self._normalize_history_row_for_write(row) for row in rows if isinstance(row, dict)],
+                compacted_rows,
                 ensure_ascii=False,
                 indent=2,
             )
