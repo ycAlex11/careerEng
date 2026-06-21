@@ -34,6 +34,7 @@ When action is needed, browser automation becomes the execution layer: opening c
 | Reports | Summarizes new jobs, submitted jobs, reviewed application statuses, raw status labels, and status changes. |
 | Application Summary | Builds a local summary of application outcomes, unmatched reviews, and repair opportunities. |
 | Assistant Bridge | Lets Codex or other assistants route `@career` requests into local commands and career memory. |
+| Assistant Context + Taskboard | Gives Codex a compact local map of current memory, reports, evolution lessons, open tasks, and follow-up work. |
 | Action Cards | Creates local review task cards when Codex/user judgment is needed instead of immediate execution. |
 | Metrics | Records runtime and usage summaries for debugging and future workflow optimization. |
 | Evolution Scaffolding | Builds evidence packs, proposals, evaluations, and rollback records for future workflow improvement. |
@@ -204,6 +205,24 @@ Examples:
 Codex should route these messages through the local assistant bridge. Detailed assistant rules live in `AGENTS.md` and `docs/assistant_bridge/`.
 
 The important design boundary is simple: Codex can understand the current conversation and help draft changes; CareerEng owns local storage, command execution, history, reports, and business state.
+
+### Assistant Context And Taskboard
+
+CareerEng can generate a compact assistant context pack so Codex can quickly understand the current workspace before acting. It summarizes local memory, reports, metrics, evolution lessons, open action cards, the current taskboard, and recent Codex-import state.
+
+The taskboard is a lightweight local tracker for ongoing work. It is useful when you customize CareerEng, tune a site Skill, adjust evolution cadence, debug a failed workflow, or carry a multi-step plan across long Codex conversations.
+
+You usually do not need to manage taskboard files or commands yourself. Ask Codex to do it:
+
+```text
+Save this task list.
+Show the current taskboard.
+Mark the first task done.
+Archive this taskboard.
+Before changing this workflow, check the current CareerEng context.
+```
+
+This is especially useful if you want to fork the project for your own job-search strategy. Codex can use the taskboard to track what you are changing, why you are changing it, what should not be touched, and how the change should be verified.
 
 ## Skills
 

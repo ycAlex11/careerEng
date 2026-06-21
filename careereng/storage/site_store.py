@@ -530,6 +530,7 @@ class SiteStore:
             "filtered_out": "terminal_filtered_out",
             "apply_failed": "terminal_apply_failed",
             "blocked": "terminal_blocked",
+            "resumable": "resumable_application",
             "rejected": "terminal_rejected",
             "closed": "terminal_closed",
             "withdrawn": "terminal_withdrawn",
@@ -556,6 +557,10 @@ class SiteStore:
                 "not applied",
                 "draft",
                 "incomplete",
+                "continue application",
+                "resume application",
+                "application started",
+                "started application",
             )
         )
 
@@ -565,7 +570,7 @@ class SiteStore:
         if not text:
             return ""
         if cls._review_indicates_non_terminal_application(status=status, raw=raw, stage=stage):
-            return ""
+            return "resumable"
         if any(marker in text for marker in ("declined", "rejected", "inactive", "closed")):
             return "rejected"
         if "withdrawn" in text:
@@ -913,6 +918,8 @@ class SiteStore:
             return 80
         if status in {"blocked", "apply_failed"} or apply_state in {"terminal_blocked", "terminal_apply_failed"}:
             return 60
+        if status == "resumable" or apply_state == "resumable_application":
+            return 55
         if status == "filtered_out" or decision_status == "filtered_out" or apply_state == "terminal_filtered_out":
             return 20
         return 10
@@ -1563,6 +1570,8 @@ class SiteStore:
             apply_state = self._history_apply_state_for_application_status(application_status)
             if apply_state:
                 row["apply_state"] = apply_state
+            if application_status == "resumable":
+                row["decision_status"] = "recommended_apply"
         if batch_id:
             row["last_seen_batch_id"] = str(batch_id)
         if site_job_id:
@@ -2229,7 +2238,10 @@ class SiteStore:
                 continue
             include = False
             reason = ""
-            if application_status in {"apply_failed", "blocked"}:
+            if application_status == "resumable" or apply_state == "resumable_application":
+                include = True
+                reason = "resume unsubmitted application from application review"
+            elif application_status in {"apply_failed", "blocked"}:
                 include = True
                 reason = f"retry previous {application_status}"
             elif application_status == "filtered_out" or decision_status == "filtered_out":
@@ -2705,6 +2717,8 @@ class SiteStore:
                 raw=status_raw,
                 stage=stage,
             )
+            if review_is_non_terminal:
+                status = "resumable"
             if not title and not url and not site_job_id:
                 continue
 
@@ -2781,6 +2795,10 @@ class SiteStore:
                     apply_state = self._history_apply_state_for_application_status(review_application_status)
                     if apply_state:
                         current["apply_state"] = apply_state
+                    if review_application_status == "resumable":
+                        current["decision_status"] = "recommended_apply"
+                        current.pop("decision_reason_type", None)
+                        current.pop("decision_context_hash", None)
                 elif review_is_non_terminal:
                     if str(current.get("application_status") or "").strip().lower() in {"already_applied", "submitted"}:
                         current["application_status"] = ""

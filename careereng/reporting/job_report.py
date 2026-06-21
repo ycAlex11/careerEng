@@ -14,9 +14,10 @@ from careereng.utils import ensure_dir, safe_file_stem, today_str
 
 APPLIED_RELATED_STATUSES = {"submitted", "already_applied"}
 TERMINAL_APPLICATION_STATUSES = {"submitted", "already_applied", "apply_failed", "blocked"}
-APPLICATION_REVIEW_STATUSES = ("active", "inactive", "rejected", "closed", "withdrawn", "unknown", "blocked")
+APPLICATION_REVIEW_STATUSES = ("active", "resumable", "inactive", "rejected", "closed", "withdrawn", "unknown", "blocked")
 APPLICATION_REVIEW_LABELS = {
     "active": "Active / In Process",
+    "resumable": "Not Submitted / Resume Needed",
     "inactive": "Inactive",
     "rejected": "Rejected",
     "closed": "Closed",

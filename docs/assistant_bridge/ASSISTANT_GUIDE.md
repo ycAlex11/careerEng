@@ -170,13 +170,31 @@ This keeps Codex responsible for thread-level understanding, while CareerEng val
 When the user asks to summarize or persist a dynamic number of recent assistant messages, keep that number as explicit evidence metadata instead of hard-coding a fixed window:
 
 ```bash
-python -m careereng assistant import-candidates /path/to/memory_candidates.jsonl \
+python -m careereng assistant import-recent /path/to/memory_candidates.jsonl \
+  --limit 100 \
   --source-client codex \
-  --source-thread <thread_id> \
-  --source-limit 100
+  --source-thread <thread_id>
 ```
 
-Use the requested number directly. For example, `总结最近 30 条对话` should use `--source-limit 30`; `总结最近 100 条对话` should use `--source-limit 100`.
+Use the requested number directly. For example, `总结最近 30 条对话` should use `--limit 30`; `总结最近 100 条对话` should use `--limit 100`.
+
+`assistant import-recent` is the preferred wrapper for recent-N conversation intake. It imports the candidate file through the existing career-memory validator, records `workspace/assistant_bridge/intake_state.json`, and refreshes `workspace/assistant_bridge/context/latest.md`.
+
+Before creating the candidate file:
+
+- Read `workspace/assistant_bridge/context/latest.md`.
+- Inspect existing `workspace/memory/memory_units.jsonl`.
+- Inspect existing `workspace/evolution/browser_control/lessons.jsonl`.
+- Import only missing, evidence-backed content.
+- Use the existing categories: `profile_resume_signal`, `career_intent_strategy`, `application_feedback`, `correction`, `interview_record`, `evolution_lesson`.
+- Do not invent a new schema for one new observation.
+
+Split recent-N summaries before importing:
+
+- Career profile, intent, application feedback, interviews, and reusable evolution lessons may become career-memory candidates.
+- Current development tasks, next steps, boundaries, and verification instructions belong in the taskboard, not career memory.
+- One-off process control, transient command chatter, and temporary debugging narration should be ignored unless it produced a durable lesson.
+- Taskboard updates must be proposed to the user first. Only write them after explicit confirmation with `python -m careereng taskboard update <file>`.
 
 The imported memory units should preserve:
 

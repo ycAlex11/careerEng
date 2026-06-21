@@ -43,14 +43,14 @@ def evaluate_evolution_run(
     run_payload = read_json(run_path)
     if not run_payload:
         raise EvolutionEvaluationError(f"Unknown evolution run: {run_id}")
-    if str(run_payload.get("status") or "") != "applied":
-        raise EvolutionEvaluationError("Only applied evolution runs can be evaluated.")
-
-    applied_files_path = _resolve_run_path(run_dir, run_payload.get("outputs", {}).get("applied_files"))
-    applied_payload = read_json(applied_files_path) if applied_files_path else {}
-    applied_at = str(applied_payload.get("applied_at") or run_payload.get("updated_at") or run_payload.get("created_at") or "")
-    applied_files = applied_payload.get("files") if isinstance(applied_payload.get("files"), list) else []
-    if str(run_payload.get("candidate_id") or "") == "assistant_router_memory_intake":
+    candidate_id = str(run_payload.get("candidate_id") or "")
+    run_status = str(run_payload.get("status") or "")
+    if candidate_id == "assistant_router_memory_intake":
+        if run_status not in {"created", "applied", "evaluated"}:
+            raise EvolutionEvaluationError(
+                "Assistant router memory intake review can only run from created, applied, or evaluated status."
+            )
+        applied_at = str(run_payload.get("updated_at") or run_payload.get("created_at") or "") if run_status == "applied" else ""
         return _evaluate_assistant_router_memory_intake(
             workspace=workspace_path,
             run_dir=run_dir,
@@ -58,6 +58,13 @@ def evaluate_evolution_run(
             applied_at=applied_at,
             recent_limit=recent_limit,
         )
+    if run_status != "applied":
+        raise EvolutionEvaluationError("Only applied evolution runs can be evaluated.")
+
+    applied_files_path = _resolve_run_path(run_dir, run_payload.get("outputs", {}).get("applied_files"))
+    applied_payload = read_json(applied_files_path) if applied_files_path else {}
+    applied_at = str(applied_payload.get("applied_at") or run_payload.get("updated_at") or run_payload.get("created_at") or "")
+    applied_files = applied_payload.get("files") if isinstance(applied_payload.get("files"), list) else []
     site_key = _infer_site_key(run_payload=run_payload, applied_files=applied_files)
     phase = _infer_primary_phase(run_payload)
 

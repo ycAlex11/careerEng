@@ -381,8 +381,10 @@ class BrowserAutomationService:
                     f"- last_successful_session_preparation_at: {last_preparation_at or '(none)'}\n"
                     f"- resume_upload_needed: {'true' if upload_needed else 'false'}\n"
                     f"- reason: {reason}\n"
-                    "If resume_upload_needed is false, do not reopen the site's resume manager just to upload again. "
-                    "Only repair the remote resume if the live site clearly shows that the resume is missing, mismatched, or unusable."
+                    "- resume_filename_sync_key: current_apply_resume_pdf_filename is the preferred remote sync key when the site shows a resume filename.\n"
+                    "resume_upload_needed is a local timestamp hint; it does not prove that the remote site already has the current PDF. "
+                    "If the active site skill requires a remote resume filename check, compare the site's visible resume filename with current_apply_resume_pdf_filename and upload the current staged PDF when it differs, is missing, or cannot be confirmed. "
+                    "If the site does not support remote filename checking and no live evidence shows a missing, mismatched, or unusable resume, then resume_upload_needed=false means do not reopen the resume manager just to upload again."
                 ),
             }
         ]

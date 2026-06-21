@@ -142,12 +142,13 @@ Do not keep exploring once the current phase goal is already satisfied.
 
 Use canonical machine statuses for durable control fields and preserve site wording separately.
 
-- `application_status` is a canonical machine status. Use only `submitted`, `already_applied`, `rejected`, `closed`, `withdrawn`, `filtered_out`, `apply_failed`, or `blocked`.
+- `application_status` is a canonical machine status. Use only `submitted`, `already_applied`, `resumable`, `rejected`, `closed`, `withdrawn`, `filtered_out`, `apply_failed`, or `blocked`.
 - `application_status_raw` is the exact website-visible status or confirmation text observed during apply, such as `Application Received`.
 - `application_review_status` is the canonical status recorded during application-status review. Use only the values allowed by `record_application_reviews`.
 - `application_review_status_raw` is the exact website-visible review status, such as `Application in Review`, `In Process`, or `Declined. Thank you for applying`.
 - Do not write website-specific wording into canonical status fields. If the website says `Application Received`, write `application_status = submitted` and `application_status_raw = Application Received`.
 - Runtime control and apply-list planning use canonical statuses and structured `apply_state`; raw fields are evidence for reports, analysis, and future skill evolution.
+- If any site shows `Continue Application`, `Resume Application`, `Not Submitted`, `Draft`, `Incomplete Application`, or `Application Started`, treat it as a resumable application. Record `application_review_status = resumable`, preserve the exact wording in `application_review_status_raw`, and let apply planning resume the application flow directly instead of re-scoring the JD/CV.
 
 ### Decision Reason Types
 
@@ -213,7 +214,7 @@ The site job identifier may be a job id, requisition number, posting id, PID, or
 Do not overwrite local project-generated `job_id` or `canonical_job_id` with a site job identifier.
 
 For every site, treat application status as a lifecycle record:
-- Write `application_review_status` as the normalized cross-site bucket: `active`, `inactive`, `rejected`, `closed`, `withdrawn`, `unknown`, or `blocked`.
+- Write `application_review_status` as the normalized cross-site bucket: `active`, `resumable`, `inactive`, `rejected`, `closed`, `withdrawn`, `unknown`, or `blocked`.
 - Write `application_review_status_raw` as the exact website-visible status text whenever it is visible, such as `Application Received`, `Application in Review`, `In Process`, `Submitted`, `Inactive`, `Not Selected`, or `Interview Scheduled`.
 - If no row-level status text is visible but the current tab or section has clear meaning, use that tab or section label as `application_review_status_raw`, such as `Submitted` or `Inactive`.
 - Write `application_review_stage` only when the page gives explicit lifecycle evidence. Use concise snake_case values such as `received`, `resume_review`, `in_process`, `assessment`, `interview`, `offer`, `rejected_before_interview`, `rejected_after_interview`, `withdrawn`, `closed`, or `unknown`.
@@ -225,6 +226,7 @@ For every site, treat application status as a lifecycle record:
 Normalize website-visible application status into one of these review statuses:
 
 - `active`
+- `resumable`
 - `inactive`
 - `rejected`
 - `closed`
@@ -325,6 +327,11 @@ Apply the same default narrowing goal on every supported jobs surface unless the
 - After each successful filter application, re-check the live page and stop immediately if the current surface is already narrowed enough for retrieval.
 - If remote-only exclusion is not available as a visible filter on the current page, do not keep searching for it forever; finish with the best available narrowing and hand off to retrieval.
 - If one target dimension remains pending while another is already completed, record that pending/completed split in `update_phase_memory` instead of reopening the completed filter group again.
+- After the useful filters are applied and the jobs results surface is visible, prefer sorting results by newest posted date before ending `Job Filtering`.
+- Use the site's visible sort control when available, such as `Newest`, `Latest`, `Date Posted`, `Most Recent`, `Recently Posted`, or an equivalent posted-date option.
+- If the active site skill defines a site-specific newest/date-posted sort route, use that route first.
+- If no reliable newest/date-posted sort route is visible after one careful attempt, record that sorting could not be confirmed in `update_phase_memory` and continue with retrieval.
+- Record the chosen or unavailable sort state in `update_phase_memory` before ending `Job Filtering`.
 
 ### Don't
 
@@ -344,6 +351,9 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - Treat the current live results page as the only source of truth for the current page.
 - Read the current page from the visible results-list surface where the live page shows one current visible result entry per job.
 - Prefer the current visible list or card region that corresponds to the current page's jobs. Treat that region as the current page's primary retrieval surface.
+- Before recording the first page, confirm whether the current results are sorted newest/date-posted first using visible sort state, URL state, or stable phase memory from `Job Filtering`.
+- If newest/date-posted sort is available but the current page is not sorted that way, return once to the sort control or site-specific sort route before calling `record_jobs`.
+- If newest/date-posted sort cannot be confirmed, continue retrieval, but do not use date-window or older-than-window evidence as a pagination stop condition for this site run.
 - Treat side detail panes, selected-job previews, recommendation rails, sticky preview panels, filter chrome, account chrome, job-alert panels, and pagination summaries as context only unless the active site skill explicitly says they are part of the current page's jobs source.
 - A page label such as `4 of 7`, a total-count badge, or another pagination signal only means additional results pages still exist. It does not mean the current visible page is already recorded.
 - The current page becomes recordable as soon as the current visible results surface yields concrete per-job `{title, url}` pairs for the current page.
@@ -443,6 +453,7 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 
 - Work from the current batch's saved jobs, one job at a time.
 - Open each saved job URL, sync the current page's JD and application state, then decide what to do for that specific role.
+- If the current apply target came from a resumable application status such as `Continue Application`, `Resume Application`, `Not Submitted`, `Draft`, `Incomplete Application`, or `Application Started`, resume the application flow directly. Do not re-score the JD/CV or reverse it to `filtered_out` merely because the JD would now need match review.
 - Before starting any apply flow, re-check the live title and JD for excluded early-career signals: `intern`, `internship`, `campus`, `student`, `graduate program`, `new grad`, `new graduate`, `co-op`, `校招`, or `实习`.
 - If an excluded early-career signal is visible, record the job as `filtered_out` and do not click `Apply`, `Submit Resume`, or any equivalent apply entry. This exclusion is a hard gate and overrides otherwise good JD/persona matching.
 - `recommended_apply` means the current job is approved to continue its apply flow. It is not a terminal outcome by itself.
@@ -529,10 +540,12 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 ### Form Filling
 
 - Fill only required fields in apply.
-- `workspace/profile/application_profile.md` is the canonical source for reusable application-form facts such as gender, address, postal code, work authorization, visa sponsorship, and routine compliance acknowledgements.
+- `workspace/profile/application_profile.md` is the canonical source for reusable application-form facts such as gender, address, postal code, work authorization, visa sponsorship, routine compliance acknowledgements, non-compete / non-solicitation status, conflict-of-interest answers, IP/economic-interest answers, secondary-employment answers, and government-official relationship answers.
 - For standard application-form fields, use this priority order: current user instruction, then active site skill site-specific option mapping, then `workspace/profile/application_profile.md`, then currently attached `apply_facts`, then persona/CV context.
 - Prefer site skill rules for site-specific workflows and option labels, but prefer `application_profile.md` for reusable cross-site facts.
 - If multiple site skills repeat the same reusable form fact, treat that as evidence to keep or promote the fact in `application_profile.md`; do not copy the same fact into every new site skill.
+- If a compliance or conflict-of-interest question maps directly to a clear field in `application_profile.md`, answer from that profile field instead of requesting CV/persona context.
+- If a compliance or conflict-of-interest question is not covered by `application_profile.md`, stop or request context instead of guessing from absence in the CV.
 - For search-style comboboxes, typing a value does not by itself mean the field is selected.
 - If the dropdown is still expanded or candidate options are still visible, the current field is not complete yet.
 - Before moving to another field, finish selecting the current field's candidate option.

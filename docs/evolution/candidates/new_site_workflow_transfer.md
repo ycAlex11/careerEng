@@ -135,6 +135,8 @@ Default safety behavior:
 - new site AI Skills should be `status: ready` so non-apply phases can be tested immediately
 - new site AI Skills keep `apply_enabled: false`
 - first tests should target non-apply phases
+- first-run login for a newly added site is a human takeover boundary; do not let a new site continue as "login-ready" merely because the public jobs list is visible
+- if the user explicitly requests applying to the new site, require a signed-in candidate/account state before downstream review, retrieval-for-apply, or apply phases continue
 - human login, MFA, CAPTCHA, verification codes, and ambiguous required answers remain user takeover points
 - final-submit behavior requires explicit user approval and site-specific apply instructions
 
@@ -201,6 +203,7 @@ Do not define site-specific click paths here. Define what each phase should leav
 - login entry point used or attempted
 - account/provider assumption when visible
 - blocked reason for MFA, CAPTCHA, verification, password entry, or ambiguous user-only input
+- for newly added sites, a public jobs list is not enough evidence for apply-ready session preparation; require user-completed login unless the run is explicitly retrieval-only
 
 `application_status_review` should provide:
 

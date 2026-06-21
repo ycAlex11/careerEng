@@ -10,6 +10,7 @@ from typing import Any
 from careereng.review.pack import create_review_pack
 from careereng.review.schema import ReviewPack
 from careereng.storage.jsonl import JSONLStore
+from careereng.utils import read_json
 
 
 SAMPLE_LIMIT = 10
@@ -27,7 +28,10 @@ def build_assistant_memory_review_pack(
     routing_examples_path = workspace_path / "assistant_bridge" / "routing_examples.jsonl"
     corrections_path = workspace_path / "assistant_bridge" / "correction_events.jsonl"
     action_events_path = workspace_path / "assistant_bridge" / "action_events.jsonl"
+    intake_state_path = workspace_path / "assistant_bridge" / "intake_state.json"
+    context_path = workspace_path / "assistant_bridge" / "context" / "latest.md"
     memory_units_path = workspace_path / "memory" / "memory_units.jsonl"
+    taskboard_current_path = workspace_path / "taskboard" / "current.md"
 
     intake_rows = _after(_read_jsonl(intake_path), applied_at, fields=("created_at",))
     routing_rows = _after(_read_jsonl(routing_examples_path), applied_at, fields=("created_at",))
@@ -40,9 +44,12 @@ def build_assistant_memory_review_pack(
     explicit_intake_count = sum(1 for row in intake_rows if bool(row.get("explicit_trigger")) or str(row.get("trigger_mode") or "") == "explicit")
     promoted_event_ids = {str(row.get("source_event_id") or "") for row in memory_rows if str(row.get("source_event_id") or "")}
     explicit_promoted_count = sum(1 for row in intake_rows if str(row.get("event_id") or "") in promoted_event_ids)
+    window_mode = "after_applied_at" if applied_at else "all_current_evidence"
+    intake_state = read_json(intake_state_path)
+    candidate_file = str(intake_state.get("last_candidate_file") or "").strip()
 
     metrics = {
-        "window": {"mode": "after_applied_at", "applied_at": applied_at},
+        "window": {"mode": window_mode, "applied_at": applied_at},
         "intake_count": len(intake_rows),
         "explicit_intake_count": explicit_intake_count,
         "routing_example_count": len(routing_rows),
@@ -69,11 +76,33 @@ def build_assistant_memory_review_pack(
         {
             "title": "Review Scope",
             "body": (
-                "This pack reviews assistant routing and career-memory intake behavior after the evolution run was applied. "
+                "This pack reviews assistant routing and career-memory intake behavior from the selected evidence window. "
                 "It is intentionally review-only: it does not accept, reject, or rollback the run automatically."
             ),
         },
     ]
+    if intake_state:
+        sections.append(
+            {
+                "title": "Recent Conversation Intake State",
+                "body": "Latest recorded recent-N conversation intake state.",
+                "rows": [intake_state],
+            }
+        )
+    evidence_refs = _existing_refs(
+        workspace_path,
+        [
+            intake_path,
+            routing_examples_path,
+            corrections_path,
+            action_events_path,
+            intake_state_path,
+            context_path,
+            memory_units_path,
+            taskboard_current_path,
+            workspace_path / candidate_file if candidate_file else None,
+        ],
+    )
     sample_rows = {
         "recent_intake_events": _compact_rows(intake_rows[-sample_limit:], kind="intake"),
         "recent_memory_units": _compact_rows(memory_rows[-sample_limit:], kind="memory"),
@@ -90,13 +119,7 @@ def build_assistant_memory_review_pack(
         sections=sections,
         sample_rows=sample_rows,
         review_questions=_assistant_memory_review_questions(),
-        evidence_refs=[
-            _rel(workspace_path, intake_path),
-            _rel(workspace_path, routing_examples_path),
-            _rel(workspace_path, corrections_path),
-            _rel(workspace_path, action_events_path),
-            _rel(workspace_path, memory_units_path),
-        ],
+        evidence_refs=evidence_refs,
     )
 
 
@@ -252,3 +275,17 @@ def _rel(root: Path, path: Path) -> str:
         return str(path.relative_to(root))
     except ValueError:
         return str(path)
+
+
+def _existing_refs(root: Path, paths: list[Path | None]) -> list[str]:
+    refs: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if path is None or not path.exists():
+            continue
+        ref = _rel(root, path)
+        if ref in seen:
+            continue
+        seen.add(ref)
+        refs.append(ref)
+    return refs

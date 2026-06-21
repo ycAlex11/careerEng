@@ -178,11 +178,17 @@ apply_enabled: true
 - If the Qualcomm target family set is already complete but `Location = China` is still missing, record that pending split in `update_phase_memory` and go back to the top location control instead of reopening `All filters`.
 - Once the Qualcomm location target and the Qualcomm target family set are satisfied, leave the filters surface before ending `Job Filtering`.
 - If `All Filters` is still open, first use its own forward action such as `Show N jobs`; if that forward action is not available, close `All Filters`.
+- After the filtered results surface is visible, sort Qualcomm results by newest posted date before ending `Job Filtering`.
+- Prefer a visible Qualcomm sort control such as `Date Posted`, `Most Recent`, `Newest`, or equivalent. If no visible sort control is available but the Qualcomm jobs URL exposes `sort_by`, change the current Qualcomm jobs URL to `sort_by=timestamp` while preserving the active filters.
+- Treat `sort_by=match` as not ready for retrieval unless no date/newest sort route is available after one careful attempt.
+- Record the chosen Qualcomm sort state in `update_phase_memory` before ending `Job Filtering`.
 - End `Job Filtering` only after the browser is back on the plain Qualcomm jobs results surface, not while the `All Filters` dialog is still open.
 
 ## Job Retrieval
 
 - Record Qualcomm jobs from the current filtered live jobs surface.
+- The expected Qualcomm retrieval order is newest posted first. Before recording the first page, verify the current page is sorted by newest/date posted when that sort route is available.
+- If the URL or visible sort still shows `sort_by=match`, return to the sort control or URL state once before calling `record_jobs`.
 - Record results page by page until a site/project retrieval stop condition is met or Qualcomm shows no further real next-page or load-more action.
 - Read each job from the job card shown on the current results page.
 - Required fields are `title` and `url`.

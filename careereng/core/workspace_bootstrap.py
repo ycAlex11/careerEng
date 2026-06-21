@@ -195,11 +195,17 @@ def bootstrap_workspace(workspace: Path) -> list[WorkspaceEntry]:
     _ensure_empty_file(workspace / "router" / "feedback.jsonl", rows, workspace)
 
     _ensure_dir(workspace / "assistant_bridge", rows, workspace)
+    _ensure_dir(workspace / "assistant_bridge" / "context", rows, workspace)
     _ensure_empty_file(workspace / "assistant_bridge" / "intake_events.jsonl", rows, workspace)
     _ensure_empty_file(workspace / "assistant_bridge" / "action_events.jsonl", rows, workspace)
     _ensure_empty_file(workspace / "assistant_bridge" / "correction_events.jsonl", rows, workspace)
     _ensure_empty_file(workspace / "assistant_bridge" / "routing_examples.jsonl", rows, workspace)
     _ensure_text_file(workspace / "assistant_bridge" / "thread_state.json", '{"threads": {}}\n', rows, workspace)
+    _ensure_text_file(workspace / "assistant_bridge" / "intake_state.json", "{}\n", rows, workspace)
+
+    _ensure_dir(workspace / "taskboard", rows, workspace)
+    _ensure_dir(workspace / "taskboard" / "archive", rows, workspace)
+    _ensure_empty_file(workspace / "taskboard" / "events.jsonl", rows, workspace)
 
     _ensure_dir(workspace / "action_cards", rows, workspace)
     _ensure_dir(workspace / "action_cards" / "open", rows, workspace)

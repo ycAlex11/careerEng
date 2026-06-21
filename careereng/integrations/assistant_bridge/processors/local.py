@@ -24,6 +24,8 @@ SITE_ALIASES = {
     "advanced micro devices": "amd",
     "高通": "qualcomm",
     "qualcomm": "qualcomm",
+    "英特尔": "intel",
+    "intel": "intel",
     "英伟达": "nvidia",
     "nvidia": "nvidia",
     "微软": "microsoft",
@@ -596,8 +598,8 @@ class LocalProcessorAdapter:
             cleaned = cleaned.replace(url, " ").strip()
 
         patterns = (
-            r"(?:帮我)?(?:投|投递|想投)\s*([\w\u4e00-\u9fff&.\- ]{2,50})",
-            r"(?:添加|新增|注册)\s*([\w\u4e00-\u9fff&.\- ]{2,50}?)(?:\s*(?:网站|站点|site|career site))?$",
+            r"(?:我想|我要|请|帮我|麻烦)?\s*(?:投递|想投递|想投|投|申请)\s*([\w\u4e00-\u9fff&.\- ]{2,50})",
+            r"^(?:我想|我要|请|帮我|麻烦|给我)?\s*(?:添加|新增|注册)\s*([\w\u4e00-\u9fff&.\- ]{2,50}?)(?:\s*(?:网站|站点|site|career site))?$",
             r"(?:apply\s+(?:to|for)\s+)([A-Za-z0-9&.\- ]{2,50})",
             r"(?:(?:add|register)\s+)([A-Za-z0-9&.\- ]{2,50}?)(?:\s+(?:site|career site|careers site))?$",
             r"(?:site\s+bootstrap\s+)([A-Za-z0-9&.\- ]{2,50})",
@@ -615,17 +617,42 @@ class LocalProcessorAdapter:
     def _clean_company_candidate(value: str) -> str:
         text = str(value or "").strip()
         text = re.sub(r"\s+", " ", text)
+        text = re.sub(
+            r"^(?:我想|我要|请|帮我|麻烦)?\s*(?:投递|想投递|想投|投|申请|添加|新增|注册)\s*",
+            "",
+            text,
+            flags=re.I,
+        ).strip()
         text = re.sub(r"(网站|站点|官网|career site|careers site|site)$", "", text, flags=re.I).strip()
+        text = re.sub(r"(一下|看一下|看看|吧|吗)$", "", text, flags=re.I).strip()
         text = text.strip(" -_，,。.;；:：")
         blocked = {
             "已注册的公司",
             "已注册公司",
+            "的公司",
+            "已激活的网站",
+            "激活的网站",
             "registered sites",
             "registered companies",
             "all registered sites",
+            "active sites",
+            "active companies",
             "公司",
             "网站",
+            "投递情况",
+            "投递状态",
+            "申请状态",
+            "递情况",
+            "递状态",
+            "递一下",
+            "情况",
+            "状态",
         }
-        if not text or text.lower() in blocked:
+        lowered = text.lower()
+        if not text or lowered in blocked:
+            return ""
+        if any(term in text for term in ("投递情况", "投递状态", "申请状态")):
+            return ""
+        if text.endswith(("情况", "状态")):
             return ""
         return text

@@ -25,6 +25,14 @@ RETRYABLE_APPLICATION_STATUSES = {
     "apply_failed",
     "blocked",
 }
+RESUMABLE_APPLICATION_STATUSES = {
+    "resumable",
+}
+RESUMABLE_APPLY_STATES = {
+    "resumable_application",
+    "draft_application",
+    "incomplete_application",
+}
 TERMINAL_DECISION_STATUSES = {
     "already_applied",
     "filtered_out",
@@ -269,6 +277,8 @@ class JobPlanningStore:
             return 100
         if application_status in TERMINAL_APPLICATION_STATUSES:
             return 100
+        if action in {"resume_application"}:
+            return 90
         if action in {"retry_blocked"}:
             return 80
         if action in {"open_for_match_review", "enrich_jd"}:
@@ -370,6 +380,8 @@ class JobPlanningStore:
             action, operation_state, reason = f"skip_{application_status}", f"terminal_{application_status}", f"history {application_status}"
         elif decision_status == "already_applied":
             action, operation_state, reason = "skip_already_applied", "terminal_already_applied", "history decision already_applied"
+        elif application_status in RESUMABLE_APPLICATION_STATUSES or apply_state in RESUMABLE_APPLY_STATES:
+            action, operation_state, reason = "resume_application", "resume_required", "site shows an unsubmitted resumable application"
         elif posted_exclusion:
             action, operation_state, reason = "skip_filtered_out", "terminal_filtered_out", str(posted_exclusion.get("reason") or "")
             decision_reason_type = "time"

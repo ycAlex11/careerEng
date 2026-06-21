@@ -4,6 +4,51 @@ CareerEng is designed to be operated by Codex or another local AI assistant.
 
 If the user uses `@career` or discusses job search, resumes, applications, interviews, target companies, career sites, reports, metrics, evolution, or CareerEng operations, read `docs/assistant_bridge/ASSISTANT_GUIDE.md`.
 
+## Assistant Context Pack
+
+For `@career`, memory, evolution, recent conversation summaries, action cards, CareerEng status, or current development taskboard work, read this generated context first:
+
+```text
+workspace/assistant_bridge/context/latest.md
+```
+
+If it does not exist or looks stale, generate it before answering:
+
+```bash
+python -m careereng assistant context
+```
+
+This context pack summarizes the current taskboard, local memory, accepted lessons, open candidates, action cards, metrics, reports, and git dirty files. Use it as the first local map, then inspect the underlying evidence files when details matter.
+
+## Taskboard
+
+When listing development tasks, prefer this structure:
+
+- `Now`: current work to advance in the next one or two assistant turns.
+- `Next`: confirmed follow-up work for the current stage.
+- `Later`: longer-term direction that should not be lost.
+- `Parking Lot`: useful ideas that are explicitly not part of the current work.
+
+When discussing tasks with the user, a simple numbered list such as `1, 2, 3` is fine because it is easier to review and revise in conversation. When saving tasks into the taskboard, convert that discussion list into the `Now / Next / Later / Parking Lot` structure instead of copying the numbered list verbatim.
+
+For development tasks saved into the taskboard, include these fields when useful:
+
+- `Goal`: why the task exists.
+- `Touch`: expected files or modules to modify.
+- `Do Not Touch`: explicit boundaries and risky areas to avoid.
+- `Verify`: checks or commands that confirm completion.
+
+Do not automatically save every task list. Only write to `workspace/taskboard/current.md` when the user explicitly asks to save, remember, update, or record the taskboard.
+
+Use taskboard commands when requested:
+
+```bash
+python -m careereng taskboard show
+python -m careereng taskboard update <file>
+python -m careereng taskboard done <index>
+python -m careereng taskboard archive
+```
+
 ## Assistant Bridge
 
 Use the assistant bridge before guessing commands:

@@ -1040,7 +1040,7 @@ class BrowserPhaseRuntime:
             "site_job_id": {"type": "string"},
             "application_review_status": {
                 "type": "string",
-                "enum": ["active", "inactive", "rejected", "closed", "withdrawn", "unknown", "blocked"],
+                "enum": ["active", "inactive", "resumable", "rejected", "closed", "withdrawn", "unknown", "blocked"],
             },
             "application_review_status_raw": {"type": "string"},
             "application_review_stage": {"type": "string"},
@@ -3551,32 +3551,17 @@ class BrowserPhaseRuntime:
                                 trace_ref=trace_ref,
                                 summary=summary,
                             )
-                            if (
-                                retrieval_history_stop_pagination_violation_count
-                                >= self.RETRIEVAL_POLICY_PAGINATION_VIOLATION_LIMIT
-                            ):
-                                return BrowserPhaseResult(
-                                    status="failed",
-                                    reason_tag="retrieval_history_stop_required",
-                                    summary=summary,
-                                    current_url=current_url,
-                                    step_count=step_count,
-                                    trace_ref=trace_ref,
-                                    raw_text=output_text,
-                                    recorded_count=len(recorded_job_ids),
-                                    new_count=len(new_job_ids),
-                                )
-                            history_items = [
-                                self._context_item(
-                                    self._job_retrieval_history_stop_required_message(
-                                        current_url=current_url,
-                                        history_stop_streak=history_stop_streak,
-                                        required_streak=required_history_stop_streak,
-                                    )
-                                )
-                            ]
-                            retry_requested = True
-                            break
+                            return BrowserPhaseResult(
+                                status="done",
+                                reason_tag="retrieval_history_stop_required",
+                                summary=summary,
+                                current_url=current_url,
+                                step_count=step_count,
+                                trace_ref=trace_ref,
+                                raw_text=output_text,
+                                recorded_count=len(recorded_job_ids),
+                                new_count=len(new_job_ids),
+                            )
                         summary = (
                             "Job retrieval history policy recommended stopping on one page; pagination is allowed once "
                             "to confirm the condition on the next recorded page."

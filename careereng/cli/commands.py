@@ -58,7 +58,9 @@ from careereng.evolution import (
     scan_evolution_triggers,
 )
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore, render_lessons_markdown
+from careereng.integrations.assistant_bridge.context import build_assistant_context_pack
 from careereng.integrations.assistant_bridge import AssistantThreadStateStore, ingest_assistant_message
+from careereng.integrations.assistant_bridge.intake_state import save_recent_intake_state
 from careereng.interviews import (
     InterviewStore,
     InterviewStoreError,
@@ -74,6 +76,7 @@ from careereng.storage.jsonl import JSONLStore
 from careereng.storage.intent_store import IntentStore
 from careereng.storage.profile_store import ProfileStore
 from careereng.storage.router_store import RouterStore
+from careereng.taskboard import TaskboardError, TaskboardStore
 from careereng.tools.site_bootstrap import bootstrap_site as bootstrap_site_launcher
 from careereng.tools.batch_apply_debug import BatchApplyDebugRunner
 from careereng.utils import make_id, safe_file_stem
@@ -94,6 +97,7 @@ report_app = typer.Typer(help="Report review commands")
 resume_app = typer.Typer(help="Resume commands")
 route_app = typer.Typer(help="Route feedback commands")
 site_app = typer.Typer(help="Site registry commands")
+taskboard_app = typer.Typer(help="Current development taskboard commands")
 app.add_typer(action_card_app, name="action-card")
 app.add_typer(application_summary_app, name="application-summary")
 app.add_typer(assistant_app, name="assistant")
@@ -109,6 +113,7 @@ app.add_typer(report_app, name="report")
 app.add_typer(resume_app, name="resume")
 app.add_typer(route_app, name="route")
 app.add_typer(site_app, name="site")
+app.add_typer(taskboard_app, name="taskboard")
 
 
 PROFILE_GENERATE_MESSAGE = "请根据当前 workspace 中已有的简历、profile sources 和对话信息，生成或更新用户画像 persona.md。"
@@ -869,6 +874,62 @@ def action_card_cancel(
     typer.echo(f"cancelled={card.get('card_id')} status={card.get('status')} markdown={_workspace_path() / str(card.get('markdown_path') or '')}")
 
 
+@taskboard_app.command("show")
+def taskboard_show():
+    """Show the current development taskboard."""
+    typer.echo(TaskboardStore(_workspace_path()).show())
+
+
+@taskboard_app.command("update")
+def taskboard_update(
+    input_file: Path = typer.Argument(..., help="Markdown/text file containing the taskboard update"),
+    source: str = typer.Option("", "--source", help="Optional source label for the update"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+):
+    """Create or append to the current development taskboard."""
+    try:
+        result = TaskboardStore(_workspace_path()).update_from_file(input_file, source_name=source)
+    except TaskboardError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    action = "created" if result.get("created") else "updated"
+    typer.echo(f"taskboard {action} id={result.get('taskboard_id')} current={result.get('current_path')}")
+
+
+@taskboard_app.command("done")
+def taskboard_done(
+    index: int = typer.Argument(..., help="1-based checkbox item index in the current taskboard"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+):
+    """Mark a checkbox item in the current taskboard as done."""
+    try:
+        result = TaskboardStore(_workspace_path()).mark_done(index)
+    except TaskboardError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    state = "updated" if result.get("changed") else "already_done"
+    typer.echo(f"taskboard item {state} index={result.get('index')} id={result.get('taskboard_id')}")
+
+
+@taskboard_app.command("archive")
+def taskboard_archive(
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+):
+    """Archive the current development taskboard."""
+    try:
+        result = TaskboardStore(_workspace_path()).archive()
+    except TaskboardError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo(f"taskboard archived id={result.get('taskboard_id')} archive={result.get('archive_path')}")
+
+
 @assistant_app.command("ingest")
 def assistant_ingest(
     message: str = typer.Option(..., "--message", "-m", help="Assistant-side user message to classify and store"),
@@ -887,6 +948,23 @@ def assistant_ingest(
         processor_backend=processor,
     )
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@assistant_app.command("context")
+def assistant_context(
+    recent_limit: int = typer.Option(8, "--recent-limit", help="Recent rows/files to include per context section"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+):
+    """Build the assistant-readable CareerEng context pack."""
+    result = build_assistant_context_pack(
+        project_root=_project_root(),
+        workspace=_workspace_path(),
+        recent_limit=recent_limit,
+    )
+    if json_output:
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo(f"assistant_context={result.get('path')}")
 
 
 @assistant_app.command("state")
@@ -944,6 +1022,60 @@ def assistant_import_candidates(
         f"thread={result.get('source_thread') or '-'} scope={scope}"
     )
     typer.echo(f"memory_units={result.get('memory_units_path')}")
+
+
+@assistant_app.command("import-recent")
+def assistant_import_recent(
+    input_file: Path = typer.Argument(..., help="JSON or JSONL file of Codex-curated recent conversation candidates"),
+    limit: int = typer.Option(..., "--limit", help="Number of recent assistant messages summarized"),
+    source_thread: str = typer.Option("codex-current", "--source-thread", help="External assistant thread/conversation ID"),
+    source_client: str = typer.Option("codex", "--source-client", help="External assistant client name"),
+    recent_limit: int = typer.Option(8, "--context-recent-limit", help="Recent rows/files to include when refreshing assistant context"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+):
+    """Import recent conversation candidates, record intake state, and refresh assistant context."""
+    try:
+        result = import_memory_candidates(
+            workspace=_workspace_path(),
+            input_path=input_file,
+            source_limit=limit,
+            source_thread=source_thread,
+            source_client=source_client,
+        )
+    except CareerMemoryError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    context_path = _workspace_path() / "assistant_bridge" / "context" / "latest.md"
+    state = save_recent_intake_state(
+        workspace=_workspace_path(),
+        import_result=result,
+        source_file=input_file,
+        source_limit=limit,
+        source_thread=source_thread,
+        source_client=source_client,
+        context_path=context_path,
+    )
+    context_result = build_assistant_context_pack(
+        project_root=_project_root(),
+        workspace=_workspace_path(),
+        recent_limit=recent_limit,
+    )
+    payload = {
+        "import": result,
+        "intake_state": state,
+        "assistant_context": context_result,
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo(
+        f"assistant recent imported created={result.get('created')} "
+        f"lessons={result.get('created_lessons', 0)} "
+        f"evidence={result.get('created_evolution_evidence', 0)} "
+        f"skipped_existing={result.get('skipped_existing')} read={result.get('read')} "
+        f"limit={limit} thread={source_thread or '-'}"
+    )
+    typer.echo(f"intake_state={_workspace_path() / 'assistant_bridge' / 'intake_state.json'}")
+    typer.echo(f"assistant_context={context_result.get('path')}")
 
 
 @career_memory_app.command("promote")
@@ -1575,7 +1707,7 @@ def evolution_evaluate(
     run: str = typer.Option(..., "--run", help="Evolution run ID"),
     recent_limit: int = typer.Option(10, "--recent-limit", min=1, help="Recent rows to compare before/after apply"),
 ):
-    """Evaluate an applied evolution run and write selection results."""
+    """Evaluate an applied run, or generate a review pack for review-only runs."""
     try:
         result = evaluate_evolution_run(
             workspace=_workspace_path(),

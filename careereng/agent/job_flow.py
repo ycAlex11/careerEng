@@ -990,7 +990,7 @@ class JobFlow:
             str(item.get("job_id") or "")
             for item in items
             if isinstance(item, dict)
-            and str(item.get("action") or "") in {"open_for_match_review", "retry_blocked", "enrich_jd"}
+            and str(item.get("action") or "") in {"open_for_match_review", "retry_blocked", "resume_application", "enrich_jd"}
             and str(item.get("job_id") or "")
         }
         if not actionable_ids:

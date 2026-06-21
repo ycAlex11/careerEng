@@ -2,7 +2,7 @@
 id: site-amd
 name: AMD Site Skill
 version: v1
-updated_at: '2026-05-02'
+updated_at: '2026-06-16'
 scope: site
 site_key: amd
 status: ready
@@ -37,7 +37,7 @@ apply_enabled: true
 
 ### Goal
 
-- Complete AMD candidate login and leave the browser on AMD's real jobs-search surface.
+- Complete AMD candidate login and leave the browser ready for downstream phases.
 
 ### Authentication
 
@@ -45,14 +45,22 @@ apply_enabled: true
 - If the current AMD jobs page shows `Returning User Login`, `Return to Login`, `Sign In`, or similar, click it during `Session Preparation` to reach the AMD login surface.
 - On the AMD login surface, use the visible `LinkedIn` account login option.
 - Continue through visible LinkedIn or remembered-account continuation steps when they are one-click browser actions.
+- If a LinkedIn or AMD login page shows a saved/filled credential state with a visible `Sign in`, `Continue`, `Log in`, `登录`, or equivalent forward button, click that forward button once before declaring the flow blocked.
+- Do not read, expose, copy, or modify saved passwords. Only use visible one-click continuation actions when credentials are already filled or remembered by the browser.
 - If the flow reaches password entry, MFA, verification code, CAPTCHA, email confirmation, or another explicit human-only challenge with no visible one-click continuation left, stop with `blocked`.
 
 ### Ready Signal
 
+- AMD signed-in dashboard signals override any visible public/header login links.
 - Treat `Session Preparation` as complete only when AMD is signed in.
 - Strong AMD signed-in signals include AMD candidate dashboard, visible signed-in identity, `Log Out`, `Past Job Submittals`, submitted-application table, or a comparable post-login candidate account surface.
+- If the signed-in AMD dashboard, submitted-application table, or `careers-amd.icims.com/jobs/dashboard` candidate surface is visible, record login readiness and finish `Session Preparation` immediately.
+- Once any AMD signed-in dashboard signal is visible, do not click `Returning User Login`, `Return to Login`, `Sign In`, or any other login entry again during `Session Preparation`.
+- If an AMD dashboard URL is open but the page is still loading or visually sparse, wait and re-read the page once before deciding; do not open another login tab from that dashboard surface.
+- Do not use AMD dashboard profile, candidate profile, account-maintenance, timezone, or generic profile-update routes during `Session Preparation` just to update the resume. AMD's dashboard profile route is not a reliable standalone resume manager.
+- Defer AMD resume upload to the concrete job apply flow. When an apply flow reaches `Candidate Profile`, follow `AMD Candidate Profile / Resume Update Handling`.
 - Do not treat AMD public jobs search, generic login page, profile chooser, marketing page, or the mere presence of searchable jobs as login-ready.
-- If `Returning User Login` or another sign-in entry remains visible, login is not complete.
+- If `Returning User Login` or another sign-in entry remains visible on a public AMD jobs/search page with no signed-in dashboard signal, login is not complete.
 
 ### Login Entry Boundaries
 
@@ -60,6 +68,8 @@ apply_enabled: true
 - During AMD search phases (`Channel Discovery`, `Job Filtering`, and `Job Retrieval`), do not click `Returning User Login`, `Return to Login`, `Sign In`, or other account login entries.
 - During search phases, if the current page is already a real AMD jobs-search surface, continue the search work even if a header login link is visible.
 - During search phases, if login is unexpectedly required before jobs can be searched, stop the phase with `blocked` instead of starting a new login flow.
+- During `Session Preparation`, do not click AMD dashboard noise links such as timezone labels or `Singapore Standard Time`.
+- Do not open AMD profile/resume/account-maintenance routes during `Session Preparation`; those routes are handled only inside a concrete job apply flow when AMD presents `Candidate Profile`.
 
 ## Channel Discovery
 
@@ -129,6 +139,8 @@ apply_enabled: true
 - Treat `Candidate Profile - <job>` pages inside `global-external-amd.icims.com/jobs/<job_id>/<slug>/candidate?mode=apply...` as a normal AMD apply step, not as an error.
 - If an AMD apply step reaches `Candidate Profile`, update only the resume unless a required field is explicitly blocking progress.
 - Use `Replace Resume`, `Upload Resume`, `My Computer`, or the closest visible AMD resume upload control to upload the staged resume PDF.
+- AMD/iCIMS resume upload controls may expose a hidden `input[type=file]` that cannot be clicked normally. Do not click a hidden file input or keep retrying a pointer click when an outer iCIMS wrapper intercepts pointer events.
+- When a file input is required, use the browser file upload / file chooser tool to set the staged resume PDF on that input, then re-read the live page before continuing.
 - Do not proactively change name, phone, address, education, professional experience, or other profile fields.
 - After the resume is selected or accepted, click `Update Profile` and treat it as AMD's safe forward action for the `Candidate Profile` apply step.
 - If `Update Profile` reports a required-field error that cannot be answered from persona, resume, or visible facts, record the job as `blocked` with the visible reason.
