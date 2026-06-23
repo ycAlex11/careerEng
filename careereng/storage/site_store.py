@@ -8,7 +8,7 @@ import re
 import shutil
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlparse
 
 from careereng.skill_schema import (
     MATCHING_POLICY_SECTION,
@@ -22,7 +22,7 @@ from careereng.skill_schema import (
     section_text,
 )
 from careereng.skill_schema.schema import file_hash
-from careereng.storage.job_identity import infer_site_job_id_from_url
+from careereng.storage.job_identity import infer_site_job_id_from_url, normalize_identity_url
 from careereng.storage.jsonl import JSONLStore
 from careereng.storage.posted_time import current_posted_age_observation, normalize_posted_fields
 from careereng.utils import dump_front_matter, ensure_dir, make_id, now_iso, parse_front_matter, read_json, safe_file_stem, today_str, write_json
@@ -180,6 +180,9 @@ class SiteStore:
             "## Site Policy\n\n"
             "### Retrieval Policy\n\n"
             "- Describe site-specific posted-window rules, pagination stop rules, and whether old roles should still be recorded.\n\n"
+            "### Job Identity Policy\n\n"
+            "- If this site uses hash-routed job detail URLs, declare the pattern in front matter, for example `job_identity.fragment_job_route_patterns: ['#/job/{site_job_id}']`.\n"
+            "- Record real job detail URLs and site-native job IDs when visible; do not record a generic company jobs-list URL as a job URL.\n\n"
             "### Application Review Policy\n\n"
             "- Describe how this site exposes submitted, active, inactive, rejected, closed, or withdrawn applications.\n\n"
             "## Matching Policy\n\n"
@@ -217,6 +220,7 @@ class SiteStore:
                 "site_key": site_id,
                 "status": "ready",
                 "apply_enabled": False,
+                "job_identity": {},
             },
             body,
         )
@@ -319,6 +323,12 @@ class SiteStore:
             "front_matter": front_matter if isinstance(front_matter, dict) else {},
             "body": body,
         }
+
+    def _job_identity_policy(self, site_id: str) -> dict[str, Any]:
+        skill = self.load_skill(site_id)
+        front_matter = skill.get("front_matter") if isinstance(skill.get("front_matter"), dict) else {}
+        policy = front_matter.get("job_identity")
+        return dict(policy) if isinstance(policy, dict) else {}
 
     def _normalize_company_name(self, value: str) -> str:
         raw = re.sub(r"\s+", " ", str(value or "").replace("_", " ").strip())
@@ -1414,7 +1424,7 @@ class SiteStore:
             skill.write_text(self._default_site_skill_text(site_id), encoding="utf-8")
         return skill, True
 
-    def _normalize_url(self, url: str) -> str:
+    def _normalize_url(self, url: str, *, identity_policy: dict[str, Any] | None = None) -> str:
         raw = (url or "").strip()
         if not raw:
             return ""
@@ -1424,9 +1434,7 @@ class SiteStore:
             return raw
         if not parsed.scheme or not parsed.netloc:
             return raw
-        kept_qs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=False) if not k.lower().startswith("utm_")]
-        norm = parsed._replace(query=urlencode(sorted(kept_qs)), fragment="")
-        return urlunparse(norm)
+        return normalize_identity_url(raw, identity_policy)
 
     @staticmethod
     def _coerce_bool(value: Any) -> bool:
@@ -1495,8 +1503,8 @@ class SiteStore:
         text = cls._normalize_job_text(str(value or ""))
         return bool(text and cls.SITE_JOB_ID_LIKE_RE.fullmatch(text))
 
-    def _infer_site_job_id_from_url(self, url: object) -> str:
-        return infer_site_job_id_from_url(url)
+    def _infer_site_job_id_from_url(self, url: object, *, identity_policy: dict[str, Any] | None = None) -> str:
+        return infer_site_job_id_from_url(url, identity_policy)
 
     def _is_application_review_non_job_url(self, url: object) -> bool:
         normalized = self._normalize_url(str(url or ""))
@@ -1586,7 +1594,7 @@ class SiteStore:
         row["canonical_job_id"] = canonical_job_id
         return row
 
-    def _job_source_refs(self, row: dict[str, Any]) -> list[str]:
+    def _job_source_refs(self, row: dict[str, Any], *, identity_policy: dict[str, Any] | None = None) -> list[str]:
         if not isinstance(row, dict):
             return []
         refs: list[str] = []
@@ -1615,7 +1623,10 @@ class SiteStore:
             for alias in self._site_job_id_aliases(row.get(field)):
                 add_ref(field, alias)
 
-        url = self._normalize_url(str(row.get("url") or ""))
+        url = self._normalize_url(str(row.get("url") or ""), identity_policy=identity_policy)
+        inferred_url_job_id = infer_site_job_id_from_url(url, identity_policy)
+        for alias in self._site_job_id_aliases(inferred_url_job_id):
+            add_ref("url-job", alias)
         if url:
             try:
                 parsed = urlparse(url)
@@ -1631,7 +1642,8 @@ class SiteStore:
                     for alias in self._site_job_id_aliases(match.group(1)):
                         add_ref("path-job", alias)
                 path_parts = [part for part in parsed.path.split("/") if part]
-                if path_parts and self._is_site_job_id_like(path_parts[-1]):
+                skip_path_tail = bool(parsed.fragment and inferred_url_job_id)
+                if path_parts and not skip_path_tail and self._is_site_job_id_like(path_parts[-1]):
                     for alias in self._site_job_id_aliases(path_parts[-1]):
                         add_ref("path-tail", alias)
 
@@ -1654,8 +1666,9 @@ class SiteStore:
             return []
         site = safe_file_stem(site_id)
         keys: list[str] = []
+        identity_policy = self._job_identity_policy(site_id)
 
-        url = self._normalize_url(str(row.get("url") or ""))
+        url = self._normalize_url(str(row.get("url") or ""), identity_policy=identity_policy)
         if url:
             keys.append(f"url|{site}|{url}")
 
@@ -1674,10 +1687,11 @@ class SiteStore:
             "requisitionid",
             "reqid",
             "workday_job_number",
+            "url-job",
             "path-job",
             "path-tail",
         }
-        for source_ref in self._job_source_refs(row):
+        for source_ref in self._job_source_refs(row, identity_policy=identity_policy):
             keys.append(f"source|{site}|{source_ref}")
             source_prefix, _, source_value = source_ref.partition(":")
             if source_value and source_prefix in strong_source_value_prefixes:
@@ -1706,7 +1720,10 @@ class SiteStore:
         """
         candidate = dict(row)
         if not str(candidate.get("site_job_id") or "").strip():
-            inferred = self._infer_site_job_id_from_url(candidate.get("url") or "")
+            inferred = self._infer_site_job_id_from_url(
+                candidate.get("url") or "",
+                identity_policy=self._job_identity_policy(site_id),
+            )
             if inferred:
                 candidate["site_job_id"] = inferred
         keys = self._history_match_keys(site_id, candidate)
@@ -1813,7 +1830,10 @@ class SiteStore:
         skill_policies = load_job_skill_policies(self.project_root, site_key)
         apply_candidate_policy = skill_policies.get("apply_candidate_policy", {})
         if not str(incoming.get("site_job_id") or "").strip():
-            inferred_site_job_id = self._infer_site_job_id_from_url(incoming.get("url") or base.get("url") or "")
+            inferred_site_job_id = self._infer_site_job_id_from_url(
+                incoming.get("url") or base.get("url") or "",
+                identity_policy=self._job_identity_policy(site_key),
+            )
             if inferred_site_job_id:
                 incoming["site_job_id"] = inferred_site_job_id
         incoming = self._normalize_filtered_out_decision(incoming, apply_candidate_policy=apply_candidate_policy)
@@ -2290,6 +2310,7 @@ class SiteStore:
         batch_id: str = "",
     ) -> list[dict[str, Any]]:
         root = self.site_dir(site_id)
+        identity_policy = self._job_identity_policy(site_id)
         ensure_dir(root / "jobs" / "runs")
         ensure_dir(root / "jobs" / "descriptions")
         run_store = JSONLStore(self._job_run_path(site_id, batch_id))
@@ -2303,10 +2324,10 @@ class SiteStore:
                     seen.add(key)
                     keys.append(key)
 
-            url = self._normalize_url(str(row.get("url") or ""))
+            url = self._normalize_url(str(row.get("url") or ""), identity_policy=identity_policy)
             site_job_id = str(row.get("site_job_id") or row.get("source_job_id") or "").strip()
             if not site_job_id:
-                site_job_id = self._infer_site_job_id_from_url(url)
+                site_job_id = self._infer_site_job_id_from_url(url, identity_policy=identity_policy)
             if site_job_id:
                 for alias in self._site_job_id_aliases(site_job_id):
                     add(f"site_job_id:{alias}")
@@ -2326,13 +2347,13 @@ class SiteStore:
             if not isinstance(job, dict):
                 continue
             title = str(job.get("title") or "").strip()
-            url = self._normalize_url(str(job.get("url") or ""))
+            url = self._normalize_url(str(job.get("url") or ""), identity_policy=identity_policy)
             employer = str(job.get("employer") or job.get("company") or root.name)
             if not title and not url:
                 continue
             site_job_id = str(job.get("site_job_id") or job.get("source_job_id") or "").strip()
             if not site_job_id:
-                site_job_id = self._infer_site_job_id_from_url(url)
+                site_job_id = self._infer_site_job_id_from_url(url, identity_policy=identity_policy)
             job_id, canonical_job_id = self._job_ids(site_id, title, employer, url)
             now = now_iso()
             description_ref = self._persist_description_ref(
@@ -2398,13 +2419,17 @@ class SiteStore:
         batch_id: str = "",
     ) -> list[dict[str, Any]]:
         root = self.site_dir(site_id)
+        identity_policy = self._job_identity_policy(site_id)
         run_store = JSONLStore(self._job_run_path(site_id, batch_id))
         rows = [row for row in run_store.read_all() if isinstance(row, dict)]
 
         def run_update_keys(row: dict[str, Any]) -> list[str]:
             candidate = dict(row)
             if not str(candidate.get("site_job_id") or "").strip():
-                inferred = self._infer_site_job_id_from_url(candidate.get("url") or "")
+                inferred = self._infer_site_job_id_from_url(
+                    candidate.get("url") or "",
+                    identity_policy=identity_policy,
+                )
                 if inferred:
                     candidate["site_job_id"] = inferred
             keys: list[str] = []
