@@ -100,6 +100,7 @@ def build_loop(*, project_root: Path, workspace: Path | None = None) -> tuple[Ag
         recovery=config.browser.recovery,
         retrieval_policy=config.browser.retrieval_policy,
         browser_name=str(config.browser.browser_name or "chrome"),
+        executable_path=str(config.browser.executable_path or ""),
     )
     loop = AgentLoop(
         project_root=project_root,

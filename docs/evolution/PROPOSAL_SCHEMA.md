@@ -8,7 +8,7 @@ The proposal is stored at:
 workspace/evolution/runs/<run_id>/proposals/proposal.json
 ```
 
-The first version does not generate proposals automatically. A proposal may be written by Codex, another assistant, or a future LLM proposal command.
+CareerEng does not synthesize business/workflow strategy in Python. A proposal is written by Codex, another assistant, or a future LLM proposal command from the run's `solution_request.md`.
 
 ## Required Top-Level Fields
 
@@ -39,9 +39,10 @@ Optional:
 
 ## Supported Change Types
 
-V1 supports only rollbackable local changes:
+V1 supports rollbackable local changes and run-local prompt overlays:
 
 - `skill_patch`
+- `run_local_overlay`
 - `routing_example_append`
 - `memory_unit_append`
 - `assistant_context_update`
@@ -55,6 +56,22 @@ V1 rejects:
 - core storage schema migration
 - final-submit permission policy changes
 - arbitrary shell commands
+
+## Codex Solution Request
+
+When loop-control evidence shows a reusable failure but no concrete proposal exists, CareerEng creates:
+
+```text
+workspace/evolution/runs/<run_id>/solution_request.md
+```
+
+Codex should read that file, inspect the referenced evidence pack/action card, and write the concrete proposal to:
+
+```text
+workspace/evolution/runs/<run_id>/proposals/proposal.json
+```
+
+The request/action-card/evidence are not themselves a proposal. A valid proposal must include a concrete `proposed_changes` entry.
 
 ## skill_patch
 
@@ -83,6 +100,34 @@ Rules:
 - `target_section` must exist.
 - `replacement_markdown` must include the same heading.
 - Apply must snapshot the original file first.
+
+## run_local_overlay
+
+Create temporary run-local guidance for the next workflow unit without editing
+`SKILL.md`.
+
+```json
+{
+  "change_id": "change_1",
+  "change_type": "run_local_overlay",
+  "summary": "Use a fresh snapshot after a page-changing action.",
+  "scope": "batch:job_batch_xxx:site:deepseek:apply",
+  "site_key": "deepseek",
+  "phase": "apply",
+  "pattern": "apply_flow_unclosed_without_terminal_update",
+  "content": "Concrete prompt overlay for the next job/run. This must be a real strategy change, not a summary.",
+  "source_evidence_id": "evidence_xxx",
+  "target_ref": "skills/search/jobs/sites/deepseek/SKILL.md",
+  "expected_validation": "The next apply target reaches a terminal state or reports a new failure pattern.",
+  "confidence": 0.65
+}
+```
+
+Rules:
+
+- `content` must tell the next workflow unit what to do differently.
+- Use this for in-batch or short-horizon validation.
+- Promote stable behavior to `skill_patch` only after enough validation evidence.
 
 ## routing_example_append
 

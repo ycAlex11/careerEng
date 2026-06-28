@@ -153,6 +153,37 @@ class BrowserContextSession:
         else:
             run_context = {}
         apply_carry_forward = str(run_context.get("apply_carry_forward") or "").strip() if isinstance(run_context, dict) else ""
+        apply_loop_refinement_summary = (
+            str(run_context.get("apply_loop_refinement_summary") or "").strip()
+            if isinstance(run_context, dict)
+            else ""
+        )
+        try:
+            from careereng.evolution.memory_units import (
+                EvolutionMemoryStore,
+                evolution_memory_has_materialized_change,
+                render_evolution_memory_guidance,
+            )
+
+            evolution_units = EvolutionMemoryStore(workspace).query(
+                candidate_id="site_apply_loop_control",
+                scopes=[
+                    f"batch:{batch_id}:site:{site_key}:apply",
+                    f"site:{site_key}:apply",
+                    "site:*:apply",
+                    "project:apply",
+                ],
+                phase="apply",
+                lifecycles=["run_local", "candidate", "accepted"],
+                statuses=["active", "candidate", "accepted"],
+                limit=6,
+            )
+            evolution_memory_summary = render_evolution_memory_guidance(
+                [unit for unit in evolution_units if evolution_memory_has_materialized_change(unit)],
+                title="Apply-Loop Evolution Memory",
+            )
+        except Exception:
+            evolution_memory_summary = ""
         pending_rows = _pending_apply_rows(
             site_store=site_store,
             site_key=site_key,
@@ -209,6 +240,29 @@ class BrowserContextSession:
                     "content": (
                         "Current apply carry-forward from an earlier completed job in this same site batch:\n"
                         f"{apply_carry_forward}"
+                    ),
+                }
+            )
+        if apply_loop_refinement_summary:
+            items.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Current apply-loop refinement guidance from earlier apply targets in this same batch:\n"
+                        f"{apply_loop_refinement_summary}\n"
+                        "Treat this as temporary strategy guidance for the next target; it does not override confirmed site/project Skills."
+                    ),
+                }
+            )
+        if evolution_memory_summary:
+            items.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Active run-local item-loop proposal(s) for this apply phase:\n"
+                        f"{evolution_memory_summary}\n"
+                        "Treat materialized run-local overlays as the strategy currently under validation for this apply item. "
+                        "Use only memory whose scope and phase match the current apply task."
                     ),
                 }
             )

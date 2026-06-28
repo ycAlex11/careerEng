@@ -9,6 +9,15 @@ from careereng.evolution.reports import ApplyProbeReport, create_apply_probe_rep
 from careereng.evolution.review import build_evolution_review, save_evolution_review
 from careereng.evolution.rollback import EvolutionRollbackError, rollback_evolution_run
 from careereng.evolution.runs import create_evolution_run
+from careereng.evolution.solution_provider import (
+    EvolutionSolutionError,
+    create_solution_request_for_action_card,
+    create_solution_request_for_run,
+)
+from careereng.evolution.solution_orchestrator import (
+    latest_pending_solution_request,
+    list_pending_solution_requests,
+)
 from careereng.evolution.triggers import (
     EvolutionTriggerError,
     scan_assistant_router_memory_triggers,
@@ -25,14 +34,19 @@ __all__ = [
     "EvolutionEvaluationError",
     "EvolutionProposalError",
     "EvolutionRollbackError",
+    "EvolutionSolutionError",
     "EvolutionTriggerError",
     "ApplyProbeReport",
     "apply_evolution_run",
     "build_evolution_review",
     "create_evolution_run",
+    "create_solution_request_for_action_card",
+    "create_solution_request_for_run",
     "create_apply_probe_report",
     "evaluate_evolution_run",
     "get_candidate_spec",
+    "latest_pending_solution_request",
+    "list_pending_solution_requests",
     "load_candidate_specs",
     "load_proposal",
     "rollback_evolution_run",

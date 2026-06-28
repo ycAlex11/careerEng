@@ -8,7 +8,13 @@ from typing import Any
 
 
 ASSISTANT_CONTEXT_TARGET = "docs/assistant_bridge/CODEX_CONTEXT.md"
-SUPPORTED_CHANGE_TYPES = {"skill_patch", "routing_example_append", "memory_unit_append", "assistant_context_update"}
+SUPPORTED_CHANGE_TYPES = {
+    "skill_patch",
+    "run_local_overlay",
+    "routing_example_append",
+    "memory_unit_append",
+    "assistant_context_update",
+}
 FORBIDDEN_CHANGE_TYPES = {
     "python_code_patch",
     "config_patch",
@@ -70,6 +76,8 @@ def _validate_change(change: dict[str, Any], *, idx: int) -> None:
         _require(change, idx=idx, fields=("target_file", "target_section", "replacement_markdown"))
         if str(change.get("patch_strategy") or "replace_section") != "replace_section":
             raise EvolutionProposalError(f"Change #{idx} skill_patch only supports patch_strategy=replace_section.")
+    elif change_type == "run_local_overlay":
+        _require(change, idx=idx, fields=("scope", "site_key", "phase", "content"))
     elif change_type in {"routing_example_append", "memory_unit_append"}:
         row = change.get("row")
         if not isinstance(row, dict) or not row:

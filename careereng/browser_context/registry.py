@@ -123,7 +123,7 @@ class BrowserContextRegistry:
         if "apply_facts" in available:
             lines.append("- `apply_facts`: current lightweight structured profile facts for routine form filling, including `workspace/profile/application_profile.md` when available.")
         if "full_cv" in available:
-            lines.append("- `full_cv`: current full CV text for detailed experience or open-ended answers.")
+            lines.append("- `full_cv`: current full CV text for resume-header/contact facts, education, employment history, detailed experience, or open-ended answers.")
         if "full_persona" in available:
             lines.append("- `full_persona`: current full persona profile data for detailed background and constraints.")
         lines.append("Do not request a fuller bundle unless the active page or active rule actually needs more detail.")

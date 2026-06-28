@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import queue
 import sys
@@ -17,6 +18,29 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 
 PLAYWRIGHT_MCP_PACKAGE = "@playwright/mcp@0.0.70"
+
+
+def _workspace_tmp_from_output_dir(output_dir: Path) -> Path:
+    parts = list(output_dir.resolve().parents)
+    if len(parts) >= 3 and parts[2].name == "tmp":
+        return parts[2]
+    return output_dir.resolve().parent
+
+
+def _cached_mcp_cli(output_dir: Path) -> Path | None:
+    tmp_dir = _workspace_tmp_from_output_dir(output_dir)
+    candidates = [
+        tmp_dir / "npm-cache",
+        tmp_dir / "npm_cache",
+        tmp_dir / "home" / ".npm",
+    ]
+    for cache_dir in candidates:
+        if not cache_dir.exists():
+            continue
+        matches = sorted(cache_dir.glob("_npx/*/node_modules/@playwright/mcp/cli.js"))
+        if matches:
+            return matches[-1].resolve()
+    return None
 
 
 @dataclass
@@ -221,6 +245,7 @@ def launch_playwright_mcp(
     profile_dir: Path,
     output_dir: Path,
     timeout_ms: int,
+    executable_path: str = "",
 ) -> PlaywrightMCPProcess:
     profile_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -228,11 +253,6 @@ def launch_playwright_mcp(
     log_handle = log_path.open("a", encoding="utf-8")
 
     args = [
-        PLAYWRIGHT_MCP_PACKAGE,
-        "--browser",
-        str(browser_name or "chrome"),
-        "--user-data-dir",
-        str(profile_dir),
         "--output-dir",
         str(output_dir),
         "--output-mode",
@@ -245,18 +265,39 @@ def launch_playwright_mcp(
         str(max(1000, int(timeout_ms or 5000))),
         "--timeout-navigation",
         str(max(30000, int(timeout_ms or 45000))),
+        "--user-data-dir",
+        str(profile_dir),
     ]
+    executable = str(executable_path or "").strip()
+    if executable:
+        args.extend(["--executable-path", executable])
+    else:
+        args.extend(["--browser", str(browser_name or "chrome")])
     if headless:
         args.append("--headless")
 
+    cached_cli = _cached_mcp_cli(output_dir)
+    if cached_cli is not None:
+        command = "node"
+        server_args = [str(cached_cli), *args]
+        endpoint_url = f"stdio://node/{cached_cli}"
+        env = None
+    else:
+        command = "npx"
+        server_args = [PLAYWRIGHT_MCP_PACKAGE, *args]
+        endpoint_url = f"stdio://npx/{PLAYWRIGHT_MCP_PACKAGE}"
+        npm_cache_dir = _workspace_tmp_from_output_dir(output_dir) / "npm-cache"
+        npm_cache_dir.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, "NPM_CONFIG_CACHE": str(npm_cache_dir), "npm_config_cache": str(npm_cache_dir)}
+
     runtime = PlaywrightMCPProcess(
         site_key=site_key,
-        endpoint_url=f"stdio://npx/{PLAYWRIGHT_MCP_PACKAGE}",
+        endpoint_url=endpoint_url,
         log_path=log_path,
         profile_dir=profile_dir,
         output_dir=output_dir,
         run_id=run_id,
-        server=StdioServerParameters(command="npx", args=args, cwd=output_dir),
+        server=StdioServerParameters(command=command, args=server_args, cwd=output_dir, env=env),
         command_timeout_seconds=max(45.0, float(timeout_ms or 45000) / 1000.0 + 30.0),
         _log_handle=log_handle,
     )

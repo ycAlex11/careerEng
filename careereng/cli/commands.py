@@ -46,12 +46,16 @@ from careereng.evolution import (
     EvolutionEvaluationError,
     EvolutionProposalError,
     EvolutionRollbackError,
+    EvolutionSolutionError,
     EvolutionTriggerError,
     apply_evolution_run,
     build_evolution_review,
     create_evolution_run,
+    create_solution_request_for_action_card,
+    create_solution_request_for_run,
     evaluate_evolution_run,
     get_candidate_spec,
+    list_pending_solution_requests,
     load_candidate_specs,
     rollback_evolution_run,
     save_evolution_review,
@@ -420,7 +424,14 @@ def _dispatch_message_with_progress(*, message: str, session: str) -> str:
     return str(result.get("reply") or "")
 
 
-_BATCH_MONITOR_DONE_STATUSES = {"completed", "partial_completed", "failed", "cancelled", "waiting_user"}
+_BATCH_MONITOR_DONE_STATUSES = {
+    "completed",
+    "partial_completed",
+    "failed",
+    "cancelled",
+    "waiting_user",
+    "waiting_solution",
+}
 _BATCH_MONITOR_HEARTBEAT_SECONDS = 60.0
 
 
@@ -461,7 +472,7 @@ def _format_active_batch_work(batch: dict[str, Any]) -> str:
         if (
             operation == "job_search"
             and apply_requested
-            and status not in {"blocked_login", "blocked", "failed", "skipped"}
+            and status not in {"blocked_login", "blocked", "waiting_solution", "failed", "skipped"}
             and (apply_status == "running" or (apply_status == "pending" and retrieve_status == "done"))
         ):
             active.append(f"{site_key}:apply")
@@ -469,7 +480,7 @@ def _format_active_batch_work(batch: dict[str, Any]) -> str:
         if status in {"queued", "running", "ready"}:
             active.append(f"{site_key}:{row.get('current_phase') or status}")
             continue
-        if status in {"blocked_login", "blocked"}:
+        if status in {"blocked_login", "blocked", "waiting_solution"}:
             active.append(f"{site_key}:blocked")
     return ", ".join(active) if active else "none"
 
@@ -517,6 +528,13 @@ def _format_monitored_batch_summary(batch: dict[str, Any], *, workspace: Path | 
             parts.append(f"reason={reason}")
         lines.append(" ".join(parts))
     return "\n".join(lines)
+
+
+def _next_evolution_batch_id(batch: dict[str, Any]) -> str:
+    payload = batch.get("evolution_loop") if isinstance(batch.get("evolution_loop"), dict) else {}
+    next_batch_id = str(payload.get("next_batch_id") or "").strip()
+    current_batch_id = str(batch.get("batch_id") or "").strip()
+    return next_batch_id if next_batch_id and next_batch_id != current_batch_id else ""
 
 
 def _shutdown_manager_after_terminal_batch(*, root: Path, workspace: Path) -> str:
@@ -769,6 +787,13 @@ def _dispatch_jobs_batch_with_monitor(
                     baseline_batch_ids=baseline_batch_ids,
                     state=progress_state,
                 )
+                next_batch_id = _next_evolution_batch_id(batch)
+                if next_batch_id:
+                    typer.echo(f"evolution continuing previous_batch={batch_id} next_batch={next_batch_id}")
+                    batch_id = next_batch_id
+                    progress_state["batch_id"] = batch_id
+                    last_activity_at = time.monotonic()
+                    continue
                 summary = _format_monitored_batch_summary(batch, workspace=workspace)
                 if status == "waiting_user":
                     return f"{summary}\nmanager=running"
@@ -1683,6 +1708,44 @@ def evolution_run(
     typer.echo("\n".join(lines))
 
 
+@evolution_app.command("solution")
+def evolution_solution(
+    card: str = typer.Option("", "--card", help="Action card ID to convert into a Codex solution request"),
+    run: str = typer.Option("", "--run", help="Existing evolution run ID to refresh solution request"),
+    candidate: str = typer.Option("", "--candidate", "-c", help="Candidate spec ID when the action card lacks one"),
+):
+    """Create a Codex-readable solution request and proposal output path."""
+    normalized_card = str(card or "").strip()
+    normalized_run = str(run or "").strip()
+    if bool(normalized_card) == bool(normalized_run):
+        raise typer.BadParameter("Pass exactly one of --card or --run.")
+    try:
+        if normalized_card:
+            result = create_solution_request_for_action_card(
+                project_root=_project_root(),
+                workspace=_workspace_path(),
+                card_id=normalized_card,
+                candidate_id=candidate,
+            )
+        else:
+            result = create_solution_request_for_run(
+                project_root=_project_root(),
+                workspace=_workspace_path(),
+                run_id=normalized_run,
+            )
+    except EvolutionSolutionError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    lines = [
+        f"run={result['run_id']} status={result['status']}",
+        f"candidate={result['candidate_id']}",
+        f"action_card={result.get('action_card_id') or ''}",
+        f"solution_request={result['solution_request']}",
+        f"proposal_output={result['proposal_output_path']}",
+        f"apply_command=python -m careereng evolution apply --run {result['run_id']}",
+    ]
+    typer.echo("\n".join(lines))
+
+
 @evolution_app.command("apply")
 def evolution_apply(
     run: str = typer.Option(..., "--run", help="Evolution run ID"),
@@ -1699,6 +1762,43 @@ def evolution_apply(
         f"applied_patch={result['applied_patch']}",
         f"summary={result['summary']}",
     ]
+    typer.echo("\n".join(lines))
+
+
+@evolution_app.command("pending-solution")
+def evolution_pending_solution(
+    site: str = typer.Option("", "--site", help="Optional site key filter"),
+    batch: str = typer.Option("", "--batch", help="Optional batch ID filter"),
+    limit: int = typer.Option(5, "--limit", min=1, help="Maximum pending solution requests to show"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON rows instead of a concise handoff view"),
+):
+    """Show pending evolution solution requests for Codex or another assistant."""
+    rows = list_pending_solution_requests(
+        workspace=_workspace_path(),
+        site_key=site,
+        batch_id=batch,
+        limit=limit,
+    )
+    if json_output:
+        typer.echo(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if not rows:
+        typer.echo("No pending evolution solution requests.")
+        return
+    lines: list[str] = []
+    for row in rows:
+        if lines:
+            lines.append("")
+        lines.extend(
+            [
+                f"run={row['run_id']} status={row['status']} next_action={row['next_action']}",
+                f"candidate={row['candidate_id']} site={row['site_key']} phase={row['phase']} batch={row['batch_id']}",
+                f"failure_pattern={row['failure_pattern']}",
+                f"solution_request={row['solution_request']}",
+                f"proposal_output={row['proposal_output_path']}",
+                f"apply_command={row['apply_command']}",
+            ]
+        )
     typer.echo("\n".join(lines))
 
 

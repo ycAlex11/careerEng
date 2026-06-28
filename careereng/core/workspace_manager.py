@@ -118,7 +118,11 @@ class WorkspaceManager:
         def _worker() -> None:
             with self._lock:
                 try:
-                    self.loop.job_flow.run_batch(batch_id)
+                    runner = getattr(self.loop.job_flow, "run_batch_with_evolution_loop", None)
+                    if callable(runner):
+                        runner(batch_id)
+                    else:
+                        self.loop.job_flow.run_batch(batch_id)
                 except BaseException as exc:  # pragma: no cover - defensive manager boundary
                     try:
                         self.loop.job_flow.fail_batch(batch_id=batch_id, error=str(exc))

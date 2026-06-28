@@ -86,6 +86,12 @@ class SiteStore:
         "application window",
         "site rule limit",
     )
+    MIXED_FULLTIME_INTERNSHIP_RE = re.compile(
+        r"(全职\s*[/／|、,，和或]*\s*实习|实习\s*[/／|、,，和或]*\s*全职|"
+        r"full[-\s]*time\s*(?:/|\\|or|and|,|，|、|／)\s*(?:intern|internship)|"
+        r"(?:intern|internship)\s*(?:/|\\|or|and|,|，|、|／)\s*full[-\s]*time)",
+        flags=re.IGNORECASE,
+    )
 
     RUN_JOB_STRING_FIELDS = (
         "batch_id",
@@ -120,6 +126,22 @@ class SiteStore:
         "last_apply_error",
         "decision_reason_type",
         "decision_context_hash",
+        "block_reason_type",
+        "failure_pattern",
+        "loop_control_action",
+        "recommended_target",
+        "loop_scope",
+        "gap_type",
+        "recommended_action",
+        "target",
+        "resume_policy",
+        "current_item_ref",
+        "evidence",
+        "refinement_hint",
+        "active_run_local_proposal_id",
+        "active_run_local_proposal_memory_id",
+        "active_run_local_proposal_pattern",
+        "active_run_local_proposal_source",
     )
     RUN_JOB_NUMERIC_FIELDS = (
         "match_score_initial",
@@ -643,6 +665,24 @@ class SiteStore:
         return any(marker in text for marker in cls.FILTERED_OUT_CONFLICT_MARKERS)
 
     @classmethod
+    def _has_mixed_fulltime_internship_text(cls, row: dict[str, Any]) -> bool:
+        text = cls._row_text(
+            row,
+            (
+                "title",
+                "employment_type",
+                "job_type",
+                "fit_reason",
+                "match_reason_initial",
+                "match_reason_final",
+                "decision_rule_source",
+                "decision_rule_name",
+                "last_apply_error",
+            ),
+        )
+        return bool(cls.MIXED_FULLTIME_INTERNSHIP_RE.search(text))
+
+    @classmethod
     def _posted_window_exclusion(cls, row: dict[str, Any], policy: dict[str, Any] | None = None) -> bool:
         payload = dict(policy or {})
         try:
@@ -816,6 +856,8 @@ class SiteStore:
             return "closed"
         existing = cls._normalize_decision_reason_type(row.get("decision_reason_type"))
         if prefer_existing and existing:
+            if existing == "hard_excluded" and cls._has_mixed_fulltime_internship_text(row):
+                return "matching_policy"
             return existing
         text = " ".join(
             str(row.get(field) or "")
@@ -831,7 +873,12 @@ class SiteStore:
                 "decision_rule_source",
             )
         ).lower()
-        if any(token in text for token in ("intern", "internship", "new grad", "campus", "graduate program", "校招")):
+        if cls._has_mixed_fulltime_internship_text(row):
+            return "matching_policy"
+        if any(
+            token in text
+            for token in ("intern", "internship", "new grad", "campus", "graduate program", "校招", "校园招聘", "应届", "实习")
+        ):
             return "hard_excluded"
         cv_markers = (
             "cv",
@@ -1785,6 +1832,12 @@ class SiteStore:
             "last_apply_error",
             "decision_reason_type",
             "decision_context_hash",
+            "block_reason_type",
+            "failure_pattern",
+            "loop_control_action",
+            "recommended_target",
+            "evidence",
+            "refinement_hint",
         ):
             value = str(incoming.get(field) or "").strip()
             if value:
@@ -2099,10 +2152,13 @@ class SiteStore:
             return False
         if application_status != "filtered_out" or apply_state != "terminal_filtered_out":
             return True
-        if not cls._normalize_decision_reason_type(row.get("decision_reason_type")):
+        reason_type = cls._normalize_decision_reason_type(row.get("decision_reason_type"))
+        if not reason_type:
+            return True
+        if reason_type == "hard_excluded" and cls._has_mixed_fulltime_internship_text(row):
             return True
         if (
-            cls._normalize_decision_reason_type(row.get("decision_reason_type")) == "time"
+            reason_type == "time"
             and not cls._posted_window_exclusion(row, apply_candidate_policy)
             and cls._infer_decision_reason_type(
                 row,

@@ -143,6 +143,12 @@ class ActionCardStore:
         metadata: dict[str, Any] | None = None,
         related_files: list[str] | None = None,
         commands: list[str] | None = None,
+        suggested_actions: list[str] | None = None,
+        safety_notes: list[str] | None = None,
+        done_when: list[str] | None = None,
+        goal: str | None = None,
+        reason: str | None = None,
+        priority: str | None = None,
         summary: str = "",
     ) -> dict[str, Any]:
         """Merge handoff metadata into an existing card and re-render it."""
@@ -153,6 +159,21 @@ class ActionCardStore:
             card["related_files"] = _append_unique(_clean_list(card.get("related_files")), _clean_list(related_files))
         if commands is not None:
             card["commands"] = _append_unique(_clean_list(card.get("commands")), _clean_list(commands))
+        if suggested_actions is not None:
+            card["suggested_actions"] = _append_unique(
+                _clean_list(card.get("suggested_actions")),
+                _clean_list(suggested_actions),
+            )
+        if safety_notes is not None:
+            card["safety_notes"] = _append_unique(_clean_list(card.get("safety_notes")), _clean_list(safety_notes))
+        if done_when is not None:
+            card["done_when"] = _append_unique(_clean_list(card.get("done_when")), _clean_list(done_when))
+        if goal is not None and str(goal or "").strip():
+            card["goal"] = str(goal).strip()
+        if reason is not None and str(reason or "").strip():
+            card["reason"] = str(reason).strip()
+        if priority is not None and str(priority or "").strip():
+            card["priority"] = str(priority).strip()
         card["updated_at"] = now_iso()
         self._write_card_markdown(card)
         self._upsert_index(card)

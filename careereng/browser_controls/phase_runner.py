@@ -97,6 +97,7 @@ class BrowserAutomationService:
         max_step_retries: int,
         max_phase_steps: int,
         browser_name: str,
+        executable_path: str = "",
         budgets: BrowserBudgetsConfig | None = None,
         guards: BrowserGuardsConfig | None = None,
         recovery: BrowserRecoveryConfig | None = None,
@@ -109,6 +110,7 @@ class BrowserAutomationService:
         self.keep_open = bool(keep_open)
         self.timeout_ms = int(timeout_ms or 45000)
         self.browser_name = browser_name or "chrome"
+        self.executable_path = str(executable_path or "").strip()
         self.guards = guards or BrowserGuardsConfig()
         self.recovery = recovery or BrowserRecoveryConfig()
         self.retrieval_policy = retrieval_policy or BrowserRetrievalPolicyConfig()
@@ -586,6 +588,7 @@ class BrowserAutomationService:
                     profile_dir=self.site_store.browser_profile_dir(site_key),
                     output_dir=output_dir,
                     timeout_ms=effective_timeout_ms,
+                    executable_path=self.executable_path,
                 )
             except Exception:
                 raise

@@ -41,6 +41,10 @@ class BrowserBudgetsConfig:
     apply_site_phase_budget_factor: float = 0.8
     apply_probe_max_attempted: int = 8
     apply_probe_unsuccessful_threshold: int = 5
+    loop_control_refinement_attempts_per_batch: int = 3
+    loop_control_user_input_attempts_per_batch: int = 3
+    loop_control_outer_batch_attempts: int = 3
+    loop_control_failed_batches_per_pattern: int = 3
     debug_session_preparation_timeout_seconds: int = 600
 
 
@@ -114,6 +118,7 @@ class BrowserConfig:
     reasoning_effort: str = "high"
     site_parallelism: int = 2
     browser_name: str = "chrome"
+    executable_path: str = ""
     mcp_port_start: int = 8931
     budgets: BrowserBudgetsConfig = field(default_factory=BrowserBudgetsConfig)
     guards: BrowserGuardsConfig = field(default_factory=BrowserGuardsConfig)

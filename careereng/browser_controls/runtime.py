@@ -624,7 +624,8 @@ class BrowserPhaseRuntime:
             "Runtime note: browser_file_upload already succeeded for the current apply page in this run.\n"
             f"{url_line}"
             f"{staged_line}"
-            "Continue from the active skills, current phase memory, and fresh current live page."
+            "Before any failure decision or moving to another apply target, read the fresh current live page. "
+            "Continue this same job to the next visible form/review/submit action, or record a concrete blocker from the fresh page."
         )
 
     @staticmethod
@@ -635,7 +636,7 @@ class BrowserPhaseRuntime:
             "Runtime note: the current apply page now confirms the staged file is uploaded.\n"
             f"{url_line}"
             f"{staged_line}"
-            "Continue from the active skills, current phase memory, and current live page."
+            "Continue this same job from the current live page until submit, already-applied, filtered_out, or a concrete blocker."
         )
 
     @staticmethod
@@ -672,6 +673,17 @@ class BrowserPhaseRuntime:
             f"{staged_line}"
             f"{chooser_line}"
             "The current live page still shows unresolved file chooser modal state. This runtime only allows a blocked phase_result from this state unless the modal resolves."
+        )
+
+    @staticmethod
+    def _apply_terminal_failure_needs_fresh_page_message(*, current_url: str, tool_name: str) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        return (
+            "Runtime note: the current response performed a page-changing apply action and then tried to write a "
+            "terminal failure or blocker before the model had a fresh post-action page observation.\n"
+            f"{url_line}"
+            f"Blocked tool: {tool_name}\n"
+            "First read the current live page, then decide whether to continue the same job, submit, or record a concrete blocker."
         )
 
     @staticmethod
@@ -1008,6 +1020,18 @@ class BrowserPhaseRuntime:
             "decision_reason_type": {"type": "string"},
             "decision_context_hash": {"type": "string"},
             "last_apply_error": {"type": "string"},
+            "block_reason_type": {"type": "string"},
+            "failure_pattern": {"type": "string"},
+            "loop_control_action": {"type": "string"},
+            "recommended_target": {"type": "string"},
+            "loop_scope": {"type": "string"},
+            "gap_type": {"type": "string"},
+            "recommended_action": {"type": "string"},
+            "target": {"type": "string"},
+            "resume_policy": {"type": "string"},
+            "current_item_ref": {"type": "string"},
+            "evidence": {"type": "string"},
+            "refinement_hint": {"type": "string"},
         }
         return {
             "type": "function",
@@ -1787,6 +1811,26 @@ class BrowserPhaseRuntime:
         )
 
     @staticmethod
+    def _update_jobs_contains_apply_failure(arguments: dict[str, Any] | None) -> bool:
+        if not isinstance(arguments, dict):
+            return False
+        jobs = arguments.get("jobs")
+        if not isinstance(jobs, list):
+            return False
+        failure_application_statuses = {"blocked", "apply_failed"}
+        failure_apply_states = {"blocked", "apply_failed", "terminal_blocked", "terminal_apply_failed"}
+        for row in jobs:
+            if not isinstance(row, dict):
+                continue
+            application_status = str(row.get("application_status") or "").strip().lower()
+            apply_state = str(row.get("apply_state") or "").strip().lower()
+            if application_status in failure_application_statuses or apply_state in failure_apply_states:
+                return True
+            if str(row.get("block_reason_type") or row.get("failure_pattern") or "").strip():
+                return True
+        return False
+
+    @staticmethod
     def _is_history_operation_success(row: dict[str, Any] | None) -> bool:
         if not isinstance(row, dict):
             return False
@@ -2195,7 +2239,7 @@ class BrowserPhaseRuntime:
     @classmethod
     def _is_page_settle_action(cls, name: str) -> bool:
         normalized = str(name or "").strip().lower()
-        return normalized in cls.PAGE_SETTLE_ACTION_TOOLS
+        return normalized in cls.PAGE_SETTLE_ACTION_TOOLS or normalized in cls.FORM_STATE_ACTION_TOOLS
 
     @classmethod
     def _page_action_signature(cls, name: str, arguments: dict[str, Any] | None) -> str:
@@ -3169,6 +3213,7 @@ class BrowserPhaseRuntime:
             retry_requested = False
             handled_tool = False
             executed_tool_this_turn = False
+            apply_page_changed_this_response = False
             for item_index, item in enumerate(output_items):
                 if str(item.get("type") or "") != "function_call":
                     continue
@@ -3208,6 +3253,23 @@ class BrowserPhaseRuntime:
                     latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
                     last_payload=last_payload if isinstance(last_payload, dict) else None,
                 )
+
+                if (
+                    phase.slug == "apply"
+                    and name == "update_jobs"
+                    and apply_page_changed_this_response
+                    and self._update_jobs_contains_apply_failure(arguments if isinstance(arguments, dict) else None)
+                ):
+                    history_items = [
+                        self._context_item(
+                            self._apply_terminal_failure_needs_fresh_page_message(
+                                current_url=current_url,
+                                tool_name=name,
+                            )
+                        )
+                    ]
+                    retry_requested = True
+                    break
 
                 if phase.slug == "apply" and apply_upload_requires_observation and name == "phase_result":
                     history_items = [
@@ -3862,6 +3924,10 @@ class BrowserPhaseRuntime:
                             last_payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else payload
                             retry_requested = True
                             break
+                    if phase.slug == "apply" and (
+                        self._is_page_settle_action(name) or name in self.FORM_STATE_ACTION_TOOLS
+                    ):
+                        apply_page_changed_this_response = True
                     post_tool_context_items: list[dict[str, Any]] = []
                     fresh_snapshot_captured = False
                     if name == "browser_snapshot":

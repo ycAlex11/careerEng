@@ -36,6 +36,21 @@ def render_action_card_markdown(card: dict[str, Any]) -> str:
         lines.extend(["```json", json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True), "```"])
     else:
         lines.append("- none")
+    required_output = str(metadata.get("required_output") or "").strip()
+    proposal_contract = metadata.get("proposal_contract") if isinstance(metadata.get("proposal_contract"), dict) else {}
+    if required_output or proposal_contract:
+        lines.extend(["", "## Required Output For Codex", ""])
+        if required_output:
+            lines.append(f"- Required output: `{required_output}`")
+        if proposal_contract:
+            lines.extend(
+                [
+                    "- Proposal contract:",
+                    "```json",
+                    json.dumps(proposal_contract, ensure_ascii=False, indent=2, sort_keys=True),
+                    "```",
+                ]
+            )
     lines.extend(["", "## Semantic Tags", ""])
     lines.extend(_bullets([f"`{tag}`" for tag in _list_values(card.get("semantic_tags"))]))
     lines.extend(["", "## Goal", "", _text_or_dash(card.get("goal"))])

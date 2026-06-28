@@ -44,16 +44,61 @@ class BatchApplyDebugRunner:
     def _sample_run_jobs(self, site_key: str, batch_id: str, *, limit: int) -> list[dict[str, Any]]:
         selected: list[dict[str, Any]] = []
         seen_job_ids: set[str] = set()
-        for row in self.job_flow._run_job_rows(site_key, batch_id):
+        rows = self.job_flow._merged_run_job_rows_for_batch(site_key, batch_id)
+        for row in rows:
             job_id = str(row.get("job_id") or "").strip()
             job_url = str(row.get("url") or "").strip()
             if not job_id or not job_url or job_id in seen_job_ids:
+                continue
+            if self.job_flow._is_apply_row_terminal(row):
                 continue
             selected.append(row)
             seen_job_ids.add(job_id)
             if len(selected) >= max(1, int(limit or 1)):
                 break
         return selected
+
+    def _resume_waiting_solution_if_materialized(
+        self,
+        *,
+        batch: dict[str, Any],
+        site_key: str,
+        current: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        flow = self.job_flow
+        is_waiting = str(current.get("status") or "") == "waiting_solution" or str(
+            (current.get("apply") or {}).get("status") or ""
+        ) == "waiting_solution"
+        if not is_waiting:
+            return batch, current
+        proposals = flow._active_run_local_apply_proposals(site_key=site_key, batch_id=str(batch.get("batch_id") or ""))
+        if not proposals:
+            return batch, current
+        apply = dict(current.get("apply") or {})
+        loop_control = dict(apply.get("loop_control") or {})
+        proposal = proposals[-1]
+        proposal_payload = proposal.get("proposal") if isinstance(proposal.get("proposal"), dict) else {}
+        loop_control.update(
+            {
+                "waiting_solution": False,
+                "materialized_change": True,
+                "proposal_status": str(proposal_payload.get("proposal_status") or "materialized"),
+                "active_run_local_proposal_id": str(proposal_payload.get("proposal_id") or ""),
+                "active_run_local_proposal_memory_id": str(proposal.get("memory_id") or ""),
+            }
+        )
+        apply.update({"status": "running", "loop_control": loop_control})
+        resumed = {
+            **current,
+            "status": "running",
+            "reason_tag": "item_loop_resume_with_run_local_overlay",
+            "apply": apply,
+            "message": "Resuming item loop with an applied run-local evolution proposal.",
+        }
+        batch = flow.job_store.update_site(batch, site_key, resumed)
+        batch["status"] = flow._compute_batch_status(batch)
+        batch = flow.job_store.save_batch(batch)
+        return batch, resumed
 
     def _select_run_job(
         self,
@@ -202,6 +247,11 @@ class BatchApplyDebugRunner:
         current = sites.get(normalized_site_key)
         if not isinstance(current, dict):
             raise KeyError(f"site not found in batch: {site_key}")
+        batch, current = self._resume_waiting_solution_if_materialized(
+            batch=batch,
+            site_key=normalized_site_key,
+            current=current,
+        )
         selected_rows = self._sample_run_jobs(normalized_site_key, batch_id, limit=limit)
         if not selected_rows:
             raise ValueError(f"no jobs with URL found for site {normalized_site_key} in batch {batch_id}")
@@ -262,6 +312,13 @@ class BatchApplyDebugRunner:
             job_url = str(target.get("url") or "").strip()
             if not job_id or not job_url:
                 continue
+            flow._mark_apply_job_uses_run_local_proposal(
+                site_key=normalized_site_key,
+                batch_id=batch_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                job_id=job_id,
+            )
             last_result = flow.browser_runner.run_site(
                 site_key=normalized_site_key,
                 site_name=str(current.get("site_name") or normalized_site_key),
@@ -281,6 +338,35 @@ class BatchApplyDebugRunner:
                 continue
             status = "blocked" if str(getattr(last_result, "status", "") or "") == "blocked" else "apply_failed"
             error_text = str(getattr(last_result, "message", "") or "").strip() or "sample apply ended without terminal job update"
+            if flow._apply_flow_started_without_terminal(job_url=job_url, last_result=last_result, latest_row=latest_row):
+                loop_gap_row = flow._write_unclosed_apply_loop_gap(
+                    site_key=normalized_site_key,
+                    batch_id=batch_id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    job_row={**target, **latest_row},
+                    last_result=last_result,
+                    error_text=error_text,
+                )
+                updated = flow._loop_control_pause_site_row(
+                    site_key=normalized_site_key,
+                    existing=current,
+                    batch_id=batch_id,
+                    last_result=last_result,
+                    job_row=loop_gap_row,
+                    turn_id=turn_id,
+                )
+                if str(updated.get("status") or "") in {"blocked", "waiting_solution"}:
+                    batch = flow.job_store.update_site(batch, normalized_site_key, updated)
+                    batch["status"] = flow._compute_batch_status(batch)
+                    batch = flow.job_store.save_batch(batch)
+                    flow._generate_batch_report_if_possible(batch)
+                    return flow._format_batch_summary(batch)
+                current = updated
+                batch = flow.job_store.update_site(batch, normalized_site_key, updated)
+                batch["status"] = flow._compute_batch_status(batch)
+                batch = flow.job_store.save_batch(batch)
+                continue
             flow._seal_apply_row_terminal(
                 site_key=normalized_site_key,
                 batch_id=batch_id,

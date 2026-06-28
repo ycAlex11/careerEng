@@ -4,6 +4,64 @@ CareerEng is designed to be operated by Codex or another local AI assistant.
 
 If the user uses `@career` or discusses job search, resumes, applications, interviews, target companies, career sites, reports, metrics, evolution, or CareerEng operations, read `docs/assistant_bridge/ASSISTANT_GUIDE.md`.
 
+## AI-First Design Boundary
+
+CareerEng is an AI-first project. Before adding Python logic for workflow behavior, ask whether the behavior should be handled by the LLM through Skills, local memory, evidence packs, action cards, or an evolution proposal.
+
+## Architecture First, Not Case-First Hacks
+
+When modifying code, preserve the intended architecture before trying to make one failing live case pass.
+
+Do not solve a local browser/application failure by adding narrow Python behavior in the nearest runtime file. First identify the proper layer:
+
+- `job_flow.py` should orchestrate phases, apply lists, state transitions, and calls into supporting engines.
+- `careereng/evolution/` should own reusable evolution loop mechanics, proposal contracts, evidence handling, validation, and promotion/rollback flow.
+- Skills and LLM/Codex proposals should own site workflow, form-filling behavior, matching policy, and business judgment.
+
+If a fix starts making `job_flow.py`, browser runtime, provider code, or storage code decide site-specific workflow strategy, stop and redesign it as one of:
+
+- A Skill change
+- An evolution lesson
+- A proposal/action-card workflow
+- A generic framework hook that lets the LLM decide the business action
+
+Never trade architecture correctness for a quick local pass. A change that makes one site work by hiding business logic in Python is considered a regression unless the user explicitly approved that runtime abstraction.
+
+Use Python for framework responsibilities:
+
+- Orchestration
+- Persistence
+- Validation
+- Safety gates
+- Metrics
+- Recovery plumbing
+- Evidence packaging
+- Patch application and rollback
+
+Use LLM/Skills for business intelligence:
+
+- Site workflow decisions
+- Job matching policy
+- Form-filling strategy
+- Status interpretation
+- Evolution/refinement of Skills
+- Adapting from previous failures
+
+Do not hard-code website-specific behavior, browser semantics, business policy, or form strategy in Python when the same behavior can be expressed as a Skill, memory/evolution lesson, or LLM-generated patch. For loop/evolution work, Python should create the conditions for the LLM to reason and improve the workflow, not replace that reasoning with fixed runtime rules.
+
+For evolution loops, prefer the existing evidence/candidate/action-card/memory/summary flow. Python may carry an `evolution_decision` between batches, but the decision content should come from LLM/Skill loop-control evidence. Do not add narrow Python subclasses or site-specific branches when a Skill or evolution proposal can express the change.
+
+An evolution loop is not complete when only evidence, an action card, or a generic refinement hint exists. The runner must not continue a failed job or follow-up batch as an evolved attempt until a concrete proposal exists, such as `run_local_overlay`, `skill_patch`, `routing_example_append`, `memory_unit_append`, or `assistant_context_update`.
+
+## Do-Not-Do List
+
+- Do not interrupt a live browser workflow while the user is observing it unless the user explicitly asks you to stop or a destructive action is imminent.
+- Do not treat action cards, evidence, or generic guidance as completed evolution.
+- Do not bypass existing evolution, lesson, taskboard, memory, or action-card infrastructure with one-off local logic.
+- Do not treat "it ran once" as "evolution succeeded"; check validation evidence from follow-up runs.
+- Do not demote a required Codex/LLM proposal step into manual hard-coded Python behavior.
+- Do not implement site workflow, matching policy, form-filling strategy, or browser business judgment in Python when it belongs in Skills, lessons, or an LLM-generated proposal.
+
 ## Assistant Context Pack
 
 For `@career`, memory, evolution, recent conversation summaries, action cards, CareerEng status, or current development taskboard work, read this generated context first:

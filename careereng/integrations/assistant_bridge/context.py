@@ -88,7 +88,11 @@ def _memory_section(workspace: Path, limit: int) -> str:
 
 
 def _lessons_section(workspace: Path, limit: int) -> str:
-    rows = _read_jsonl(workspace / "evolution" / "browser_control" / "lessons.jsonl")[-limit:]
+    rows = [
+        row
+        for row in _read_jsonl(workspace / "evolution" / "browser_control" / "lessons.jsonl")
+        if str(row.get("status") or "").strip().lower() == "accepted"
+    ][-limit:]
     return _rows_section(
         "Accepted Evolution Lessons",
         rows,

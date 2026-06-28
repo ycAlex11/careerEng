@@ -56,6 +56,8 @@ slow_mo_ms = 0
 reasoning_effort = "high"
 site_parallelism = 2
 browser_name = "chrome"
+# Optional browser executable for Playwright MCP, for example Chrome for Testing.
+executable_path = ""
 mcp_port_start = 8931
 
 [browser.budgets]
@@ -77,6 +79,10 @@ apply_max_phase_steps = 240
 apply_job_phase_timeout_seconds = 3600
 apply_job_timeout_ms = 180000
 apply_site_phase_budget_factor = 0.8
+loop_control_refinement_attempts_per_batch = 3
+loop_control_user_input_attempts_per_batch = 3
+loop_control_outer_batch_attempts = 3
+loop_control_failed_batches_per_pattern = 3
 debug_session_preparation_timeout_seconds = 600
 
 [browser.guards.same_url_no_progress]

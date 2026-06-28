@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import re
 import threading
 import time
@@ -14,7 +15,14 @@ from careereng.action_cards.schema import ACTION_CARD_CODEX_REVIEW
 from careereng.config.schema import BrowserBudgetsConfig
 from careereng.evolution.apply_probe import apply_probe_counters
 from careereng.evolution.capabilities import EvolutionCapabilityStore
+from careereng.evolution.loop_control import (
+    LOOP_ACTION_PAUSE_SITE,
+    LOOP_ACTION_TRIGGER_REFINEMENT,
+    loop_control_from_row,
+)
+from careereng.evolution.loop_engine import ApplyLoopEngine
 from careereng.evolution.reports import create_apply_probe_report
+from careereng.evolution.workflow_summary import generate_workflow_evolution_summary
 from careereng.reporting.job_report import generate_job_batch_report
 from careereng.skill_schema import load_job_skill_policies
 from careereng.storage.application_store import ApplicationStore
@@ -91,6 +99,18 @@ class JobFlow:
         self.browser_budgets = browser_budgets or BrowserBudgetsConfig()
         self.job_planning_store = JobPlanningStore(job_store.workspace)
         self.capability_store = EvolutionCapabilityStore(job_store.workspace)
+        self.loop_engine = ApplyLoopEngine(
+            project_root=project_root,
+            workspace=job_store.workspace,
+            site_store=site_tools.site_store,
+            job_store=job_store,
+            browser_budgets=self.browser_budgets,
+            trace_path_for_ref=self._trace_path_for_ref,
+            run_job_rows=self._run_job_rows,
+            merged_run_job_rows=self._merged_run_job_rows_for_batch,
+            apply_counters_from_run=self._apply_counters_from_run,
+            apply_counter_payload=self._apply_counter_payload,
+        )
 
     @property
     def APPLY_JOB_PHASE_TIMEOUT_SECONDS(self) -> int:
@@ -111,6 +131,22 @@ class JobFlow:
     @property
     def APPLY_PROBE_UNSUCCESSFUL_THRESHOLD(self) -> int:
         return int(self.browser_budgets.apply_probe_unsuccessful_threshold)
+
+    @property
+    def LOOP_CONTROL_REFINEMENT_ATTEMPTS_PER_BATCH(self) -> int:
+        return int(self.browser_budgets.loop_control_refinement_attempts_per_batch)
+
+    @property
+    def LOOP_CONTROL_USER_INPUT_ATTEMPTS_PER_BATCH(self) -> int:
+        return int(getattr(self.browser_budgets, "loop_control_user_input_attempts_per_batch", 3) or 3)
+
+    @property
+    def LOOP_CONTROL_OUTER_BATCH_ATTEMPTS(self) -> int:
+        return int(getattr(self.browser_budgets, "loop_control_outer_batch_attempts", 3) or 3)
+
+    @property
+    def LOOP_CONTROL_FAILED_BATCHES_PER_PATTERN(self) -> int:
+        return int(self.browser_budgets.loop_control_failed_batches_per_pattern)
 
     def close(self) -> None:
         closer = getattr(self.browser_runner, "close", None)
@@ -149,10 +185,16 @@ class JobFlow:
                 row_status = str(row.get("status") or "")
                 retrieve_status = str((row.get("retrieve") or {}).get("status") or "")
                 apply_status = str((row.get("apply") or {}).get("status") or "")
-                if row_status in {"blocked_login", "blocked", "failed", "skipped"}:
+                if row_status in {"blocked_login", "blocked", "waiting_solution", "failed", "skipped"}:
                     continue
                 if apply_status == "running" or (apply_status == "pending" and retrieve_status == "done"):
                     return "running"
+        if any(
+            str(row.get("status") or "") == "waiting_solution"
+            or str((row.get("apply") or {}).get("status") or "") == "waiting_solution"
+            for row in rows
+        ):
+            return "waiting_solution"
         if any(str(row.get("status") or "") in {"blocked_login", "blocked"} for row in rows):
             return "waiting_user"
         if any(
@@ -208,6 +250,17 @@ class JobFlow:
             skill_path = str(row.get("skill_path") or "")
             suffix = f" 请补充 {skill_path}。" if skill_path else ""
             return f"- {site_name} [{site_key}]: 已跳过（{reason or 'preflight_skip'}）。{suffix}".rstrip()
+        if status == "waiting_solution" or str(apply.get("status") or "") == "waiting_solution":
+            loop_control = apply.get("loop_control") if isinstance(apply.get("loop_control"), dict) else {}
+            solution_request = str(row.get("solution_request") or loop_control.get("solution_request") or "")
+            proposal_output = str(row.get("proposal_output_path") or loop_control.get("proposal_output_path") or "")
+            suffix_parts = []
+            if solution_request:
+                suffix_parts.append(f"solution_request={solution_request}")
+            if proposal_output:
+                suffix_parts.append(f"proposal_output={proposal_output}")
+            suffix = f"（{'; '.join(suffix_parts)}）" if suffix_parts else ""
+            return f"- {site_name} [{site_key}]: 等待 Codex 生成并应用 evolution proposal{suffix}。"
         if status in {"blocked_login", "blocked"}:
             message = str(row.get("message") or "")
             if message:
@@ -332,6 +385,113 @@ class JobFlow:
                 "final_markdown_path": str(report.get("final_markdown_path") or ""),
             },
         )
+
+    def _generate_workflow_evolution_summary_if_possible(self, batch: dict[str, Any]) -> None:
+        batch_id = str(batch.get("batch_id") or "")
+        if not batch_id:
+            return
+        try:
+            summary = generate_workflow_evolution_summary(workspace=self.job_store.workspace, batch=batch)
+        except Exception as exc:
+            self.job_store.append_event(
+                "evolution.workflow_summary.failed",
+                {
+                    "batch_id": batch_id,
+                    "error": str(exc),
+                },
+            )
+            return
+        if not summary:
+            return
+        self.job_store.append_event(
+            "evolution.workflow_summary.generated",
+            {
+                "batch_id": batch_id,
+                "json_path": str(summary.get("json_path") or ""),
+                "markdown_path": str(summary.get("markdown_path") or ""),
+                "lesson_candidates_written": int(summary.get("lesson_candidates_written") or 0),
+                "sites_with_loop_evidence": int(summary.get("sites_with_loop_evidence") or 0),
+            },
+        )
+
+    @staticmethod
+    def _loop_control_payload_from_site_row(row: dict[str, Any]) -> dict[str, Any]:
+        return ApplyLoopEngine.loop_control_payload_from_site_row(row)
+
+    def _outer_loop_retry_sites(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
+        return self.loop_engine.outer_loop_retry_sites(
+            batch=batch,
+            operation_job_search=self.OPERATION_JOB_SEARCH,
+            normalize_operation=self._normalize_operation,
+        )
+
+    @staticmethod
+    def _outer_loop_attempt(batch: dict[str, Any]) -> int:
+        return ApplyLoopEngine.outer_loop_attempt(batch)
+
+    def _outer_loop_followup_context(
+        self,
+        *,
+        previous_batch: dict[str, Any],
+        site_key: str,
+        control: dict[str, Any],
+        loop_payload: dict[str, Any],
+        decision: dict[str, Any] | None = None,
+        next_attempt: int,
+        max_attempts: int,
+    ) -> str:
+        return self.loop_engine.outer_loop_followup_context(
+            previous_batch=previous_batch,
+            site_key=site_key,
+            control=control,
+            loop_payload=loop_payload,
+            decision=decision,
+            next_attempt=next_attempt,
+            max_attempts=max_attempts,
+        )
+
+    def _create_outer_loop_followup_batch(
+        self,
+        *,
+        previous_batch: dict[str, Any],
+        retry_sites: list[dict[str, Any]],
+        next_attempt: int,
+        max_attempts: int,
+    ) -> dict[str, Any]:
+        return self.loop_engine.create_outer_loop_followup_batch(
+            previous_batch=previous_batch,
+            retry_sites=retry_sites,
+            next_attempt=next_attempt,
+            max_attempts=max_attempts,
+            create_batch=self.create_batch,
+            operation_job_search=self.OPERATION_JOB_SEARCH,
+            generate_summary=self._generate_workflow_evolution_summary_if_possible,
+        )
+
+    def run_batch_with_evolution_loop(self, batch_id: str) -> str:
+        current_batch_id = str(batch_id or "")
+        last_reply = ""
+        max_attempts = max(1, int(self.LOOP_CONTROL_OUTER_BATCH_ATTEMPTS or 1))
+        while current_batch_id:
+            last_reply = self.run_batch(current_batch_id)
+            batch = self.job_store.load_batch(current_batch_id)
+            retry_sites = self._outer_loop_retry_sites(batch)
+            if not retry_sites:
+                return last_reply
+            current_attempt = self._outer_loop_attempt(batch)
+            if current_attempt >= max_attempts:
+                return last_reply
+            next_batch = self._create_outer_loop_followup_batch(
+                previous_batch=batch,
+                retry_sites=retry_sites,
+                next_attempt=current_attempt + 1,
+                max_attempts=max_attempts,
+            )
+            next_batch_id = str(next_batch.get("batch_id") or "")
+            if not next_batch_id:
+                return last_reply
+            current_batch_id = next_batch_id
+        return last_reply
 
     def _disabled_site_row(
         self,
@@ -982,6 +1142,9 @@ class JobFlow:
             return "blocked"
         return "done"
 
+    def _aggregate_apply_status_for_run(self, *, site_key: str, batch_id: str) -> str:
+        return self.loop_engine.aggregate_apply_status_for_run(site_key=site_key, batch_id=batch_id)
+
     def _pending_apply_rows(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
         rows = [row for row in self._merged_run_job_rows_for_batch(site_key, batch_id) if not self._is_apply_row_terminal(row)]
         plan = self.job_planning_store.load_apply_plan(batch_id=batch_id, site_key=site_key)
@@ -1022,6 +1185,191 @@ class JobFlow:
             batch_id,
         )
 
+    def _trace_path_for_ref(self, trace_ref: Any) -> Path | None:
+        text = str(trace_ref or "").strip()
+        if not text:
+            return None
+        path = Path(text)
+        if path.is_absolute():
+            return path
+        return self.job_store.workspace / path
+
+    @staticmethod
+    def _runtime_gap_error_text(text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "response.completed",
+                "rate_limits",
+                "rate limit",
+                "provider error",
+                "stream",
+                "bad_response_status_code",
+                "connection reset",
+                "network",
+            )
+        )
+
+    @staticmethod
+    def _trace_text_matches_job_url(*, text: str, job_url: str) -> bool:
+        needle = str(job_url or "").strip()
+        if not needle:
+            return False
+        haystack = str(text or "")
+        if needle in haystack:
+            return True
+        trimmed = needle.rstrip("/")
+        return bool(trimmed and f"{trimmed}/apply" in haystack)
+
+    @staticmethod
+    def _trace_event_started_apply_flow(event: dict[str, Any], *, job_url: str) -> bool:
+        if str(event.get("phase") or "") != "apply":
+            return False
+        output = str(event.get("output") or "")
+        arguments = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
+        argument_text = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+        combined = f"{argument_text}\n{output}"
+        if not JobFlow._trace_text_matches_job_url(text=combined, job_url=job_url):
+            return False
+        tool_name = str(event.get("tool_name") or "")
+        if tool_name == "browser_file_upload":
+            return True
+        if "/apply" in combined or "#/apply" in combined:
+            return True
+        if tool_name == "browser_click":
+            lowered = combined.lower()
+            return any(
+                marker in lowered
+                for marker in (
+                    "apply",
+                    "submit",
+                    "upload",
+                    "continue",
+                    "next",
+                    "review",
+                    "申请",
+                    "提交",
+                    "上传",
+                    "继续",
+                    "下一步",
+                )
+            )
+        return False
+
+    def _trace_indicates_apply_flow_started(self, *, trace_ref: Any, job_url: str) -> bool:
+        path = self._trace_path_for_ref(trace_ref)
+        if path is None or not path.exists():
+            return False
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return False
+        for line in reversed(lines[-300:]):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and self._trace_event_started_apply_flow(event, job_url=job_url):
+                return True
+        return False
+
+    def _loop_recent_trace_context(self, *, trace_ref: Any, phase: str = "apply", limit: int = 8) -> dict[str, list[str]]:
+        return self.loop_engine.loop_recent_trace_context(trace_ref=trace_ref, phase=phase, limit=limit)
+
+    @staticmethod
+    def _compact_trace_output(event: dict[str, Any]) -> str:
+        return ApplyLoopEngine.compact_trace_output(event)
+
+    def _loop_next_iteration_guidance(
+        self,
+        *,
+        control: dict[str, Any],
+        trace_context: dict[str, list[str]],
+        job_row: dict[str, Any],
+    ) -> str:
+        return ApplyLoopEngine.loop_next_iteration_guidance(
+            control=control,
+            trace_context=trace_context,
+            job_row=job_row,
+        )
+
+    def _related_accepted_lessons_summary(self, *, site_key: str, phase: str, limit: int = 5) -> str:
+        return self.loop_engine.related_accepted_lessons_summary(site_key=site_key, phase=phase, limit=limit)
+
+    def _apply_flow_started_without_terminal(
+        self,
+        *,
+        job_url: str,
+        last_result: Any | None,
+        latest_row: dict[str, Any],
+    ) -> bool:
+        apply_state = str(latest_row.get("apply_state") or "").strip().lower()
+        decision_status = str(latest_row.get("decision_status") or "").strip().lower()
+        current_url = str(getattr(last_result, "current_url", "") or "")
+        if apply_state.startswith("in_progress") or apply_state in {"form_visible", "resume_uploaded"}:
+            return True
+        if decision_status == "recommended_apply" and ("/apply" in current_url or current_url.rstrip("/").startswith(job_url.rstrip("/"))):
+            return True
+        if job_url and self._trace_text_matches_job_url(text=current_url, job_url=job_url) and "/apply" in current_url:
+            return True
+        return self._trace_indicates_apply_flow_started(trace_ref=getattr(last_result, "trace_ref", ""), job_url=job_url)
+
+    def _write_unclosed_apply_loop_gap(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        session_id: str,
+        turn_id: str,
+        job_row: dict[str, Any],
+        last_result: Any | None,
+        error_text: str,
+    ) -> dict[str, Any]:
+        runtime_gap = self._runtime_gap_error_text(error_text)
+        action = LOOP_ACTION_PAUSE_SITE if runtime_gap else LOOP_ACTION_TRIGGER_REFINEMENT
+        gap_type = "runtime_gap" if runtime_gap else "site_workflow_gap"
+        pattern = (
+            "apply_flow_runtime_error_without_terminal_update"
+            if runtime_gap
+            else "apply_flow_unclosed_without_terminal_update"
+        )
+        target = "runtime_config" if runtime_gap else "site_skill"
+        current_url = str(getattr(last_result, "current_url", "") or job_row.get("url") or "")
+        evidence = (
+            "The apply target entered the live apply flow but returned to the outer apply loop without a terminal "
+            f"`update_jobs` state. last_result_status={str(getattr(last_result, 'status', '') or '')}; "
+            f"reason={str(getattr(last_result, 'reason_tag', '') or '')}; error={error_text}; current_url={current_url}"
+        )
+        refinement_hint = (
+            "Refine the site apply workflow skill so the current item is completed, explicitly blocked, or converted "
+            "into a structured loop-control gap before moving to another apply target."
+        )
+        update = {
+            "job_id": str(job_row.get("job_id") or ""),
+            "title": str(job_row.get("title") or ""),
+            "url": str(job_row.get("url") or ""),
+            "application_status": "blocked",
+            "apply_state": "terminal_blocked",
+            "last_apply_error": str(error_text or ""),
+            "loop_scope": "apply_item",
+            "gap_type": gap_type,
+            "block_reason_type": gap_type,
+            "failure_pattern": pattern,
+            "recommended_action": action,
+            "loop_control_action": action,
+            "target": target,
+            "recommended_target": target,
+            "resume_policy": "retry_same_item",
+            "current_item_ref": current_url or str(job_row.get("job_id") or ""),
+            "evidence": evidence,
+            "refinement_hint": refinement_hint,
+        }
+        rows = self.site_tools.site_store.update_run_jobs(site_key, [update], session_id, turn_id, batch_id)
+        return rows[0] if rows else update
+
     def _finalize_apply_site_row(
         self,
         *,
@@ -1034,7 +1382,7 @@ class JobFlow:
         retrieve = dict(existing.get("retrieve") or {})
         apply = dict(existing.get("apply") or {})
         counters = self._apply_counters_from_run(site_key, batch_id)
-        apply_status = self._aggregate_apply_status(counters)
+        apply_status = self._aggregate_apply_status_for_run(site_key=site_key, batch_id=batch_id)
         apply.update(
             {
                 "status": apply_status,
@@ -1163,6 +1511,43 @@ class JobFlow:
             candidate_id="apply_form_workflow",
         )
 
+    def _active_run_local_apply_proposals(self, *, site_key: str, batch_id: str, limit: int = 3) -> list[dict[str, Any]]:
+        return self.loop_engine.active_run_local_apply_proposals(site_key=site_key, batch_id=batch_id, limit=limit)
+
+    def _mark_apply_job_uses_run_local_proposal(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        session_id: str,
+        turn_id: str,
+        job_id: str,
+    ) -> dict[str, str]:
+        return self.loop_engine.mark_apply_job_uses_run_local_proposal(
+            site_key=site_key,
+            batch_id=batch_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            job_id=job_id,
+        )
+
+    @staticmethod
+    def _run_local_proposal_validation_result(*, row: dict[str, Any], proposal_pattern: str = "") -> str:
+        return ApplyLoopEngine._run_local_proposal_validation_result(row=row, proposal_pattern=proposal_pattern)
+
+    def _record_run_local_proposal_validation(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        job_row: dict[str, Any],
+    ) -> None:
+        self.loop_engine.record_run_local_proposal_validation(
+            site_key=site_key,
+            batch_id=batch_id,
+            job_row=job_row,
+        )
+
     def _apply_probe_stop_reason(self, site_key: str, counters: dict[str, int]) -> str:
         if self._apply_probe_is_accepted(site_key):
             return ""
@@ -1175,6 +1560,156 @@ class JobFlow:
         if max_attempted and attempted >= max_attempted:
             return "max_attempted_reached"
         return ""
+
+    def _loop_control_pattern_attempts_in_batch(self, *, site_key: str, batch_id: str, phase: str, pattern: str) -> int:
+        return self.loop_engine.loop_control_pattern_attempts_in_batch(
+            site_key=site_key,
+            batch_id=batch_id,
+            phase=phase,
+            pattern=pattern,
+        )
+
+    @staticmethod
+    def _loop_control_gap_type(control: dict[str, Any]) -> str:
+        return ApplyLoopEngine.loop_control_gap_type(control)
+
+    @staticmethod
+    def _loop_control_is_human_only_gap(control: dict[str, Any]) -> bool:
+        from careereng.evolution.loop_control import loop_control_is_human_only_gap
+
+        return loop_control_is_human_only_gap(control)
+
+    def _loop_control_should_pause(
+        self,
+        *,
+        control: dict[str, Any],
+        attempts: int,
+        artifacts: dict[str, Any],
+        has_materialized_change: bool = False,
+    ) -> bool:
+        from careereng.evolution.item_loop import plan_item_loop_transition
+
+        transition = plan_item_loop_transition(
+            control,
+            attempts=attempts,
+            max_refinement_attempts=self.LOOP_CONTROL_REFINEMENT_ATTEMPTS_PER_BATCH,
+            max_user_input_attempts=self.LOOP_CONTROL_USER_INPUT_ATTEMPTS_PER_BATCH,
+            has_materialized_change=has_materialized_change,
+            artifacts=artifacts,
+        )
+        return bool(transition.pause_loop)
+
+    def _persist_loop_control_guidance(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        control: dict[str, Any],
+        job_row: dict[str, Any],
+        artifacts: dict[str, Any],
+        trace_context: dict[str, list[str]] | None = None,
+        next_iteration_guidance: str = "",
+        accepted_lessons_summary: str = "",
+    ) -> dict[str, Any]:
+        return self.loop_engine.persist_loop_control_guidance(
+            site_key=site_key,
+            batch_id=batch_id,
+            control=control,
+            job_row=job_row,
+            artifacts=artifacts,
+            trace_context=trace_context,
+            next_iteration_guidance=next_iteration_guidance,
+            accepted_lessons_summary=accepted_lessons_summary,
+        )
+
+    def _persist_loop_control_evolution_memory(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        control: dict[str, Any],
+        job_row: dict[str, Any],
+        item: dict[str, Any],
+        artifacts: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.loop_engine.persist_loop_control_evolution_memory(
+            site_key=site_key,
+            batch_id=batch_id,
+            control=control,
+            job_row=job_row,
+            item=item,
+            artifacts=artifacts,
+        )
+
+    @staticmethod
+    def _loop_memory_avoid_patterns(*, pattern: str, evidence: str) -> list[str]:
+        return ApplyLoopEngine.loop_memory_avoid_patterns(pattern=pattern, evidence=evidence)
+
+    @staticmethod
+    def _loop_memory_recommended_patterns(*, pattern: str, evidence: str, next_guidance: str) -> list[str]:
+        return ApplyLoopEngine.loop_memory_recommended_patterns(
+            pattern=pattern,
+            evidence=evidence,
+            next_guidance=next_guidance,
+        )
+
+    def _persist_loop_control_workflow_memory(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        turn_id: str,
+        control: dict[str, Any],
+        artifacts: dict[str, Any],
+    ) -> None:
+        self.loop_engine.persist_loop_control_workflow_memory(
+            site_key=site_key,
+            batch_id=batch_id,
+            turn_id=turn_id,
+            control=control,
+            artifacts=artifacts,
+        )
+
+    def _record_loop_control(
+        self,
+        *,
+        site_key: str,
+        existing: dict[str, Any],
+        batch_id: str,
+        last_result: Any | None,
+        job_row: dict[str, Any],
+        turn_id: str = "",
+    ) -> dict[str, Any]:
+        return self.loop_engine.record_loop_control(
+            site_key=site_key,
+            existing=existing,
+            batch_id=batch_id,
+            turn_id=turn_id,
+            last_result=last_result,
+            job_row=job_row,
+        )
+
+    def _create_loop_control_solution_request(self, *, artifacts: dict[str, Any]) -> dict[str, Any]:
+        return self.loop_engine.create_loop_control_solution_request(artifacts=artifacts)
+
+    def _loop_control_pause_site_row(
+        self,
+        *,
+        site_key: str,
+        existing: dict[str, Any],
+        batch_id: str,
+        last_result: Any | None,
+        job_row: dict[str, Any],
+        turn_id: str = "",
+    ) -> dict[str, Any]:
+        return self._record_loop_control(
+            site_key=site_key,
+            existing=existing,
+            batch_id=batch_id,
+            turn_id=turn_id,
+            last_result=last_result,
+            job_row=job_row,
+        )
 
     def _apply_probe_stop_site_row(
         self,
@@ -1356,6 +1891,13 @@ class JobFlow:
                 self.APPLY_JOB_PHASE_TIMEOUT_SECONDS,
                 max(1, int(remaining_site_phase_seconds)),
             )
+            self._mark_apply_job_uses_run_local_proposal(
+                site_key=site_key,
+                batch_id=batch_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                job_id=job_id,
+            )
             last_result = self._run_site_with_auth_recovery(
                 site_key=site_key,
                 site_name=str(current.get("site_name") or site_key),
@@ -1374,7 +1916,24 @@ class JobFlow:
 
             latest_rows = {str(row.get("job_id") or ""): row for row in self._run_job_rows(site_key, batch_id)}
             latest_row = latest_rows.get(job_id) or {}
+            self._record_run_local_proposal_validation(site_key=site_key, batch_id=batch_id, job_row=latest_row)
             if self._is_apply_row_terminal(latest_row):
+                if loop_control_from_row(latest_row):
+                    loop_site_row = self._loop_control_pause_site_row(
+                        site_key=site_key,
+                        existing=current,
+                        batch_id=batch_id,
+                        last_result=last_result,
+                        job_row=latest_row,
+                        turn_id=turn_id,
+                    )
+                    if str(loop_site_row.get("status") or "") in {"blocked", "waiting_solution"}:
+                        return loop_site_row
+                    if callable(progress_callback):
+                        current = progress_callback(loop_site_row)
+                    else:
+                        current = loop_site_row
+                    continue
                 if callable(progress_callback):
                     current = progress_callback(
                         self._apply_progress_site_row(
@@ -1396,6 +1955,31 @@ class JobFlow:
                 continue
             status = "blocked" if str(getattr(last_result, "status", "") or "") == "blocked" else "apply_failed"
             error_text = str(getattr(last_result, "message", "") or "").strip() or "apply phase ended without terminal job update"
+            if self._apply_flow_started_without_terminal(job_url=job_url, last_result=last_result, latest_row=latest_row):
+                loop_gap_row = self._write_unclosed_apply_loop_gap(
+                    site_key=site_key,
+                    batch_id=batch_id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    job_row={**target, **latest_row},
+                    last_result=last_result,
+                    error_text=error_text,
+                )
+                loop_site_row = self._loop_control_pause_site_row(
+                    site_key=site_key,
+                    existing=current,
+                    batch_id=batch_id,
+                    last_result=last_result,
+                    job_row=loop_gap_row,
+                    turn_id=turn_id,
+                )
+                if str(loop_site_row.get("status") or "") in {"blocked", "waiting_solution"}:
+                    return loop_site_row
+                if callable(progress_callback):
+                    current = progress_callback(loop_site_row)
+                else:
+                    current = loop_site_row
+                continue
             self._seal_apply_row_terminal(
                 site_key=site_key,
                 batch_id=batch_id,
@@ -1517,7 +2101,7 @@ class JobFlow:
         counters = self._apply_counters_from_run(site_key, batch_id)
 
         if str(getattr(result, "status", "") or "") == "ready" and current_phase == "apply":
-            apply_status = self._aggregate_apply_status(counters)
+            apply_status = self._aggregate_apply_status_for_run(site_key=site_key, batch_id=batch_id)
             apply.update(
                 {
                     "status": apply_status,
@@ -1650,6 +2234,7 @@ class JobFlow:
             },
         )
         self._generate_batch_report_if_possible(batch)
+        self._generate_workflow_evolution_summary_if_possible(batch)
         return batch
 
     def run_batch(self, batch_id: str) -> str:
@@ -1688,6 +2273,7 @@ class JobFlow:
             batch["status"] = self._compute_batch_status(batch)
             batch = self.job_store.save_batch(batch)
             self._generate_batch_report_if_possible(batch)
+            self._generate_workflow_evolution_summary_if_possible(batch)
             return self._format_batch_summary(batch)
 
         batch_id = str(batch.get("batch_id") or "")
@@ -1788,10 +2374,12 @@ class JobFlow:
         if str((latest_batch or {}).get("status") or "") == "cancelled":
             batch = latest_batch or batch
             self._generate_batch_report_if_possible(batch)
+            self._generate_workflow_evolution_summary_if_possible(batch)
             return self._format_batch_summary(batch)
         batch["status"] = self._compute_batch_status(batch)
         batch = self.job_store.save_batch(batch)
         self._generate_batch_report_if_possible(batch)
+        self._generate_workflow_evolution_summary_if_possible(batch)
         return self._format_batch_summary(batch)
 
     def start_batch(

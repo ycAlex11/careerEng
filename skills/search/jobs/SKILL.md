@@ -457,7 +457,7 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - Before starting any apply flow, re-check the live title and JD for excluded early-career signals: `intern`, `internship`, `campus`, `student`, `graduate program`, `new grad`, `new graduate`, `co-op`, `校招`, or `实习`.
 - If an excluded early-career signal is visible, record the job as `filtered_out` and do not click `Apply`, `Submit Resume`, or any equivalent apply entry. This exclusion is a hard gate and overrides otherwise good JD/persona matching.
 - `recommended_apply` means the current job is approved to continue its apply flow. It is not a terminal outcome by itself.
-- For every job, move on only after the current job reaches a true terminal run-state such as `filtered_out`, `already_applied`, `submitted`, or `blocked`.
+- For every job, move on only after the current job reaches a true terminal run-state such as `filtered_out`, `already_applied`, `submitted`, or `blocked`, or after a structured loop-control gap has been recorded for the current job.
 - Submit only the jobs that are judged `recommended_apply`.
 - Record JD sync, decision, and application progress when it helps preserve information without interrupting the visible live-page flow.
 - Use `update_jobs` whenever the current job gains new JD data, decision state, apply state, submission result, or blocking reason.
@@ -467,6 +467,8 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - On a confirmed hard exclusion or final not-fit decision, write `application_status = filtered_out`, `decision_status = filtered_out`, and `apply_state = terminal_filtered_out`.
 - On any site, a confirmed unavailable or closed job page is a cross-site terminal state: write `application_status = closed`, `apply_state = terminal_closed`, and `decision_reason_type = closed`.
 - On a confirmed blocking condition, write `application_status = blocked` and a structured blocking `apply_state` such as `terminal_blocked` or `blocked_login_password_required`.
+- After entering an apply flow, do not switch to another job until the current job has one of these explicit outcomes: `submitted`, `already_applied`, `filtered_out`, `blocked`, `apply_failed`, or a structured loop-control/refinement record.
+- When a blocking condition or failed forward progress reveals a reusable workflow or form-policy gap rather than a one-off job problem, include loop-control fields in `update_jobs` so the orchestration layer can pause and create refinement evidence before more jobs are processed with the same stale Skill.
 - Treat apply as a page-by-page workflow on the current live page.
 - At the start of each apply page, read the current live page first before taking the next action.
 - Before making the final apply decision for a job, sync the current live JD, apply state, and any site-native match signal that the current page exposes for that job.
@@ -486,6 +488,37 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - Use the final irreversible action such as `Submit` or `Submit application` only when the current page is clearly the final confirmation page for the current job.
 - Move to an irreversible submit action only when the current job is already `recommended_apply` under the active site or project matching rules.
 - Do not keep retrying upload, forward, or submit blindly on the same unchanged page. If an action did not advance, re-read the current page and resolve the visible blocking reason first.
+
+### Loop Control
+
+Use loop-control fields whenever the current loop item exposes a reusable gap that should affect the surrounding loop. Do not wait until multiple jobs fail with the same issue.
+
+- `loop_control_action = trigger_refinement`: use when the live page exposes a reusable site/project Skill gap, such as a repeated form-field policy that should be added to a Skill before processing more jobs.
+- `loop_control_action = request_user_input`: use when a required answer is a real user fact that is missing locally and must not be guessed.
+- `loop_control_action = retry_recovery`: use only when the likely issue is page freshness, network, or snapshot/tool state and the runtime should recover rather than change Skills.
+- `loop_control_action = pause_site` or `pause_batch`: use when continuing would likely corrupt more job records or require broader human/Codex review.
+- Leave `loop_control_action` empty or use `continue` when the job is a normal terminal result and the next apply target should proceed.
+- `loop_scope` should identify the current loop item, such as `apply_item`, `retrieval_page`, `status_review_section`, `site_bootstrap`, or `memory_intake`.
+- `block_reason_type` should classify the business reason, such as `form_policy_gap`, `missing_user_fact`, `auth_required`, `site_navigation_gap`, `network_or_snapshot_issue`, or `unknown`.
+- `gap_type` may duplicate `block_reason_type` when using the generic LoopGap schema.
+- `failure_pattern` should be a reusable snake_case pattern, not a one-off sentence.
+- `recommended_target` should name where the fix belongs: `project_jobs_skill`, `site_skill`, `application_profile`, or another concrete local file when known.
+- `recommended_action` may duplicate `loop_control_action` when using the generic LoopGap schema.
+- `target` may duplicate `recommended_target` when using the generic LoopGap schema.
+- `resume_policy` should say how to continue after the fix, such as `retry_same_item`, `continue_next_item`, `rerun_phase`, or `rerun_batch`.
+- `current_item_ref` should identify the current job/page/section, such as the current URL or job id.
+- `evidence` should quote or summarize the live-page fact that caused the loop decision.
+- `refinement_hint` should describe the smallest Skill/profile/config change to try next.
+
+For example, if a required desired-work-city multi-select blocks because the current Skill lacks a default multi-select policy, write `block_reason_type = form_policy_gap`, `failure_pattern = desired_work_city_multiselect_policy_missing`, `loop_control_action = trigger_refinement`, and `recommended_target = project_jobs_skill`.
+
+Loop-control continuation semantics:
+
+- `trigger_refinement` is not automatically a user pause. It tells orchestration to record evidence, create/update the evolution candidate/action card, carry the refinement hint into run-local context, and continue the loop until the configured threshold is reached.
+- At batch end, `trigger_refinement` can become an `evolution_decision` for a follow-up batch. Make the decision executable by writing a concrete `recommended_target`, `evidence`, `refinement_hint`, and `resume_policy`; do not rely on Python to infer the missing business logic.
+- `request_user_input` should be used only for real missing user facts. It may continue observing briefly, but if the same missing fact repeats, orchestration will pause and ask the user.
+- Human-only gates such as password entry, MFA, CAPTCHA, email/device verification, or account safety should use `pause_site`, `pause_batch`, or a clearly human-only `block_reason_type`.
+- Keep the current job's terminal state explicit even when loop control is used. Do not leave an apply item ambiguous.
 
 ### Carry-Forward
 
@@ -542,6 +575,9 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - Fill only required fields in apply.
 - `workspace/profile/application_profile.md` is the canonical source for reusable application-form facts such as gender, address, postal code, work authorization, visa sponsorship, routine compliance acknowledgements, non-compete / non-solicitation status, conflict-of-interest answers, IP/economic-interest answers, secondary-employment answers, and government-official relationship answers.
 - For standard application-form fields, use this priority order: current user instruction, then active site skill site-specific option mapping, then `workspace/profile/application_profile.md`, then currently attached `apply_facts`, then persona/CV context.
+- The LLM is responsible for judging which available context source is relevant to a required form field. Do not assume a field is missing merely because it is absent from the currently attached lightweight bundle.
+- `full_cv` is a valid source for resume-header facts and contact-style facts such as name, email, phone, education, and employment-history evidence when those facts are not present in `application_profile.md`, `apply_facts`, or persona context.
+- Before writing `missing_user_fact`, confirm that the relevant available context sources have been checked. For contact or resume-header fields, request `full_cv` when it is available and not already attached.
 - Prefer site skill rules for site-specific workflows and option labels, but prefer `application_profile.md` for reusable cross-site facts.
 - If multiple site skills repeat the same reusable form fact, treat that as evidence to keep or promote the fact in `application_profile.md`; do not copy the same fact into every new site skill.
 - If a compliance or conflict-of-interest question maps directly to a clear field in `application_profile.md`, answer from that profile field instead of requesting CV/persona context.
@@ -549,9 +585,14 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - For search-style comboboxes, typing a value does not by itself mean the field is selected.
 - If the dropdown is still expanded or candidate options are still visible, the current field is not complete yet.
 - Before moving to another field, finish selecting the current field's candidate option.
+- For desired work city, preferred city, target city, work location, or acceptable location fields in application forms, if the control allows multiple selections and visible city/location options are available, select all visible city/location options by default.
+- If a desired-city or work-location field only allows one selection, use the best matching city from `application_profile.md`, `apply_facts`, or the current intent/profile context.
+- Do not require profile evidence before selecting visible options in a multi-select desired-city or work-location field, unless current user instruction, `application_profile.md`, or the active site skill explicitly restricts acceptable cities.
+- Do not block on desired-city fields merely because there are multiple visible options; multi-select all visible options when available.
 - When the page changes, re-read the current live page instead of relying on previous candidate options or old refs.
+- After upload, click, continue, save, next, submit, or any other page-changing action, do not write `blocked`, `apply_failed`, or `missing_user_fact` from the pre-action page. Re-read the fresh live page first, then continue or record the concrete blocker.
 - Once one field establishes the right interaction path for this control style, reuse that same path for similar fields.
-- If a required field cannot be answered from the live page, active site skill, `application_profile.md`, or lightweight apply facts, call `request_context` for the smallest needed bundle, usually `full_cv` for detailed experience or `full_persona` for background constraints.
+- If a required field cannot be answered from the live page, active site skill, `application_profile.md`, or lightweight apply facts, call `request_context` for the smallest needed bundle: use `full_cv` for resume-header/contact facts, education, employment history, detailed experience, or role-specific evidence; use `full_persona` for broader background constraints.
 - If a required field already has a visible current value, selected option, checked state, or uploaded file, leave it as-is and move on.
 - A passive CAPTCHA or anti-bot attribution label alone is not a blocker if normal required fields and forward buttons are still visible and usable.
 - Do not spend time rewriting or re-answering fields that are already filled.

@@ -13,6 +13,53 @@ Every evolution candidate should follow the same lifecycle:
 
 This applies to new-site workflow transfer, site apply workflows, assistant-memory routing, skill compaction, target-company intelligence, and future evolution candidates.
 
+## Two-Layer Evolution Model
+
+CareerEng separates short-term loop learning from long-term evolution.
+
+### Short-Term Run/Batch Loop
+
+The short-term layer is scoped to one current run or batch. It is allowed to make
+the next loop item smarter, but it must not treat one observation as a durable
+truth.
+
+Python is responsible for:
+
+- recording loop evidence
+- creating/updating an executable action card
+- writing run-local workflow evidence and solution requests
+- injecting only concrete proposals into the next iteration context
+- enforcing thresholds and human-only boundaries
+
+The LLM is responsible for:
+
+- producing a concrete proposal before a failed strategy is retried
+- using that proposal on the next item
+- completing the item to a terminal state or writing a structured loop-control gap
+- avoiding the known failed strategy
+
+Evidence, action cards, generic refinement hints, and failure summaries are not
+proposals. A failed workflow may continue only after a concrete proposal exists,
+such as `run_local_overlay`, `skill_patch`, `routing_example_append`,
+`memory_unit_append`, or `assistant_context_update`.
+
+The short-term layer may continue the batch until the configured threshold is
+reached. It should not directly create accepted lessons.
+
+### Long-Term Evolution / Lesson Layer
+
+The long-term layer runs after a batch or after enough accumulated evidence.
+
+It is responsible for:
+
+- summarizing repeated loop patterns across the batch/run window
+- creating lesson candidates, open candidates, and action cards
+- proposing site skill, project skill, profile/memory, or config changes
+- evaluating follow-up runs before accepting or rolling back a change
+
+Accepted lessons and durable skill changes belong here, not inside a single
+apply item.
+
 ## Boundaries
 
 Python is responsible for:
@@ -81,6 +128,56 @@ Reports should classify the next action as one of:
 - `inspect_runtime_or_page`: the page/runtime appears stuck or unstable
 - `evaluate_acceptance`: the probe completed and should be evaluated for acceptance
 - `retry`: rerun after user action or after a proposal is applied
+
+## Loop Engineering Control
+
+Loop-control signals are not all user pauses.
+
+### Evolution Decision Contract
+
+At the end of a batch, orchestration may build a lightweight
+`evolution_decision` from the LLM-provided loop-control evidence.
+
+The decision is intentionally thin:
+
+- `verdict`: `continue_evolution`, `needs_solution_proposal`, `needs_user_input`, or `stop_no_action`
+- `site_key`, `phase`, `failure_pattern`, and source evidence/action-card refs
+- `target_ref` and `refinement_hint` supplied by the LLM/Skill
+- `proposal_overlay`: temporary run context only when backed by a concrete proposal
+- `validation_plan`: what the next batch should prove
+
+Python must not infer detailed business categories here. If the LLM/Skill says
+there is a refinement opportunity but no concrete proposal has been produced,
+the runner must pause at `waiting_evolution_solution` and surface the action
+card/evidence pack to a solution provider such as Codex or Claude Code. The
+outer loop can run the next batch only after a concrete proposal exists.
+
+Default behavior:
+
+- `trigger_refinement` means the current loop found a reusable skill/profile/workflow gap. Record evidence and create/update the candidate/action card. Continue only if a concrete `run_local_overlay` or durable proposal exists; otherwise pause for a solution provider.
+- `request_user_input` means the system appears to lack a real user fact. Record evidence and continue observing until the configured user-input threshold is reached, unless the gap is clearly human-only.
+- `retry_recovery` means the runtime/page state likely needs recovery, not skill editing.
+- `pause_site` and `pause_batch` are explicit stop signals.
+
+Immediate human boundaries:
+
+- login password entry
+- MFA
+- CAPTCHA
+- email or device verification
+- account safety or other human-only gate
+
+Threshold behavior:
+
+- Same reusable refinement gap may continue within the current loop until the configured per-batch threshold is reached.
+- Same missing-user-fact gap may continue until the configured user-input threshold is reached.
+- After threshold exhaustion, pause and surface the latest evidence/action card instead of silently repeating stale behavior.
+
+Python should enforce the loop mechanics and thresholds. The LLM/Codex should diagnose the gap and propose the smallest skill/profile/config change.
+
+At batch end, write a workflow evolution summary. The summary can create lesson
+candidates or follow-up candidates, but it must not auto-accept durable lessons
+from one batch alone.
 
 ## Linked Follow-Up Runs
 

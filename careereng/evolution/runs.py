@@ -51,6 +51,7 @@ def create_evolution_run(
             "run_json": str(run_json_path),
             "evidence_pack": str(evidence_pack_path),
             "summary": str(summary_path),
+            "solution_request": "",
             "proposal": "",
             "applied_patch": "",
             "evaluation": "",
