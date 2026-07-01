@@ -41,6 +41,8 @@ class BrowserBudgetsConfig:
     apply_site_phase_budget_factor: float = 0.8
     apply_probe_max_attempted: int = 8
     apply_probe_unsuccessful_threshold: int = 5
+    inner_max_failures: int = 3
+    outer_max_attempts: int = 3
     loop_control_refinement_attempts_per_batch: int = 3
     loop_control_user_input_attempts_per_batch: int = 3
     loop_control_outer_batch_attempts: int = 3
@@ -79,6 +81,14 @@ class BrowserGuardsConfig:
 class BrowserRecoveryConfig:
     snapshot_timeout_seconds: int = 90
     max_attempts: int = 3
+    tool_settle_policies: dict[str, dict[str, float]] = field(
+        default_factory=lambda: {
+            "browser_file_upload": {
+                "max_snapshot_retries": 8,
+                "sleep_seconds": 2.0,
+            }
+        }
+    )
 
 
 @dataclass

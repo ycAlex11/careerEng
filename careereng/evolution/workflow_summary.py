@@ -8,11 +8,12 @@ but it never accepts lessons or applies skill changes.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore
-from careereng.evolution.memory_units import EvolutionMemoryStore
+from careereng.evolution.memory_units import RUN_LOCAL_CLOSED_FOR_SYNTHESIS, EvolutionMemoryStore
 from careereng.storage.jsonl import JSONLStore
 from careereng.utils import ensure_dir, now_iso, safe_file_stem, write_json
 
@@ -38,7 +39,7 @@ def generate_workflow_evolution_summary(
             site_key=str(site_key),
             site_row=site_row,
         )
-        if summary.get("loop_pattern_count") or summary.get("guidance_count"):
+        if _site_has_evolution_evidence(summary):
             site_summaries.append(summary)
             lesson_candidates += _write_candidate_lessons(workspace=workspace_path, batch_id=batch_id, site_summary=summary)
 
@@ -67,15 +68,15 @@ def generate_workflow_evolution_summary(
 
 def _site_loop_summary(*, workspace: Path, batch_id: str, site_key: str, site_row: dict[str, Any]) -> dict[str, Any]:
     run_rows = _read_run_rows(workspace=workspace, site_key=site_key, batch_id=batch_id)
+    merged_rows = _merge_run_job_rows(run_rows)
     context = _read_json(workspace / "sites" / safe_file_stem(site_key) / "jobs" / "runs" / f"{safe_file_stem(batch_id)}.context.json")
     guidance = context.get("apply_loop_refinement_guidance") if isinstance(context.get("apply_loop_refinement_guidance"), list) else []
     memory_units = EvolutionMemoryStore(workspace).query(
-        candidate_id="site_apply_loop_control",
-        scopes=[f"batch:{batch_id}:site:{site_key}:apply", f"site:{site_key}:apply"],
+        scopes=[f"batch:{batch_id}:site:{site_key}:apply"],
         phase="apply",
         lifecycles=["run_local"],
-        statuses=["active"],
-        limit=20,
+        statuses=["active", RUN_LOCAL_CLOSED_FOR_SYNTHESIS, "accepted", "rejected", "expired", "superseded"],
+        limit=80,
     )
     grouped: dict[str, dict[str, Any]] = {}
     for row in run_rows:
@@ -114,12 +115,114 @@ def _site_loop_summary(*, workspace: Path, batch_id: str, site_key: str, site_ro
         "loop_pattern_count": len(patterns),
         "guidance_count": len(guidance),
         "patterns": patterns,
+        "job_outcomes": _job_outcomes(merged_rows),
+        "failure_examples": _failure_examples(merged_rows),
         "run_local_memory": _compact_memory_units(memory_units),
+        "run_local_proposal_results": _run_local_proposal_results(memory_units),
         "run_context": {
             "path": str(workspace / "sites" / safe_file_stem(site_key) / "jobs" / "runs" / f"{safe_file_stem(batch_id)}.context.json"),
             "apply_loop_refinement_summary": str(context.get("apply_loop_refinement_summary") or ""),
         },
     }
+
+
+def _site_has_evolution_evidence(site_summary: dict[str, Any]) -> bool:
+    outcomes = site_summary.get("job_outcomes") if isinstance(site_summary.get("job_outcomes"), dict) else {}
+    return bool(
+        site_summary.get("loop_pattern_count")
+        or site_summary.get("guidance_count")
+        or site_summary.get("run_local_memory")
+        or site_summary.get("failure_examples")
+        or int(outcomes.get("terminal_or_failed_count") or 0) > 0
+    )
+
+
+def _merge_run_job_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = _run_job_key(row)
+        if not key:
+            continue
+        current = merged.setdefault(key, {})
+        if key not in order:
+            order.append(key)
+        for field, value in row.items():
+            if value is None or value == "":
+                continue
+            current[field] = value
+    return [merged[key] for key in order if key in merged]
+
+
+def _run_job_key(row: dict[str, Any]) -> str:
+    for field in ("job_id", "canonical_job_id", "site_id", "url"):
+        value = str(row.get(field) or "").strip()
+        if value:
+            return f"{field}:{value}"
+    title = str(row.get("title") or "").strip()
+    return f"title:{title}" if title else ""
+
+
+def _job_status(row: dict[str, Any]) -> str:
+    for field in ("application_status", "decision_status", "apply_state"):
+        value = str(row.get(field) or "").strip().lower()
+        if not value:
+            continue
+        if field == "apply_state" and value.startswith("terminal_"):
+            return value.removeprefix("terminal_") or value
+        return value
+    action = str(row.get("loop_control_action") or row.get("recommended_action") or "").strip().lower()
+    if action and action != "continue":
+        return f"loop_control_{safe_file_stem(action)}"
+    return "observed"
+
+
+def _has_failed_or_terminal_signal(row: dict[str, Any]) -> bool:
+    status = _job_status(row)
+    if status != "observed":
+        return True
+    action = str(row.get("loop_control_action") or row.get("recommended_action") or "").strip().lower()
+    if action == "continue":
+        return False
+    if action and action != "continue":
+        return True
+    return any(str(row.get(field) or "").strip() for field in ("failure_pattern", "block_reason_type", "last_apply_error"))
+
+
+def _job_outcomes(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    status_counts = Counter(_job_status(row) for row in rows)
+    return {
+        "total_jobs": len(rows),
+        "terminal_or_failed_count": sum(1 for row in rows if _has_failed_or_terminal_signal(row)),
+        "status_counts": dict(sorted(status_counts.items())),
+    }
+
+
+def _failure_examples(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+    examples: list[dict[str, str]] = []
+    for row in rows:
+        status = _job_status(row)
+        pattern = str(row.get("failure_pattern") or row.get("block_reason_type") or "").strip()
+        action = str(row.get("loop_control_action") or row.get("recommended_action") or "").strip()
+        error = str(row.get("last_apply_error") or row.get("evidence") or "").strip()
+        if action == "continue":
+            continue
+        if not pattern and not error and status not in {"blocked", "apply_failed", "failed"} and action in {"", "continue"}:
+            continue
+        examples.append(
+            {
+                "job_id": str(row.get("job_id") or ""),
+                "title": str(row.get("title") or "")[:160],
+                "status": status,
+                "failure_pattern": pattern,
+                "loop_control_action": action,
+                "current_item_ref": str(row.get("current_item_ref") or row.get("target") or row.get("url") or "")[:300],
+                "evidence": error[:600],
+            }
+        )
+    return examples[-20:]
 
 
 def _write_candidate_lessons(*, workspace: Path, batch_id: str, site_summary: dict[str, Any]) -> int:
@@ -174,6 +277,7 @@ def _compact_memory_units(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
             {
                 "memory_id": str(unit.get("memory_id") or ""),
                 "scope": str(unit.get("scope") or ""),
+                "status": str(unit.get("status") or ""),
                 "phase": str(unit.get("phase") or ""),
                 "pattern": str(unit.get("pattern") or ""),
                 "summary": str(unit.get("summary") or "")[:500],
@@ -189,9 +293,49 @@ def _compact_memory_units(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "validation_events": _compact_validation_events(
                     unit.get("validation_events") if isinstance(unit.get("validation_events"), list) else []
                 ),
+                "close_events": _compact_close_events(
+                    unit.get("close_events") if isinstance(unit.get("close_events"), list) else []
+                ),
             }
         )
     return compact
+
+
+def _run_local_proposal_results(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        proposal = unit.get("proposal") if isinstance(unit.get("proposal"), dict) else {}
+        proposal_id = str(proposal.get("proposal_id") or "").strip()
+        if not proposal_id:
+            continue
+        usage_events = unit.get("usage_events") if isinstance(unit.get("usage_events"), list) else []
+        validation_events = unit.get("validation_events") if isinstance(unit.get("validation_events"), list) else []
+        validation_counts = Counter(
+            str(event.get("result") or "unknown").strip() or "unknown"
+            for event in validation_events
+            if isinstance(event, dict)
+        )
+        results.append(
+            {
+                "memory_id": str(unit.get("memory_id") or ""),
+                "candidate_id": str(unit.get("candidate_id") or ""),
+                "scope": str(unit.get("scope") or ""),
+                "status": str(unit.get("status") or ""),
+                "pattern": str(unit.get("pattern") or ""),
+                "proposal_id": proposal_id,
+                "proposal_kind": str(proposal.get("proposal_kind") or ""),
+                "proposal_status": str(proposal.get("proposal_status") or ""),
+                "materialized_change_type": str((proposal.get("materialized_change") or {}).get("type") or "")
+                if isinstance(proposal.get("materialized_change"), dict)
+                else "",
+                "usage_count": len([event for event in usage_events if isinstance(event, dict)]),
+                "validation_count": len([event for event in validation_events if isinstance(event, dict)]),
+                "validation_result_counts": dict(sorted(validation_counts.items())),
+            }
+        )
+    return results[-20:]
 
 
 def _compact_proposal(proposal: dict[str, Any]) -> dict[str, str]:
@@ -241,6 +385,22 @@ def _compact_validation_events(events: list[Any]) -> list[dict[str, str]]:
             }
         )
     return compact[-10:]
+
+
+def _compact_close_events(events: list[Any]) -> list[dict[str, str]]:
+    compact: list[dict[str, str]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        compact.append(
+            {
+                "closed_at": str(event.get("closed_at") or ""),
+                "status": str(event.get("status") or ""),
+                "reason": str(event.get("reason") or ""),
+                "run_id": str(event.get("run_id") or ""),
+            }
+        )
+    return compact[-5:]
 
 
 def _compact_evolution_decisions(batch: dict[str, Any]) -> list[dict[str, str]]:
@@ -424,6 +584,16 @@ def _render_markdown(payload: dict[str, Any]) -> str:
         lines.append("- No loop-control evidence in this batch.")
     for site in sites:
         lines.append(f"- `{site.get('site_key')}` status=`{site.get('site_status')}` patterns={site.get('loop_pattern_count')}")
+        outcomes = site.get("job_outcomes") if isinstance(site.get("job_outcomes"), dict) else {}
+        status_counts = outcomes.get("status_counts") if isinstance(outcomes.get("status_counts"), dict) else {}
+        if outcomes:
+            status_text = ", ".join(f"{key}={value}" for key, value in sorted(status_counts.items())) or "none"
+            lines.append(
+                "  Jobs: "
+                f"total={outcomes.get('total_jobs')} "
+                f"terminal_or_failed={outcomes.get('terminal_or_failed_count')} "
+                f"statuses={status_text}"
+            )
         summary = str((site.get("run_context") or {}).get("apply_loop_refinement_summary") or "").strip()
         if summary:
             lines.append(f"  Guidance: {summary[:500]}")
@@ -433,13 +603,57 @@ def _render_markdown(payload: dict[str, Any]) -> str:
             lines.append(
                 f"  - `{pattern.get('phase')}` `{pattern.get('pattern')}` action=`{pattern.get('action')}` count={pattern.get('count')}"
             )
+        failure_examples = site.get("failure_examples") if isinstance(site.get("failure_examples"), list) else []
+        if failure_examples:
+            lines.append("  Failure examples:")
+            for example in failure_examples[-8:]:
+                if not isinstance(example, dict):
+                    continue
+                lines.append(
+                    f"  - status=`{example.get('status')}` pattern=`{example.get('failure_pattern')}` "
+                    f"action=`{example.get('loop_control_action')}` job=`{example.get('job_id')}` "
+                    f"title={example.get('title')}"
+                )
+                ref = str(example.get("current_item_ref") or "").strip()
+                evidence = str(example.get("evidence") or "").strip()
+                if ref:
+                    lines.append(f"    Ref: {ref[:240]}")
+                if evidence:
+                    lines.append(f"    Evidence: {evidence[:240]}")
+        proposal_results = (
+            site.get("run_local_proposal_results")
+            if isinstance(site.get("run_local_proposal_results"), list)
+            else []
+        )
+        if proposal_results:
+            lines.append("  Run-local proposal results:")
+            for result in proposal_results[-8:]:
+                if not isinstance(result, dict):
+                    continue
+                validation_counts = (
+                    result.get("validation_result_counts")
+                    if isinstance(result.get("validation_result_counts"), dict)
+                    else {}
+                )
+                validation_text = ", ".join(
+                    f"{key}={value}" for key, value in sorted(validation_counts.items())
+                ) or "none"
+                lines.append(
+                    f"  - proposal=`{result.get('proposal_id')}` candidate=`{result.get('candidate_id')}` "
+                    f"memory_status=`{result.get('status')}` proposal_status=`{result.get('proposal_status')}` "
+                    f"change=`{result.get('materialized_change_type')}` "
+                    f"usage={result.get('usage_count')} validation={result.get('validation_count')} "
+                    f"results={validation_text}"
+                )
         memories = site.get("run_local_memory") if isinstance(site.get("run_local_memory"), list) else []
         if memories:
             lines.append("  Run-local evolution memory:")
             for unit in memories[-5:]:
                 if not isinstance(unit, dict):
                     continue
-                lines.append(f"  - `{unit.get('pattern')}` memory=`{unit.get('memory_id')}`")
+                lines.append(
+                    f"  - `{unit.get('pattern')}` memory=`{unit.get('memory_id')}` status=`{unit.get('status')}`"
+                )
                 avoid = unit.get("avoid_patterns") if isinstance(unit.get("avoid_patterns"), list) else []
                 recommended = unit.get("recommended_patterns") if isinstance(unit.get("recommended_patterns"), list) else []
                 if avoid:

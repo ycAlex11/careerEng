@@ -166,21 +166,16 @@ class BrowserContextSession:
             )
 
             evolution_units = EvolutionMemoryStore(workspace).query(
-                candidate_id="site_apply_loop_control",
-                scopes=[
-                    f"batch:{batch_id}:site:{site_key}:apply",
-                    f"site:{site_key}:apply",
-                    "site:*:apply",
-                    "project:apply",
-                ],
+                scopes=[f"batch:{batch_id}:site:{site_key}:apply"],
                 phase="apply",
-                lifecycles=["run_local", "candidate", "accepted"],
-                statuses=["active", "candidate", "accepted"],
-                limit=6,
+                lifecycles=["run_local"],
+                statuses=["active"],
+                limit=20,
             )
+            materialized_units = [unit for unit in evolution_units if evolution_memory_has_materialized_change(unit)]
             evolution_memory_summary = render_evolution_memory_guidance(
-                [unit for unit in evolution_units if evolution_memory_has_materialized_change(unit)],
-                title="Apply-Loop Evolution Memory",
+                materialized_units[-1:],
+                title="Current Batch Active Run-Local Proposal",
             )
         except Exception:
             evolution_memory_summary = ""
@@ -261,8 +256,8 @@ class BrowserContextSession:
                     "content": (
                         "Active run-local item-loop proposal(s) for this apply phase:\n"
                         f"{evolution_memory_summary}\n"
-                        "Treat materialized run-local overlays as the strategy currently under validation for this apply item. "
-                        "Use only memory whose scope and phase match the current apply task."
+                        "Treat this latest materialized run-local overlay as the strategy currently under validation for this apply item. "
+                        "Do not use older or site-scope run-local proposal history as execution instructions."
                     ),
                 }
             )

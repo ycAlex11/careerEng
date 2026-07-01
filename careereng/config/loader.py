@@ -79,6 +79,8 @@ apply_max_phase_steps = 240
 apply_job_phase_timeout_seconds = 3600
 apply_job_timeout_ms = 180000
 apply_site_phase_budget_factor = 0.8
+inner_max_failures = 3
+outer_max_attempts = 3
 loop_control_refinement_attempts_per_batch = 3
 loop_control_user_input_attempts_per_batch = 3
 loop_control_outer_batch_attempts = 3
@@ -100,6 +102,10 @@ token_limit = 260000
 [browser.recovery]
 snapshot_timeout_seconds = 90
 max_attempts = 3
+
+[browser.recovery.tool_settle_policies.browser_file_upload]
+max_snapshot_retries = 8
+sleep_seconds = 2.0
 
 [evolution.apply_probe]
 max_attempted = 8

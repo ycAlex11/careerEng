@@ -129,6 +129,26 @@ Rules:
 - Use this for in-batch or short-horizon validation.
 - Promote stable behavior to `skill_patch` only after enough validation evidence.
 
+## Outer-Loop Synthesis Contract
+
+When a run context marks `solution_level=outer_synthesis` or
+`solution_request_kind=synthesis_work_order`, the proposal still uses this same
+schema. Codex/LLM chooses supported change types from the evidence and candidate
+spec.
+
+Outer-loop proposals should usually prefer durable changes when evidence
+supports them:
+
+- `skill_patch`
+- `memory_unit_append`
+- `routing_example_append`
+- `assistant_context_update`
+
+If evidence only supports a short-horizon experiment, `run_local_overlay` is
+allowed, but it is validated by the next batch rather than accepted immediately.
+The existing report/selection/capability flow decides acceptance after follow-up
+evidence.
+
 ## routing_example_append
 
 Append one routing example to:

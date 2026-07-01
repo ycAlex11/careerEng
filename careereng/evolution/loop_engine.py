@@ -67,7 +67,14 @@ class ApplyLoopEngine:
 
     @property
     def refinement_attempts_per_batch(self) -> int:
-        return int(self.browser_budgets.loop_control_refinement_attempts_per_batch)
+        return int(
+            getattr(
+                self.browser_budgets,
+                "inner_max_failures",
+                getattr(self.browser_budgets, "loop_control_refinement_attempts_per_batch", 3),
+            )
+            or 3
+        )
 
     @property
     def user_input_attempts_per_batch(self) -> int:
@@ -75,7 +82,14 @@ class ApplyLoopEngine:
 
     @property
     def outer_batch_attempts(self) -> int:
-        return int(getattr(self.browser_budgets, "loop_control_outer_batch_attempts", 3) or 3)
+        return int(
+            getattr(
+                self.browser_budgets,
+                "outer_max_attempts",
+                getattr(self.browser_budgets, "loop_control_outer_batch_attempts", 3),
+            )
+            or 3
+        )
 
     @property
     def failed_batches_per_pattern(self) -> int:
@@ -123,6 +137,7 @@ class ApplyLoopEngine:
                 limit=max(20, int(limit or 1) * 5),
             )
             materialized = [proposal for proposal in proposals if evolution_memory_has_materialized_change(proposal)]
+            materialized.sort(key=lambda row: (str(row.get("created_at") or ""), str(row.get("memory_id") or "")))
             return materialized[-max(1, int(limit or 1)) :]
         except Exception:
             return []
@@ -459,6 +474,13 @@ class ApplyLoopEngine:
             loop_payload = apply_payload.get("loop_control") if isinstance(apply_payload.get("loop_control"), dict) else {}
             if not bool(loop_payload.get("materialized_change")):
                 continue
+            apply_status = str(apply_payload.get("status") or "").strip()
+            site_status = str(row.get("status") or "").strip()
+            if not bool(loop_payload.get("should_pause")) and site_status not in {"blocked", "waiting_solution"} and apply_status not in {
+                "blocked",
+                "waiting_solution",
+            }:
+                continue
             artifacts = loop_payload.get("artifacts") if isinstance(loop_payload.get("artifacts"), dict) else {}
             decision = build_evolution_decision(
                 site_key=str(site_key),
@@ -469,6 +491,20 @@ class ApplyLoopEngine:
                 attempt=self.outer_loop_attempt(batch) + 1,
                 max_attempts=max(1, int(self.outer_batch_attempts or 1)),
             )
+            if str(control.get("action") or "") == LOOP_ACTION_TRIGGER_REFINEMENT:
+                decision = {
+                    **decision,
+                    "verdict": EVOLUTION_DECISION_CONTINUE,
+                    "requires_solution_provider": False,
+                    "proposal_status": str(loop_payload.get("proposal_status") or "materialized"),
+                    "materialized_change": True,
+                    "next_batch_strategy": "continue_followup_batch_with_applied_solution",
+                    "validation_plan": (
+                        "Start the next outer-loop batch with the applied proposal or durable change. "
+                        "The next batch should validate whether the same failure pattern is reduced, "
+                        "changes to a more specific blocker, or reaches terminal job states."
+                    ),
+                }
             if bool(decision.get("needs_user_input")):
                 return []
             if str(decision.get("verdict") or "") != EVOLUTION_DECISION_CONTINUE:
@@ -764,7 +800,12 @@ class ApplyLoopEngine:
             return ""
         return render_lessons_markdown(lessons, title="Relevant Accepted Lessons", limit=limit).strip()
 
-    def create_loop_control_solution_request(self, *, artifacts: dict[str, Any]) -> dict[str, Any]:
+    def create_loop_control_solution_request(
+        self,
+        *,
+        artifacts: dict[str, Any],
+        context_overrides: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         card_id = str(artifacts.get("action_card_id") or "").strip()
         if not card_id:
             return {}
@@ -773,6 +814,7 @@ class ApplyLoopEngine:
                 project_root=self.project_root,
                 workspace=self.workspace,
                 card_id=card_id,
+                context_overrides=context_overrides or {},
             )
         except (EvolutionSolutionError, Exception) as exc:
             return {"error": str(exc), "action_card_id": card_id}

@@ -8,6 +8,7 @@ from typing import Any
 
 from careereng.evolution.candidate_specs import CandidateSpec, get_candidate_spec
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore, render_lessons_markdown
+from careereng.evolution.strategy_router import related_strategy_spec_payloads, strategy_family, strategy_router_payload
 from careereng.storage.jsonl import JSONLStore
 from careereng.utils import ensure_dir, make_id, now_iso, read_json, write_json
 
@@ -112,6 +113,7 @@ def _run_inputs(workspace: Path, *, root: Path | None = None) -> dict[str, Path]
     return {
         "assistant_guide": project_root / "docs" / "assistant_bridge" / "ASSISTANT_GUIDE.md",
         "assistant_codex_context": project_root / "docs" / "assistant_bridge" / "CODEX_CONTEXT.md",
+        "evolution_strategy_router": project_root / "docs" / "evolution" / "EVOLUTION_STRATEGY_ROUTER.md",
         "context_pack": workspace / "evolution" / "context" / "latest.md",
         "open_candidates": workspace / "evolution" / "candidates" / "open.jsonl",
         "evidence": workspace / "evolution" / "evidence" / "all.jsonl",
@@ -167,6 +169,8 @@ def _render_evidence_pack(
     context: dict[str, Any],
 ) -> str:
     inputs = _run_inputs(workspace, root=project_root)
+    router = strategy_router_payload(project_root)
+    related_specs = related_strategy_spec_payloads(project_root, candidate_id=spec.id, max_chars=8000)
     lines = [
         "# Evolution Run Evidence Pack",
         "",
@@ -185,6 +189,7 @@ def _render_evidence_pack(
         f"- Risk Level: `{spec.risk_level}`",
         f"- Apply Policy: `{spec.apply_policy}`",
         f"- Spec Path: `{_relative_or_str(spec.path, workspace.parent)}`",
+        f"- Strategy Family: `{strategy_family(spec.id)}`",
         "",
         "## Target Site Context",
         "",
@@ -193,6 +198,24 @@ def _render_evidence_pack(
         "## Candidate Spec Body",
         "",
         spec.body or "_No candidate body found._",
+        "",
+        "## Evolution Strategy Router",
+        "",
+        f"- Router Path: `{router.get('relative_path') or router.get('path')}`",
+        f"- Router Status: `{router.get('status')}`",
+        "",
+        str(router.get("text") or "_Router file not found._"),
+        "",
+        "## Related Strategy Specs",
+        "",
+        *_format_strategy_specs(related_specs),
+        "",
+        "## Evidence Selection Contract",
+        "",
+        "- Python lists local evidence paths and starter rows only.",
+        "- Codex/LLM chooses which indexed evidence to inspect according to the router and candidate spec.",
+        "- Starter excerpts are not exhaustive and must not be treated as the diagnosis.",
+        "- Business strategy, site workflow choices, and matching policy belong in proposals/Skills, not Python.",
         "",
         "## Current Evolution Context",
         "",
@@ -228,6 +251,17 @@ def _render_evidence_pack(
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _format_strategy_specs(specs: list[dict[str, Any]]) -> list[str]:
+    if not specs:
+        return ["- No related strategy specs found."]
+    lines: list[str] = []
+    for spec in specs:
+        lines.append(
+            f"- `{spec.get('id') or ''}` path=`{spec.get('relative_path') or spec.get('path') or ''}` status=`{spec.get('status') or ''}`"
+        )
+    return lines
 
 
 def _render_summary(run_payload: dict[str, Any]) -> str:

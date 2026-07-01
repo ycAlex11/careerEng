@@ -8,6 +8,7 @@ from typing import Any
 
 from careereng.action_cards import ActionCardError, ActionCardStore
 from careereng.evolution.candidate_specs import CandidateSpecError
+from careereng.evolution.evidence_pack import build_solution_evidence_pack
 from careereng.evolution.proposals import FORBIDDEN_CHANGE_TYPES, SUPPORTED_CHANGE_TYPES, proposal_path_for_run
 from careereng.evolution.runs import create_evolution_run
 from careereng.utils import now_iso, read_json, write_json
@@ -23,6 +24,7 @@ def create_solution_request_for_action_card(
     workspace: Path | str,
     card_id: str,
     candidate_id: str = "",
+    context_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create an evolution run and solution request for one action card.
 
@@ -57,12 +59,15 @@ def create_solution_request_for_action_card(
         workspace=workspace_path,
         run_id=str(run["run_id"]),
         card_id=str(card.get("card_id") or card_id),
+        context_overrides=context_overrides or {},
     )
     updated_card = store.update_card_metadata(
         str(card.get("card_id") or card_id),
         metadata={
             "solution_run_id": request["run_id"],
             "solution_request": str(request["solution_request"]),
+            "evidence_pack": str(request["evidence_pack"]),
+            "evidence_pack_json": str(request["evidence_pack_json"]),
             "proposal_output_path": str(request["proposal_output_path"]),
             "evolution_run_dir": str(request["run_dir"]),
         },
@@ -70,6 +75,7 @@ def create_solution_request_for_action_card(
             str(_workspace_relative(workspace_path, request["solution_request"])),
             str(_workspace_relative(workspace_path, request["proposal_output_path"])),
             str(_workspace_relative(workspace_path, request["evidence_pack"])),
+            str(_workspace_relative(workspace_path, request["evidence_pack_json"])),
         ],
         commands=[
             f"python -m careereng evolution solution --card {card.get('card_id') or card_id}",
@@ -90,6 +96,7 @@ def create_solution_request_for_run(
     workspace: Path | str,
     run_id: str,
     card_id: str = "",
+    context_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = Path(project_root)
     workspace_path = Path(workspace)
@@ -101,6 +108,11 @@ def create_solution_request_for_run(
     run_payload = read_json(run_json)
     if not run_payload:
         raise EvolutionSolutionError(f"Unknown evolution run: {normalized_run}")
+    if context_overrides:
+        context = run_payload.setdefault("context", {})
+        if isinstance(context, dict):
+            context.update({key: value for key, value in context_overrides.items() if value not in (None, "", [], {})})
+            write_json(run_json, run_payload)
 
     card: dict[str, Any] = {}
     card_markdown = ""
@@ -116,9 +128,16 @@ def create_solution_request_for_run(
 
     proposal_path = proposal_path_for_run(run_dir)
     solution_request = run_dir / "solution_request.md"
-    evidence_pack = Path(str((run_payload.get("outputs") or {}).get("evidence_pack") or run_dir / "evidence_pack.md"))
-    if not evidence_pack.is_absolute():
-        evidence_pack = run_dir / evidence_pack
+    detailed_pack = build_solution_evidence_pack(
+        project_root=root,
+        workspace=workspace_path,
+        run_dir=run_dir,
+        run_payload=run_payload,
+        card=card,
+        card_markdown=card_markdown,
+    )
+    evidence_pack = Path(detailed_pack["markdown_path"])
+    evidence_pack_json = Path(detailed_pack["json_path"])
     request_text = _render_solution_request(
         root=root,
         workspace=workspace_path,
@@ -127,6 +146,7 @@ def create_solution_request_for_run(
         card=card,
         card_markdown=card_markdown,
         evidence_pack=evidence_pack,
+        evidence_pack_json=evidence_pack_json,
         solution_request=solution_request,
         proposal_path=proposal_path,
     )
@@ -138,6 +158,8 @@ def create_solution_request_for_run(
     outputs = run_payload.setdefault("outputs", {})
     outputs["solution_request"] = str(solution_request)
     outputs["proposal"] = str(Path("proposals") / "proposal.json")
+    outputs["evidence_pack"] = str(evidence_pack)
+    outputs["evidence_pack_json"] = str(evidence_pack_json)
     lifecycle = run_payload.setdefault("lifecycle", [])
     if isinstance(lifecycle, list):
         lifecycle.append(
@@ -161,6 +183,7 @@ def create_solution_request_for_run(
         "run_dir": run_dir,
         "run_json": run_json,
         "evidence_pack": evidence_pack,
+        "evidence_pack_json": evidence_pack_json,
         "summary": run_dir / "summary.md",
         "solution_request": solution_request,
         "proposal_output_path": proposal_path,
@@ -208,41 +231,19 @@ def _render_solution_request(
     card: dict[str, Any],
     card_markdown: str,
     evidence_pack: Path,
+    evidence_pack_json: Path,
     solution_request: Path,
     proposal_path: Path,
 ) -> str:
     candidate = run_payload.get("candidate") if isinstance(run_payload.get("candidate"), dict) else {}
     context = run_payload.get("context") if isinstance(run_payload.get("context"), dict) else {}
     card_metadata = card.get("metadata") if isinstance(card.get("metadata"), dict) else {}
-    proposal_contract = card_metadata.get("proposal_contract") if isinstance(card_metadata.get("proposal_contract"), dict) else {}
-    skeleton = {
-        "run_id": run_payload.get("run_id"),
-        "candidate_id": run_payload.get("candidate_id"),
-        "provider": "codex",
-        "diagnosis": "Replace this with an evidence-backed diagnosis.",
-        "proposed_changes": [
-            {
-                "change_id": "change_1",
-                "change_type": "run_local_overlay",
-                "summary": "Concrete strategy to validate on the next unit.",
-                "scope": f"batch:{context.get('batch_id') or '<batch_id>'}:site:{context.get('site_key') or '<site_key>'}:{context.get('phase') or '<phase>'}",
-                "site_key": context.get("site_key") or "",
-                "phase": context.get("phase") or "",
-                "pattern": context.get("failure_pattern") or "",
-                "content": "Write the exact prompt overlay the next job/run must follow. This must be a real strategy change, not a summary of evidence.",
-                "source_evidence_id": context.get("evidence_id") or "",
-                "action_card": context.get("action_card_id") or "",
-                "target_ref": context.get("target_ref") or candidate.get("target_ref") or "",
-                "expected_validation": "State what the next job/run must prove.",
-                "confidence": 0.65,
-            }
-        ],
-        "evaluation_plan": [
-            "The next unit should not repeat the same failure pattern unchanged.",
-            "Record whether the proposed change led to submitted, filtered_out, blocked_new_reason, or repeated_same_failure.",
-        ],
-        "risk_notes": [],
-    }
+    proposal_contract = _solution_level_contract(
+        card_metadata.get("proposal_contract") if isinstance(card_metadata.get("proposal_contract"), dict) else {},
+        context=context,
+    )
+    outer_synthesis = _is_outer_synthesis_context(context)
+    skeleton = _proposal_skeleton(run_payload=run_payload, candidate=candidate, context=context, outer_synthesis=outer_synthesis)
     lines = [
         "# Codex Evolution Solution Request",
         "",
@@ -253,19 +254,36 @@ def _render_solution_request(
         f"- Write a valid JSON proposal to: `{proposal_path}`",
         "- Do not answer in prose only.",
         "- Do not treat this request, the action card, evidence, or a generic hint as the proposal.",
+        "- Synthesize the full proposal/validation chain from the evidence pack into a new proposal.",
+        "- Start from the evolution strategy router and candidate spec; use the evidence index to choose which local evidence to inspect.",
+        "- Do not copy an old run-local overlay unchanged unless the evidence supports another validation pass.",
         "- The proposal must validate against `docs/evolution/PROPOSAL_SCHEMA.md`.",
+        (
+            "- This is an outer-loop synthesis request: synthesize a concrete batch-level proposal from the evidence. "
+            "Use supported proposal changes; do not add Python business logic."
+            if outer_synthesis
+            else "- This is an inner-loop or short-horizon request: `run_local_overlay` is allowed when it changes the next unit's behavior."
+        ),
         "",
         "## Boundary",
         "",
         "- Python packages evidence, validates proposal shape, applies rollbackable changes, and records results.",
         "- Codex/LLM writes the concrete strategy or Skill/memory/context change.",
+        "- Codex/LLM should synthesize across proposal history and validation results; Python must not choose the business strategy.",
+        "- Python may provide starter excerpts and indexed paths, but Codex/LLM must decide which evidence matters.",
         "- Do not hard-code site-specific form behavior, job matching policy, or website workflow decisions in Python.",
         "",
         "## Supported Change Types",
         "",
         *[f"- `{item}`" for item in sorted(SUPPORTED_CHANGE_TYPES)],
         "",
-        "Preferred first change for in-batch workflow refinement: `run_local_overlay`.",
+        (
+            "Outer-loop synthesis should normally use durable supported changes such as `skill_patch`, "
+            "`memory_unit_append`, `routing_example_append`, or `assistant_context_update` when the evidence supports them. "
+            "If the evidence supports only a short-horizon experiment, use `run_local_overlay` and explain the validation plan."
+            if outer_synthesis
+            else "Preferred first change for in-batch workflow refinement: `run_local_overlay`."
+        ),
         "",
         "## Forbidden Change Types",
         "",
@@ -278,6 +296,7 @@ def _render_solution_request(
         f"- Candidate Target: `{candidate.get('target_ref') or ''}`",
         f"- Solution Request: `{solution_request}`",
         f"- Evidence Pack: `{evidence_pack}`",
+        f"- Evidence Pack JSON: `{evidence_pack_json}`",
         f"- Run Directory: `{run_dir}`",
         "",
         "## Context",
@@ -308,6 +327,91 @@ def _render_solution_request(
         "2. Rerun the target workflow unit and verify the proposal is injected as active run-local or durable context.",
     ]
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _is_outer_synthesis_context(context: dict[str, Any]) -> bool:
+    return (
+        str(context.get("solution_level") or "").strip() == "outer_synthesis"
+        or str(context.get("solution_request_kind") or "").strip() == "synthesis_work_order"
+    )
+
+
+def _solution_level_contract(contract: dict[str, Any], *, context: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(contract or {})
+    if not _is_outer_synthesis_context(context):
+        return payload
+    payload["preferred_first_change"] = payload.get("preferred_first_change") or "skill_patch"
+    payload["batch_level_synthesis"] = True
+    rejection_rules = payload.get("rejection_rules") if isinstance(payload.get("rejection_rules"), list) else []
+    payload["rejection_rules"] = [
+        *[str(item) for item in rejection_rules],
+        "Do not answer with prose only.",
+        "Do not add Python business logic for site workflow, matching policy, or form-filling strategy.",
+        "Use the evidence pack and candidate spec to choose supported proposal changes.",
+    ]
+    return payload
+
+
+def _proposal_skeleton(
+    *,
+    run_payload: dict[str, Any],
+    candidate: dict[str, Any],
+    context: dict[str, Any],
+    outer_synthesis: bool,
+) -> dict[str, Any]:
+    if outer_synthesis:
+        return {
+            "run_id": run_payload.get("run_id"),
+            "candidate_id": run_payload.get("candidate_id"),
+            "provider": "codex",
+            "diagnosis": "Replace this with an evidence-backed batch-level synthesis.",
+            "proposed_changes": [
+                {
+                    "change_id": "change_1",
+                    "change_type": "skill_patch",
+                    "summary": "Durable site-skill refinement supported by batch-level evidence.",
+                    "target_file": str(context.get("target_ref") or candidate.get("target_ref") or ""),
+                    "target_section": "Apply",
+                    "patch_strategy": "replace_section",
+                    "replacement_markdown": "Replace this with the complete updated Markdown section.",
+                    "source_evidence_id": context.get("evidence_id") or "",
+                    "confidence": 0.7,
+                }
+            ],
+            "evaluation_plan": [
+                "Run the next outer-loop batch and verify the repeated failure pattern is reduced or replaced by a more specific terminal outcome.",
+                "Record whether the durable change led to submitted, filtered_out, blocked_new_reason, or repeated_same_failure.",
+            ],
+            "risk_notes": [],
+        }
+    return {
+        "run_id": run_payload.get("run_id"),
+        "candidate_id": run_payload.get("candidate_id"),
+        "provider": "codex",
+        "diagnosis": "Replace this with an evidence-backed diagnosis.",
+        "proposed_changes": [
+            {
+                "change_id": "change_1",
+                "change_type": "run_local_overlay",
+                "summary": "Concrete strategy to validate on the next unit.",
+                "scope": f"batch:{context.get('batch_id') or '<batch_id>'}:site:{context.get('site_key') or '<site_key>'}:{context.get('phase') or '<phase>'}",
+                "site_key": context.get("site_key") or "",
+                "phase": context.get("phase") or "",
+                "pattern": context.get("failure_pattern") or "",
+                "content": "Write the exact prompt overlay the next job/run must follow. This must be a real strategy change, not a summary of evidence.",
+                "source_evidence_id": context.get("evidence_id") or "",
+                "action_card": context.get("action_card_id") or "",
+                "target_ref": context.get("target_ref") or candidate.get("target_ref") or "",
+                "expected_validation": "State what the next job/run must prove.",
+                "confidence": 0.65,
+            }
+        ],
+        "evaluation_plan": [
+            "The next unit should not repeat the same failure pattern unchanged.",
+            "Record whether the proposed change led to submitted, filtered_out, blocked_new_reason, or repeated_same_failure.",
+        ],
+        "risk_notes": [],
+    }
 
 
 def _write_solution_summary(

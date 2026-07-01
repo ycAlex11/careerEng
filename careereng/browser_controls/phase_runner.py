@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
+import json
+import os
 from pathlib import Path
 import shutil
 import threading
@@ -49,6 +51,12 @@ DEFAULT_RUN_PHASES = ("session_preparation", "application_status_review", "chann
 GLOBAL_BLOCKED_TOOL_NAMES = {"browser_run_code"}
 SESSION_PREPARATION_BLOCKED_TOOL_NAMES = {"browser_resize"}
 JOB_RETRIEVAL_BLOCKED_TOOL_NAMES = {"browser_navigate"}
+_PROFILE_OWNER_GUARD_LOCK = threading.Lock()
+_PROFILE_OWNER_RUNS: dict[str, str] = {}
+
+
+class BrowserProfileOwnerError(RuntimeError):
+    """Raised when a site browser profile is already owned by another runtime."""
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,7 @@ class ActiveSiteRuntime:
     site_key: str
     runtime: PlaywrightMCPProcess
     entry_url: str
+    owner_lock_path: Path
 
 
 class BrowserAutomationService:
@@ -177,6 +186,7 @@ class BrowserAutomationService:
             recovery_max_attempts=int(
                 self.recovery.max_attempts
             ),
+            tool_settle_policies=dict(self.recovery.tool_settle_policies or {}),
         )
         self.phase_runtime: BrowserPhaseRuntime | Any | None = None
 
@@ -564,6 +574,154 @@ class BrowserAutomationService:
             config = replace(config, step_timeout_seconds=step_timeout_seconds)
         return BrowserPhaseRuntime(config)
 
+    def _profile_owner_lock_path(self, site_key: str) -> Path:
+        return self.site_store.browser_profile_dir(site_key).parent / "runtime_owner.json"
+
+    @staticmethod
+    def _profile_owner_key(lock_path: Path) -> str:
+        return str(Path(lock_path).resolve())
+
+    @staticmethod
+    def _process_is_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _read_profile_owner(lock_path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _write_profile_owner(lock_path: Path, payload: dict[str, Any], *, exclusive: bool = False) -> None:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        if exclusive:
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            return
+        lock_path.write_text(text, encoding="utf-8")
+
+    def _profile_owner_payload(
+        self,
+        *,
+        site_key: str,
+        run_id: str,
+        profile_dir: Path,
+        output_dir: Path | None = None,
+        status: str,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "site_key": str(site_key or ""),
+            "run_id": str(run_id or ""),
+            "owner_pid": os.getpid(),
+            "profile_dir": str(Path(profile_dir).resolve()),
+            "status": str(status or "running"),
+            "updated_at": now_iso(),
+        }
+        if output_dir is not None:
+            payload["output_dir"] = str(Path(output_dir).resolve())
+        return payload
+
+    def _acquire_profile_owner(
+        self,
+        *,
+        site_key: str,
+        run_id: str,
+        profile_dir: Path,
+        output_dir: Path,
+    ) -> Path:
+        lock_path = self._profile_owner_lock_path(site_key)
+        key = self._profile_owner_key(lock_path)
+        payload = self._profile_owner_payload(
+            site_key=site_key,
+            run_id=run_id,
+            profile_dir=profile_dir,
+            output_dir=output_dir,
+            status="starting",
+        )
+        with _PROFILE_OWNER_GUARD_LOCK:
+            for _ in range(2):
+                try:
+                    self._write_profile_owner(lock_path, payload, exclusive=True)
+                except FileExistsError:
+                    current = self._read_profile_owner(lock_path)
+                    owner_pid = int(current.get("owner_pid") or 0)
+                    owner_run_id = str(current.get("run_id") or "")
+                    owner_alive = self._process_is_alive(owner_pid)
+                    owner_is_current_process = owner_pid == os.getpid()
+                    owner_known_in_process = _PROFILE_OWNER_RUNS.get(key) == owner_run_id
+                    if owner_alive and (not owner_is_current_process or owner_known_in_process):
+                        raise BrowserProfileOwnerError(
+                            "browser_profile_in_use: "
+                            f"site={site_key} profile={profile_dir} owner_pid={owner_pid} owner_run_id={owner_run_id}"
+                        )
+                    try:
+                        lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+                else:
+                    _PROFILE_OWNER_RUNS[key] = run_id
+                    return lock_path
+            raise BrowserProfileOwnerError(f"browser_profile_owner_lock_unavailable: site={site_key} profile={profile_dir}")
+
+    def _refresh_profile_owner(
+        self,
+        *,
+        site_key: str,
+        run_id: str,
+        profile_dir: Path,
+        output_dir: Path,
+        status: str = "running",
+    ) -> None:
+        lock_path = self._profile_owner_lock_path(site_key)
+        key = self._profile_owner_key(lock_path)
+        with _PROFILE_OWNER_GUARD_LOCK:
+            if _PROFILE_OWNER_RUNS.get(key) not in {None, run_id}:
+                return
+            self._write_profile_owner(
+                lock_path,
+                self._profile_owner_payload(
+                    site_key=site_key,
+                    run_id=run_id,
+                    profile_dir=profile_dir,
+                    output_dir=output_dir,
+                    status=status,
+                ),
+            )
+            _PROFILE_OWNER_RUNS[key] = run_id
+
+    def _release_profile_owner(self, site_key: str, run_id: str = "") -> None:
+        lock_path = self._profile_owner_lock_path(site_key)
+        key = self._profile_owner_key(lock_path)
+        with _PROFILE_OWNER_GUARD_LOCK:
+            current = self._read_profile_owner(lock_path)
+            current_run_id = str(current.get("run_id") or "")
+            current_pid = int(current.get("owner_pid") or 0)
+            if run_id and current_run_id and current_run_id != run_id:
+                return
+            if current_pid and current_pid != os.getpid():
+                return
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            if not run_id or _PROFILE_OWNER_RUNS.get(key) == run_id:
+                _PROFILE_OWNER_RUNS.pop(key, None)
+
     def _reserve_runtime(self, site_key: str, entry_url: str, timeout_ms: int | None = None) -> tuple[ActiveSiteRuntime, bool]:
         effective_timeout_ms = int(timeout_ms or self.timeout_ms or 45000)
         with self._lock:
@@ -574,25 +732,55 @@ class BrowserAutomationService:
                     float(getattr(current.runtime, "command_timeout_seconds", 0.0) or 0.0),
                     max(45.0, float(effective_timeout_ms) / 1000.0 + 30.0),
                 )
+                self._refresh_profile_owner(
+                    site_key=site_key,
+                    run_id=current.runtime.run_id,
+                    profile_dir=current.runtime.profile_dir,
+                    output_dir=current.runtime.output_dir,
+                )
                 return current, True
             if current:
                 current.runtime.stop()
+                self._release_profile_owner(site_key, current.runtime.run_id)
             run_id = now_iso().replace(":", "").replace("-", "")
             output_dir = self.workspace / "tmp" / "browser_controls" / site_key / run_id
+            profile_dir = self.site_store.browser_profile_dir(site_key)
+            owner_lock_path = self._acquire_profile_owner(
+                site_key=site_key,
+                run_id=run_id,
+                profile_dir=profile_dir,
+                output_dir=output_dir,
+            )
             try:
                 runtime = launch_playwright_mcp(
                     site_key=site_key,
                     run_id=run_id,
                     browser_name=self.browser_name,
                     headless=self.headless,
-                    profile_dir=self.site_store.browser_profile_dir(site_key),
+                    profile_dir=profile_dir,
                     output_dir=output_dir,
                     timeout_ms=effective_timeout_ms,
                     executable_path=self.executable_path,
                 )
-            except Exception:
+            except Exception as exc:
+                self._release_profile_owner(site_key, run_id)
+                if "browser is already in use" in str(exc).lower():
+                    raise BrowserProfileOwnerError(
+                        f"browser_profile_in_use: site={site_key} profile={profile_dir}"
+                    ) from exc
                 raise
-            active = ActiveSiteRuntime(site_key=site_key, runtime=runtime, entry_url=entry_url)
+            self._refresh_profile_owner(
+                site_key=site_key,
+                run_id=run_id,
+                profile_dir=profile_dir,
+                output_dir=output_dir,
+            )
+            active = ActiveSiteRuntime(
+                site_key=site_key,
+                runtime=runtime,
+                entry_url=entry_url,
+                owner_lock_path=owner_lock_path,
+            )
             self._active[site_key] = active
             return active, False
 
@@ -601,6 +789,7 @@ class BrowserAutomationService:
             active = self._active.pop(site_key, None)
         if active:
             active.runtime.stop()
+            self._release_profile_owner(site_key, active.runtime.run_id)
         self.site_store.save_browser_session(site_key, {"browser_status": "stopped", "active_run_id": ""})
 
     async def _run_site_async(
@@ -1050,6 +1239,22 @@ class BrowserAutomationService:
                 )
 
             return anyio.run(_runner)
+        except BrowserProfileOwnerError as exc:
+            message = MCPToolBridge._format_exception(exc) or str(exc)
+            self.site_store.save_browser_session(
+                site_key,
+                {
+                    "browser_status": "profile_in_use",
+                    "last_step_error": message[:1000],
+                },
+            )
+            return BrowserAutomationResult(
+                site_key=site_key,
+                site_name=site_name,
+                status="failed",
+                reason_tag="browser_profile_in_use",
+                message=message[:4000],
+            )
         except Exception as exc:
             self._release_runtime(site_key)
             message = MCPToolBridge._format_exception(exc) or str(exc)

@@ -21,6 +21,30 @@ This candidate is not only about reducing time or token usage. Its main value is
 - new site skills can be drafted from known patterns
 - the LLM does not rediscover the same page behavior from scratch every run
 
+## Evolution Strategy
+
+This is the compaction member of the `site_workflow_evolution` family.
+
+Loop shape:
+
+- Evidence loop: collect terminal runs by `site_key + phase`, including successes, blocks, failures, guard events, traces, workflow memory, and metrics.
+- Proposal loop: Codex selects the evidence it needs and proposes site Skill changes, workflow memory, project-level generalizations, or keep-observing decisions.
+- Validation loop: evaluate the next runs for the same `site_key + phase` bucket. Roll back or keep observing if quality worsens or evidence is insufficient.
+
+Codex intervention points:
+
+- every scheduled phase bucket trigger
+- repeated same-page exploration, empty extraction, no-progress guard, or blocked phase evidence
+- user correction that a workflow choice was wrong
+- repeated success that should be compacted into a Skill or workflow memory
+
+Evidence-selection policy:
+
+- Start from the router and this spec, then inspect the indexed local paths relevant to the site and phase.
+- Use traces, failure snapshots, workflow memory, and successful runs to infer missing or stable operations.
+- Metrics are inputs, not the strategy. Python may compute time/token/guard counts; Codex decides whether the pattern should change and where it belongs.
+- Keep site-specific behavior in site Skills or workflow memory unless repeated cross-site evidence supports project-level guidance.
+
 ## Required Evidence
 
 Use these local sources:

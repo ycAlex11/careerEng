@@ -62,6 +62,7 @@ from careereng.evolution import (
     scan_evolution_triggers,
 )
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore, render_lessons_markdown
+from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
 from careereng.integrations.assistant_bridge.context import build_assistant_context_pack
 from careereng.integrations.assistant_bridge import AssistantThreadStateStore, ingest_assistant_message
 from careereng.integrations.assistant_bridge.intake_state import save_recent_intake_state
@@ -429,8 +430,8 @@ _BATCH_MONITOR_DONE_STATUSES = {
     "partial_completed",
     "failed",
     "cancelled",
-    "waiting_user",
     "waiting_solution",
+    "waiting_user",
 }
 _BATCH_MONITOR_HEARTBEAT_SECONDS = 60.0
 
@@ -527,6 +528,22 @@ def _format_monitored_batch_summary(batch: dict[str, Any], *, workspace: Path | 
         if reason:
             parts.append(f"reason={reason}")
         lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
+def _format_pending_solution_handoff(*, workspace: Path, batch_id: str) -> str:
+    rows = list_pending_solution_requests(workspace=workspace, batch_id=batch_id, limit=1)
+    if not rows:
+        return "next_action=no_pending_solution_found"
+    row = rows[0]
+    lines = [
+        f"next_action={row.get('next_action') or 'write_proposal'}",
+        f"run={row.get('run_id') or ''}",
+        f"solution_request={row.get('solution_request') or ''}",
+        f"proposal_output={row.get('proposal_output_path') or ''}",
+        f"apply_command={row.get('apply_command') or ''}",
+        f"continue_command=python -m careereng evolution continue-batch --batch {batch_id}",
+    ]
     return "\n".join(lines)
 
 
@@ -787,16 +804,10 @@ def _dispatch_jobs_batch_with_monitor(
                     baseline_batch_ids=baseline_batch_ids,
                     state=progress_state,
                 )
-                next_batch_id = _next_evolution_batch_id(batch)
-                if next_batch_id:
-                    typer.echo(f"evolution continuing previous_batch={batch_id} next_batch={next_batch_id}")
-                    batch_id = next_batch_id
-                    progress_state["batch_id"] = batch_id
-                    last_activity_at = time.monotonic()
-                    continue
                 summary = _format_monitored_batch_summary(batch, workspace=workspace)
-                if status == "waiting_user":
-                    return f"{summary}\nmanager=running"
+                if status in {"waiting_user", "waiting_solution"}:
+                    handoff = _format_pending_solution_handoff(workspace=workspace, batch_id=batch_id)
+                    return f"{summary}\n{handoff}\nmanager=running"
                 shutdown_line = _shutdown_manager_after_terminal_batch(root=root, workspace=workspace)
                 return f"{summary}\n{shutdown_line}"
             now = time.monotonic()
@@ -1799,6 +1810,63 @@ def evolution_pending_solution(
                 f"apply_command={row['apply_command']}",
             ]
         )
+    typer.echo("\n".join(lines))
+
+
+@evolution_app.command("continue-batch")
+def evolution_continue_batch(
+    batch: str = typer.Option(..., "--batch", help="Batch ID to continue after an evolution solution"),
+    site: str = typer.Option("", "--site", help="Optional site key filter for pending solution lookup"),
+):
+    """Apply a written proposal if present, then continue the outer evolution batch loop."""
+    rows = list_pending_solution_requests(
+        workspace=_workspace_path(),
+        site_key=site,
+        batch_id=batch,
+        limit=1,
+    )
+    lines: list[str] = []
+    if rows:
+        row = rows[0]
+        if not bool(row.get("proposal_exists")):
+            lines.extend(
+                [
+                    f"batch={batch} status=waiting_solution next_action=write_proposal",
+                    f"run={row['run_id']}",
+                    f"solution_request={row['solution_request']}",
+                    f"proposal_output={row['proposal_output_path']}",
+                    f"apply_command={row['apply_command']}",
+                    f"continue_command=python -m careereng evolution continue-batch --batch {batch}",
+                ]
+            )
+            typer.echo("\n".join(lines))
+            return
+        try:
+            applied = apply_evolution_run(
+                workspace=_workspace_path(),
+                project_root=_project_root(),
+                run_id=str(row.get("run_id") or ""),
+            )
+        except (EvolutionApplyError, EvolutionProposalError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        lines.extend(
+            [
+                f"applied_run={applied['run_id']} status={applied['status']}",
+                f"applied_count={applied['applied_count']}",
+            ]
+        )
+
+    loop, _ = _build_loop()
+    try:
+        try:
+            reply = BatchEvolutionOrchestrator(loop.job_flow).continue_after_solution(batch)
+        finally:
+            _close_loop_if_possible(loop)
+    except (FileNotFoundError, KeyError, ValueError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if lines:
+        lines.append("")
+    lines.append(reply)
     typer.echo("\n".join(lines))
 
 

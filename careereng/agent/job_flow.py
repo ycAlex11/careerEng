@@ -102,7 +102,7 @@ class JobFlow:
         self.loop_engine = ApplyLoopEngine(
             project_root=project_root,
             workspace=job_store.workspace,
-            site_store=site_tools.site_store,
+            site_store=getattr(site_tools, "site_store", None),
             job_store=job_store,
             browser_budgets=self.browser_budgets,
             trace_path_for_ref=self._trace_path_for_ref,
@@ -134,19 +134,18 @@ class JobFlow:
 
     @property
     def LOOP_CONTROL_REFINEMENT_ATTEMPTS_PER_BATCH(self) -> int:
-        return int(self.browser_budgets.loop_control_refinement_attempts_per_batch)
+        return int(
+            getattr(
+                self.browser_budgets,
+                "inner_max_failures",
+                getattr(self.browser_budgets, "loop_control_refinement_attempts_per_batch", 3),
+            )
+            or 3
+        )
 
     @property
     def LOOP_CONTROL_USER_INPUT_ATTEMPTS_PER_BATCH(self) -> int:
         return int(getattr(self.browser_budgets, "loop_control_user_input_attempts_per_batch", 3) or 3)
-
-    @property
-    def LOOP_CONTROL_OUTER_BATCH_ATTEMPTS(self) -> int:
-        return int(getattr(self.browser_budgets, "loop_control_outer_batch_attempts", 3) or 3)
-
-    @property
-    def LOOP_CONTROL_FAILED_BATCHES_PER_PATTERN(self) -> int:
-        return int(self.browser_budgets.loop_control_failed_batches_per_pattern)
 
     def close(self) -> None:
         closer = getattr(self.browser_runner, "close", None)
@@ -417,81 +416,6 @@ class JobFlow:
     @staticmethod
     def _loop_control_payload_from_site_row(row: dict[str, Any]) -> dict[str, Any]:
         return ApplyLoopEngine.loop_control_payload_from_site_row(row)
-
-    def _outer_loop_retry_sites(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
-        return self.loop_engine.outer_loop_retry_sites(
-            batch=batch,
-            operation_job_search=self.OPERATION_JOB_SEARCH,
-            normalize_operation=self._normalize_operation,
-        )
-
-    @staticmethod
-    def _outer_loop_attempt(batch: dict[str, Any]) -> int:
-        return ApplyLoopEngine.outer_loop_attempt(batch)
-
-    def _outer_loop_followup_context(
-        self,
-        *,
-        previous_batch: dict[str, Any],
-        site_key: str,
-        control: dict[str, Any],
-        loop_payload: dict[str, Any],
-        decision: dict[str, Any] | None = None,
-        next_attempt: int,
-        max_attempts: int,
-    ) -> str:
-        return self.loop_engine.outer_loop_followup_context(
-            previous_batch=previous_batch,
-            site_key=site_key,
-            control=control,
-            loop_payload=loop_payload,
-            decision=decision,
-            next_attempt=next_attempt,
-            max_attempts=max_attempts,
-        )
-
-    def _create_outer_loop_followup_batch(
-        self,
-        *,
-        previous_batch: dict[str, Any],
-        retry_sites: list[dict[str, Any]],
-        next_attempt: int,
-        max_attempts: int,
-    ) -> dict[str, Any]:
-        return self.loop_engine.create_outer_loop_followup_batch(
-            previous_batch=previous_batch,
-            retry_sites=retry_sites,
-            next_attempt=next_attempt,
-            max_attempts=max_attempts,
-            create_batch=self.create_batch,
-            operation_job_search=self.OPERATION_JOB_SEARCH,
-            generate_summary=self._generate_workflow_evolution_summary_if_possible,
-        )
-
-    def run_batch_with_evolution_loop(self, batch_id: str) -> str:
-        current_batch_id = str(batch_id or "")
-        last_reply = ""
-        max_attempts = max(1, int(self.LOOP_CONTROL_OUTER_BATCH_ATTEMPTS or 1))
-        while current_batch_id:
-            last_reply = self.run_batch(current_batch_id)
-            batch = self.job_store.load_batch(current_batch_id)
-            retry_sites = self._outer_loop_retry_sites(batch)
-            if not retry_sites:
-                return last_reply
-            current_attempt = self._outer_loop_attempt(batch)
-            if current_attempt >= max_attempts:
-                return last_reply
-            next_batch = self._create_outer_loop_followup_batch(
-                previous_batch=batch,
-                retry_sites=retry_sites,
-                next_attempt=current_attempt + 1,
-                max_attempts=max_attempts,
-            )
-            next_batch_id = str(next_batch.get("batch_id") or "")
-            if not next_batch_id:
-                return last_reply
-            current_batch_id = next_batch_id
-        return last_reply
 
     def _disabled_site_row(
         self,
@@ -1820,21 +1744,6 @@ class JobFlow:
         turn_id: str,
         progress_callback: Any | None = None,
     ) -> dict[str, Any]:
-        try:
-            self.site_tools.ensure_default_resume_pdf()
-        except Exception as exc:
-            updated = dict(current)
-            updated["reason_tag"] = "resume_pdf_unavailable"
-            updated["message"] = str(exc)
-            updated["apply"] = {
-                **dict(current.get("apply") or {}),
-                "status": "failed",
-                "attempted": 0,
-                "submitted": 0,
-            }
-            return updated
-
-        last_result: Any | None = None
         apply_plan = self._ensure_apply_plan(
             site_key=site_key,
             batch_id=batch_id,
@@ -1852,6 +1761,65 @@ class JobFlow:
                 "requeued_from_history": int(apply_plan.get("requeued_from_history") or 0),
             }
             current = {**current, "apply": apply_payload}
+        return self._continue_apply_pending_items(
+            site_key=site_key,
+            current=current,
+            batch_id=batch_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            progress_callback=progress_callback,
+        )
+
+    def continue_item_loop(
+        self,
+        *,
+        site_key: str,
+        current: dict[str, Any],
+        batch_id: str,
+        session_id: str,
+        turn_id: str,
+        continuation: dict[str, Any],
+        progress_callback: Any | None = None,
+    ) -> dict[str, Any]:
+        """Continue an existing item loop without rerunning the full phase head."""
+
+        phase = str((continuation or {}).get("phase") or "").strip()
+        if phase == "apply":
+            return self._continue_apply_pending_items(
+                site_key=site_key,
+                current=current,
+                batch_id=batch_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                progress_callback=progress_callback,
+            )
+        raise ValueError(f"unsupported item-loop continuation phase: {phase or '<missing>'}")
+
+    def _continue_apply_pending_items(
+        self,
+        *,
+        site_key: str,
+        current: dict[str, Any],
+        batch_id: str,
+        session_id: str,
+        turn_id: str,
+        progress_callback: Any | None = None,
+    ) -> dict[str, Any]:
+        try:
+            self.site_tools.ensure_default_resume_pdf()
+        except Exception as exc:
+            updated = dict(current)
+            updated["reason_tag"] = "resume_pdf_unavailable"
+            updated["message"] = str(exc)
+            updated["apply"] = {
+                **dict(current.get("apply") or {}),
+                "status": "failed",
+                "attempted": 0,
+                "submitted": 0,
+            }
+            return updated
+
+        last_result: Any | None = None
         initial_pending_rows = self._pending_apply_rows(site_key, batch_id)
         site_phase_budget_seconds = self._apply_site_phase_budget_seconds(job_count=len(initial_pending_rows))
         site_phase_deadline = time.monotonic() + float(site_phase_budget_seconds or 0)

@@ -20,6 +20,7 @@ from careereng.utils import now_iso, safe_file_stem
 MATERIALIZED_CHANGE_TYPES = set(SUPPORTED_CHANGE_TYPES)
 PROPOSAL_STATUSES = {"incomplete", "materialized"}
 NON_MATERIALIZED_CHANGE_SOURCES = {"loop_control_llm_guidance", "loop_control_evidence", "python_guidance"}
+RUN_LOCAL_CLOSED_FOR_SYNTHESIS = "closed_for_synthesis"
 
 
 def evolution_memory_path(workspace: Path | str) -> Path:
@@ -95,6 +96,65 @@ class EvolutionMemoryStore:
 
     def append_usage_event(self, *, memory_id: str = "", proposal_id: str = "", event: dict[str, Any]) -> dict[str, Any]:
         return self._append_event(memory_id=memory_id, proposal_id=proposal_id, event=event, key="usage_events")
+
+    def close_run_local_scope_after_synthesis(
+        self,
+        *,
+        scope: str,
+        reason: str,
+        run_id: str = "",
+        exclude_memory_ids: list[str] | tuple[str, ...] | None = None,
+        exclude_proposal_ids: list[str] | tuple[str, ...] | None = None,
+        status: str = RUN_LOCAL_CLOSED_FOR_SYNTHESIS,
+    ) -> dict[str, Any]:
+        """Close active run-local execution state after synthesis has consumed it.
+
+        Records are retained as history/evidence. This only changes execution
+        lifecycle state; it does not evaluate proposal quality.
+        """
+
+        normalized_scope = str(scope or "").strip()
+        if not normalized_scope:
+            return {"closed_count": 0, "closed_memory_ids": []}
+        excluded_memory = {str(item or "").strip() for item in (exclude_memory_ids or []) if str(item or "").strip()}
+        excluded_proposals = {str(item or "").strip() for item in (exclude_proposal_ids or []) if str(item or "").strip()}
+        close_status = str(status or RUN_LOCAL_CLOSED_FOR_SYNTHESIS).strip()
+        now = now_iso()
+        rows = self.store.read_all()
+        closed_ids: list[str] = []
+        next_rows: list[dict[str, Any]] = []
+        for raw in rows:
+            proposal = raw.get("proposal") if isinstance(raw.get("proposal"), dict) else {}
+            memory_id = str(raw.get("memory_id") or "").strip()
+            proposal_id = str(proposal.get("proposal_id") or "").strip()
+            should_close = (
+                str(raw.get("scope") or "").strip() == normalized_scope
+                and str(raw.get("lifecycle") or "").strip() == "run_local"
+                and str(raw.get("status") or "").strip() == "active"
+                and memory_id not in excluded_memory
+                and proposal_id not in excluded_proposals
+            )
+            if should_close:
+                row = normalize_evolution_memory_unit(raw)
+                row["status"] = close_status
+                row["updated_at"] = now
+                close_events = _dict_list(row.get("close_events"))
+                close_events.append(
+                    {
+                        "closed_at": now,
+                        "status": close_status,
+                        "reason": str(reason or "").strip(),
+                        "run_id": str(run_id or "").strip(),
+                    }
+                )
+                row["close_events"] = close_events[-20:]
+                closed_ids.append(memory_id)
+                next_rows.append(row)
+            else:
+                next_rows.append(raw)
+        if closed_ids:
+            self.store.write_all(next_rows)
+        return {"closed_count": len(closed_ids), "closed_memory_ids": closed_ids, "scope": normalized_scope, "status": close_status}
 
     def _append_event(
         self,
@@ -218,6 +278,7 @@ def normalize_evolution_memory_unit(payload: dict[str, Any]) -> dict[str, Any]:
         "proposal": normalize_proposal(proposal),
         "usage_events": _dict_list(payload.get("usage_events"))[-20:],
         "validation_events": _dict_list(payload.get("validation_events"))[-20:],
+        "close_events": _dict_list(payload.get("close_events"))[-20:],
         "labels": _string_list(payload.get("labels")) or [
             "evolution_memory",
             candidate_id,

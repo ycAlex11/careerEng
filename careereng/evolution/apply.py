@@ -8,10 +8,11 @@ from pathlib import Path
 import shutil
 from typing import Any
 
+from careereng.action_cards import ActionCardError, ActionCardStore
 from careereng.evolution.proposals import ASSISTANT_CONTEXT_TARGET, EvolutionProposalError, load_proposal
 from careereng.evolution.memory_units import EvolutionMemoryStore, build_loop_evolution_memory
 from careereng.storage.jsonl import JSONLStore
-from careereng.utils import ensure_dir, make_id, now_iso, read_json, write_json
+from careereng.utils import ensure_dir, make_id, now_iso, read_json, safe_file_stem, write_json
 
 
 class EvolutionApplyError(ValueError):
@@ -78,6 +79,11 @@ def apply_evolution_run(*, workspace: Path | str, run_id: str, project_root: Pat
     patch_path.write_text("\n".join(chunk for chunk in diff_chunks if chunk).rstrip() + ("\n" if diff_chunks else ""), encoding="utf-8")
     applied_files_path = run_dir / "applied_files.json"
     write_json(applied_files_path, {"applied_at": now_iso(), "files": applied_files})
+    closed_run_local = _close_superseded_run_local_overlays(
+        workspace=workspace_path,
+        run_payload=run_payload,
+        applied_files=applied_files,
+    )
 
     now = now_iso()
     run_payload["status"] = "applied"
@@ -86,6 +92,8 @@ def apply_evolution_run(*, workspace: Path | str, run_id: str, project_root: Pat
     outputs["proposal"] = str(Path("proposals") / "proposal.json")
     outputs["applied_patch"] = str(patch_path)
     outputs["applied_files"] = str(applied_files_path)
+    if closed_run_local.get("closed_count"):
+        outputs["closed_run_local"] = closed_run_local
     lifecycle = run_payload.setdefault("lifecycle", [])
     if isinstance(lifecycle, list):
         lifecycle.append({"status": "applied", "at": now, "summary": f"Applied {len(applied_files)} proposal change(s)."})
@@ -97,6 +105,7 @@ def apply_evolution_run(*, workspace: Path | str, run_id: str, project_root: Pat
     selection = run_payload.setdefault("selection", {})
     selection["status"] = "pending_evaluation"
     write_json(run_path, run_payload)
+    _mark_action_card_applied(workspace=workspace_path, run_payload=run_payload, applied_files=applied_files)
     _update_summary(run_dir=run_dir, run_payload=run_payload, applied_files=applied_files)
 
     return {
@@ -106,6 +115,7 @@ def apply_evolution_run(*, workspace: Path | str, run_id: str, project_root: Pat
         "applied_count": len(applied_files),
         "applied_files": applied_files_path,
         "applied_patch": patch_path,
+        "closed_run_local": closed_run_local,
         "summary": run_dir / "summary.md",
     }
 
@@ -120,9 +130,26 @@ def _apply_skill_patch(*, change: dict[str, Any], root: Path, run_dir: Path) -> 
     replacement = str(change.get("replacement_markdown") or "").rstrip() + "\n"
     section = str(change.get("target_section") or "").strip()
     heading_level = int(change.get("heading_level") or 2)
+    _validate_skill_patch_replacement(
+        replacement=replacement,
+        section=section,
+        heading_level=heading_level,
+        target=target,
+    )
     updated = _replace_markdown_section(original, section=section, level=heading_level, replacement=replacement)
     if updated == original:
-        raise EvolutionApplyError(f"skill_patch produced no change: {target}")
+        return {
+            "file_record": {
+                "change_id": str(change.get("change_id") or ""),
+                "change_type": "skill_patch",
+                "target_file": str(target),
+                "relative_path": str(relative_target),
+                "snapshot_path": "",
+                "summary": str(change.get("summary") or ""),
+                "status": "skipped_noop",
+            },
+            "diff": "",
+        }
     snapshot = _snapshot_file(target=target, root=root, run_dir=run_dir)
     target.write_text(updated, encoding="utf-8")
     diff = "".join(
@@ -149,7 +176,14 @@ def _apply_skill_patch(*, change: dict[str, Any], root: Path, run_dir: Path) -> 
 def _apply_run_local_overlay(*, change: dict[str, Any], workspace: Path, proposal: dict[str, Any]) -> dict[str, Any]:
     content = str(change.get("content") or "").strip()
     change_id = str(change.get("change_id") or make_id("change"))
-    proposal_id = str(change.get("proposal_id") or f"run_local_prop_{change_id}").strip()
+    run_id_part = safe_file_stem(str(proposal.get("run_id") or "")).replace("-", "_")
+    change_id_part = safe_file_stem(change_id).replace("-", "_")
+    default_proposal_id = (
+        f"run_local_prop_{run_id_part}_{change_id_part}"
+        if run_id_part
+        else f"run_local_prop_{change_id_part}_{make_id('auto')}"
+    )
+    proposal_id = str(change.get("proposal_id") or default_proposal_id).strip()
     pattern = str(change.get("pattern") or "manual_solution_proposal").strip()
     site_key = str(change.get("site_key") or "").strip()
     phase = str(change.get("phase") or "").strip()
@@ -204,6 +238,38 @@ def _apply_run_local_overlay(*, change: dict[str, Any], workspace: Path, proposa
         "proposal_id": proposal_id,
         "scope": scope,
     }
+
+
+def _close_superseded_run_local_overlays(
+    *,
+    workspace: Path,
+    run_payload: dict[str, Any],
+    applied_files: list[dict[str, Any]],
+) -> dict[str, Any]:
+    context = run_payload.get("context") if isinstance(run_payload.get("context"), dict) else {}
+    batch_id = str(context.get("batch_id") or "").strip()
+    site_key = str(context.get("site_key") or "").strip()
+    phase = str(context.get("phase") or "").strip()
+    if not batch_id or not site_key or not phase:
+        return {"closed_count": 0, "closed_memory_ids": []}
+    scope = f"batch:{batch_id}:site:{site_key}:{phase}"
+    exclude_memory_ids = [
+        str(row.get("memory_id") or "").strip()
+        for row in applied_files
+        if isinstance(row, dict) and str(row.get("memory_id") or "").strip()
+    ]
+    exclude_proposal_ids = [
+        str(row.get("proposal_id") or "").strip()
+        for row in applied_files
+        if isinstance(row, dict) and str(row.get("proposal_id") or "").strip()
+    ]
+    return EvolutionMemoryStore(workspace).close_run_local_scope_after_synthesis(
+        scope=scope,
+        reason="new evolution proposal applied",
+        run_id=str(run_payload.get("run_id") or ""),
+        exclude_memory_ids=exclude_memory_ids,
+        exclude_proposal_ids=exclude_proposal_ids,
+    )
 
 
 def _apply_assistant_context_update(*, change: dict[str, Any], root: Path, run_dir: Path) -> dict[str, Any]:
@@ -303,6 +369,47 @@ def _replace_markdown_section(text: str, *, section: str, level: int, replacemen
                 break
     replacement_text = replacement if replacement.endswith("\n") else replacement + "\n"
     return "".join([*lines[:start], replacement_text, *lines[end:]])
+
+
+def _validate_skill_patch_replacement(*, replacement: str, section: str, heading_level: int, target: Path) -> None:
+    text = str(replacement or "")
+    if "\\n" in text:
+        raise EvolutionApplyError(
+            f"skill_patch replacement appears to contain literal escaped newlines instead of Markdown line breaks: {target}"
+        )
+    lines = text.splitlines()
+    non_empty = [line.strip() for line in lines if line.strip()]
+    if not non_empty:
+        raise EvolutionApplyError(f"skill_patch replacement is empty: {target}")
+    expected_heading = f"{'#' * max(1, int(heading_level or 1))} {section}"
+    if non_empty[0] != expected_heading:
+        raise EvolutionApplyError(f"skill_patch replacement must start with target heading `{expected_heading}`: {target}")
+    if len(lines) < 2:
+        raise EvolutionApplyError(f"skill_patch replacement must include Markdown body lines: {target}")
+
+
+def _mark_action_card_applied(*, workspace: Path, run_payload: dict[str, Any], applied_files: list[dict[str, Any]]) -> None:
+    context = run_payload.get("context") if isinstance(run_payload.get("context"), dict) else {}
+    card_id = str(context.get("action_card_id") or "").strip()
+    if not card_id:
+        return
+    try:
+        ActionCardStore(workspace).update_card_metadata(
+            card_id,
+            metadata={
+                "proposal_status": "applied",
+                "proposal_applied_at": now_iso(),
+                "solution_run_id": str(run_payload.get("run_id") or ""),
+                "applied_change_types": [
+                    str(row.get("change_type") or "")
+                    for row in applied_files
+                    if isinstance(row, dict) and str(row.get("change_type") or "")
+                ],
+            },
+            summary="Evolution proposal applied.",
+        )
+    except ActionCardError:
+        return
 
 
 def _update_summary(*, run_dir: Path, run_payload: dict[str, Any], applied_files: list[dict[str, Any]]) -> None:

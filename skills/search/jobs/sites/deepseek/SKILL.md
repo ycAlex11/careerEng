@@ -46,6 +46,18 @@ DeepSeek currently uses a Moka/High-Flyer recruiting surface.
 - No reliable DeepSeek application-review workflow has been confirmed yet.
 - If the logged-in page exposes submitted, active, inactive, rejected, closed, or withdrawn applications, record the visible raw status and canonical status.
 
+### DeepSeek / Moka Apply-Page Closure
+
+- When a DeepSeek job reaches a Moka `#/job/<id>/apply` page, keep that same job exclusively active until one terminal `update_jobs` result is written for that exact job.
+- Do not leave an entered apply flow unclosed. Before switching jobs, restarting bootstrap, or abandoning the page, convert the current job into one of: submitted/already_applied/closed, blocked with a specific reason, or apply_failed with a specific runtime reason.
+- Treat successful resume upload as a mandatory closure checkpoint, not as permission to move on. Immediately re-read the same live `/apply` page after upload. If the first read is sparse, take exactly one more same-page observation before deciding the next step.
+- After upload or any other page-changing action, use the freshest same-job page state to choose the next branch:
+  - visible submitted / success / duplicate / already-applied / closed text -> record the matching terminal status immediately;
+  - visible required field / consent checkbox / validation message / continue / next / review / submit / confirm / save control -> act on that visible requirement and stay on the same job;
+  - no visible progress control, no visible missing requirement, and no visible terminal text -> record a terminal blocker with a concrete reason such as `post_upload_apply_shell_without_progress_control`, and include the current URL plus the visible controls or lack of controls.
+- If browser/session/runtime instability happens after `/apply` entry and prevents the required fresh observation or visible next step, do not return to the outer apply loop without closing the item. Record a same-job terminal blocked/apply_failed outcome with the interruption reason and current URL.
+- A live apply interruption is not grounds to silently resume browsing other jobs. The apply item must be terminalized first, even when the reason is runtime recovery exhaustion or browser-in-use/session instability.
+- Prefer concrete blocker reasons over generic loop escape. If the form shell is visible but offers no actionable next control after re-observation, write the blocker for that shell state instead of leaving the item unclosed.
 ## Matching Policy
 
 ### Application Gate
@@ -79,37 +91,32 @@ DeepSeek currently uses a Moka/High-Flyer recruiting surface.
 
 ## Apply
 
-### Matching Override
-
-- Use the project common matching rule for DeepSeek roles.
-- Prioritize AI/core engineering and model-data strategy roles that match the current persona/CV, especially `Agent`, `深度学习`, `搜索算法`, `预训练`, `核心系统`, `AI超算`, `Harness`, `全栈`, `AI核心研发`, `模型数据策略`, `数据策略`, `模型数据`, `AI跨界人才`, backend, systems, infrastructure, and data/agent engineering roles.
-- Do not apply to pure internship/campus/student/new-grad/co-op/校招/应届 roles.
-- For mixed `全职/实习` or `实习/全职` roles, do not filter at list stage only because of the mixed label. If the role is a target AI/core role, proceed with normal JD/CV matching and choose the full-time path when the form asks. If the live path only supports internship, record the job as blocked or filtered with that concrete reason.
-- If the role is a product, operations, data analyst, non-engineering, or hardware/facilities role and the JD does not strongly connect to software/AI agent engineering, mark it `filtered_out`.
-- If the current local history already shows a terminal submitted/already-applied/rejected/closed/withdrawn state for the same hash-route job id, do not submit again.
-
 ### Form Filling
 
-- Use the visible `立即投递` / apply entry on the job detail page only after the role has been judged `recommended_apply`.
-- Upload the staged resume PDF when the form asks for a resume/CV.
-- Uploading the resume is not a terminal outcome. After selecting/uploading the staged PDF, wait for the upload state to settle, re-read or resnapshot the live page, then continue with the next visible form step, validation, review, or final submit action.
-- For DeepSeek/Moka apply, after `browser_file_upload` succeeds, immediately take a fresh live page snapshot before any navigation to another job. If the snapshot is empty or only shows shell content, wait briefly and snapshot again. Stay on the same apply URL until the page either exposes parsed profile fields, required questions, a review/submit step, a clear human-only blocker, or a concrete site/runtime failure.
-- Do not leave a DeepSeek apply URL after upload unless exactly one terminal `update_jobs` state has been written for the current job: `submitted`, `already_applied`, `filtered_out`, `closed`, `blocked`, or `apply_failed`.
-- If the upload parsed the resume and required fields become visible, fill them from profile/CV/apply facts and continue to final submit when safe; do not treat upload completion as success, failure, or a reason to advance to the next apply target.
-- If the page stays on the same upload step after the file chooser completes, inspect visible upload status, required-field validation, disabled buttons, and next-step controls before retrying upload. Do not move to another job without writing a terminal `update_jobs` state or a structured loop-control gap.
+- Use the visible `立即投递` / `申请职位` apply entry on the job detail page only after the role has been judged `recommended_apply`.
+- Once the flow enters a DeepSeek/Moka `#/job/<id>/apply` URL, keep that same job exclusively active until exactly one terminal `update_jobs` state is written for the current item.
+- Treat resume upload as an intermediate transition, never as success, failure, or permission to move to another job.
+- On first entering `/apply`, read the current live form state before opening the resume upload chooser.
+- Before resume upload, complete visible required fields and acknowledgements that are already present on the page when they can be answered from profile, CV, application facts, or this skill. Common DeepSeek/Moka pre-upload fields include name, phone, email, personal email, intended work city, consent/declaration checkbox, employment-type/full-time path, education, start-work date, and similar profile fields.
+- For intended work city controls, follow the project-wide city-selection rule: select all acceptable visible cities if multi-select is supported; if the control is visibly single-select, choose an acceptable visible China target city and record the choice in phase memory.
+- Do not treat a city option click as complete until a fresh same-page observation shows a committed selected value/chip, no field-level required warning, or a clear value in the field.
+- For compliance, authenticity, privacy, code-of-conduct, rules acknowledgements, and factual declarations the applicant can truthfully make, select the affirmative/agree/confirm option when required.
+- Do not open `上传简历` while a visible required pre-upload field, city control, acknowledgement, validation message, or failed pre-upload tool action on the same page is unresolved.
+- If a city/location option click or acknowledgement checkbox click fails or is uncertain, re-read the same `/apply` page, make at most one visible alternative attempt on that same field/control, then re-read again. If the control still cannot be verified as committed, write a same-job terminal `blocked` or `apply_failed` state with a specific reason such as `pre_upload_city_not_committed` or `pre_upload_acknowledgement_not_committed`.
+- After visible pre-upload requirements are handled, upload the staged resume PDF through the visible resume/CV upload control.
+- Immediately after `browser_file_upload`, stay on the same `/apply` URL and use a fresh `browser_snapshot`-style same-page observation as the first post-upload read. Do not use stale pre-upload refs and do not switch targets.
+- Do not make `browser_evaluate` the first post-upload observation on DeepSeek/Moka. Use it only after a normal snapshot shows enough page structure to justify targeted inspection.
+- If the first post-upload observation is sparse, shell-only, still settling, or only shows an empty `### Snapshot`, wait briefly and re-read the same `/apply` page once with another same-page snapshot before classification.
+- From the freshest post-upload page state, choose one concrete branch:
+  - Visible parsed profile fields, required questions, validation messages, city controls, acknowledgement controls, Continue/Next/Review/Submit/Confirm controls, or disabled-button reasons are present: handle the visible requirement from allowed context and continue the same job.
+  - Upload is still processing, visibly pending, not accepted, rejected, or missing: retry or confirm upload once for the same job if a visible upload control allows it, then re-read the same page.
+  - Visible success, submitted, duplicate, already-applied, closed, withdrawn, or unavailable text appears: write the matching canonical terminal state immediately.
+  - The `/apply` shell is visible after the allowed re-observation but no usable forward control, required field, upload state, validation text, or terminal text can be observed: write a same-job terminal blocker `post_upload_apply_shell_without_progress_control` with current URL and visible page/control summary.
+  - Both post-upload same-page observations are empty/sparse and no reliable form state can be obtained: write a same-job terminal `apply_failed` or `blocked` state with `runtime_or_page_issue` and reason `post_upload_snapshot_empty_or_unstable`, including the current URL and the last confirmed operation `browser_file_upload`.
+  - Browser/runtime recovery prevents reliable post-upload observation after the same-page reread attempt: write a same-job terminal `apply_failed` or `blocked` state with `runtime_or_page_issue`, current URL, and the interrupted operation.
 - Use factual profile context for name, email, phone, location, city, province, school, degree, work authorization, and similar profile fields.
 - For gender questions, answer Male when required.
-- For compliance, code-of-conduct, authenticity, privacy, and rules acknowledgements, select Yes when the statement is an agreement/confirmation the applicant can truthfully make.
-- For mixed full-time/internship employment-type questions, choose the full-time option when visible. For pure internship/campus availability, non-full-time availability, or ambiguous employment-type questions without a full-time option, stop and ask the user unless the page clearly supports full-time.
-- For any required question whose answer is not available from profile/persona/CV/site skill, stop the current job as `blocked` and ask the user to take over or provide the answer. Do not guess.
-- Continue through safe next/submit steps until the final submit action only when all required visible fields are answered.
-
-### Site Signals
-
-- Treat visible success text after final submission, such as submitted successfully / 投递成功 / 申请已提交 / 简历投递成功, as `application_status=submitted`, `apply_state=terminal_submitted`, and `decision_status=recommended_apply`.
-- Treat visible already-applied text, duplicate application text, or a job detail/application page that clearly says the current user already submitted as `application_status=already_applied`.
-- Treat a missing/closed job page, no-position page, or unavailable job detail as `application_status=closed`.
-
-### Escalation
-
-- Stop and ask the user to take over for password entry, verification, CAPTCHA, phone/email code, ambiguous required personal answers, or any page where the visible form cannot be safely completed from local profile/persona/CV facts.
+- For mixed full-time/internship employment-type questions, choose the full-time option when visible. For pure internship/campus availability, non-full-time availability, or ambiguous employment-type questions without a full-time option, stop the current job as `blocked` unless the page clearly supports full-time.
+- For any required question whose answer is not available from profile/persona/CV/application facts/site skill, stop the current job as `blocked` and name the missing fact. Do not guess.
+- Continue through safe next/review/submit steps until final submit only when all visible required fields are answered.
+- The apply unit is complete only when the current job reaches one terminal `update_jobs` state: `submitted`, `already_applied`, `filtered_out`, `closed`, `blocked`, or `apply_failed`. Do not switch to another DeepSeek apply target first.

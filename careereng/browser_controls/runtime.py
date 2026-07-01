@@ -42,6 +42,7 @@ class BrowserRuntimeConfig:
     same_url_no_progress_phase_overrides: dict[str, dict[str, int]] = field(default_factory=dict)
     recovery_snapshot_timeout_seconds: int = 90
     recovery_max_attempts: int = 3
+    tool_settle_policies: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -925,6 +926,16 @@ class BrowserPhaseRuntime:
             for phrase in (
                 "codex.rate_limits",
                 "expected to have received",
+                "response.completed",
+                "responses stream",
+                "stream_read_error",
+                "stream disconnected",
+                "stream closed",
+                "stream reset",
+                "stream interrupted",
+                "server disconnected",
+                "remote protocol",
+                "connection reset",
                 "gateway timeout",
                 "bad gateway",
                 "service unavailable",
@@ -1645,19 +1656,20 @@ class BrowserPhaseRuntime:
         bridge: MCPToolBridge,
         session: Any,
         tool_names: set[str],
-    ) -> tuple[dict[str, Any] | None, str]:
+    ) -> tuple[dict[str, Any] | None, str, dict[str, Any]]:
         if not self._is_page_settle_action(tool_name):
-            return latest_snapshot_payload, current_url
+            return latest_snapshot_payload, current_url, {"status": "not_required", "tool_name": str(tool_name or "")}
         payload = latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None
         updated_url = str(current_url or "")
+        max_retries, sleep_seconds = self._page_settle_policy(tool_name)
         retries = 0
         while (
             payload is not None
             and self._payload_requires_page_settle_retry(payload)
-            and retries < self.PAGE_SETTLE_MAX_SNAPSHOT_RETRIES
+            and retries < max_retries
         ):
             retries += 1
-            await self._sleep(self.PAGE_SETTLE_SLEEP_SECONDS)
+            await self._sleep(sleep_seconds)
             refreshed = await self._capture_snapshot_payload(
                 bridge=bridge,
                 session=session,
@@ -1669,7 +1681,30 @@ class BrowserPhaseRuntime:
             snapshot_url = MCPToolBridge.extract_current_url(refreshed)
             if snapshot_url:
                 updated_url = snapshot_url
-        return payload, updated_url
+        status = "settled"
+        if payload is not None and self._payload_requires_page_settle_retry(payload):
+            status = "exhausted_empty_snapshot"
+        return (
+            payload,
+            updated_url,
+            {
+                "status": status,
+                "tool_name": str(tool_name or "").strip(),
+                "attempts": retries,
+                "max_snapshot_retries": max_retries,
+                "sleep_seconds": sleep_seconds,
+            },
+        )
+
+    def _page_settle_policy(self, tool_name: str) -> tuple[int, float]:
+        normalized = str(tool_name or "").strip().lower()
+        configured = self.config.tool_settle_policies if isinstance(self.config.tool_settle_policies, dict) else {}
+        policy = configured.get(normalized) if isinstance(configured.get(normalized), dict) else {}
+        retry_value = policy.get("max_snapshot_retries") if "max_snapshot_retries" in policy else self.PAGE_SETTLE_MAX_SNAPSHOT_RETRIES
+        sleep_value = policy.get("sleep_seconds") if "sleep_seconds" in policy else self.PAGE_SETTLE_SLEEP_SECONDS
+        retries = int(retry_value)
+        sleep_seconds = float(sleep_value)
+        return max(0, retries), max(0.0, sleep_seconds)
 
     @staticmethod
     def _context_item(content: str) -> dict[str, str]:
@@ -2339,6 +2374,25 @@ class BrowserPhaseRuntime:
         )
 
     @staticmethod
+    def _repeated_page_action_failure_message(
+        *,
+        phase: PhasePrompt,
+        current_url: str,
+        tool_name: str,
+        failure_count: int,
+    ) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        tool_line = f"Repeated failed page action: {tool_name}\n" if tool_name else ""
+        return (
+            f"Repeated page action failures were detected during `{phase.slug}`.\n"
+            f"{url_line}"
+            f"{tool_line}"
+            f"Failure count for the same action signature: {max(1, int(failure_count or 0))}\n"
+            "The runtime stopped this phase to avoid repeating the same browser-control failure. "
+            "Use the trace and evidence to refine the active Skill or run-local proposal."
+        )
+
+    @staticmethod
     def _job_retrieval_missing_urls_message(*, current_url: str, page_label: str, missing_count: int) -> str:
         page_line = f"Current page label: {page_label}\n" if page_label else ""
         url_line = f"Current page URL: {current_url}\n" if current_url else ""
@@ -2842,6 +2896,7 @@ class BrowserPhaseRuntime:
         apply_auth_recovery_page_key = ""
         failed_page_action_signature = ""
         failed_page_action_name = ""
+        failed_page_action_counts: dict[str, int] = {}
         response_turn_timeout_count = 0
         response_runtime_error_count = 0
         max_response_turn_timeouts = max(1, int(self.config.recovery_max_attempts or 0))
@@ -3953,7 +4008,7 @@ class BrowserPhaseRuntime:
                                 current_url = snapshot_url
                             fresh_snapshot_captured = True
                     if fresh_snapshot_captured and not error_text:
-                        settled_payload, settled_url = await self._wait_for_page_settle(
+                        settled_payload, settled_url, settle_info = await self._wait_for_page_settle(
                             tool_name=name,
                             latest_snapshot_payload=latest_snapshot_payload if isinstance(latest_snapshot_payload, dict) else None,
                             current_url=current_url,
@@ -3965,6 +4020,24 @@ class BrowserPhaseRuntime:
                             latest_snapshot_payload = settled_payload
                         if settled_url:
                             current_url = settled_url
+                        if settle_info.get("status") == "exhausted_empty_snapshot":
+                            self._record_browser_control_event(
+                                site_store=site_store,
+                                event_type="page_settle_empty_snapshot",
+                                batch_id=batch_id,
+                                site_key=site_key,
+                                phase=phase,
+                                turn_id=turn_id,
+                                current_url=current_url,
+                                guard_name="page_settle_empty_snapshot",
+                                trigger_values=settle_info,
+                                last_record_jobs_policy=last_record_jobs_policy,
+                                trace_ref=trace_ref,
+                                summary=(
+                                    f"{name} finished, but repeated post-action browser_snapshot calls still returned "
+                                    "an empty observable snapshot."
+                                ),
+                            )
                     if phase.slug == "apply" and not error_text:
                         auth_signal_payload = (
                             latest_snapshot_payload
@@ -4314,6 +4387,47 @@ class BrowserPhaseRuntime:
                             arguments if isinstance(arguments, dict) else None,
                         )
                         failed_page_action_name = str(name or "").strip()
+                        if failed_page_action_signature:
+                            failed_count = failed_page_action_counts.get(failed_page_action_signature, 0) + 1
+                            failed_page_action_counts[failed_page_action_signature] = failed_count
+                            failed_limit = max(2, int(self.config.recovery_max_attempts or 3))
+                            if failed_count >= failed_limit:
+                                summary = self._repeated_page_action_failure_message(
+                                    phase=phase,
+                                    current_url=current_url,
+                                    tool_name=failed_page_action_name,
+                                    failure_count=failed_count,
+                                )
+                                self._record_browser_control_event(
+                                    site_store=site_store,
+                                    event_type="repeated_page_action_failed",
+                                    batch_id=batch_id,
+                                    site_key=site_key,
+                                    phase=phase,
+                                    turn_id=turn_id,
+                                    current_url=current_url,
+                                    guard_name="repeated_page_action_failed",
+                                    trigger_values={
+                                        "tool_name": failed_page_action_name,
+                                        "failed_page_action_signature": failed_page_action_signature,
+                                        "failed_count": failed_count,
+                                        "failed_limit": failed_limit,
+                                    },
+                                    last_record_jobs_policy=last_record_jobs_policy,
+                                    trace_ref=trace_ref,
+                                    summary=summary,
+                                )
+                                return BrowserPhaseResult(
+                                    status="failed",
+                                    reason_tag="repeated_page_action_failed",
+                                    summary=summary,
+                                    current_url=current_url,
+                                    step_count=step_count,
+                                    trace_ref=trace_ref,
+                                    raw_text=output_text,
+                                    recorded_count=len(recorded_job_ids),
+                                    new_count=len(new_job_ids),
+                                )
                         if phase_memory.has_recent_actions():
                             phase_memory.keep_last_recent_action()
                     previous_url = current_url

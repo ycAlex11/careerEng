@@ -53,6 +53,7 @@ class SiteStore:
         "withdrawn",
     }
     RUNTIME_STOP_ERROR_MARKERS = (
+        "browser is already in use",
         "cannot schedule new futures after shutdown",
         "cannot schedule new futures after interpreter shutdown",
         "interpreter shutdown",
@@ -1140,8 +1141,8 @@ class SiteStore:
         return compacted
 
     @classmethod
-    def _is_runtime_stop_apply_failed(cls, *, status: str, error_text: str) -> bool:
-        if str(status or "").strip().lower() != "apply_failed":
+    def _is_runtime_stop_application_outcome(cls, *, status: str, error_text: str) -> bool:
+        if str(status or "").strip().lower() not in {"apply_failed", "blocked"}:
             return False
         lowered = str(error_text or "").strip().lower()
         return bool(lowered) and any(marker in lowered for marker in cls.RUNTIME_STOP_ERROR_MARKERS)
@@ -1796,13 +1797,48 @@ class SiteStore:
         return job_id, canonical_job_id
 
     @classmethod
+    def _has_history_outcome_signal(cls, row: dict[str, Any]) -> bool:
+        application_status = str(row.get("application_status") or "").strip()
+        decision_status = str(row.get("decision_status") or "").strip()
+        apply_state = str(row.get("apply_state") or "").strip().lower()
+        if application_status or decision_status:
+            return True
+        if (
+            apply_state.startswith("terminal_")
+            or apply_state.startswith("blocked_")
+            or apply_state
+            in {
+                "already_applied",
+                "submitted",
+                "filtered_out",
+                "apply_failed",
+                "blocked",
+                "rejected",
+                "closed",
+                "withdrawn",
+                "resumable_application",
+                "draft_application",
+                "incomplete_application",
+            }
+        ):
+            return True
+        for field in ("application_review_status", "application_review_stage", "application_review_batch_id"):
+            if str(row.get(field) or "").strip():
+                return True
+        return False
+
+    @classmethod
     def _merge_job_row(cls, base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
         incoming = normalize_posted_fields(dict(incoming))
         merged = dict(base)
+        incoming_has_outcome = cls._has_history_outcome_signal(incoming)
+        base_has_outcome = cls._has_history_outcome_signal(base)
+        if incoming_has_outcome or not base_has_outcome:
+            for field in ("batch_id", "session_id", "turn_id"):
+                value = str(incoming.get(field) or "").strip()
+                if value:
+                    merged[field] = value
         for field in (
-            "batch_id",
-            "session_id",
-            "turn_id",
             "canonical_job_id",
             "site_id",
             "employer",
@@ -2707,11 +2743,9 @@ class SiteStore:
             error_text = str(app.get("detail", {}).get("error") if isinstance(app.get("detail"), dict) else "")
             current_status = str(current.get("application_status") or "").strip().lower()
             current_decision_status = str(current.get("decision_status") or "").strip().lower()
-            if (
-                (current_status in self.DURABLE_APPLICATION_STATUSES or current_decision_status == "filtered_out")
-                and self._is_runtime_stop_apply_failed(status=status, error_text=error_text)
-            ):
+            if self._is_runtime_stop_application_outcome(status=status, error_text=error_text):
                 current["last_runtime_apply_error"] = error_text
+                current["last_runtime_apply_error_type"] = "runtime_stop"
                 changed = True
                 continue
             current["application_status"] = status

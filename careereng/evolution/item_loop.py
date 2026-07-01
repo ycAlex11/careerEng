@@ -132,8 +132,8 @@ def plan_item_loop_transition(
                 action=ITEM_LOOP_PAUSE_THRESHOLD,
                 hold_next_item=True,
                 pause_loop=True,
-                requires_materialized_change=not has_materialized_change,
-                should_create_solution_request=not has_materialized_change,
+                requires_materialized_change=False,
+                should_create_solution_request=False,
                 reason_tag="item_loop_refinement_threshold",
                 message="Refinement threshold reached for this loop pattern.",
             )

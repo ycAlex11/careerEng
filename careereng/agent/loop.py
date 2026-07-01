@@ -24,6 +24,7 @@ from careereng.agent.route_decider import RouteDecider
 from careereng.agent.router import detect_search_request, is_no, is_yes, parse_yes_no_reason
 from careereng.agent.search_flow import SearchFlow
 from careereng.agent.strategies import SearchStrategyEngine
+from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
 from careereng.providers.base import LLMProvider, ProviderError
 from careereng.session.manager import SessionManager
 from careereng.storage.application_store import ApplicationStore
@@ -124,7 +125,6 @@ class AgentLoop:
             site_parallelism=self.site_parallelism,
             browser_budgets=browser_budgets,
         )
-
     def close(self) -> None:
         self.job_flow.close()
 
@@ -583,12 +583,15 @@ class AgentLoop:
         return "\n".join(lines)
 
     def _handle_jobs_batch_request(self, session_id: str, message: str, turn_id: str, apply_requested: bool) -> str:
-        return self.job_flow.start_batch(
+        batch = self.job_flow.create_batch(
             session_id=session_id,
             turn_id=turn_id,
             user_message=message,
             apply_requested=apply_requested,
         )
+        if not batch:
+            return "当前没有已注册的 active sites。请先完成公司注册。"
+        return BatchEvolutionOrchestrator(self.job_flow).run_batch_with_outer_loop(str(batch.get("batch_id") or ""))
 
     def _interrupt_search_pending_if_needed(self, session_id: str, message: str) -> None:
         state = self.session_manager.get_state(session_id)

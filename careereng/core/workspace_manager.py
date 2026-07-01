@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from careereng.core.runtime import build_loop
+from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
 from careereng.utils import make_id
 
 
@@ -118,11 +119,7 @@ class WorkspaceManager:
         def _worker() -> None:
             with self._lock:
                 try:
-                    runner = getattr(self.loop.job_flow, "run_batch_with_evolution_loop", None)
-                    if callable(runner):
-                        runner(batch_id)
-                    else:
-                        self.loop.job_flow.run_batch(batch_id)
+                    BatchEvolutionOrchestrator(self.loop.job_flow).run_batch_with_outer_loop(batch_id)
                 except BaseException as exc:  # pragma: no cover - defensive manager boundary
                     try:
                         self.loop.job_flow.fail_batch(batch_id=batch_id, error=str(exc))

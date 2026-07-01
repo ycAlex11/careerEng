@@ -4,6 +4,8 @@ Evolution candidates define what CareerEng is allowed to improve, what evidence 
 
 They are the framework-level equivalent of AlphaEvolve's candidate programs plus evaluators, adapted to CareerEng's job-search domain.
 
+Read `docs/evolution/EVOLUTION_STRATEGY_ROUTER.md` before choosing a candidate. The router selects the strategy family; each candidate spec defines the concrete loop, evidence policy, proposal types, validation, and persistence rules for that strategy.
+
 ## Purpose
 
 A candidate spec should answer:
@@ -32,6 +34,8 @@ The Markdown body should define:
 
 - `purpose`: why this candidate exists.
 - `required_evidence`: local data needed before a useful evolution run can happen.
+- `evolution_strategy`: loop shape, Codex intervention points, and when run-local versus durable change is expected.
+- `evidence_selection_policy`: which evidence sources Codex should consider and how it should choose them.
 - `allowed_proposals`: proposal types the LLM may generate.
 - `evaluators`: deterministic, LLM-assisted, or human evaluation signals.
 - `archive_requirements`: what must be saved for later selection, rollback, or comparison.
@@ -48,6 +52,8 @@ The Markdown body should define:
 | `site_workflow_compaction` | Compact repeated site operations into reusable skill/workflow patterns. | Medium |
 | `target_company_intelligence_evolution` | Build target-company role intelligence, user gaps, and preparation plans from local evidence. | High |
 
+`new_site_workflow_transfer`, `apply_form_workflow`, and `site_workflow_compaction` are the `site_workflow_evolution` family. Keep them as separate specs, but let Codex read them together when a site-workflow proposal needs bootstrap, apply-form, and compaction context.
+
 ## Adding A New Candidate
 
 Add a new Markdown file under this directory.
@@ -60,5 +66,7 @@ The new candidate should keep business interpretation in Markdown and LLM prompt
 - running deterministic evaluators
 - archiving runs and evaluations
 - enforcing safety boundaries
+
+Python may provide an evidence index and starter excerpts. Codex/LLM chooses which indexed evidence to inspect and which strategy to propose.
 
 Do not add a new candidate if it belongs to infrastructure or security correctness rather than experience-driven evolution. Provider transport, MCP/browser protocol, login security, MFA, CAPTCHA, final-submit permission policy, and core storage schema are outside the evolution scope.

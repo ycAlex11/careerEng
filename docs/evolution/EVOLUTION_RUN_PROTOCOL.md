@@ -46,6 +46,11 @@ such as `run_local_overlay`, `skill_patch`, `routing_example_append`,
 The short-term layer may continue the batch until the configured threshold is
 reached. It should not directly create accepted lessons.
 
+When the batch ends, short-term proposals must be summarized and closed or
+archived for synthesis. They must not leak into later batches as active
+strategy unless a later long-term proposal promotes them into durable Skill,
+memory, routing, or context changes.
+
 ### Long-Term Evolution / Lesson Layer
 
 The long-term layer runs after a batch or after enough accumulated evidence.
@@ -59,6 +64,17 @@ It is responsible for:
 
 Accepted lessons and durable skill changes belong here, not inside a single
 apply item.
+
+Outer-loop synthesis must produce a concrete proposal using the existing
+proposal schema. Codex/LLM chooses the supported change types from the evidence
+and candidate spec. Python does not decide whether the answer should be a skill
+patch, memory lesson, routing update, context update, run-local experiment, user
+fact request, or another supported proposal shape.
+
+After the proposal is applied, the next outer batch validates it. If the batch
+has no failures, the existing report/selection/capability flow can accept the
+evolution. If failures remain and the outer budget is not exhausted, another
+synthesis cycle may run.
 
 ## Boundaries
 
@@ -159,6 +175,13 @@ Default behavior:
 - `retry_recovery` means the runtime/page state likely needs recovery, not skill editing.
 - `pause_site` and `pause_batch` are explicit stop signals.
 
+At inner-loop level, a concrete `run_local_overlay` is sufficient to try the
+next item in the same batch. At outer-loop level, the existing proposal/apply
+flow controls continuation: apply the proposal, close batch-local overlays as
+evidence, and run the next outer batch if the configured outer budget allows it.
+Do not treat old batch-local overlays as durable site strategy unless a proposal
+or accepted lesson explicitly promotes them.
+
 Immediate human boundaries:
 
 - login password entry
@@ -178,6 +201,11 @@ Python should enforce the loop mechanics and thresholds. The LLM/Codex should di
 At batch end, write a workflow evolution summary. The summary can create lesson
 candidates or follow-up candidates, but it must not auto-accept durable lessons
 from one batch alone.
+
+The batch-end summary should include run-local proposal usage and validation
+outcomes so Codex can decide whether to promote, revise, keep observing, or
+discard them. Python should not make that business decision; it should only
+make the lifecycle state explicit.
 
 ## Linked Follow-Up Runs
 

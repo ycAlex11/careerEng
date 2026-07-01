@@ -27,6 +27,28 @@ Automatic apply should stay disabled until the user explicitly approves site-spe
 
 This candidate is a transfer mechanism, not a new browser executor. It should package existing CareerEng capabilities and local evidence so Codex can draft or refine a site AI Skill.
 
+## Evolution Strategy
+
+This is the bootstrap member of the `site_workflow_evolution` family.
+
+Loop shape:
+
+- Handoff loop: create or reuse the site record, target Skill template, action card, and evidence pack.
+- Draft loop: Codex reads the router, this spec, project job Skill, mature site Skills, and site evidence to draft a testable site Skill.
+- Test loop: later browser runs validate non-apply phases first. Failures feed `site_workflow_compaction` or `apply_form_workflow` depending on the phase.
+
+Codex intervention points:
+
+- when a new site has no mature site Skill
+- when first-run evidence shows the template is too generic
+- when a site is registered but apply behavior is not approved or not proven
+
+Evidence-selection policy:
+
+- Codex chooses mature reference Skills and evidence from the index. Python may list AMD, Microsoft, NVIDIA, Qualcomm, or other available examples, but should not decide which one is the right analogy.
+- Prefer evidence from local site files, existing Skills, action cards, first-run traces, and failure snapshots.
+- Keep new-site decisions in Markdown Skills and proposals. Do not add ATS-specific Python behavior.
+
 ## Reuse Contract
 
 New-site workflow transfer must reuse existing project functions instead of creating a parallel implementation.

@@ -14,10 +14,12 @@ from careereng.evolution.solution_provider import (
     create_solution_request_for_action_card,
     create_solution_request_for_run,
 )
+from careereng.evolution.solution_bridge import EvolutionSolutionBridgeError, ProviderSolutionBridge
 from careereng.evolution.solution_orchestrator import (
     latest_pending_solution_request,
     list_pending_solution_requests,
 )
+from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
 from careereng.evolution.triggers import (
     EvolutionTriggerError,
     scan_assistant_router_memory_triggers,
@@ -34,9 +36,12 @@ __all__ = [
     "EvolutionEvaluationError",
     "EvolutionProposalError",
     "EvolutionRollbackError",
+    "EvolutionSolutionBridgeError",
     "EvolutionSolutionError",
     "EvolutionTriggerError",
     "ApplyProbeReport",
+    "BatchEvolutionOrchestrator",
+    "ProviderSolutionBridge",
     "apply_evolution_run",
     "build_evolution_review",
     "create_evolution_run",

@@ -15,6 +15,39 @@ Improve the application-form phase for a registered site by running bounded prob
 
 This candidate starts after jobs have already been retrieved and filtered. It does not decide which jobs are desirable. It only evaluates whether the site's apply workflow can reliably move from a selected job detail page to a terminal outcome.
 
+## Evolution Strategy
+
+This is a site-workflow evolution strategy focused on the apply/form phase.
+
+Loop shape:
+
+- Inner loop: each selected apply target is one validation unit. If one unit exposes a reusable failure pattern, Codex may generate a `run_local_overlay` for the next unit instead of waiting for the whole batch.
+- Outer loop: when the apply probe or batch completes, summarize all inner-loop proposals, validations, blockers, and traces. Promote stable changes to `skill_patch`, accepted lesson, memory, or action card when evidence supports durability.
+- Stop loop: pause only for human-only blockers, missing user facts, or repeated same-pattern failures beyond the configured threshold.
+
+Run-local and outer-loop outputs have different lifecycles:
+
+- `run_local_overlay` is valid only for the current batch or current short-horizon validation unit.
+- At batch end, all active run-local overlays should be summarized with their usage and validation results, then closed or archived for synthesis.
+- The next outer batch should validate a durable change, not an old batch-local overlay.
+- If Codex cannot justify a durable `skill_patch`, memory/lesson update, routing/context update, or explicit keep-observing decision from the evidence, the outer synthesis is incomplete and should not be treated as successful evolution.
+
+Codex intervention points:
+
+- after a sampled form workflow fails without a terminal state
+- after repeated blockers point to a site-skill or project-skill gap
+- after upload/form/continue/submit evidence shows unstable page observation
+- after probe completion, whether successful, failed, or partial
+
+Evidence-selection policy:
+
+- Start from the evolution strategy router and this spec.
+- Inspect the evidence index and choose the relevant run rows, trace refs, failure snapshots, active run-local proposals, workflow summaries, and Skill sections.
+- For outer-loop synthesis, inspect the inner-loop proposal usage and validation outcomes, not only the last failure example.
+- For upload or page-render instability, inspect before/after tool traces and snapshots around the browser operation. Treat empty snapshot after retries as engineering evidence, not as a site-specific form rule.
+- Do not rely only on Python-provided excerpts. They are starter context, not the full evidence set.
+- Do not let Python choose form strategy, field mappings, or job desirability.
+
 ## Probe Budget
 
 V1 budget:
@@ -120,6 +153,7 @@ LLM/Codex may:
 - decide whether the next step is user fact collection, site skill patch, project skill patch, or runtime investigation
 - propose skill updates after evidence is available
 - review or override the accepted capability later if user feedback shows the workflow was wrongly accepted
+- decide whether inner-loop run-local behavior should be promoted, revised, kept observing, or discarded at batch end
 
 ## Completion Standard
 

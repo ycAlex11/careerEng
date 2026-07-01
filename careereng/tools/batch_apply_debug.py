@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from careereng.config.schema import BrowserBudgetsConfig
+from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
 from careereng.utils import safe_file_stem
 
 
@@ -65,40 +66,19 @@ class BatchApplyDebugRunner:
         site_key: str,
         current: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        flow = self.job_flow
-        is_waiting = str(current.get("status") or "") == "waiting_solution" or str(
-            (current.get("apply") or {}).get("status") or ""
-        ) == "waiting_solution"
-        if not is_waiting:
-            return batch, current
-        proposals = flow._active_run_local_apply_proposals(site_key=site_key, batch_id=str(batch.get("batch_id") or ""))
-        if not proposals:
-            return batch, current
-        apply = dict(current.get("apply") or {})
-        loop_control = dict(apply.get("loop_control") or {})
-        proposal = proposals[-1]
-        proposal_payload = proposal.get("proposal") if isinstance(proposal.get("proposal"), dict) else {}
-        loop_control.update(
-            {
-                "waiting_solution": False,
-                "materialized_change": True,
-                "proposal_status": str(proposal_payload.get("proposal_status") or "materialized"),
-                "active_run_local_proposal_id": str(proposal_payload.get("proposal_id") or ""),
-                "active_run_local_proposal_memory_id": str(proposal.get("memory_id") or ""),
-            }
+        batch, updated, _ = BatchEvolutionOrchestrator(self.job_flow).resume_waiting_solution_if_materialized(
+            batch=batch,
+            site_key=site_key,
+            current=current,
         )
-        apply.update({"status": "running", "loop_control": loop_control})
-        resumed = {
-            **current,
-            "status": "running",
-            "reason_tag": "item_loop_resume_with_run_local_overlay",
-            "apply": apply,
-            "message": "Resuming item loop with an applied run-local evolution proposal.",
-        }
-        batch = flow.job_store.update_site(batch, site_key, resumed)
-        batch["status"] = flow._compute_batch_status(batch)
-        batch = flow.job_store.save_batch(batch)
-        return batch, resumed
+        return batch, updated
+
+    def _generate_outputs_if_possible(self, batch: dict[str, Any]) -> None:
+        flow = self.job_flow
+        flow._generate_batch_report_if_possible(batch)
+        generate_workflow_summary = getattr(flow, "_generate_workflow_evolution_summary_if_possible", None)
+        if callable(generate_workflow_summary):
+            generate_workflow_summary(batch)
 
     def _select_run_job(
         self,
@@ -278,7 +258,7 @@ class BatchApplyDebugRunner:
             batch = flow.job_store.update_site(batch, normalized_site_key, updated)
             batch["status"] = flow._compute_batch_status(batch)
             batch = flow.job_store.save_batch(batch)
-            flow._generate_batch_report_if_possible(batch)
+            self._generate_outputs_if_possible(batch)
             return flow._format_batch_summary(batch)
 
         login_result: Any | None = None
@@ -303,7 +283,7 @@ class BatchApplyDebugRunner:
                 batch = flow.job_store.update_site(batch, normalized_site_key, updated)
                 batch["status"] = flow._compute_batch_status(batch)
                 batch = flow.job_store.save_batch(batch)
-                flow._generate_batch_report_if_possible(batch)
+                self._generate_outputs_if_possible(batch)
                 return flow._format_batch_summary(batch)
 
         last_result: Any | None = login_result
@@ -335,6 +315,11 @@ class BatchApplyDebugRunner:
             latest_rows = {str(row.get("job_id") or ""): row for row in flow._run_job_rows(normalized_site_key, batch_id)}
             latest_row = latest_rows.get(job_id) or {}
             if flow._is_apply_row_terminal(latest_row):
+                flow._record_run_local_proposal_validation(
+                    site_key=normalized_site_key,
+                    batch_id=batch_id,
+                    job_row=latest_row,
+                )
                 continue
             status = "blocked" if str(getattr(last_result, "status", "") or "") == "blocked" else "apply_failed"
             error_text = str(getattr(last_result, "message", "") or "").strip() or "sample apply ended without terminal job update"
@@ -348,6 +333,11 @@ class BatchApplyDebugRunner:
                     last_result=last_result,
                     error_text=error_text,
                 )
+                flow._record_run_local_proposal_validation(
+                    site_key=normalized_site_key,
+                    batch_id=batch_id,
+                    job_row=loop_gap_row,
+                )
                 updated = flow._loop_control_pause_site_row(
                     site_key=normalized_site_key,
                     existing=current,
@@ -360,7 +350,7 @@ class BatchApplyDebugRunner:
                     batch = flow.job_store.update_site(batch, normalized_site_key, updated)
                     batch["status"] = flow._compute_batch_status(batch)
                     batch = flow.job_store.save_batch(batch)
-                    flow._generate_batch_report_if_possible(batch)
+                    self._generate_outputs_if_possible(batch)
                     return flow._format_batch_summary(batch)
                 current = updated
                 batch = flow.job_store.update_site(batch, normalized_site_key, updated)
@@ -375,6 +365,12 @@ class BatchApplyDebugRunner:
                 job_id=job_id,
                 status=status,
                 error_text=error_text,
+            )
+            sealed_rows = {str(row.get("job_id") or ""): row for row in flow._run_job_rows(normalized_site_key, batch_id)}
+            flow._record_run_local_proposal_validation(
+                site_key=normalized_site_key,
+                batch_id=batch_id,
+                job_row=sealed_rows.get(job_id) or {"job_id": job_id, "application_status": status},
             )
 
         flow._promote_apply_run_to_history(
@@ -392,5 +388,5 @@ class BatchApplyDebugRunner:
         batch = flow.job_store.update_site(batch, normalized_site_key, updated)
         batch["status"] = flow._compute_batch_status(batch)
         batch = flow.job_store.save_batch(batch)
-        flow._generate_batch_report_if_possible(batch)
+        self._generate_outputs_if_possible(batch)
         return flow._format_batch_summary(batch)
