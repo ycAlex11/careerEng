@@ -58,6 +58,17 @@ class BrowserPhaseResult:
     new_count: int = 0
 
 
+@dataclass(frozen=True)
+class ObservationRecoveryOutcome:
+    snapshot_payload: dict[str, Any] | None
+    current_url: str
+    context_items: list[dict[str, Any]]
+    unavailable_count: int
+    failure_result: BrowserPhaseResult | None = None
+    settle_info: dict[str, Any] = field(default_factory=dict)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
 class ResponsesClient:
     def __init__(
         self,
@@ -422,6 +433,58 @@ class BrowserPhaseRuntime:
     PAGE_SETTLE_MAX_SNAPSHOT_RETRIES = 2
     PAGE_SETTLE_SLEEP_SECONDS = 0.75
     RESPONSE_RETRYABLE_STATUS_CODES = ("500", "502", "503", "504")
+    POST_ACTION_OBSERVATION_DIAGNOSTIC_FUNCTION = r"""() => {
+  const visible = (el) => {
+    if (!el || !el.ownerDocument || !el.ownerDocument.defaultView) return false;
+    const win = el.ownerDocument.defaultView;
+    const style = win.getComputedStyle(el);
+    if (!style || style.display === "none" || style.visibility === "hidden") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0;
+  };
+  const safeText = (value, max = 180) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+  const bodyText = safeText(document.body ? document.body.innerText : "", 1200);
+  const countVisible = (selector) => Array.from(document.querySelectorAll(selector)).filter(visible).length;
+  const controls = Array.from(document.querySelectorAll("button,input,select,textarea,a[href],[role='button']"))
+    .filter(visible)
+    .slice(0, 25)
+    .map((el) => ({
+      tag: String(el.tagName || "").toLowerCase(),
+      type: safeText(el.getAttribute("type"), 60),
+      role: safeText(el.getAttribute("role"), 60),
+      name: safeText(el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.innerText || el.value, 160),
+      disabled: Boolean(el.disabled || el.getAttribute("aria-disabled") === "true")
+    }));
+  const errors = Array.from(document.querySelectorAll("[role='alert'],[aria-invalid='true'],.error,.errors,.field-error"))
+    .filter(visible)
+    .slice(0, 20)
+    .map((el) => safeText(el.innerText || el.getAttribute("aria-label"), 240))
+    .filter(Boolean);
+  const active = document.activeElement;
+  return {
+    url: location.href,
+    title: document.title,
+    readyState: document.readyState,
+    bodyTextLength: document.body && document.body.innerText ? document.body.innerText.length : 0,
+    bodyTextSample: bodyText,
+    visibleControlCounts: {
+      button: countVisible("button"),
+      input: countVisible("input"),
+      select: countVisible("select"),
+      textarea: countVisible("textarea"),
+      link: countVisible("a[href]"),
+      roleButton: countVisible("[role='button']")
+    },
+    visibleControls: controls,
+    errorTextSamples: errors,
+    activeElement: active ? {
+      tag: String(active.tagName || "").toLowerCase(),
+      type: safeText(active.getAttribute("type"), 60),
+      role: safeText(active.getAttribute("role"), 60),
+      name: safeText(active.getAttribute("aria-label") || active.getAttribute("placeholder") || active.innerText || active.value, 160)
+    } : {}
+  };
+}"""
 
     def __init__(
         self,
@@ -1647,6 +1710,161 @@ class BrowserPhaseRuntime:
         except Exception as exc:
             return {"isError": True, "error": f"snapshot_failed: {exc}", "tool": "browser_snapshot"}
 
+    async def _capture_post_action_observation_diagnostics(
+        self,
+        *,
+        bridge: MCPToolBridge,
+        session: Any,
+        tool_names: set[str],
+        current_url: str,
+    ) -> dict[str, Any]:
+        if "browser_evaluate" not in tool_names:
+            return {
+                "status": "unavailable",
+                "reason": "browser_evaluate_unavailable",
+                "current_url": str(current_url or ""),
+            }
+        try:
+            payload = await bridge.call_tool(
+                session,
+                "browser_evaluate",
+                {"function": self.POST_ACTION_OBSERVATION_DIAGNOSTIC_FUNCTION},
+            )
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "reason": "browser_evaluate_failed",
+                "error": str(exc),
+                "current_url": str(current_url or ""),
+            }
+        if not isinstance(payload, dict):
+            return {
+                "status": "unavailable",
+                "reason": "browser_evaluate_returned_non_dict",
+                "current_url": str(current_url or ""),
+            }
+        if bool(payload.get("isError")):
+            return {
+                "status": "unavailable",
+                "reason": "browser_evaluate_error",
+                "current_url": str(current_url or ""),
+                "summary": MCPToolBridge.summarize_tool_output(payload),
+            }
+        diagnostics = self._post_action_observation_diagnostics_from_payload(payload)
+        diagnostics.setdefault("current_url", str(current_url or ""))
+        diagnostics["status"] = "ok" if self._post_action_observation_diagnostics_are_useful(diagnostics) else "unavailable"
+        diagnostics["reason"] = "" if diagnostics["status"] == "ok" else "diagnostics_has_no_visible_page_state"
+        return diagnostics
+
+    @classmethod
+    def _post_action_observation_diagnostics_from_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        candidates: list[Any] = []
+        structured = payload.get("structuredContent") if isinstance(payload, dict) else None
+        candidates.append(structured)
+        candidates.extend(cls._parse_result_json_blocks(payload))
+        source: dict[str, Any] = {}
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                source = dict(candidate)
+                break
+        result: dict[str, Any] = {}
+        for key in ("url", "title", "readyState", "bodyTextLength", "bodyTextSample"):
+            value = source.get(key)
+            if value not in (None, "", [], {}):
+                result[key] = value
+        counts = source.get("visibleControlCounts")
+        if isinstance(counts, dict):
+            compact_counts: dict[str, int] = {}
+            for key, value in counts.items():
+                parsed = cls._coerce_nonnegative_int(value)
+                if parsed is not None:
+                    compact_counts[str(key)] = parsed
+            if compact_counts:
+                result["visibleControlCounts"] = compact_counts
+        controls = source.get("visibleControls")
+        if isinstance(controls, list):
+            compact_controls = []
+            for item in controls[:25]:
+                if not isinstance(item, dict):
+                    continue
+                compact_controls.append(
+                    {
+                        key: str(item.get(key) or "").strip()
+                        for key in ("tag", "type", "role", "name")
+                        if str(item.get(key) or "").strip()
+                    }
+                    | {"disabled": bool(item.get("disabled"))}
+                )
+            if compact_controls:
+                result["visibleControls"] = compact_controls
+        errors = source.get("errorTextSamples")
+        if isinstance(errors, list):
+            result["errorTextSamples"] = [
+                str(item or "").strip()[:240]
+                for item in errors[:20]
+                if str(item or "").strip()
+            ]
+        active = source.get("activeElement")
+        if isinstance(active, dict):
+            result["activeElement"] = {
+                key: str(active.get(key) or "").strip()
+                for key in ("tag", "type", "role", "name")
+                if str(active.get(key) or "").strip()
+            }
+        if not result:
+            summary = MCPToolBridge.summarize_tool_output(payload)
+            if summary:
+                result["summary"] = summary
+        return result
+
+    @staticmethod
+    def _coerce_nonnegative_int(value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except Exception:
+            return None
+        return max(0, parsed)
+
+    @classmethod
+    def _post_action_observation_diagnostics_are_useful(cls, diagnostics: dict[str, Any]) -> bool:
+        if not isinstance(diagnostics, dict):
+            return False
+        body_length = cls._coerce_nonnegative_int(diagnostics.get("bodyTextLength"))
+        if body_length and body_length > 0:
+            return True
+        counts = diagnostics.get("visibleControlCounts")
+        if isinstance(counts, dict):
+            for value in counts.values():
+                parsed = cls._coerce_nonnegative_int(value)
+                if parsed and parsed > 0:
+                    return True
+        controls = diagnostics.get("visibleControls")
+        if isinstance(controls, list) and controls:
+            return True
+        errors = diagnostics.get("errorTextSamples")
+        return bool(isinstance(errors, list) and errors)
+
+    @staticmethod
+    def _post_action_observation_fallback_message(
+        *,
+        tool_name: str,
+        current_url: str,
+        settle_info: dict[str, Any],
+        diagnostics: dict[str, Any],
+    ) -> str:
+        url_line = f"Current page URL: {current_url}\n" if current_url else ""
+        return (
+            "Runtime fallback observation after post-action empty snapshots.\n"
+            f"Triggering tool: {tool_name}\n"
+            f"{url_line}"
+            "Repeated post-action browser_snapshot calls returned an empty observable snapshot after the configured retry policy.\n"
+            "This is engineering/runtime evidence only; it is not a business decision and does not replace active Skills.\n"
+            "Use the diagnostics below as current page evidence, avoid stale refs, and decide the next workflow action from the live facts.\n"
+            "If the diagnostics are still insufficient, surface an appropriate runtime/evolution blocker instead of guessing.\n"
+            f"Snapshot retry info: {json.dumps(settle_info, ensure_ascii=False, sort_keys=True)}\n"
+            f"Diagnostics: {json.dumps(diagnostics, ensure_ascii=False, sort_keys=True)}"
+        )
+
     async def _wait_for_page_settle(
         self,
         *,
@@ -1694,6 +1912,166 @@ class BrowserPhaseRuntime:
                 "max_snapshot_retries": max_retries,
                 "sleep_seconds": sleep_seconds,
             },
+        )
+
+    async def _recover_observation_after_tool_issue(
+        self,
+        *,
+        tool_name: str,
+        current_url: str,
+        bridge: MCPToolBridge,
+        session: Any,
+        tool_names: set[str],
+        site_store: Any,
+        batch_id: str,
+        site_key: str,
+        phase: PhasePrompt,
+        turn_id: str,
+        last_record_jobs_policy: dict[str, Any] | None,
+        trace_ref: str,
+        unavailable_count: int,
+        unavailable_limit: int,
+        step_count: int,
+        output_text: str,
+        recorded_count: int,
+        new_count: int,
+        initial_snapshot_payload: dict[str, Any] | None = None,
+        initial_wait_seconds: float = 0.0,
+    ) -> ObservationRecoveryOutcome:
+        if initial_wait_seconds > 0:
+            await self._sleep(initial_wait_seconds)
+
+        snapshot_payload: dict[str, Any] | None = (
+            initial_snapshot_payload
+            if isinstance(initial_snapshot_payload, dict)
+            and initial_snapshot_payload
+            and not bool(initial_snapshot_payload.get("isError"))
+            else None
+        )
+        updated_url = str(current_url or "")
+        if snapshot_payload is None:
+            captured = await self._capture_snapshot_payload(
+                bridge=bridge,
+                session=session,
+                tool_names=tool_names,
+            )
+            if isinstance(captured, dict) and captured and not bool(captured.get("isError")):
+                snapshot_payload = captured
+
+        context_items: list[dict[str, Any]] = []
+        if isinstance(snapshot_payload, dict) and snapshot_payload and not bool(snapshot_payload.get("isError")):
+            snapshot_url = MCPToolBridge.extract_current_url(snapshot_payload)
+            if snapshot_url:
+                updated_url = snapshot_url
+            context_items.append(self._context_item(self._live_snapshot_primary_message()))
+
+        settled_payload, settled_url, settle_info = await self._wait_for_page_settle(
+            tool_name=tool_name,
+            latest_snapshot_payload=snapshot_payload,
+            current_url=updated_url,
+            bridge=bridge,
+            session=session,
+            tool_names=tool_names,
+        )
+        if isinstance(settled_payload, dict):
+            snapshot_payload = settled_payload
+        if settled_url:
+            updated_url = settled_url
+
+        diagnostics: dict[str, Any] = {}
+        next_unavailable_count = int(unavailable_count)
+        if settle_info.get("status") == "exhausted_empty_snapshot":
+            diagnostics = await self._capture_post_action_observation_diagnostics(
+                bridge=bridge,
+                session=session,
+                tool_names=tool_names,
+                current_url=updated_url,
+            )
+            context_items.append(
+                self._context_item(
+                    self._post_action_observation_fallback_message(
+                        tool_name=tool_name,
+                        current_url=updated_url,
+                        settle_info=settle_info,
+                        diagnostics=diagnostics,
+                    )
+                )
+            )
+            if self._post_action_observation_diagnostics_are_useful(diagnostics):
+                next_unavailable_count = 0
+            else:
+                next_unavailable_count += 1
+            self._record_browser_control_event(
+                site_store=site_store,
+                event_type="page_settle_empty_snapshot",
+                batch_id=batch_id,
+                site_key=site_key,
+                phase=phase,
+                turn_id=turn_id,
+                current_url=updated_url,
+                guard_name="page_settle_empty_snapshot",
+                trigger_values=settle_info,
+                last_record_jobs_policy=last_record_jobs_policy,
+                trace_ref=trace_ref,
+                summary=(
+                    f"{tool_name} finished or failed, but repeated browser_snapshot calls still returned "
+                    "an empty observable snapshot."
+                ),
+            )
+            if next_unavailable_count >= unavailable_limit:
+                summary = (
+                    "post-action page observation remained unavailable after repeated snapshot retry "
+                    "and fallback diagnostics attempts"
+                )
+                self._record_browser_control_event(
+                    site_store=site_store,
+                    event_type="post_action_observation_unavailable",
+                    batch_id=batch_id,
+                    site_key=site_key,
+                    phase=phase,
+                    turn_id=turn_id,
+                    current_url=updated_url,
+                    guard_name="post_action_observation_unavailable",
+                    trigger_values={
+                        "count": next_unavailable_count,
+                        "limit": unavailable_limit,
+                        "last_tool_name": str(tool_name or ""),
+                        "last_diagnostics_status": str(diagnostics.get("status") or ""),
+                        "last_diagnostics_reason": str(diagnostics.get("reason") or ""),
+                    },
+                    last_record_jobs_policy=last_record_jobs_policy,
+                    trace_ref=trace_ref,
+                    summary=summary,
+                )
+                return ObservationRecoveryOutcome(
+                    snapshot_payload=snapshot_payload,
+                    current_url=updated_url,
+                    context_items=context_items,
+                    unavailable_count=next_unavailable_count,
+                    failure_result=BrowserPhaseResult(
+                        status="failed",
+                        reason_tag="post_action_observation_unavailable",
+                        summary=summary,
+                        current_url=updated_url,
+                        step_count=step_count,
+                        trace_ref=trace_ref,
+                        raw_text=output_text,
+                        recorded_count=recorded_count,
+                        new_count=new_count,
+                    ),
+                    settle_info=settle_info,
+                    diagnostics=diagnostics,
+                )
+        elif settle_info.get("status") == "settled":
+            next_unavailable_count = 0
+
+        return ObservationRecoveryOutcome(
+            snapshot_payload=snapshot_payload,
+            current_url=updated_url,
+            context_items=context_items,
+            unavailable_count=next_unavailable_count,
+            settle_info=settle_info,
+            diagnostics=diagnostics,
         )
 
     def _page_settle_policy(self, tool_name: str) -> tuple[int, float]:
@@ -2910,6 +3288,8 @@ class BrowserPhaseRuntime:
         pre_execution_retry_count = 0
         pre_execution_retry_last_tool = ""
         pre_execution_retry_limit = max(1, int(self.config.recovery_max_attempts or 3))
+        post_action_observation_unavailable_count = 0
+        post_action_observation_unavailable_limit = max(1, int(self.config.recovery_max_attempts or 3))
 
         def track_same_url_no_progress(
             *,
@@ -3326,15 +3706,89 @@ class BrowserPhaseRuntime:
                     retry_requested = True
                     break
 
-                if phase.slug == "apply" and apply_upload_requires_observation and name == "phase_result":
-                    history_items = [
-                        self._context_item(
-                            self._apply_file_upload_observe_message(
-                                current_url=current_url,
-                                staged_path=staged_resume_pdf_path,
+                if phase.slug == "apply" and apply_upload_requires_observation and not is_observation_tool:
+                    observation_recovery = await self._recover_observation_after_tool_issue(
+                        tool_name=str(name or ""),
+                        current_url=current_url,
+                        bridge=bridge,
+                        session=session,
+                        tool_names=tool_names,
+                        site_store=site_store,
+                        batch_id=batch_id,
+                        site_key=site_key,
+                        phase=phase,
+                        turn_id=turn_id,
+                        last_record_jobs_policy=last_record_jobs_policy,
+                        trace_ref=trace_ref,
+                        unavailable_count=post_action_observation_unavailable_count,
+                        unavailable_limit=post_action_observation_unavailable_limit,
+                        step_count=step_count,
+                        output_text=output_text,
+                        recorded_count=len(recorded_job_ids),
+                        new_count=len(new_job_ids),
+                        initial_wait_seconds=min(2.0, max(0.25, float(self.config.step_timeout_seconds or 1) / 10.0)),
+                    )
+                    post_action_observation_unavailable_count = observation_recovery.unavailable_count
+                    if isinstance(observation_recovery.snapshot_payload, dict):
+                        latest_snapshot_payload = observation_recovery.snapshot_payload
+                    current_url = observation_recovery.current_url
+                    if observation_recovery.failure_result is not None:
+                        return observation_recovery.failure_result
+
+                    recovery_payload = (
+                        observation_recovery.snapshot_payload
+                        if isinstance(observation_recovery.snapshot_payload, dict)
+                        else current_signal_payload
+                    )
+                    history_items = list(observation_recovery.context_items)
+                    if self._payload_confirms_staged_file_upload(
+                        recovery_payload,
+                        staged_path=staged_resume_pdf_path,
+                    ):
+                        apply_upload_requires_observation = False
+                        apply_upload_modal_unresolved = False
+                        history_items.append(
+                            self._context_item(
+                                self._apply_file_upload_confirmed_message(
+                                    current_url=current_url,
+                                    staged_path=staged_resume_pdf_path,
+                                )
                             )
                         )
-                    ]
+                    elif self._payload_has_file_chooser(recovery_payload):
+                        apply_upload_requires_observation = False
+                        apply_upload_modal_unresolved = True
+                        history_items.append(
+                            self._context_item(
+                                self._apply_file_upload_modal_unresolved_message(
+                                    current_url=current_url,
+                                    staged_path=staged_resume_pdf_path,
+                                    chooser_count=self._payload_file_chooser_count(recovery_payload),
+                                )
+                            )
+                        )
+                    else:
+                        snapshot_is_observable = (
+                            isinstance(recovery_payload, dict)
+                            and recovery_payload
+                            and not bool(recovery_payload.get("isError"))
+                            and not self._payload_requires_page_settle_retry(recovery_payload)
+                        )
+                        diagnostics_are_observable = self._post_action_observation_diagnostics_are_useful(
+                            observation_recovery.diagnostics
+                        )
+                        if snapshot_is_observable or diagnostics_are_observable:
+                            apply_upload_requires_observation = False
+                            apply_upload_modal_unresolved = False
+                        history_items.append(
+                            self._context_item(
+                                self._apply_file_upload_observe_message(
+                                    current_url=current_url,
+                                    staged_path=staged_resume_pdf_path,
+                                )
+                            )
+                        )
+                    executed_tool_this_turn = True
                     retry_requested = True
                     break
 
@@ -3502,18 +3956,6 @@ class BrowserPhaseRuntime:
                         ]
                         retry_requested = True
                         break
-
-                if phase.slug == "apply" and apply_upload_requires_observation and not is_observation_tool:
-                    history_items = [
-                        self._context_item(
-                            self._apply_file_upload_observe_message(
-                                current_url=current_url,
-                                staged_path=staged_resume_pdf_path,
-                            )
-                        )
-                    ]
-                    retry_requested = True
-                    break
 
                 if phase.slug == "apply" and name == "browser_file_upload":
                     upload_paths = self._normalize_file_upload_paths(arguments if isinstance(arguments, dict) else None)
@@ -4021,6 +4463,26 @@ class BrowserPhaseRuntime:
                         if settled_url:
                             current_url = settled_url
                         if settle_info.get("status") == "exhausted_empty_snapshot":
+                            diagnostics = await self._capture_post_action_observation_diagnostics(
+                                bridge=bridge,
+                                session=session,
+                                tool_names=tool_names,
+                                current_url=current_url,
+                            )
+                            post_tool_context_items.append(
+                                self._context_item(
+                                    self._post_action_observation_fallback_message(
+                                        tool_name=name,
+                                        current_url=current_url,
+                                        settle_info=settle_info,
+                                        diagnostics=diagnostics,
+                                    )
+                                )
+                            )
+                            if self._post_action_observation_diagnostics_are_useful(diagnostics):
+                                post_action_observation_unavailable_count = 0
+                            else:
+                                post_action_observation_unavailable_count += 1
                             self._record_browser_control_event(
                                 site_store=site_store,
                                 event_type="page_settle_empty_snapshot",
@@ -4038,6 +4500,44 @@ class BrowserPhaseRuntime:
                                     "an empty observable snapshot."
                                 ),
                             )
+                            if post_action_observation_unavailable_count >= post_action_observation_unavailable_limit:
+                                summary = (
+                                    "post-action page observation remained unavailable after repeated snapshot retry "
+                                    "and fallback diagnostics attempts"
+                                )
+                                self._record_browser_control_event(
+                                    site_store=site_store,
+                                    event_type="post_action_observation_unavailable",
+                                    batch_id=batch_id,
+                                    site_key=site_key,
+                                    phase=phase,
+                                    turn_id=turn_id,
+                                    current_url=current_url,
+                                    guard_name="post_action_observation_unavailable",
+                                    trigger_values={
+                                        "count": post_action_observation_unavailable_count,
+                                        "limit": post_action_observation_unavailable_limit,
+                                        "last_tool_name": str(name or ""),
+                                        "last_diagnostics_status": str(diagnostics.get("status") or ""),
+                                        "last_diagnostics_reason": str(diagnostics.get("reason") or ""),
+                                    },
+                                    last_record_jobs_policy=last_record_jobs_policy,
+                                    trace_ref=trace_ref,
+                                    summary=summary,
+                                )
+                                return BrowserPhaseResult(
+                                    status="failed",
+                                    reason_tag="post_action_observation_unavailable",
+                                    summary=summary,
+                                    current_url=current_url,
+                                    step_count=step_count,
+                                    trace_ref=trace_ref,
+                                    raw_text=output_text,
+                                    recorded_count=len(recorded_job_ids),
+                                    new_count=len(new_job_ids),
+                                )
+                        elif settle_info.get("status") == "settled":
+                            post_action_observation_unavailable_count = 0
                     if phase.slug == "apply" and not error_text:
                         auth_signal_payload = (
                             latest_snapshot_payload
@@ -4084,6 +4584,7 @@ class BrowserPhaseRuntime:
                                 apply_upload_modal_unresolved = False
                                 history_items = [
                                     tool_feedback,
+                                    *post_tool_context_items,
                                     self._context_item(
                                         self._apply_file_upload_confirmed_message(
                                             current_url=current_url,
@@ -4096,6 +4597,7 @@ class BrowserPhaseRuntime:
                                 apply_upload_modal_unresolved = True
                                 history_items = [
                                     tool_feedback,
+                                    *post_tool_context_items,
                                     self._context_item(
                                         self._apply_file_upload_modal_unresolved_message(
                                             current_url=current_url,
@@ -4109,6 +4611,7 @@ class BrowserPhaseRuntime:
                                 apply_upload_modal_unresolved = False
                                 history_items = [
                                     tool_feedback,
+                                    *post_tool_context_items,
                                     self._context_item(
                                         self._apply_file_upload_observe_message(
                                             current_url=current_url,
@@ -4431,31 +4934,36 @@ class BrowserPhaseRuntime:
                         if phase_memory.has_recent_actions():
                             phase_memory.keep_last_recent_action()
                     previous_url = current_url
-                    await self._sleep(min(2.0, max(0.25, float(self.config.step_timeout_seconds or 1) / 10.0)))
-                    snapshot_payload = await self._capture_snapshot_payload(
+                    observation_recovery = await self._recover_observation_after_tool_issue(
+                        tool_name=str(name or ""),
+                        current_url=current_url,
                         bridge=bridge,
                         session=session,
                         tool_names=tool_names,
+                        site_store=site_store,
+                        batch_id=batch_id,
+                        site_key=site_key,
+                        phase=phase,
+                        turn_id=turn_id,
+                        last_record_jobs_policy=last_record_jobs_policy,
+                        trace_ref=trace_ref,
+                        unavailable_count=post_action_observation_unavailable_count,
+                        unavailable_limit=post_action_observation_unavailable_limit,
+                        step_count=step_count,
+                        output_text=output_text,
+                        recorded_count=len(recorded_job_ids),
+                        new_count=len(new_job_ids),
+                        initial_wait_seconds=min(2.0, max(0.25, float(self.config.step_timeout_seconds or 1) / 10.0)),
                     )
-                    snapshot_text = ""
-                    if (
-                        isinstance(snapshot_payload, dict)
-                        and snapshot_payload
-                        and not bool(snapshot_payload.get("isError"))
-                    ):
-                        latest_snapshot_payload = snapshot_payload
-                        snapshot_url = MCPToolBridge.extract_current_url(snapshot_payload)
-                        if snapshot_url:
-                            current_url = snapshot_url
+                    post_action_observation_unavailable_count = observation_recovery.unavailable_count
+                    if isinstance(observation_recovery.snapshot_payload, dict):
+                        latest_snapshot_payload = observation_recovery.snapshot_payload
+                    current_url = observation_recovery.current_url
+                    if observation_recovery.failure_result is not None:
+                        return observation_recovery.failure_result
                     stale_context_error = self._is_objective_stale_context_error(error_text)
                     if stale_context_error:
-                        history_items = []
-                        if (
-                            isinstance(snapshot_payload, dict)
-                            and snapshot_payload
-                            and not bool(snapshot_payload.get("isError"))
-                        ):
-                            history_items.append(self._context_item(self._live_snapshot_primary_message()))
+                        history_items = list(observation_recovery.context_items)
                         history_items.append(
                             self._context_item(
                                 self._browser_recovery_message(
@@ -4472,12 +4980,7 @@ class BrowserPhaseRuntime:
                         )
                     else:
                         history_items = [tool_feedback]
-                        if (
-                            isinstance(snapshot_payload, dict)
-                            and snapshot_payload
-                            and not bool(snapshot_payload.get("isError"))
-                        ):
-                            history_items.append(self._context_item(self._live_snapshot_primary_message()))
+                        history_items.extend(observation_recovery.context_items)
                         history_items.append(
                             self._context_item(
                                 self._browser_recovery_message(

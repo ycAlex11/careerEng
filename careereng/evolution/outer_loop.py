@@ -108,11 +108,6 @@ class BatchEvolutionOrchestrator:
             reply = self.continue_current_item_loops(batch)
             solved_reply = self.solve_waiting_solution_and_continue(self.job_store.load_batch(str(batch.get("batch_id") or "")))
             return solved_reply or reply
-        if self._batch_has_unapplied_pending_solution(batch):
-            return self.job_flow._format_batch_summary(batch)
-        next_batch = self.create_followup_batch_if_needed(batch)
-        if next_batch:
-            return self.run_batch_with_outer_loop(str(next_batch.get("batch_id") or ""))
         batch, thresholded = self.reconcile_item_loop_thresholds(batch)
         if thresholded:
             batch, _ = self.create_synthesis_request_if_needed(batch)
@@ -120,6 +115,11 @@ class BatchEvolutionOrchestrator:
             if solved_reply:
                 return solved_reply
             return self.job_flow._format_batch_summary(batch)
+        if self._batch_has_unapplied_pending_solution(batch):
+            return self.job_flow._format_batch_summary(batch)
+        next_batch = self.create_followup_batch_if_needed(batch)
+        if next_batch:
+            return self.run_batch_with_outer_loop(str(next_batch.get("batch_id") or ""))
         batch, synthesis_created = self.create_synthesis_request_if_needed(batch)
         if synthesis_created:
             solved_reply = self.solve_waiting_solution_and_continue(batch)

@@ -85,15 +85,6 @@ def plan_item_loop_transition(
             message="No loop-control action was provided.",
         )
 
-    if action in {LOOP_ACTION_PAUSE_SITE, LOOP_ACTION_PAUSE_BATCH}:
-        return ItemLoopTransition(
-            action=ITEM_LOOP_PAUSE_EXPLICIT,
-            hold_next_item=True,
-            pause_loop=True,
-            reason_tag="item_loop_pause_explicit",
-            message=f"Loop explicitly requested `{action}`.",
-        )
-
     if loop_control_is_human_only_gap(payload):
         return ItemLoopTransition(
             action=ITEM_LOOP_PAUSE_FOR_USER_INPUT,
@@ -101,6 +92,15 @@ def plan_item_loop_transition(
             pause_loop=True,
             reason_tag="item_loop_waiting_user_input",
             message="Loop-control evidence requires human-only input.",
+        )
+
+    if action in {LOOP_ACTION_PAUSE_SITE, LOOP_ACTION_PAUSE_BATCH}:
+        return ItemLoopTransition(
+            action=ITEM_LOOP_PAUSE_EXPLICIT,
+            hold_next_item=True,
+            pause_loop=True,
+            reason_tag="item_loop_pause_explicit",
+            message=f"Loop explicitly requested `{action}`.",
         )
 
     if action != LOOP_ACTION_TRIGGER_REFINEMENT and bool(artifact_payload.get("escalated")):

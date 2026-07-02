@@ -2097,6 +2097,7 @@ def batch_apply(
 ):
     """Apply the first N jobs from an existing batch without rerunning retrieval."""
     loop, _ = _build_loop()
+    reply = ""
     try:
         try:
             reply = BatchApplyDebugRunner(loop.job_flow).run(
@@ -2108,7 +2109,8 @@ def batch_apply(
                 apply_only=apply_only,
             )
         finally:
-            _close_loop_if_possible(loop)
+            if "status=waiting_user" not in str(reply or ""):
+                _close_loop_if_possible(loop)
     except (FileNotFoundError, KeyError, ValueError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(reply)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from careereng.config.schema import BrowserBudgetsConfig
+from careereng.evolution.loop_control import loop_control_from_row
 from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
 from careereng.utils import safe_file_stem
 
@@ -320,6 +321,22 @@ class BatchApplyDebugRunner:
                     batch_id=batch_id,
                     job_row=latest_row,
                 )
+                if loop_control_from_row(latest_row):
+                    updated = flow._loop_control_pause_site_row(
+                        site_key=normalized_site_key,
+                        existing=current,
+                        batch_id=batch_id,
+                        last_result=last_result,
+                        job_row=latest_row,
+                        turn_id=turn_id,
+                    )
+                    batch = flow.job_store.update_site(batch, normalized_site_key, updated)
+                    batch["status"] = flow._compute_batch_status(batch)
+                    batch = flow.job_store.save_batch(batch)
+                    self._generate_outputs_if_possible(batch)
+                    if str(updated.get("status") or "") in {"blocked", "waiting_solution"}:
+                        return flow._format_batch_summary(batch)
+                    current = updated
                 continue
             status = "blocked" if str(getattr(last_result, "status", "") or "") == "blocked" else "apply_failed"
             error_text = str(getattr(last_result, "message", "") or "").strip() or "sample apply ended without terminal job update"
