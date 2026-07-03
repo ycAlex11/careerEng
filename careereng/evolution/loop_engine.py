@@ -103,6 +103,14 @@ class ApplyLoopEngine:
             if not isinstance(row, dict):
                 continue
             application_status = str(row.get("application_status") or "").strip().lower()
+            if application_status in {"submitted", "already_applied", "filtered_out", "rejected", "closed", "withdrawn"}:
+                continue
+            if application_status == "apply_failed":
+                has_failed = True
+                continue
+            if application_status == "blocked":
+                has_blocked = True
+                continue
             control = loop_control_from_row(row)
             if control:
                 if loop_control_is_human_only_gap(control):
@@ -117,10 +125,6 @@ class ApplyLoopEngine:
                 if attempts >= self.refinement_attempts_per_batch:
                     has_blocked = True
                 continue
-            if application_status == "apply_failed":
-                has_failed = True
-            elif application_status == "blocked":
-                has_blocked = True
         if has_failed:
             return "failed"
         if has_blocked:

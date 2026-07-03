@@ -26,6 +26,7 @@ def _pending_apply_rows(
     site_key: str,
     batch_id: str,
     target_job_ids: tuple[str, ...] | None = None,
+    include_target_terminal: bool = False,
 ) -> list[dict[str, Any]]:
     target_ids = _target_job_ids(target_job_ids)
     list_run_jobs = getattr(site_store, "list_run_jobs", None)
@@ -47,7 +48,10 @@ def _pending_apply_rows(
             continue
         decision_status = str(row.get("decision_status") or "").strip().lower()
         application_status = str(row.get("application_status") or "").strip().lower()
-        if decision_status in terminal_decisions or application_status in terminal_applications:
+        target_terminal_allowed = bool(include_target_terminal and target_ids and job_id in target_ids)
+        if not target_terminal_allowed and (
+            decision_status in terminal_decisions or application_status in terminal_applications
+        ):
             continue
         pending_rows.append(
             {
@@ -142,6 +146,7 @@ class BrowserContextSession:
         target_job_ids: tuple[str, ...] | None = None,
         staged_resume_pdf_path: str = "",
         phase_memory: BrowserPhaseMemory | None = None,
+        continuation_context: dict[str, Any] | None = None,
     ) -> "BrowserContextSession":
         bundle_texts = {name: registry.bundle_item_text(name) for name in registry.available_bundles()}
         load_run_context = getattr(site_store, "load_run_context", None)
@@ -184,8 +189,12 @@ class BrowserContextSession:
             site_key=site_key,
             batch_id=batch_id,
             target_job_ids=target_job_ids,
+            include_target_terminal=bool(continuation_context),
         )
         items: list[dict[str, str]] = []
+        continuation_item = cls._continuation_context_item(continuation_context)
+        if continuation_item:
+            items.append(continuation_item)
         items.append(
             {
                 "role": "user",
@@ -271,8 +280,28 @@ class BrowserContextSession:
         cls,
         *,
         phase_memory: BrowserPhaseMemory | None = None,
+        continuation_context: dict[str, Any] | None = None,
     ) -> "BrowserContextSession":
-        return cls(bundle_texts={}, base_items=[], phase_memory=phase_memory)
+        items: list[dict[str, str]] = []
+        continuation_item = cls._continuation_context_item(continuation_context)
+        if continuation_item:
+            items.append(continuation_item)
+        return cls(bundle_texts={}, base_items=items, phase_memory=phase_memory)
+
+    @staticmethod
+    def _continuation_context_item(continuation_context: dict[str, Any] | None) -> dict[str, str] | None:
+        if not isinstance(continuation_context, dict) or not continuation_context:
+            return None
+        return {
+            "role": "user",
+            "content": (
+                "Fresh snapshot resume context for this phase:\n"
+                f"{json.dumps(continuation_context, ensure_ascii=False, sort_keys=True)}\n"
+                "The user has completed the external/manual step. Take a fresh live snapshot of the current page, "
+                "then use the current live page plus Skills to decide the next action. "
+                "This context is not a business outcome; terminal job/application updates must still come from the live page."
+            ),
+        }
 
     def items(self) -> list[dict[str, str]]:
         items = list(self.base_items)

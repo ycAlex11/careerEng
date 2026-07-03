@@ -12,6 +12,7 @@ from typing import Any
 
 from careereng.action_cards import ActionCardStore
 from careereng.action_cards.schema import ACTION_CARD_CODEX_REVIEW
+from careereng.agent.fresh_resume import build_fresh_snapshot_resume_plan
 from careereng.config.schema import BrowserBudgetsConfig
 from careereng.evolution.apply_probe import apply_probe_counters
 from careereng.evolution.capabilities import EvolutionCapabilityStore
@@ -678,22 +679,26 @@ class JobFlow:
         phase_slugs: tuple[str, ...],
         resume: bool = False,
         apply_target_job_ids: tuple[str, ...] | None = None,
+        continuation_context: dict[str, Any] | None = None,
         phase_timeout_seconds_override: int | None = None,
         timeout_ms_override: int | None = None,
     ) -> Any:
-        result = self.browser_runner.run_site(
-            site_key=site_key,
-            site_name=site_name,
-            entry_url=entry_url,
-            session_id=session_id,
-            turn_id=turn_id,
-            batch_id=batch_id,
-            resume=resume,
-            phase_slugs=phase_slugs,
-            apply_target_job_ids=apply_target_job_ids,
-            phase_timeout_seconds_override=phase_timeout_seconds_override,
-            timeout_ms_override=timeout_ms_override,
-        )
+        run_kwargs = {
+            "site_key": site_key,
+            "site_name": site_name,
+            "entry_url": entry_url,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "batch_id": batch_id,
+            "resume": resume,
+            "phase_slugs": phase_slugs,
+            "apply_target_job_ids": apply_target_job_ids,
+            "phase_timeout_seconds_override": phase_timeout_seconds_override,
+            "timeout_ms_override": timeout_ms_override,
+        }
+        if continuation_context:
+            run_kwargs["continuation_context"] = continuation_context
+        result = self.browser_runner.run_site(**run_kwargs)
         if not self._phase_requires_auth_recovery(result):
             return result
 
@@ -717,23 +722,26 @@ class JobFlow:
         )
         if not remaining_phases:
             return login_result
-        return self.browser_runner.run_site(
-            site_key=site_key,
-            site_name=site_name,
-            entry_url=str(
+        recovery_kwargs = {
+            "site_key": site_key,
+            "site_name": site_name,
+            "entry_url": str(
                 getattr(login_result, "current_url", "")
                 or getattr(result, "current_url", "")
                 or entry_url
             ),
-            session_id=session_id,
-            turn_id=turn_id,
-            batch_id=batch_id,
-            resume=True,
-            phase_slugs=remaining_phases,
-            apply_target_job_ids=apply_target_job_ids,
-            phase_timeout_seconds_override=phase_timeout_seconds_override,
-            timeout_ms_override=timeout_ms_override,
-        )
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "batch_id": batch_id,
+            "resume": True,
+            "phase_slugs": remaining_phases,
+            "apply_target_job_ids": apply_target_job_ids,
+            "phase_timeout_seconds_override": phase_timeout_seconds_override,
+            "timeout_ms_override": timeout_ms_override,
+        }
+        if continuation_context:
+            recovery_kwargs["continuation_context"] = continuation_context
+        return self.browser_runner.run_site(**recovery_kwargs)
 
     def _run_job_rows(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
         list_run_jobs = getattr(self.site_tools.site_store, "list_run_jobs", None)
@@ -839,6 +847,68 @@ class JobFlow:
             "closed",
             "withdrawn",
         }
+
+    @staticmethod
+    def _is_apply_row_success_terminal(row: dict[str, Any]) -> bool:
+        decision_status = str(row.get("decision_status") or "").strip().lower()
+        application_status = JobFlow._terminal_application_status(row)
+        return decision_status in {"filtered_out", "already_applied"} or application_status in {
+            "already_applied",
+            "filtered_out",
+            "submitted",
+            "rejected",
+            "closed",
+            "withdrawn",
+        }
+
+    def _accept_apply_capability_if_terminal_success(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        counters: dict[str, int],
+    ) -> dict[str, Any]:
+        existing = self._apply_probe_capability(site_key)
+        if str(existing.get("status") or "").strip().lower() == "accepted":
+            return existing
+        rows = self._merged_run_job_rows_for_batch(site_key, batch_id)
+        if not rows or self._pending_apply_rows(site_key, batch_id):
+            return {}
+        if int(counters.get("failed") or 0) or int(counters.get("blocked") or 0):
+            return {}
+        if int(counters.get("excluded_role_violations") or 0):
+            return {}
+        if not any(self._is_apply_row_success_terminal(row) for row in rows):
+            return {}
+        if any(not self._is_apply_row_success_terminal(row) for row in rows):
+            return {}
+        if not (
+            int(counters.get("submitted") or 0)
+            or int(counters.get("already_applied") or 0)
+            or int(counters.get("form_successful") or 0)
+        ):
+            return {}
+        capability = self.capability_store.accept(
+            site_key=site_key,
+            phase="apply",
+            candidate_id="apply_form_workflow",
+            source_run_id="",
+            source_batch_id=batch_id,
+            metrics=dict(counters or {}),
+            reason="All apply-list rows reached acceptable terminal states in this batch.",
+        )
+        self.job_store.append_event(
+            "evolution.apply_capability.accepted",
+            {
+                "batch_id": batch_id,
+                "site_key": site_key,
+                "candidate_id": "apply_form_workflow",
+                "phase": "apply",
+                "acceptance_reason": "all_apply_items_terminal_success",
+                "capability_id": str(capability.get("capability_id") or ""),
+            },
+        )
+        return capability
 
     def _write_retrieval_snapshot(self, *, site_key: str, batch_id: str, current: dict[str, Any]) -> dict[str, Any]:
         rows = self._merged_run_job_rows_for_batch(site_key, batch_id)
@@ -1313,6 +1383,13 @@ class JobFlow:
                 **self._apply_counter_payload(counters),
             }
         )
+        capability = (
+            self._accept_apply_capability_if_terminal_success(site_key=site_key, batch_id=batch_id, counters=counters)
+            if apply_status == "done"
+            else {}
+        )
+        if capability:
+            apply["capability"] = capability
         retrieve["count"] = max(int(retrieve.get("count") or 0), counters["retrieved"])
         current_url = str(
             getattr(last_result, "current_url", "") or existing.get("current_url") or existing.get("entry_url") or ""
@@ -2076,9 +2153,17 @@ class JobFlow:
                     **self._apply_counter_payload(counters),
                 }
             )
+            if apply_status == "done":
+                apply.pop("loop_control", None)
             retrieve["count"] = max(int(retrieve.get("count") or 0), counters["retrieved"])
             site_status = "blocked" if apply_status == "blocked" else ("failed" if apply_status == "failed" else "completed")
             final_reason_tag = reason_tag or str(existing.get("reason_tag") or "").strip()
+            if apply_status == "done" and final_reason_tag in {
+                "item_loop_waiting_user_input",
+                "apply_blocked",
+                "ready",
+            }:
+                final_reason_tag = "apply_done"
             if apply_status == "failed" and not final_reason_tag:
                 final_reason_tag = "apply_failed"
             if apply_status == "blocked" and not final_reason_tag:
@@ -2406,21 +2491,60 @@ class JobFlow:
                 allow_apply=str((current.get("apply") or {}).get("status") or "") != "skipped",
             )
         else:
+            operation = self._normalize_operation(str(batch.get("operation") or self.OPERATION_JOB_SEARCH))
+            plan = build_fresh_snapshot_resume_plan(
+                site_key=site_key,
+                current=current,
+                batch=batch,
+                message=message,
+                phase_plan=self._phase_plan_for_operation(operation),
+                browser_session=self.site_tools.site_store.load_browser_session(site_key),
+                run_rows=self._merged_run_job_rows_for_batch(site_key, str(batch.get("batch_id") or "")),
+            )
             result = self._run_site_with_auth_recovery(
                 site_key=site_key,
                 site_name=str(current.get("site_name") or site_key),
-                entry_url=str(current.get("entry_url") or current.get("current_url") or ""),
+                entry_url=str(plan.get("entry_url") or current.get("entry_url") or current.get("current_url") or ""),
                 session_id=session_id,
                 turn_id=turn_id,
                 batch_id=str(batch.get("batch_id") or ""),
                 resume=True,
-                phase_slugs=self.DISCOVERY_PHASES,
+                phase_slugs=tuple(plan.get("phase_slugs") or self.DISCOVERY_PHASES),
+                apply_target_job_ids=plan.get("apply_target_job_ids"),
+                continuation_context=plan.get("continuation_context") if isinstance(plan.get("continuation_context"), dict) else None,
             )
-            replacement = self._browser_result_to_site_row(
-                result=result,
-                existing=current,
-                allow_apply=str((current.get("apply") or {}).get("status") or "") != "skipped",
-            )
+            if str(getattr(result, "current_phase", "") or "") == "apply":
+                replacement = self._apply_result_to_site_row(
+                    result=result,
+                    existing=current,
+                    batch_id=str(batch.get("batch_id") or ""),
+                )
+                if str((replacement.get("apply") or {}).get("status") or "") in {"done", "blocked", "failed"}:
+                    self._promote_apply_run_to_history(
+                        site_key=site_key,
+                        batch_id=str(batch.get("batch_id") or ""),
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
+                if (
+                    str(getattr(result, "status", "") or "") == "ready"
+                    and str((replacement.get("apply") or {}).get("status") or "") == "done"
+                    and self._pending_apply_rows(site_key, str(batch.get("batch_id") or ""))
+                ):
+                    replacement = self._continue_apply_pending_items(
+                        site_key=site_key,
+                        current=replacement,
+                        batch_id=str(batch.get("batch_id") or ""),
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
+            else:
+                replacement = self._browser_result_to_site_row(
+                    result=result,
+                    existing=current,
+                    allow_apply=str((current.get("apply") or {}).get("status") or "") != "skipped",
+                    operation=str(batch.get("operation") or self.OPERATION_JOB_SEARCH),
+                )
         batch = self.job_store.update_site(batch, site_key, replacement)
         batch["status"] = self._compute_batch_status(batch)
         batch = self.job_store.save_batch(batch)

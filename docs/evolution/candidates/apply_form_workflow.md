@@ -45,6 +45,8 @@ Evidence-selection policy:
 - Inspect the evidence index and choose the relevant run rows, trace refs, failure snapshots, active run-local proposals, workflow summaries, and Skill sections.
 - For outer-loop synthesis, inspect the inner-loop proposal usage and validation outcomes, not only the last failure example.
 - For upload or page-render instability, inspect before/after tool traces and snapshots around the browser operation. Treat empty snapshot after retries as engineering evidence, not as a site-specific form rule.
+- For form-field strategy, compare repeated successful submissions, failed validation traces, blockers, and snapshots to infer the site's minimal required submit path. Do not assume every visible field is required. Treat a field as optional unless the live page blocks submission, shows validation, the active Skill marks it required, or the user explicitly requires it.
+- When multiple successful submissions show that optional fields can be skipped safely, summarize that evidence and propose a site Skill refinement only after the pattern is stable enough to reuse.
 - Do not rely only on Python-provided excerpts. They are starter context, not the full evidence set.
 - Do not let Python choose form strategy, field mappings, or job desirability.
 

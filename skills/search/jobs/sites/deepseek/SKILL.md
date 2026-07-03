@@ -11,6 +11,9 @@ job_identity:
   fragment_job_route_patterns:
   - '#/job/{site_job_id}'
   - '#/jobs/{site_job_id}'
+  application_review_fallback:
+    unique_title: true
+    when_review_has_no_real_job_url: true
 ---
 # DeepSeek Site Skill
 
@@ -43,7 +46,10 @@ DeepSeek currently uses a Moka/High-Flyer recruiting surface.
 
 ### Application Review Policy
 
-- No reliable DeepSeek application-review workflow has been confirmed yet.
+- DeepSeek/Moka application-review pages may show an application status and title without the same `#/job/<uuid>` used by job-list/detail pages.
+- In application review, record the visible title, raw status, canonical review status, and review URL when present.
+- If the review page has no reliable `#/job/<uuid>` job URL, CareerEng may merge the review state to an existing DeepSeek job by same-site unique title only. If the title is duplicated, treat it as ambiguous and do not auto-merge.
+- Treat active review states such as `初筛`, resume review, application received, in review, in process, or similar as an active/submitted application state for apply planning; such jobs should be skipped by normal apply list generation unless the site clearly exposes a resumable unfinished application.
 - If the logged-in page exposes submitted, active, inactive, rejected, closed, or withdrawn applications, record the visible raw status and canonical status.
 
 ### DeepSeek / Moka Apply-Page Closure

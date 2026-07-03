@@ -1131,6 +1131,8 @@ class SiteStore:
                     target_idx = key_to_index[key]
                     break
             if target_idx is None:
+                target_idx = self._unique_application_review_title_match_index(site_id, normalized, compacted)
+            if target_idx is None:
                 target_idx = len(compacted)
                 compacted.append(normalized)
             else:
@@ -1759,6 +1761,68 @@ class SiteStore:
                 deduped.append(key)
         return deduped
 
+    @staticmethod
+    def _application_review_title_fallback_enabled(identity_policy: dict[str, Any]) -> bool:
+        fallback = identity_policy.get("application_review_fallback") if isinstance(identity_policy, dict) else None
+        if isinstance(fallback, dict):
+            return bool(
+                fallback.get("unique_title")
+                or fallback.get("same_site_unique_title")
+                or fallback.get("title")
+            )
+        return bool(fallback)
+
+    def _is_application_review_identity_row(self, row: dict[str, Any]) -> bool:
+        if not isinstance(row, dict):
+            return False
+        if str(row.get("history_source") or "").strip() == "application_status_review":
+            return True
+        for field in (
+            "application_review_status",
+            "application_review_status_raw",
+            "application_review_stage",
+            "application_review_url",
+            "application_review_checked_at",
+        ):
+            if str(row.get(field) or "").strip():
+                return True
+        url = self._normalize_url(str(row.get("url") or ""))
+        return bool(url and not self._is_real_job_posting_url(url) and str(row.get("title") or "").strip())
+
+    def _unique_application_review_title_match_index(
+        self,
+        site_id: str,
+        row: dict[str, Any],
+        history_rows: list[dict[str, Any]],
+    ) -> int | None:
+        identity_policy = self._job_identity_policy(site_id)
+        if not self._application_review_title_fallback_enabled(identity_policy):
+            return None
+        title = self._normalize_job_text(str(row.get("title") or ""))
+        if not title:
+            return None
+        candidates: list[int] = []
+        real_job_candidates: list[int] = []
+        incoming_is_review = self._is_application_review_identity_row(row)
+        for idx, existing in enumerate(history_rows):
+            if not isinstance(existing, dict):
+                continue
+            if self._normalize_job_text(str(existing.get("title") or "")) != title:
+                continue
+            existing_is_review = self._is_application_review_identity_row(existing)
+            if not incoming_is_review and not existing_is_review:
+                continue
+            candidates.append(idx)
+            if self._is_real_job_posting_url(existing.get("url")):
+                real_job_candidates.append(idx)
+        unique_real = sorted(set(real_job_candidates))
+        if len(unique_real) == 1:
+            return unique_real[0]
+        unique_candidates = sorted(set(candidates))
+        if len(unique_candidates) == 1:
+            return unique_candidates[0]
+        return None
+
     def job_identity_keys(self, site_id: str, row: dict[str, Any]) -> list[str]:
         """Return history-compatible keys ordered for run/apply-plan dedupe.
 
@@ -2042,6 +2106,7 @@ class SiteStore:
                 by_job_id=by_job_id,
                 by_canonical_job_id=by_canonical_job_id,
                 by_match_key=by_match_key,
+                history_rows=history_rows,
             )
             if match_idx is None:
                 classifications.append(
@@ -2104,6 +2169,7 @@ class SiteStore:
         by_job_id: dict[str, int],
         by_canonical_job_id: dict[str, int],
         by_match_key: dict[str, int],
+        history_rows: list[dict[str, Any]] | None = None,
     ) -> int | None:
         if not isinstance(row, dict):
             return None
@@ -2116,6 +2182,10 @@ class SiteStore:
         for key in self._history_match_keys(site_id, row):
             if key in by_match_key:
                 return by_match_key[key]
+        if history_rows is not None:
+            title_match = self._unique_application_review_title_match_index(site_id, row, history_rows)
+            if title_match is not None:
+                return title_match
         return None
 
     def match_history_rows(self, site_id: str, jobs: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
@@ -2129,6 +2199,7 @@ class SiteStore:
                 by_job_id=by_job_id,
                 by_canonical_job_id=by_canonical_job_id,
                 by_match_key=by_match_key,
+                history_rows=rows,
             )
             if match_idx is None:
                 matches.append(None)
@@ -2680,6 +2751,7 @@ class SiteStore:
                 by_job_id=by_job_id,
                 by_canonical_job_id=by_canonical_job_id,
                 by_match_key=by_match_key,
+                history_rows=rows,
             )
             if match_idx is None:
                 continue
@@ -2735,6 +2807,7 @@ class SiteStore:
                 by_job_id=by_job_id,
                 by_canonical_job_id=by_canonical_job_id,
                 by_match_key=by_match_key,
+                history_rows=rows,
             )
             if match_idx is None:
                 continue
@@ -2856,6 +2929,7 @@ class SiteStore:
                 by_job_id=by_job_id,
                 by_canonical_job_id=by_canonical_job_id,
                 by_match_key=by_match_key,
+                history_rows=history_rows,
             )
             matched_job_id = ""
             if match_idx is None:

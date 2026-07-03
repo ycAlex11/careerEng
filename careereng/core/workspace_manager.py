@@ -49,6 +49,8 @@ class WorkspaceManager:
             return self._handle_shutdown(payload)
         if op == "start_jobs_batch":
             return self._handle_start_jobs_batch(payload)
+        if op == "fresh_snapshot_resume":
+            return self._handle_fresh_snapshot_resume(payload)
         if op != "process_message":
             return {"ok": False, "error": f"unsupported op: {op}"}
         session_id = str(payload.get("session_id") or "cli:default")
@@ -138,6 +140,27 @@ class WorkspaceManager:
             "operation": operation,
             "reply": f"batch={batch_id} status=running",
         }
+
+    def _handle_fresh_snapshot_resume(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session_id = str(payload.get("session_id") or "cli:default")
+        message = str(payload.get("message") or "")
+        turn_id = str(payload.get("turn_id") or make_id("turn"))
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return {"ok": False, "error": "workspace manager is busy with another operation"}
+        try:
+            if self._background_batch_running:
+                return {"ok": False, "error": "workspace manager is busy with another job batch"}
+            reply = self.loop.job_flow.handle_resume_message(
+                session_id=session_id,
+                message=message,
+                turn_id=turn_id,
+            )
+        finally:
+            self._lock.release()
+        if reply is None:
+            return {"ok": True, "accepted": False, "reply": ""}
+        return {"ok": True, "accepted": True, "reply": reply, "turn_id": turn_id}
 
 
 class _ManagerRequestHandler(socketserver.StreamRequestHandler):

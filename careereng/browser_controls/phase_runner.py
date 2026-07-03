@@ -352,6 +352,7 @@ class BrowserAutomationService:
         target_job_ids: tuple[str, ...] | None = None,
         staged_resume_pdf_path: str = "",
         phase_memory: BrowserPhaseMemory | None = None,
+        continuation_context: dict[str, Any] | None = None,
     ) -> BrowserContextSession | None:
         if phase_slug == "apply":
             self._browser_context_registry.refresh()
@@ -364,8 +365,12 @@ class BrowserAutomationService:
                 target_job_ids=target_job_ids,
                 staged_resume_pdf_path=staged_resume_pdf_path,
                 phase_memory=phase_memory,
+                continuation_context=continuation_context,
             )
-        return BrowserContextSession.for_phase(phase_memory=phase_memory)
+        return BrowserContextSession.for_phase(
+            phase_memory=phase_memory,
+            continuation_context=continuation_context,
+        )
 
     def _session_preparation_context_items(self, site_key: str) -> list[dict[str, str]]:
         resume_pdf_path = default_apply_resume_pdf_path(self.workspace)
@@ -804,6 +809,7 @@ class BrowserAutomationService:
         resume: bool,
         phase_slugs: tuple[str, ...] | None,
         apply_target_job_ids: tuple[str, ...] | None = None,
+        continuation_context: dict[str, Any] | None = None,
         phase_timeout_seconds_override: int | None = None,
         timeout_ms_override: int | None = None,
     ) -> BrowserAutomationResult:
@@ -996,6 +1002,7 @@ class BrowserAutomationService:
                                         target_job_ids=apply_target_job_ids,
                                         staged_resume_pdf_path=apply_staged_resume_pdf_path,
                                         phase_memory=phase_memory,
+                                        continuation_context=continuation_context,
                                     ),
                                     apply_staged_resume_pdf_path=apply_staged_resume_pdf_path,
                                 )
@@ -1219,6 +1226,7 @@ class BrowserAutomationService:
         resume: bool = False,
         phase_slugs: tuple[str, ...] | None = None,
         apply_target_job_ids: tuple[str, ...] | None = None,
+        continuation_context: dict[str, Any] | None = None,
         phase_timeout_seconds_override: int | None = None,
         timeout_ms_override: int | None = None,
     ) -> BrowserAutomationResult:
@@ -1234,6 +1242,7 @@ class BrowserAutomationService:
                     resume=resume,
                     phase_slugs=phase_slugs,
                     apply_target_job_ids=apply_target_job_ids,
+                    continuation_context=continuation_context,
                     phase_timeout_seconds_override=phase_timeout_seconds_override,
                     timeout_ms_override=timeout_ms_override,
                 )
