@@ -2,7 +2,7 @@
 id: site-deepseek
 name: deepseek Site Skill
 version: v1
-updated_at: '2026-06-27'
+updated_at: '2026-07-04'
 scope: site
 site_key: deepseek
 status: ready
@@ -47,6 +47,10 @@ DeepSeek currently uses a Moka/High-Flyer recruiting surface.
 ### Application Review Policy
 
 - DeepSeek/Moka application-review pages may show an application status and title without the same `#/job/<uuid>` used by job-list/detail pages.
+- DeepSeek runs in CareerEng target social recruitment roles only. During `Application Status Review`, inspect the `社招` application records only.
+- Do not inspect, switch to, or record `校招` / campus application records during normal DeepSeek runs.
+- If the candidate applications page opens on `校招`, switch once to `社招`; if `社招` is already visible, stay there.
+- After all visible `社招` application rows have been recorded through `record_application_reviews`, immediately finish `Application Status Review` as done. Do not revisit `校招`, re-open already reviewed application rows, or repeat the same `社招` list.
 - In application review, record the visible title, raw status, canonical review status, and review URL when present.
 - If the review page has no reliable `#/job/<uuid>` job URL, CareerEng may merge the review state to an existing DeepSeek job by same-site unique title only. If the title is duplicated, treat it as ambiguous and do not auto-merge.
 - Treat active review states such as `初筛`, resume review, application received, in review, in process, or similar as an active/submitted application state for apply planning; such jobs should be skipped by normal apply list generation unless the site clearly exposes a resumable unfinished application.

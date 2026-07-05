@@ -2,7 +2,7 @@
 id: application_strategy_evolution
 name: Application Strategy And Gap Evolution
 target_type: project_skill_strategy
-target_ref: skills/search/jobs/SKILL.md#Apply Matching
+target_ref: skills/search/jobs/SKILL.md#Matching Policy
 risk_level: high
 apply_policy: auto_draft_human_review_required
 ---
@@ -16,10 +16,47 @@ Improve how CareerEng decides whether a visible JD should be applied to, and hel
 This candidate is broader than apply matching. It uses application outcomes, rejection timing, JD signals, persona/CV evidence, and interview/status progression to produce:
 
 - apply matching strategy proposals
+- site or project `Matching Policy` calibration proposals
 - user gap analysis
 - learning or project direction
 - resume/persona/intent update suggestions
 - long-term application strategy memory
+
+## Matching Policy Calibration
+
+Use this candidate when evidence suggests that the project-level or site-level `Matching Policy` should change.
+
+Matching-policy evidence includes:
+
+- user corrections that a filtered-out role should have been considered or that an applied role should have been avoided
+- repeated `decision_reason_type = matching_policy` filtered-out rows for a site or role cluster
+- positive-progress applications that share a role cluster, JD signal, or site-native signal
+- rejection or no-progress clusters that share unsupported requirements
+- application feedback signals imported from Codex or `@career` conversation summaries
+- company-specific demand patterns from `target_company_intelligence_evolution`
+
+The LLM should decide whether the evidence supports:
+
+- a project-level `Matching Policy` patch
+- a site-level `Matching Policy` override
+- a memory or accepted lesson without changing Skills yet
+- a better evidence-gathering plan when the signal is weak
+
+Python may count matching-policy-relevant evidence and create this candidate, but Python must not decide which role cluster is promising or what policy wording should change.
+
+## Review-Gated Site Calibration
+
+When a site accumulates enough matching-policy evidence, CareerEng may create a Codex-facing review card before creating a concrete proposal. Codex is the interaction layer for this review.
+
+The review should:
+
+- explain why the site reached the strategy-evolution threshold
+- ask whether the user wants to evolve this site now
+- list available evolution directions from existing candidate specs
+- surface related accepted lessons, memory units, and action cards as optional evidence to inspect
+- let the user include or reject cross-site lesson transfer before writing a proposal
+
+Cross-site lessons are not automatically applied. Codex/LLM must inspect the evidence, decide whether it applies to the current site, and then write a concrete proposal using the existing proposal schema.
 
 ## Required Evidence
 
@@ -35,6 +72,11 @@ Use these local sources:
 - `workspace/cv/current/`
 - `workspace/memory/application_feedback_signals.jsonl`
 - `workspace/interviews/events.jsonl`
+- `workspace/evolution/candidates/open.jsonl`
+- `workspace/evolution/runs/`
+- `workspace/evolution/browser_control/lessons.jsonl`
+- `workspace/evolution/memory/units.jsonl`
+- `workspace/action_cards/index.jsonl`
 
 Useful evidence includes:
 
@@ -48,12 +90,15 @@ Useful evidence includes:
 - blocked or ambiguous applications
 - repeated JD requirement clusters
 - persona/CV coverage or missing evidence for those clusters
+- user correction text that explicitly changes how a role should be matched
+- previous matching-policy proposal, validation, or rollback records
 
 ## Allowed Proposals
 
 The LLM may propose:
 
-- changes to the project-level `Apply -> Matching` skill section
+- changes to the project-level `Matching Policy` skill section
+- changes to the project-level or site-level `Matching Policy` section
 - site-specific matching override suggestions if outcomes are site-specific
 - strategy memory about role types that appear more or less promising
 - gap analysis for missing skills, project evidence, domain experience, or resume wording
@@ -120,6 +165,8 @@ A proposal should include:
 - `negative_role_signals`
 - `uncertain_or_low_evidence_findings`
 - `skill_patch_proposal`
+- `matching_policy_patch_target`
+- `matching_policy_requeue_expectation`
 - `gap_analysis`
 - `learning_direction_candidates`
 - `resume_or_persona_update_suggestions`

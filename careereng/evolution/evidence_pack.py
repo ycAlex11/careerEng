@@ -11,6 +11,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from careereng.action_cards.store import ActionCardStore
+from careereng.evolution.browser_control.lessons import BrowserControlLessonStore
 from careereng.evolution.memory_units import RUN_LOCAL_CLOSED_FOR_SYNTHESIS, EvolutionMemoryStore
 from careereng.evolution.strategy_router import related_strategy_spec_payloads, strategy_family, strategy_router_payload
 from careereng.storage.jsonl import JSONLStore
@@ -100,6 +102,11 @@ def build_solution_evidence_pack(
             site_key=site_key,
             phase=phase,
             failure_pattern=failure_pattern,
+        ),
+        "related_evolution_context": _related_evolution_context(
+            workspace_path=workspace_path,
+            site_key=site_key,
+            phase=phase,
         ),
         "action_card_markdown_excerpt": _truncate(card_markdown.strip(), MAX_TEXT_CHARS),
         "proposal_contract": _proposal_contract(normalized_card, context),
@@ -228,6 +235,7 @@ def render_solution_evidence_pack_markdown(payload: dict[str, Any]) -> str:
             lines.append("```")
             lines.append("")
     lines.extend(["## Proposal Usage And Validation History", "", _json_block(payload.get("proposal_history")), ""])
+    lines.extend(["## Related Evolution Context", "", _json_block(payload.get("related_evolution_context")), ""])
     contract = payload.get("proposal_contract") if isinstance(payload.get("proposal_contract"), dict) else {}
     lines.extend(["## Required Output Contract", "", _json_block(contract), ""])
     paths = payload.get("source_paths") if isinstance(payload.get("source_paths"), dict) else {}
@@ -565,6 +573,70 @@ def _proposal_history(
     return history[-30:]
 
 
+def _related_evolution_context(*, workspace_path: Path, site_key: str, phase: str) -> dict[str, Any]:
+    lessons = BrowserControlLessonStore(workspace_path).accepted(phase=phase, limit=12)
+    memories = EvolutionMemoryStore(workspace_path).query(
+        lifecycles=["candidate", "accepted"],
+        statuses=["candidate", "accepted"],
+        limit=12,
+    )
+    cards = ActionCardStore(workspace_path).list_cards(status="open", limit=12)
+    return {
+        "accepted_browser_control_lessons": [_related_lesson_brief(row) for row in lessons],
+        "evolution_memory_units": [_related_memory_brief(row) for row in memories],
+        "open_action_cards": [_related_action_card_brief(row) for row in cards],
+        "selection_policy": (
+            "These are indexed candidates for Codex/LLM inspection. Python does not decide whether any lesson "
+            f"applies to {site_key}:{phase}."
+        ),
+    }
+
+
+def _related_lesson_brief(row: dict[str, Any]) -> dict[str, Any]:
+    origin = row.get("evidence_origin") if isinstance(row.get("evidence_origin"), dict) else {}
+    return {
+        "lesson_id": str(row.get("lesson_id") or ""),
+        "origin_site_key": str(origin.get("site_key") or row.get("site_key") or ""),
+        "phase": str(row.get("phase") or ""),
+        "lesson_type": str(row.get("lesson_type") or ""),
+        "applicability_scope": str(row.get("applicability_scope") or row.get("scope") or ""),
+        "summary": str(row.get("summary") or "")[:500],
+        "recommended_patterns": _string_list(row.get("recommended_patterns"))[:5],
+        "avoid_patterns": _string_list(row.get("avoid_patterns"))[:5],
+        "tags": _string_list(row.get("applicability_tags") or row.get("applies_to"))[:8],
+    }
+
+
+def _related_memory_brief(row: dict[str, Any]) -> dict[str, Any]:
+    proposal = row.get("proposal") if isinstance(row.get("proposal"), dict) else {}
+    materialized_change = proposal.get("materialized_change") if isinstance(proposal.get("materialized_change"), dict) else {}
+    return {
+        "memory_id": str(row.get("memory_id") or ""),
+        "candidate_id": str(row.get("candidate_id") or ""),
+        "scope": str(row.get("scope") or ""),
+        "site_key": str(row.get("site_key") or ""),
+        "phase": str(row.get("phase") or ""),
+        "lifecycle": str(row.get("lifecycle") or ""),
+        "status": str(row.get("status") or ""),
+        "pattern": str(row.get("pattern") or ""),
+        "summary": str(row.get("summary") or "")[:500],
+        "proposal_id": str(proposal.get("proposal_id") or ""),
+        "materialized_change_type": str(materialized_change.get("type") or ""),
+    }
+
+
+def _related_action_card_brief(card: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "card_id": str(card.get("card_id") or ""),
+        "card_type": str(card.get("card_type") or ""),
+        "status": str(card.get("status") or ""),
+        "priority": str(card.get("priority") or ""),
+        "title": str(card.get("title") or ""),
+        "source_type": str(card.get("source_type") or ""),
+        "source_id": str(card.get("source_id") or ""),
+    }
+
+
 def _compact_close_events(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -681,6 +753,9 @@ def _source_paths(
         ),
         "target_skill": str(_resolve_project_path(project_root, target_ref)),
         "project_jobs_skill": str(project_root / "skills" / "search" / "jobs" / "SKILL.md"),
+        "accepted_browser_control_lessons": str(workspace_path / "evolution" / "browser_control" / "lessons.jsonl"),
+        "evolution_memory_units": str(workspace_path / "evolution" / "memory" / "units.jsonl"),
+        "action_cards_index": str(workspace_path / "action_cards" / "index.jsonl"),
         "trace_refs": trace_refs,
     }
 
@@ -715,6 +790,12 @@ def _evidence_index(
             if name != "trace_refs" and value not in (None, "", [], {})
         ],
         "trace_refs": list(trace_refs),
+        "related_evolution_context": {
+            "accepted_browser_control_lessons": source_paths.get("accepted_browser_control_lessons") or "",
+            "evolution_memory_units": source_paths.get("evolution_memory_units") or "",
+            "action_cards_index": source_paths.get("action_cards_index") or "",
+            "selection_policy": "Codex/LLM inspects these sources and decides whether any lesson is relevant; Python only indexes them.",
+        },
         "starter_excerpt_warning": "Trace/skill/failure excerpts are convenience context only; inspect indexed sources when writing a durable proposal.",
     }
 
@@ -764,6 +845,15 @@ def _compact_json_value(value: Any) -> Any:
     if isinstance(value, str):
         return _truncate(value, 500)
     return value
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, tuple):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    return [text] if text else []
 
 
 def _json_block(value: Any) -> str:

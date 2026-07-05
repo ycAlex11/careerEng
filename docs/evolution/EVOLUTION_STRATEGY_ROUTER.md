@@ -12,6 +12,16 @@ Python may load this file, list candidate specs, archive evidence paths, validat
 4. Use the evidence index to choose which local files to inspect. Do not assume Python-selected excerpts are exhaustive.
 5. Write a concrete proposal through the existing proposal schema. Do not answer with only a summary.
 
+## Review-Gated Triggering
+
+When a site reaches an evolution threshold, CareerEng may create a Codex-readable review card before creating a concrete evolution run.
+
+The review card is not the proposal. It should be used by Codex to explain the trigger, list available evolution directions, and ask the user whether to evolve now. If the user agrees, Codex should select one or more existing candidate specs and then create the normal solution request/proposal through the existing evolution flow.
+
+The review card may list related accepted lessons, memory units, and action cards from other sites. These are evidence candidates only. Codex/LLM decides whether to inspect them and whether any cross-site lesson should influence the current site. Python must not auto-transfer lessons or decide applicability.
+
+If the user says not now, record the skip/selection outcome so the same threshold evidence does not repeatedly interrupt the user until new evidence reaches the next threshold.
+
 ## Strategy Map
 
 | Strategy | Candidate Spec | Use When |
@@ -19,7 +29,7 @@ Python may load this file, list candidate specs, archive evidence paths, validat
 | `site_workflow_evolution` | `new_site_workflow_transfer` | A new target company/site needs a draft or first testable site Skill. |
 | `site_workflow_evolution` | `apply_form_workflow` | A selected job enters apply/form/upload/submit workflow and repeated blockers or probe results should change strategy. |
 | `site_workflow_evolution` | `site_workflow_compaction` | An existing site/phase has repeated runs and should compact stable operations, caveats, or workflow memory into Skills. |
-| `application_strategy_evolution` | `application_strategy_evolution` | JD matching, filtered-out policy, application decision rules, or outcome-driven strategy should change. |
+| `application_strategy_evolution` | `application_strategy_evolution` | JD matching, filtered-out policy, user/site matching-policy calibration, application decision rules, or outcome-driven strategy should change. |
 | `assistant_memory_evolution` | `assistant_router_memory_intake` | Codex/@career conversations, memory routing, curation examples, or assistant-intake policy should improve. |
 | `resume_profile_evolution` | `resume_profile_evolution` | CV, persona, profile facts, resume Markdown/PDF, or user capability representation should change. |
 | `target_company_intelligence_evolution` | `target_company_intelligence_evolution` | Company demand, rejected/progress patterns, skill gaps, learning plans, or interview intelligence should be synthesized. |
@@ -52,6 +62,19 @@ Disallowed Python responsibilities:
 - choose site-specific form actions, selectors, filters, or matching policy
 - infer user facts or job desirability
 - write narrow site-specific runtime branches to make one observed case pass
+
+## Matching Policy Calibration Routing
+
+Route to `application_strategy_evolution` when the primary question is whether user/application evidence should change project-level or site-level matching rules.
+
+Examples:
+
+- the user corrects a `filtered_out` role and says it should have been considered
+- a company has repeated positive-progress roles with a shared JD pattern
+- a company has repeated matching-policy filtered-out rows that may no longer reflect the user's current direction
+- imported application feedback says the user's target direction has shifted
+
+Do not route these cases to `site_workflow_evolution` unless the issue is how to operate the website. Website navigation, filters, forms, uploads, and submit flow are workflow evolution. Job desirability, role-cluster weighting, and `Matching Policy` wording are application-strategy evolution.
 
 ## Proposal Expectations
 

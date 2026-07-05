@@ -84,13 +84,12 @@ apply_enabled: true
 - If `apply_enabled` is true or the current task requests applying and only public `Profile` or `Sign In` links are visible, the previous login preparation is not complete. Open the sign-in/profile path if possible; if Apple requires password, MFA, verification, CAPTCHA, device approval, passkey approval, or another human-only challenge, stop with `blocked` and ask for user takeover.
 - For apply-enabled runs, do not end `Application Status Review` as `done` from a public-only search page unless a signed-in profile/account surface is visible or the phase records a precise blocked reason.
 - From a clearly signed-in Apple Careers page, open `Profile`.
-- On Apple's `Your Roles` page (`/app/en-us/profile/roles`), check only the application-related role areas once:
-  - Use `Submissions` as the primary submitted-application surface.
-  - Treat `Active` under `Submissions` as the realtime area. Inspect every reachable Active page, record visible submitted application rows page by page, and stop Active only when no real `Next Page` or load-more action remains.
-  - Treat `Archived` under `Submissions` as the historical area. Inspect and record the current Archived page before deciding whether to continue. If the current Archived page is already covered by matched terminal local history, has no unmatched rows, and shows no status changes, stop Archived instead of paging through older records.
-  - Click `Archived` only after Active is complete. Do not switch back and forth between `Active` and `Archived`.
-  - If a current area shows no application rows, treat that area as complete only when there is also no usable pagination or load-more control for that area.
-  - Do not call `record_application_reviews` with an empty list until every required visible area has been checked and all required areas are empty or unavailable.
+- On Apple's `Your Roles` page (`/app/en-us/profile/roles`), treat `Submissions` as one submitted-application review surface:
+  - Prefer the currently visible submitted-role list. Record visible rows from the current `Submissions` surface before any tab or pagination action.
+  - `Active` is the primary live area. `Archived` is an optional historical supplement only when it is clearly visible and can be opened once without revisiting an already-inspected area.
+  - Do not switch back and forth between `Active` and `Archived`, and do not click either tab only to confirm progress after rows were already recorded.
+  - If the current `Submissions` surface has no application rows, treat it as complete when there is no usable pagination or load-more control visible for that same surface.
+  - Do not call `record_application_reviews` with an empty list until the current visible `Submissions` surface has been inspected and is empty or unavailable.
 - Look for visible application, submitted role, saved role, recently viewed role, or profile application-history surfaces.
 - If Apple shows an application list, record each visible application row with the best available title, URL, role number, visible raw status, and normalized `application_review_status`.
 - If Apple only shows saved roles, recently viewed roles, profile info, or no application-history area, record that no reliable application-status dashboard was found and end `Application Status Review` with `done`.
@@ -104,12 +103,12 @@ apply_enabled: true
 
 ### Completion Or Blocked
 
-- End the phase only after Active has been fully paged and Archived has been checked or safely stopped by the project historical-area coverage rule.
-- On `/app/en-us/profile/roles`, the phase is complete after `Submissions -> Active` and, when visible, `Submissions -> Archived` have both been completed.
+- On `/app/en-us/profile/roles`, the phase is complete after the current visible `Submissions` surface has been inspected and recorded or found empty with no same-surface pagination remaining.
+- If `Archived` was not already open and opening it would revisit a completed area, create a tab loop, or leave the current recorded surface without clear new rows, skip it and finish the phase.
 - If no Apple submitted applications are visible in any required area and no pagination remains, recording zero application reviews is a valid completion. After recording zero reviews, immediately call `phase_result` with `status=done`.
 - Do not loop through saved roles, recently viewed roles, or profile tabs when no submitted-application list is visible.
 - Do not click `Active` and `Archived` repeatedly after zero visible application rows have already been established.
-- After any successful `record_application_reviews` call for the final required Apple area, immediately call `phase_result` with `status=done`; do not click `Next Page`, `Active`, or `Archived` again.
+- After any successful `record_application_reviews` call for the current Apple `Submissions` surface, immediately call `phase_result` with `status=done` unless a real same-surface `Next Page` or load-more control is visible and has not been inspected. Do not click `Active` or `Archived` again after recording the current surface.
 - Do not create history rows for Apple dashboard records that are not already in local history; record them through application review only.
 
 ## Channel Discovery

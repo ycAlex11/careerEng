@@ -24,7 +24,12 @@ from careereng.skill_schema import (
 from careereng.skill_schema.schema import file_hash
 from careereng.storage.job_identity import infer_site_job_id_from_url, normalize_identity_url
 from careereng.storage.jsonl import JSONLStore
-from careereng.storage.posted_time import current_posted_age_observation, normalize_posted_fields
+from careereng.storage.posted_time import (
+    current_posted_age_observation,
+    normalize_posted_fields,
+    parse_posted_date,
+    parse_relative_posted_age,
+)
 from careereng.utils import dump_front_matter, ensure_dir, make_id, now_iso, parse_front_matter, read_json, safe_file_stem, today_str, write_json
 
 
@@ -107,7 +112,13 @@ class SiteStore:
         "posted_at",
         "posted_label",
         "posted_observed_at",
+        "posted_first_observed_at",
+        "posted_first_observed_label",
         "inferred_posted_date",
+        "current_posted_age_source",
+        "posted_age_refreshed_at",
+        "posted_age_bound_source",
+        "posted_age_bound_from_row_index",
         "employment_type",
         "match_label",
         "apply_state",
@@ -149,8 +160,50 @@ class SiteStore:
         "match_score_final",
         "fit_confidence",
         "observed_posted_age_days",
+        "first_observed_posted_age_days",
+        "current_posted_age_days",
     )
-    RUN_JOB_BOOL_FIELDS = ("fit_apply", "observed_posted_age_is_lower_bound")
+    RUN_JOB_BOOL_FIELDS = (
+        "fit_apply",
+        "observed_posted_age_is_lower_bound",
+        "first_observed_posted_age_is_lower_bound",
+        "current_posted_age_is_lower_bound",
+    )
+    HISTORY_DECISION_FIELDS = {
+        "apply_state",
+        "decision_status",
+        "decision_rule_source",
+        "decision_rule_name",
+        "site_match_signal_raw",
+        "match_reason_initial",
+        "match_reason_final",
+        "fit_reason",
+        "fit_source",
+        "application_status",
+        "application_status_raw",
+        "last_apply_error",
+        "decision_reason_type",
+        "decision_context_hash",
+        "block_reason_type",
+        "failure_pattern",
+        "loop_control_action",
+        "recommended_target",
+        "evidence",
+        "refinement_hint",
+    }
+    FRESH_FILTERED_DECISION_SIGNAL_FIELDS = (
+        "fit_apply",
+        "fit_reason",
+        "fit_source",
+        "decision_rule_source",
+        "decision_rule_name",
+        "site_match_signal_raw",
+        "match_reason_initial",
+        "match_reason_final",
+        "evidence",
+        "refinement_hint",
+        "decision_updated_at",
+    )
 
     def __init__(self, workspace: Path, project_root: Path | None = None):
         self.workspace = Path(workspace)
@@ -692,7 +745,7 @@ class SiteStore:
             window_days = 0
         if window_days <= 0:
             return False
-        posted_age = current_posted_age_observation(normalize_posted_fields(dict(row)))
+        posted_age = cls._safe_current_posted_age_observation(row)
         days = posted_age.get("days")
         if days is None:
             return str(payload.get("unknown_posted_age") or "review").strip().lower() == "filtered_out"
@@ -710,7 +763,7 @@ class SiteStore:
         *,
         apply_candidate_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        normalized = normalize_posted_fields(dict(row))
+        normalized = cls._normalize_history_posted_age_row(dict(row), refreshed_at=now_iso())
         application_status = str(normalized.get("application_status") or "").strip().lower()
         decision_status = str(normalized.get("decision_status") or "").strip().lower()
         match_label = str(normalized.get("match_label") or "").strip().lower()
@@ -834,9 +887,17 @@ class SiteStore:
             normalized["decision_reason_type"] = reason_type
         posted_age = cls._infer_posted_age(normalized)
         posted_age_days = posted_age.get("days")
-        if posted_age_days is not None and normalized.get("observed_posted_age_days") in (None, ""):
+        if (
+            posted_age_days is not None
+            and posted_age.get("source") != "retrieval_order_estimate"
+            and normalized.get("observed_posted_age_days") in (None, "")
+        ):
             normalized["observed_posted_age_days"] = posted_age_days
-        if posted_age.get("is_lower_bound") and normalized.get("observed_posted_age_is_lower_bound") in (None, ""):
+        if (
+            posted_age.get("source") != "retrieval_order_estimate"
+            and posted_age.get("is_lower_bound")
+            and normalized.get("observed_posted_age_is_lower_bound") in (None, "")
+        ):
             normalized["observed_posted_age_is_lower_bound"] = True
         return normalized
 
@@ -930,7 +991,92 @@ class SiteStore:
 
     @staticmethod
     def _infer_posted_age(row: dict[str, Any]) -> dict[str, Any]:
-        return current_posted_age_observation(normalize_posted_fields(dict(row)))
+        return SiteStore._safe_current_posted_age_observation(row)
+
+    @classmethod
+    def _safe_current_posted_age_observation(cls, row: dict[str, Any], *, refreshed_at: str = "") -> dict[str, Any]:
+        refresh_time = refreshed_at or now_iso()
+        stored = cls._stored_current_posted_age(row, current_at=refresh_time)
+        if stored.get("days") is not None:
+            return stored
+        normalized = cls._normalize_history_posted_age_row(dict(row), refreshed_at=refresh_time)
+        if cls._has_unanchored_relative_posted_age(row, normalized):
+            return {"days": None, "is_lower_bound": False, "source": ""}
+        return current_posted_age_observation(normalized)
+
+    @classmethod
+    def _stored_current_posted_age(cls, row: dict[str, Any], *, current_at: str = "") -> dict[str, Any]:
+        days = cls._coerce_int(row.get("current_posted_age_days"))
+        if days is None:
+            return {"days": None, "is_lower_bound": False, "source": ""}
+        refreshed_date = parse_posted_date(row.get("posted_age_refreshed_at"), observed_at=current_at or now_iso())
+        current_date = parse_posted_date(current_at or now_iso(), observed_at=current_at or now_iso())
+        if refreshed_date is not None and current_date is not None:
+            days += max(0, (current_date - refreshed_date).days)
+        is_lower_bound = cls._coerce_bool(row.get("current_posted_age_is_lower_bound"))
+        if days >= 30:
+            days = 30
+            is_lower_bound = True
+        return {
+            "days": max(0, days),
+            "is_lower_bound": is_lower_bound,
+            "source": str(row.get("current_posted_age_source") or "current_posted_age"),
+        }
+
+    @classmethod
+    def _write_current_posted_age(
+        cls,
+        row: dict[str, Any],
+        *,
+        current_age: dict[str, Any],
+        refreshed_at: str,
+        source: str = "",
+        bound_source: str = "",
+        bound_row_index: int | None = None,
+    ) -> dict[str, Any]:
+        days = cls._coerce_int(current_age.get("days"))
+        if days is None:
+            return row
+        lower_bound = cls._coerce_bool(current_age.get("is_lower_bound"))
+        if days >= 30:
+            days = 30
+            lower_bound = True
+        row["current_posted_age_days"] = max(0, days)
+        row["current_posted_age_is_lower_bound"] = lower_bound
+        row["current_posted_age_source"] = source or str(current_age.get("source") or "")
+        row["posted_age_refreshed_at"] = refreshed_at
+        if bound_source:
+            row["posted_age_bound_source"] = bound_source
+        if bound_row_index is not None:
+            row["posted_age_bound_from_row_index"] = str(bound_row_index)
+        return row
+
+    @classmethod
+    def _with_posted_first_observation(cls, row: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        if str(normalized.get("posted_first_observed_at") or "").strip():
+            return normalized
+        observed_at = str(
+            normalized.get("posted_observed_at")
+            or normalized.get("ts")
+            or normalized.get("first_seen_at")
+            or normalized.get("last_seen_at")
+            or ""
+        ).strip()
+        label = str(normalized.get("posted_label") or normalized.get("posted_at") or "").strip()
+        age_days = cls._coerce_int(normalized.get("observed_posted_age_days"))
+        if not observed_at and not label and age_days is None:
+            return normalized
+        if observed_at:
+            normalized["posted_first_observed_at"] = observed_at
+        if label:
+            normalized["posted_first_observed_label"] = label
+        if age_days is not None:
+            normalized["first_observed_posted_age_days"] = age_days
+            normalized["first_observed_posted_age_is_lower_bound"] = cls._coerce_bool(
+                normalized.get("observed_posted_age_is_lower_bound")
+            )
+        return normalized
 
     @classmethod
     def _normalize_history_row_for_write(cls, row: dict[str, Any]) -> dict[str, Any]:
@@ -1033,7 +1179,13 @@ class SiteStore:
             "posted_at",
             "posted_label",
             "posted_observed_at",
+            "posted_first_observed_at",
+            "posted_first_observed_label",
             "inferred_posted_date",
+            "current_posted_age_source",
+            "posted_age_refreshed_at",
+            "posted_age_bound_source",
+            "posted_age_bound_from_row_index",
             "employment_type",
             "match_label",
             "apply_state",
@@ -1077,10 +1229,35 @@ class SiteStore:
         first_seen = cls._merge_earliest(primary.get("first_seen_at"), secondary.get("first_seen_at"))
         if first_seen:
             merged["first_seen_at"] = first_seen
+        posted_first_observed_at = cls._merge_earliest(
+            primary.get("posted_first_observed_at"),
+            secondary.get("posted_first_observed_at"),
+        )
+        if posted_first_observed_at:
+            merged["posted_first_observed_at"] = posted_first_observed_at
+            for source in sorted(
+                (primary, secondary),
+                key=lambda item: str(item.get("posted_first_observed_at") or "9999"),
+            ):
+                if str(source.get("posted_first_observed_at") or "").strip() != posted_first_observed_at:
+                    continue
+                if str(source.get("posted_first_observed_label") or "").strip():
+                    merged["posted_first_observed_label"] = source["posted_first_observed_label"]
+                if source.get("first_observed_posted_age_days") not in (None, ""):
+                    try:
+                        merged["first_observed_posted_age_days"] = int(float(source["first_observed_posted_age_days"]))
+                    except Exception:
+                        pass
+                if source.get("first_observed_posted_age_is_lower_bound") not in (None, ""):
+                    merged["first_observed_posted_age_is_lower_bound"] = source[
+                        "first_observed_posted_age_is_lower_bound"
+                    ]
+                break
         for field in (
             "last_seen_at",
             "ts",
             "posted_observed_at",
+            "posted_age_refreshed_at",
             "application_review_checked_at",
             "application_updated_at",
             "decision_updated_at",
@@ -1093,13 +1270,28 @@ class SiteStore:
             merged["seen_count"] = max(int(primary.get("seen_count") or 0), int(secondary.get("seen_count") or 0))
         except Exception:
             pass
-        for field in ("observed_posted_age_days",):
+        for field in ("observed_posted_age_days", "first_observed_posted_age_days"):
             if merged.get(field) in (None, "") and secondary.get(field) not in (None, ""):
                 try:
                     merged[field] = int(float(secondary.get(field)))
                 except Exception:
                     pass
-        for field in ("observed_posted_age_is_lower_bound", "fit_apply", "is_active", "application_review_status_changed"):
+        for field in ("current_posted_age_days",):
+            if secondary.get(field) not in (None, ""):
+                try:
+                    merged[field] = int(float(secondary.get(field)))
+                except Exception:
+                    pass
+        for field in ("current_posted_age_is_lower_bound",):
+            if field in secondary:
+                merged[field] = secondary[field]
+        for field in (
+            "observed_posted_age_is_lower_bound",
+            "first_observed_posted_age_is_lower_bound",
+            "fit_apply",
+            "is_active",
+            "application_review_status_changed",
+        ):
             if field not in merged and field in secondary:
                 merged[field] = secondary[field]
         if isinstance(primary.get("context_versions"), dict):
@@ -1494,6 +1686,15 @@ class SiteStore:
         if text in {"", "0", "false", "no", "off", "none", "null"}:
             return False
         return True
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return int(float(value))
+        except Exception:
+            return None
 
     def _job_ids(self, site_id: str, title: str, employer: str, url: str) -> tuple[str, str]:
         canonical_source = "|".join(
@@ -1892,11 +2093,39 @@ class SiteStore:
         return False
 
     @classmethod
+    def _is_filtered_out_terminal_row(cls, row: dict[str, Any]) -> bool:
+        application_status = str(row.get("application_status") or "").strip().lower()
+        decision_status = str(row.get("decision_status") or "").strip().lower()
+        apply_state = str(row.get("apply_state") or "").strip().lower()
+        return (
+            application_status == "filtered_out"
+            or decision_status == "filtered_out"
+            or apply_state in {"filtered_out", "terminal_filtered_out", "not_started_filtered_out"}
+        )
+
+    @classmethod
+    def _has_fresh_filtered_out_decision_signal(cls, row: dict[str, Any]) -> bool:
+        for field in cls.FRESH_FILTERED_DECISION_SIGNAL_FIELDS:
+            if field == "fit_apply":
+                if field in row:
+                    return True
+                continue
+            if str(row.get(field) or "").strip():
+                return True
+        return False
+
+    @classmethod
     def _merge_job_row(cls, base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
         incoming = normalize_posted_fields(dict(incoming))
+        incoming = cls._with_posted_first_observation(incoming)
         merged = dict(base)
         incoming_has_outcome = cls._has_history_outcome_signal(incoming)
         base_has_outcome = cls._has_history_outcome_signal(base)
+        preserve_existing_filtered_decision = (
+            cls._is_filtered_out_terminal_row(base)
+            and cls._is_filtered_out_terminal_row(incoming)
+            and not cls._has_fresh_filtered_out_decision_signal(incoming)
+        )
         if incoming_has_outcome or not base_has_outcome:
             for field in ("batch_id", "session_id", "turn_id"):
                 value = str(incoming.get(field) or "").strip()
@@ -1912,7 +2141,13 @@ class SiteStore:
             "posted_at",
             "posted_label",
             "posted_observed_at",
+            "posted_first_observed_at",
+            "posted_first_observed_label",
             "inferred_posted_date",
+            "current_posted_age_source",
+            "posted_age_refreshed_at",
+            "posted_age_bound_source",
+            "posted_age_bound_from_row_index",
             "employment_type",
             "match_label",
             "apply_state",
@@ -1941,16 +2176,40 @@ class SiteStore:
         ):
             value = str(incoming.get(field) or "").strip()
             if value:
+                if preserve_existing_filtered_decision and field in cls.HISTORY_DECISION_FIELDS:
+                    continue
+                if field.startswith("posted_first_observed") and str(merged.get(field) or "").strip():
+                    continue
                 merged[field] = value
-        if isinstance(incoming.get("context_versions"), dict):
+        if isinstance(incoming.get("context_versions"), dict) and not preserve_existing_filtered_decision:
             merged["context_versions"] = dict(incoming["context_versions"])
         if incoming.get("observed_posted_age_days") not in (None, ""):
             try:
                 merged["observed_posted_age_days"] = int(float(incoming.get("observed_posted_age_days")))
             except Exception:
                 pass
+        if incoming.get("first_observed_posted_age_days") not in (None, "") and merged.get(
+            "first_observed_posted_age_days"
+        ) in (None, ""):
+            try:
+                merged["first_observed_posted_age_days"] = int(float(incoming.get("first_observed_posted_age_days")))
+            except Exception:
+                pass
+        if incoming.get("current_posted_age_days") not in (None, ""):
+            try:
+                merged["current_posted_age_days"] = int(float(incoming.get("current_posted_age_days")))
+            except Exception:
+                pass
         if incoming.get("observed_posted_age_is_lower_bound") not in (None, ""):
             merged["observed_posted_age_is_lower_bound"] = cls._coerce_bool(incoming.get("observed_posted_age_is_lower_bound"))
+        if incoming.get("first_observed_posted_age_is_lower_bound") not in (None, "") and (
+            "first_observed_posted_age_is_lower_bound" not in merged
+        ):
+            merged["first_observed_posted_age_is_lower_bound"] = cls._coerce_bool(
+                incoming.get("first_observed_posted_age_is_lower_bound")
+            )
+        if incoming.get("current_posted_age_is_lower_bound") not in (None, ""):
+            merged["current_posted_age_is_lower_bound"] = cls._coerce_bool(incoming.get("current_posted_age_is_lower_bound"))
         ts = str(incoming.get("ts") or "").strip()
         if ts:
             merged["ts"] = ts
@@ -2021,6 +2280,8 @@ class SiteStore:
                 continue
             text = str(value).strip()
             if text:
+                if field.startswith("posted_first_observed") and str(merged.get(field) or "").strip():
+                    continue
                 if field == "url":
                     merged[field] = self._normalize_url(text)
                 else:
@@ -2030,10 +2291,14 @@ class SiteStore:
             if value in (None, ""):
                 continue
             try:
+                if field.startswith("first_observed_") and merged.get(field) not in (None, ""):
+                    continue
                 merged[field] = float(value)
             except Exception:
                 continue
         for field in self.RUN_JOB_BOOL_FIELDS:
+            if field.startswith("first_observed_") and field in merged:
+                continue
             if field in incoming:
                 merged[field] = self._coerce_bool(incoming.get(field))
         if isinstance(incoming.get("context_versions"), dict):
@@ -2353,9 +2618,17 @@ class SiteStore:
                 row["decision_context_hash"] = context_hash(row["context_versions"])
             posted_age = self._infer_posted_age(row)
             posted_age_days = posted_age.get("days")
-            if posted_age_days is not None and row.get("observed_posted_age_days") in (None, ""):
+            if (
+                posted_age_days is not None
+                and posted_age.get("source") != "retrieval_order_estimate"
+                and row.get("observed_posted_age_days") in (None, "")
+            ):
                 row["observed_posted_age_days"] = posted_age_days
-            if posted_age.get("is_lower_bound") and row.get("observed_posted_age_is_lower_bound") in (None, ""):
+            if (
+                posted_age.get("source") != "retrieval_order_estimate"
+                and posted_age.get("is_lower_bound")
+                and row.get("observed_posted_age_is_lower_bound") in (None, "")
+            ):
                 row["observed_posted_age_is_lower_bound"] = True
             rows[idx] = row
             updated += 1
@@ -2471,6 +2744,8 @@ class SiteStore:
         session_id: str,
         turn_id: str,
         batch_id: str = "",
+        *,
+        newest_first_confirmed: bool = False,
     ) -> list[dict[str, Any]]:
         root = self.site_dir(site_id)
         identity_policy = self._job_identity_policy(site_id)
@@ -2506,7 +2781,10 @@ class SiteStore:
                 run_index.setdefault(key, idx)
 
         appended_rows: list[dict[str, Any]] = []
-        for job in jobs:
+        order_cursor_age: int | None = None
+        order_cursor_lower_bound = False
+        order_cursor_row_index: int | None = None
+        for current_page_index, job in enumerate(jobs):
             if not isinstance(job, dict):
                 continue
             title = str(job.get("title") or "").strip()
@@ -2546,7 +2824,35 @@ class SiteStore:
                 "site_job_id": site_job_id,
                 "description_ref": description_ref,
             }
-            snapshot = normalize_posted_fields(snapshot, observed_at=now)
+            snapshot = self._with_posted_first_observation(normalize_posted_fields(snapshot, observed_at=now))
+            explicit_current_age = current_posted_age_observation(snapshot)
+            if explicit_current_age.get("days") is not None:
+                snapshot = self._write_current_posted_age(
+                    snapshot,
+                    current_age=explicit_current_age,
+                    refreshed_at=now,
+                )
+                order_cursor_age = self._coerce_int(snapshot.get("current_posted_age_days"))
+                order_cursor_lower_bound = self._coerce_bool(snapshot.get("current_posted_age_is_lower_bound"))
+                order_cursor_row_index = current_page_index
+            elif newest_first_confirmed and order_cursor_age is not None:
+                estimated_age = min(order_cursor_age + 1, 30)
+                estimated_lower_bound = order_cursor_lower_bound or estimated_age >= 30
+                snapshot = self._write_current_posted_age(
+                    snapshot,
+                    current_age={
+                        "days": estimated_age,
+                        "is_lower_bound": estimated_lower_bound,
+                        "source": "retrieval_order_estimate",
+                    },
+                    refreshed_at=now,
+                    source="retrieval_order_estimate",
+                    bound_source="retrieval_order_estimate",
+                    bound_row_index=order_cursor_row_index,
+                )
+                order_cursor_age = estimated_age
+                order_cursor_lower_bound = estimated_lower_bound
+                order_cursor_row_index = current_page_index
             dedupe_keys = run_dedupe_keys(snapshot)
             row_index = next((run_index[key] for key in dedupe_keys if key in run_index), None)
             if row_index is not None:
@@ -2738,6 +3044,108 @@ class SiteStore:
         self._write_history_jobs(site_id, merged_rows)
         return [history_index[job_id] for job_id in promoted_ids if job_id in history_index]
 
+    def refresh_history_posted_age_metadata(self, site_id: str) -> dict[str, Any]:
+        """Refresh deterministic posted-age fields before batch planning.
+
+        This preserves raw site text and only updates derived comparison fields.
+        """
+
+        rows = self._load_history_jobs(site_id)
+        if not rows:
+            return {"status": "empty", "site_key": site_id, "count": 0, "updated_count": 0}
+
+        refreshed_at = now_iso()
+        updated_count = 0
+        comparable_count = 0
+        unknown_count = 0
+        next_rows: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                next_rows.append(row)
+                continue
+            original = dict(row)
+            normalized = self._normalize_history_posted_age_row(original, refreshed_at=refreshed_at)
+            current_age = (
+                {"days": None, "is_lower_bound": False, "source": ""}
+                if self._has_unanchored_relative_posted_age(original, normalized)
+                else self._stored_current_posted_age(normalized, current_at=refreshed_at)
+            )
+            if current_age.get("days") is None and not self._has_unanchored_relative_posted_age(original, normalized):
+                current_age = current_posted_age_observation(normalized)
+            days = current_age.get("days")
+            if days is None:
+                unknown_count += 1
+            else:
+                comparable_count += 1
+                normalized = self._write_current_posted_age(
+                    normalized,
+                    current_age=current_age,
+                    refreshed_at=refreshed_at,
+                )
+            if normalized != original:
+                updated_count += 1
+            next_rows.append(normalized)
+
+        if updated_count:
+            self._write_history_jobs(site_id, next_rows)
+        return {
+            "status": "updated" if updated_count else "unchanged",
+            "site_key": site_id,
+            "count": len(rows),
+            "updated_count": updated_count,
+            "comparable_count": comparable_count,
+            "unknown_count": unknown_count,
+            "refreshed_at": refreshed_at,
+        }
+
+    @classmethod
+    def _normalize_history_posted_age_row(cls, row: dict[str, Any], *, refreshed_at: str) -> dict[str, Any]:
+        observation_time = cls._posted_observation_time(row)
+        candidate = dict(row)
+        if not str(candidate.get("posted_label") or candidate.get("posted_at") or "").strip():
+            first_label = str(candidate.get("posted_first_observed_label") or "").strip()
+            if first_label:
+                candidate["posted_label"] = first_label
+        if observation_time:
+            return cls._with_posted_first_observation(normalize_posted_fields(candidate, observed_at=observation_time))
+        if cls._has_absolute_posted_date(candidate, observed_at=refreshed_at):
+            return cls._with_posted_first_observation(normalize_posted_fields(candidate, observed_at=refreshed_at))
+        if cls._has_relative_posted_age_text(candidate):
+            return cls._with_posted_first_observation(candidate)
+        return cls._with_posted_first_observation(normalize_posted_fields(candidate, observed_at=refreshed_at))
+
+    @staticmethod
+    def _posted_observation_time(row: dict[str, Any]) -> str:
+        for field in ("posted_observed_at", "posted_first_observed_at", "last_seen_at", "first_seen_at", "ts"):
+            value = str(row.get(field) or "").strip()
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _has_relative_posted_age_text(row: dict[str, Any]) -> bool:
+        text = " ".join(
+            str(row.get(field) or "")
+            for field in ("posted_label", "posted_at", "fit_reason", "match_reason_initial", "match_reason_final", "reason")
+        )
+        relative = parse_relative_posted_age(text)
+        return relative.get("days") is not None
+
+    @staticmethod
+    def _has_absolute_posted_date(row: dict[str, Any], *, observed_at: str) -> bool:
+        for field in ("posted_at", "posted_label", "inferred_posted_date"):
+            if parse_posted_date(row.get(field), observed_at=observed_at) is not None:
+                return True
+        return False
+
+    @classmethod
+    def _has_unanchored_relative_posted_age(cls, original: dict[str, Any], normalized: dict[str, Any]) -> bool:
+        if cls._posted_observation_time(original):
+            return False
+        if str(normalized.get("inferred_posted_date") or "").strip():
+            return False
+        return cls._has_relative_posted_age_text(original)
+
     def update_job_decisions(self, site_id: str, jobs: list[dict[str, Any]]) -> None:
         rows = self._load_history_jobs(site_id)
         by_job_id, by_canonical_job_id, by_match_key = self._history_resolution_indexes(site_id, rows)
@@ -2778,16 +3186,31 @@ class SiteStore:
                 current["decision_reason_type"] = reason_type
             elif current["decision_status"] == "filtered_out" and not str(current.get("decision_reason_type") or "").strip():
                 current["decision_reason_type"] = self._infer_decision_reason_type(current)
-            posted_payload = normalize_posted_fields(dict(job))
+            posted_payload = self._with_posted_first_observation(normalize_posted_fields(dict(job)))
             for field in (
                 "posted_at",
                 "posted_label",
                 "posted_observed_at",
+                "posted_first_observed_at",
+                "posted_first_observed_label",
                 "inferred_posted_date",
                 "observed_posted_age_days",
                 "observed_posted_age_is_lower_bound",
+                "first_observed_posted_age_days",
+                "first_observed_posted_age_is_lower_bound",
+                "current_posted_age_days",
+                "current_posted_age_is_lower_bound",
+                "current_posted_age_source",
+                "posted_age_refreshed_at",
+                "posted_age_bound_source",
+                "posted_age_bound_from_row_index",
             ):
                 if posted_payload.get(field) not in (None, ""):
+                    if (
+                        field.startswith("posted_first_observed")
+                        or field.startswith("first_observed_posted")
+                    ) and current.get(field) not in (None, ""):
+                        continue
                     current[field] = posted_payload[field]
             current["decision_updated_at"] = now_iso()
             changed = True
@@ -2834,16 +3257,31 @@ class SiteStore:
                 current["decision_reason_type"] = reason_type
             elif str(status or "").strip().lower() == "filtered_out" and not str(current.get("decision_reason_type") or "").strip():
                 current["decision_reason_type"] = self._infer_decision_reason_type(current)
-            posted_payload = normalize_posted_fields(dict(app))
+            posted_payload = self._with_posted_first_observation(normalize_posted_fields(dict(app)))
             for field in (
                 "posted_at",
                 "posted_label",
                 "posted_observed_at",
+                "posted_first_observed_at",
+                "posted_first_observed_label",
                 "inferred_posted_date",
                 "observed_posted_age_days",
                 "observed_posted_age_is_lower_bound",
+                "first_observed_posted_age_days",
+                "first_observed_posted_age_is_lower_bound",
+                "current_posted_age_days",
+                "current_posted_age_is_lower_bound",
+                "current_posted_age_source",
+                "posted_age_refreshed_at",
+                "posted_age_bound_source",
+                "posted_age_bound_from_row_index",
             ):
                 if posted_payload.get(field) not in (None, ""):
+                    if (
+                        field.startswith("posted_first_observed")
+                        or field.startswith("first_observed_posted")
+                    ) and current.get(field) not in (None, ""):
+                        continue
                     current[field] = posted_payload[field]
             apply_state = self._history_apply_state_for_application_status(status)
             if apply_state:

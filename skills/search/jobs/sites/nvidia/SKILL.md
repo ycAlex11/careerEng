@@ -42,6 +42,7 @@ apply_candidate_policy:
 ### Application Gate
 
 - Use the project common matching rule unless NVIDIA exposes a clearer site-native decision signal for the current role.
+- During NVIDIA matching-policy calibration, live-review near-threshold software roles when they combine NVIDIA engineering context with AI/software productivity, platform infrastructure, compiler/toolchain, test automation, or developer-experience signals.
 - Do not apply to NVIDIA roles posted 30 days ago, `30+ Days Ago`, or older.
 - If posted timing cannot be confirmed as within the last 30 days after checking the live job page, mark the role `filtered_out`.
 - Hard-exclude intern, campus, student, new-grad, co-op, 校招, and 实习 roles before opening any apply flow.
@@ -185,21 +186,31 @@ apply_candidate_policy:
 
 ### Matching Override
 
-- NVIDIA does not add a stronger fit rule here by default.
-- Use the common matching rule from the project jobs skill unless the live page exposes a clearer site-native decision signal for the current role.
+- NVIDIA matching should be more apply-forward than the project default when the role has strong technical overlap with the user's current AI/software direction.
+- Treat NVIDIA roles as `recommended_apply` when the JD has credible overlap with Python, C++, software engineering, AI application delivery, AI agents, LLM/generative-AI systems, MCP/agentic workflow, AI platform/application engineering, CI/infrastructure, test automation, developer tooling, or engineering productivity, even if the business domain is not an exact match.
+- For NVIDIA, do not filter out a role merely because its product area is compiler, CUDA-adjacent testing, deep-learning libraries, infrastructure, MarTech platform engineering, or platform tooling when the required technical stack is close and the years requirement is realistic for the user.
+- Weight explicit AI application, AI agent, LLM, generative-AI, MCP, workflow automation, applied-AI platform, or AI-assisted engineering signals strongly. These signals can move a near-threshold role into `recommended_apply` unless a hard exclusion below applies.
+- For the current NVIDIA matching-policy calibration, treat near-threshold software roles as worth live JD review when they combine NVIDIA engineering context with AI/software productivity, platform infrastructure, compiler/toolchain, test automation, or developer-experience signals.
+- Keep hard exclusions strict: do not apply to internships, campus/new-grad/co-op roles, roles posted outside the active posted-age window, roles dominated by pure hardware/ASIC/SoC/EE/circuit/board design, obvious people-management roles, or roles whose core requirement is clearly around `10+ years` or similarly senior experience beyond the user's profile.
 - Do not apply to NVIDIA roles posted 30 days ago, `30+ Days Ago`, or older.
 - If the saved NVIDIA job lacks a reliable posted age or date, re-check the live job page before applying. If the posted timing still cannot be confirmed as within the last 30 days, mark the job as `filtered_out` instead of applying.
 - Follow the project-level closed/unavailable rule. NVIDIA/Workday examples include a direct job URL resolving to a missing page, `0 JOBS FOUND`, no openings, or no longer available; record those as `application_status = closed`, `apply_state = terminal_closed`, `decision_reason_type = closed`, and preserve the exact NVIDIA text in `application_status_raw` or `last_apply_error`.
 
 ### Form Filling
 
-- For the first NVIDIA job you apply in the current batch, follow the normal visible resume upload / autofill path on the live page.
-- For later NVIDIA jobs in the same current batch, if the live page offers `Use My Last Application`, prefer that reuse path before falling back to the normal visible application entry.
+- For every NVIDIA job in the current batch, if the live `Start Your Application` dialog offers `Use My Last Application`, select that path. This applies to the first NVIDIA apply target too.
+- Do not select `Autofill with Resume` or `Apply Manually` while `Use My Last Application` is visible and enabled. Use `Autofill with Resume` only when `Use My Last Application` is absent or unavailable.
+- After choosing `Use My Last Application`, inspect `My Experience`, `Resume/CV`, or the visible resume summary before continuing past that section.
+- Do not click the `Resume/CV` dropzone, upload area, or `Select files` control just to inspect the current resume. On Workday, those controls may immediately open a file chooser and cause an unnecessary upload.
+- Compare the visible resume file name on the live page with the staged resume basename from the current apply context.
+- If the visible resume file name matches the staged resume basename, treat the resume step as satisfied and continue; do not delete or upload again.
+- If the visible resume file name is different from the staged resume basename, remove/delete/replace the old visible resume using the page's own controls, then upload the staged PDF and re-read the page.
+- If the page shows an uploaded or accepted resume but the file name is not visible, first re-read the page or expand a safe details control if one exists. If the file name still cannot be confirmed but the page shows an accepted resume and no validation error, continue without uploading. Replace the resume only if the page explicitly shows a different file name, no accepted resume, or a validation error requiring a resume upload.
 - Use the default-third-option rule only for the `How Did You Hear About Us?` dropdown when no more specific source choice is required.
 - For country, region, residence, nationality, or phone-country-code style selectors, use the factual China value from the current profile context instead of a default ordinal choice.
 - For gender questions, answer `Male`.
 - For policy, compliance, code-of-conduct, or similar acknowledgement questions, select `Yes`.
-- On NVIDIA `Autofill with Resume` or any later `Resume/CV` section, if the staged PDF is not yet visibly accepted on the current page, use the page's upload entry such as `Select files` first, then upload the staged PDF, then re-read the page before continuing.
+- On NVIDIA `Autofill with Resume`, `My Experience`, or any later `Resume/CV` section, upload the staged PDF only when the page explicitly requires a file, shows no accepted resume, or shows a visible file name different from the staged resume basename. After any upload, re-read the page before continuing.
 - If NVIDIA apply returns to `Create Account / Sign In`, prefer the visible Google sign-in continuation when it is available on the live page instead of stopping immediately.
 - If NVIDIA apply is back on `Create Account / Sign In` but only password entry, email entry, MFA, verification, CAPTCHA, or another human-only challenge remains, stop that job as `blocked`.
 - Do not click `Continue` or `Save and Continue` while the current NVIDIA page is still waiting for the staged PDF to be accepted.

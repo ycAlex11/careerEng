@@ -23,6 +23,7 @@ from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
 from careereng.evolution.triggers import (
     EvolutionTriggerError,
     scan_assistant_router_memory_triggers,
+    scan_application_strategy_triggers,
     scan_evolution_triggers,
     scan_site_workflow_triggers,
     scan_target_company_intelligence_triggers,
@@ -57,6 +58,7 @@ __all__ = [
     "rollback_evolution_run",
     "save_evolution_review",
     "scan_assistant_router_memory_triggers",
+    "scan_application_strategy_triggers",
     "scan_evolution_triggers",
     "scan_site_workflow_triggers",
     "scan_target_company_intelligence_triggers",

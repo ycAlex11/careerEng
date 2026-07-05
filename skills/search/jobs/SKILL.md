@@ -2,7 +2,7 @@
 id: search-jobs
 name: Search Jobs Skill
 version: v1
-updated_at: "2026-03-17"
+updated_at: "2026-07-04"
 scope: jobs
 retrieval_policy:
   preferred_sort: newest_first
@@ -51,6 +51,13 @@ apply_candidate_policy:
 - For mixed roles that combine applied AI, LLM/generative AI, AI agents, ML/deep-learning frameworks, or AI platform/application delivery with GPU, performance, system architecture, or kernel-adjacent work, do not immediately score the job below 40 only because low-level GPU/performance evidence is incomplete. Put the role in the 40-70 range and request `full_cv` before the final decision unless the JD is clearly dominated by unsupported low-level hard requirements.
 - Do not let applied-AI experience override missing hard requirements when the JD is mainly CUDA/GPU kernel, compiler, ASIC/SoC, hardware architecture, low-level systems, or performance-modeling work and the AI/agent/LLM content is only incidental or weakly related.
 - Never invent unsupported experience. If a required answer or match decision needs missing evidence, request the smallest relevant context bundle.
+
+### Matching Policy Evolution Signals
+
+- When the user corrects a job decision, such as saying a filtered-out job should have been applied to or an applied job should have been avoided, treat that correction as matching-policy evolution evidence, not only as a one-off job update.
+- When submitted, rejected, in-process, review, or long-pending application records reveal repeated role-cluster patterns, preserve the evidence for `application_strategy_evolution`.
+- If the evidence suggests a company-specific preference or role-cluster weighting, propose a site-level `Matching Policy` patch. If the evidence applies across companies, propose a project-level `Matching Policy` patch.
+- Do not directly change matching rules from one weak signal. Record the evidence, identify the target policy section, and let the evolution proposal decide whether to patch Skill text, append memory/lesson, or keep observing.
 
 ## Input Priority
 
@@ -354,6 +361,10 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - Before recording the first page, confirm whether the current results are sorted newest/date-posted first using visible sort state, URL state, or stable phase memory from `Job Filtering`.
 - If newest/date-posted sort is available but the current page is not sorted that way, return once to the sort control or site-specific sort route before calling `record_jobs`.
 - If newest/date-posted sort cannot be confirmed, continue retrieval, but do not use date-window or older-than-window evidence as a pagination stop condition for this site run.
+- When newest/date-posted order is confirmed for the current page, call `record_jobs` with `newest_first_confirmed=true`.
+- When newest/date-posted order is not confirmed, omit `newest_first_confirmed` or set it to false.
+- `newest_first_confirmed=true` lets storage apply deterministic posted-age normalization for missing labels in the visible order: after a visible `Posted N days ago` item, following unknown items may be treated as `N+1`, capped at `30+`. Do not set it unless the ordering is actually confirmed.
+- Preserve raw posted text exactly when visible. Treat `30 days`, `30+ days`, or any age older than 30 as the `30+` bucket for current posted-age comparison.
 - Treat side detail panes, selected-job previews, recommendation rails, sticky preview panels, filter chrome, account chrome, job-alert panels, and pagination summaries as context only unless the active site skill explicitly says they are part of the current page's jobs source.
 - A page label such as `4 of 7`, a total-count badge, or another pagination signal only means additional results pages still exist. It does not mean the current visible page is already recorded.
 - The current page becomes recordable as soon as the current visible results surface yields concrete per-job `{title, url}` pairs for the current page.

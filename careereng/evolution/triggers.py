@@ -7,18 +7,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from careereng.action_cards.schema import ACTION_CARD_MANUAL_DECISION
+from careereng.action_cards.store import ActionCardStore
+from careereng.evolution.browser_control.lessons import BrowserControlLessonStore
+from careereng.evolution.candidate_specs import load_candidate_specs
+from careereng.evolution.memory_units import EvolutionMemoryStore
 from careereng.evolution.runs import create_evolution_run
 from careereng.storage.jsonl import JSONLStore
 from careereng.storage.site_store import SiteStore
-from careereng.utils import ensure_dir, now_iso, read_json, write_json
+from careereng.utils import ensure_dir, now_iso, read_json, safe_file_stem, write_json
 
 
 SITE_WORKFLOW_CANDIDATE_ID = "site_workflow_compaction"
 TARGET_COMPANY_CANDIDATE_ID = "target_company_intelligence_evolution"
+APPLICATION_STRATEGY_CANDIDATE_ID = "application_strategy_evolution"
 ASSISTANT_ROUTER_MEMORY_CANDIDATE_ID = "assistant_router_memory_intake"
 SITE_WORKFLOW_SCHEDULED_THRESHOLD = 10
 SITE_WORKFLOW_PROBLEM_THRESHOLD = 2
 SITE_WORKFLOW_PROBLEM_RECENT_LIMIT = 10
+APPLICATION_FEEDBACK_TOTAL_THRESHOLD = 3
+APPLICATION_FEEDBACK_NEW_THRESHOLD = 3
+MATCHING_FILTERED_TOTAL_THRESHOLD = 10
+MATCHING_FILTERED_NEW_THRESHOLD = 5
+STRATEGY_REJECTION_TOTAL_THRESHOLD = 5
+STRATEGY_REJECTION_NEW_THRESHOLD = 3
 ASSISTANT_EXPLICIT_INTAKE_TOTAL_THRESHOLD = 50
 ASSISTANT_EXPLICIT_INTAKE_NEW_THRESHOLD = 20
 ASSISTANT_MEMORY_UNIT_TOTAL_THRESHOLD = 50
@@ -69,6 +81,14 @@ PHASE_SECTION_BY_SLUG = {
     "job_retrieval": "Job Retrieval",
     "apply": "Apply",
 }
+EVOLUTION_REVIEW_DIRECTION_IDS = (
+    SITE_WORKFLOW_CANDIDATE_ID,
+    "apply_form_workflow",
+    APPLICATION_STRATEGY_CANDIDATE_ID,
+    TARGET_COMPANY_CANDIDATE_ID,
+    "resume_profile_evolution",
+    ASSISTANT_ROUTER_MEMORY_CANDIDATE_ID,
+)
 
 
 class EvolutionTriggerError(ValueError):
@@ -81,18 +101,28 @@ def scan_evolution_triggers(
     workspace: Path | str,
     status: str = "active",
     create_runs: bool = True,
+    review_gate: bool = False,
 ) -> dict[str, Any]:
     site_workflow = scan_site_workflow_triggers(
         project_root=project_root,
         workspace=workspace,
         status=status,
         create_runs=create_runs,
+        review_gate=review_gate,
     )
     target_company = scan_target_company_intelligence_triggers(
         project_root=project_root,
         workspace=workspace,
         status=status,
         create_runs=create_runs,
+        review_gate=review_gate,
+    )
+    application_strategy = scan_application_strategy_triggers(
+        project_root=project_root,
+        workspace=workspace,
+        status=status,
+        create_runs=create_runs,
+        review_gate=review_gate,
     )
     assistant_memory = scan_assistant_router_memory_triggers(
         project_root=project_root,
@@ -103,10 +133,12 @@ def scan_evolution_triggers(
         "generated_at": now_iso(),
         "site_workflow": site_workflow,
         "target_company_intelligence": target_company,
+        "application_strategy": application_strategy,
         "assistant_router_memory_intake": assistant_memory,
         "triggered_count": (
             int(site_workflow.get("triggered_count") or 0)
             + int(target_company.get("triggered_count") or 0)
+            + int(application_strategy.get("triggered_count") or 0)
             + int(assistant_memory.get("triggered_count") or 0)
         ),
     }
@@ -118,6 +150,7 @@ def scan_site_workflow_triggers(
     workspace: Path | str,
     status: str = "active",
     create_runs: bool = True,
+    review_gate: bool = False,
 ) -> dict[str, Any]:
     root = Path(project_root)
     workspace_path = Path(workspace)
@@ -138,16 +171,19 @@ def scan_site_workflow_triggers(
         current_count = int(stats.get("phase_run_count") or 0)
         previous = previous_site_state.get(key) if isinstance(previous_site_state.get(key), dict) else {}
         last_evolved_count = int(previous.get("last_evolved_phase_run_count") or 0)
+        last_reviewed_count = int(previous.get("last_reviewed_phase_run_count") or 0)
+        last_handled_count = max(last_evolved_count, last_reviewed_count)
         reasons: list[str] = []
         trigger_type = ""
-        if current_count - last_evolved_count >= SITE_WORKFLOW_SCHEDULED_THRESHOLD:
+        if current_count - last_handled_count >= SITE_WORKFLOW_SCHEDULED_THRESHOLD:
             trigger_type = "scheduled"
             reasons.append(
-                f"{site_key}:{phase} reached {current_count - last_evolved_count} new terminal phase run(s) since last evolution."
+                f"{site_key}:{phase} reached {current_count - last_handled_count} new terminal phase run(s) since last evolution review."
             )
 
         problem_count = int(stats.get("recent_problem_terminal_count") or 0) + int(browser_problem_counts.get(key, 0))
-        if problem_count >= SITE_WORKFLOW_PROBLEM_THRESHOLD:
+        problem_key = f"{stats.get('latest_phase_at') or ''}:{problem_count}"
+        if problem_count >= SITE_WORKFLOW_PROBLEM_THRESHOLD and str(previous.get("last_reviewed_problem_key") or "") != problem_key:
             if not trigger_type:
                 trigger_type = "problem_driven"
             reasons.append(f"{site_key}:{phase} has {problem_count} recent problem signal(s).")
@@ -165,34 +201,43 @@ def scan_site_workflow_triggers(
             last_evolved_count=last_evolved_count,
             reasons=reasons,
         )
-        run_result = {}
         if create_runs:
-            run_result = create_evolution_run(
-                project_root=root,
-                workspace=workspace_path,
-                candidate_id=SITE_WORKFLOW_CANDIDATE_ID,
-            )
-            _attach_trigger_to_run(
-                run_dir=Path(run_result["run_dir"]),
-                trigger=candidate,
-                site_key=site_key,
-                phase=phase,
-            )
-            candidate["evolution_run_id"] = str(run_result.get("run_id") or "")
-            candidate["run_dir"] = str(run_result.get("run_dir") or "")
+            if review_gate:
+                _attach_review_card(
+                    project_root=root,
+                    workspace=workspace_path,
+                    candidate=candidate,
+                    site_key=site_key,
+                    phase=phase,
+                )
+            else:
+                run_result = create_evolution_run(
+                    project_root=root,
+                    workspace=workspace_path,
+                    candidate_id=SITE_WORKFLOW_CANDIDATE_ID,
+                )
+                _attach_trigger_to_run(
+                    run_dir=Path(run_result["run_dir"]),
+                    trigger=candidate,
+                    site_key=site_key,
+                    phase=phase,
+                )
+                candidate["evolution_run_id"] = str(run_result.get("run_id") or "")
+                candidate["run_dir"] = str(run_result.get("run_dir") or "")
 
         if create_runs:
             JSONLStore(workspace_path / "evolution" / "candidates" / "open.jsonl").append(candidate)
-            previous_site_state[key] = {
-                "site_key": site_key,
-                "phase": phase,
-                "phase_run_count": current_count,
-                "last_evolved_phase_run_count": current_count,
-                "last_evolution_run_id": str(candidate.get("evolution_run_id") or ""),
-                "last_triggered_at": candidate["created_at"],
-                "last_trigger_type": trigger_type,
-                "last_reason": " ".join(reasons),
-            }
+            previous_site_state[key] = _site_workflow_state_row(
+                previous=previous,
+                site_key=site_key,
+                phase=phase,
+                current_count=current_count,
+                trigger_type=trigger_type,
+                problem_key=problem_key,
+                reasons=reasons,
+                candidate=candidate,
+                review_gate=review_gate,
+            )
         triggered.append(candidate)
 
     generated_at = now_iso()
@@ -217,6 +262,7 @@ def scan_target_company_intelligence_triggers(
     workspace: Path | str,
     status: str = "active",
     create_runs: bool = True,
+    review_gate: bool = False,
 ) -> dict[str, Any]:
     root = Path(project_root)
     workspace_path = Path(workspace)
@@ -246,19 +292,28 @@ def scan_target_company_intelligence_triggers(
                 reasons=reasons,
             )
             if create_runs:
-                run_result = create_evolution_run(
-                    project_root=root,
-                    workspace=workspace_path,
-                    candidate_id=TARGET_COMPANY_CANDIDATE_ID,
-                )
-                _attach_trigger_to_run(
-                    run_dir=Path(run_result["run_dir"]),
-                    trigger=candidate,
-                    site_key=site_key,
-                    phase=area,
-                )
-                candidate["evolution_run_id"] = str(run_result.get("run_id") or "")
-                candidate["run_dir"] = str(run_result.get("run_dir") or "")
+                if review_gate:
+                    _attach_review_card(
+                        project_root=root,
+                        workspace=workspace_path,
+                        candidate=candidate,
+                        site_key=site_key,
+                        phase=area,
+                    )
+                else:
+                    run_result = create_evolution_run(
+                        project_root=root,
+                        workspace=workspace_path,
+                        candidate_id=TARGET_COMPANY_CANDIDATE_ID,
+                    )
+                    _attach_trigger_to_run(
+                        run_dir=Path(run_result["run_dir"]),
+                        trigger=candidate,
+                        site_key=site_key,
+                        phase=area,
+                    )
+                    candidate["evolution_run_id"] = str(run_result.get("run_id") or "")
+                    candidate["run_dir"] = str(run_result.get("run_dir") or "")
 
             if create_runs:
                 JSONLStore(workspace_path / "evolution" / "candidates" / "open.jsonl").append(candidate)
@@ -267,6 +322,8 @@ def scan_target_company_intelligence_triggers(
                     area=area,
                     stats=stats,
                     candidate=candidate,
+                    previous=previous,
+                    review_gate=review_gate,
                 )
             triggered.append(candidate)
 
@@ -277,6 +334,90 @@ def scan_target_company_intelligence_triggers(
     return {
         "generated_at": generated_at,
         "candidate_id": TARGET_COMPANY_CANDIDATE_ID,
+        "site_count": len(sites),
+        "bucket_count": scanned_buckets,
+        "triggered_count": len(triggered),
+        "triggered": triggered,
+        "state_path": str(_trigger_state_path(workspace_path)),
+        "open_candidates_path": str(workspace_path / "evolution" / "candidates" / "open.jsonl"),
+    }
+
+
+def scan_application_strategy_triggers(
+    *,
+    project_root: Path | str,
+    workspace: Path | str,
+    status: str = "active",
+    create_runs: bool = True,
+    review_gate: bool = False,
+) -> dict[str, Any]:
+    root = Path(project_root)
+    workspace_path = Path(workspace)
+    site_store = SiteStore(workspace_path, project_root=root)
+    sites = site_store.list_sites(status=status or None)
+    state = _load_trigger_state(workspace_path)
+    previous_state = state.setdefault("application_strategy", {})
+    stats_by_site = _collect_application_strategy_stats(workspace=workspace_path, site_store=site_store, sites=sites)
+
+    triggered: list[dict[str, Any]] = []
+    scanned_buckets = 0
+    for site_key in sorted(stats_by_site):
+        scanned_buckets += 1
+        stats = stats_by_site[site_key]
+        key = _company_bucket_key(site_key, "matching_policy_calibration")
+        previous = previous_state.get(key) if isinstance(previous_state.get(key), dict) else {}
+        reasons = _application_strategy_reasons(stats=stats, previous=previous)
+        if not reasons:
+            continue
+        candidate = _application_strategy_candidate_row(
+            workspace=workspace_path,
+            site_store=site_store,
+            site_key=site_key,
+            stats=stats,
+            previous=previous,
+            reasons=reasons,
+        )
+        if create_runs:
+            if review_gate:
+                _attach_review_card(
+                    project_root=root,
+                    workspace=workspace_path,
+                    candidate=candidate,
+                    site_key=site_key,
+                    phase="matching_policy_calibration",
+                )
+            else:
+                run_result = create_evolution_run(
+                    project_root=root,
+                    workspace=workspace_path,
+                    candidate_id=APPLICATION_STRATEGY_CANDIDATE_ID,
+                )
+                _attach_trigger_to_run(
+                    run_dir=Path(run_result["run_dir"]),
+                    trigger=candidate,
+                    site_key=site_key,
+                    phase="matching_policy_calibration",
+                )
+                candidate["evolution_run_id"] = str(run_result.get("run_id") or "")
+                candidate["run_dir"] = str(run_result.get("run_dir") or "")
+
+        if create_runs:
+            JSONLStore(workspace_path / "evolution" / "candidates" / "open.jsonl").append(candidate)
+            previous_state[key] = _application_strategy_state_row(
+                stats=stats,
+                candidate=candidate,
+                previous=previous,
+                review_gate=review_gate,
+            )
+        triggered.append(candidate)
+
+    generated_at = now_iso()
+    if create_runs:
+        state["updated_at"] = generated_at
+        write_json(_trigger_state_path(workspace_path), state)
+    return {
+        "generated_at": generated_at,
+        "candidate_id": APPLICATION_STRATEGY_CANDIDATE_ID,
         "site_count": len(sites),
         "bucket_count": scanned_buckets,
         "triggered_count": len(triggered),
@@ -431,12 +572,61 @@ def _collect_target_company_stats(*, workspace: Path, site_store: SiteStore, sit
     return rows
 
 
+def _collect_application_strategy_stats(*, workspace: Path, site_store: SiteStore, sites: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    feedback_path = workspace / "memory" / "application_feedback_signals.jsonl"
+    feedback_rows = JSONLStore(feedback_path).read_all() if feedback_path.exists() else []
+    feedback_by_site: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in feedback_rows:
+        if not isinstance(row, dict):
+            continue
+        site_key = _feedback_site_key(row)
+        if site_key:
+            feedback_by_site[site_key].append(row)
+
+    rows: dict[str, dict[str, Any]] = {}
+    for site in sites:
+        site_key = str(site.get("site_key") or "").strip()
+        if not site_key:
+            continue
+        history_rows = [row for row in site_store.list_jobs(site_key) if isinstance(row, dict)]
+        matching_filtered_rows = [
+            row
+            for row in history_rows
+            if _row_is_filtered_out(row) and _normalized_reason_type(row.get("decision_reason_type")) == "matching_policy"
+        ]
+        rejected_rows = [
+            row
+            for row in history_rows
+            if _normalized_status(row.get("application_review_status")) == "rejected"
+        ]
+        positive_rows = [row for row in history_rows if _row_has_positive_progress(row)]
+        rows[site_key] = {
+            "site_key": site_key,
+            "feedback_count": len(feedback_by_site.get(site_key, [])),
+            "matching_filtered_count": len(matching_filtered_rows),
+            "rejected_count": len(rejected_rows),
+            "positive_progress_count": len(positive_rows),
+            "positive_progress_keys": sorted(_row_identity(row) for row in positive_rows if _row_identity(row)),
+            "latest_feedback_at": _latest_text(feedback_by_site.get(site_key, []), ("created_at", "updated_at")),
+            "latest_history_at": _latest_text(history_rows, ("last_seen_at", "application_updated_at", "first_seen_at")),
+            "evidence_refs": [
+                _source_ref(workspace, feedback_path),
+                _source_ref(workspace, site_store.site_dir(site_key) / "jobs" / "history_jobs.json"),
+                _source_ref(workspace, site_store.site_dir(site_key) / "applications" / "reviews"),
+            ],
+        }
+    return rows
+
+
 def _target_company_reasons(*, area: str, stats: dict[str, Any], previous: dict[str, Any]) -> list[str]:
     site_key = str(stats.get("site_key") or "")
     reasons: list[str] = []
     if area == "jd_demand":
         job_count = int(stats.get("job_count") or 0)
-        last_count = int(previous.get("last_evolved_job_count") or 0)
+        last_count = max(
+            int(previous.get("last_evolved_job_count") or 0),
+            int(previous.get("last_reviewed_job_count") or 0),
+        )
         if job_count >= JD_DEMAND_TOTAL_THRESHOLD and last_count == 0:
             reasons.append(f"{site_key} has {job_count} local job records.")
         elif job_count - last_count >= JD_DEMAND_NEW_THRESHOLD:
@@ -444,12 +634,19 @@ def _target_company_reasons(*, area: str, stats: dict[str, Any], previous: dict[
     elif area == "rejection_pattern":
         rejected_count = int(stats.get("rejected_count") or 0)
         fast_count = int(stats.get("fast_rejection_count") or 0)
-        last_rejected = int(previous.get("last_evolved_rejected_count") or 0)
+        last_rejected = max(
+            int(previous.get("last_evolved_rejected_count") or 0),
+            int(previous.get("last_reviewed_rejected_count") or 0),
+        )
+        last_fast = max(
+            int(previous.get("last_evolved_fast_rejection_count") or 0),
+            int(previous.get("last_reviewed_fast_rejection_count") or 0),
+        )
         if rejected_count >= REJECTION_TOTAL_THRESHOLD and last_rejected == 0:
             reasons.append(f"{site_key} has {rejected_count} rejected applications.")
         elif rejected_count - last_rejected >= REJECTION_NEW_THRESHOLD:
             reasons.append(f"{site_key} has {rejected_count - last_rejected} new rejected applications since last intelligence evolution.")
-        if fast_count >= FAST_REJECTION_THRESHOLD and fast_count > int(previous.get("last_evolved_fast_rejection_count") or 0):
+        if fast_count >= FAST_REJECTION_THRESHOLD and fast_count > last_fast:
             reasons.append(f"{site_key} has {fast_count} fast rejection signal(s).")
     elif area == "positive_progress":
         keys = set(str(item) for item in stats.get("positive_progress_keys") or [] if str(item))
@@ -460,14 +657,65 @@ def _target_company_reasons(*, area: str, stats: dict[str, Any], previous: dict[
     elif area == "feedback_behavior":
         review_count = int(stats.get("review_count") or 0)
         pending_count = int(stats.get("long_pending_count") or 0)
-        last_review = int(previous.get("last_evolved_review_count") or 0)
-        last_pending = int(previous.get("last_evolved_long_pending_count") or 0)
+        last_review = max(
+            int(previous.get("last_evolved_review_count") or 0),
+            int(previous.get("last_reviewed_review_count") or 0),
+        )
+        last_pending = max(
+            int(previous.get("last_evolved_long_pending_count") or 0),
+            int(previous.get("last_reviewed_long_pending_count") or 0),
+        )
         if review_count >= FEEDBACK_REVIEW_THRESHOLD and last_review == 0:
             reasons.append(f"{site_key} has {review_count} application review records.")
         elif review_count - last_review >= FEEDBACK_REVIEW_THRESHOLD:
             reasons.append(f"{site_key} has {review_count - last_review} new application review records since last feedback evolution.")
         if pending_count >= LONG_PENDING_THRESHOLD and pending_count > last_pending:
             reasons.append(f"{site_key} has {pending_count} long-pending application(s).")
+    return reasons
+
+
+def _application_strategy_reasons(*, stats: dict[str, Any], previous: dict[str, Any]) -> list[str]:
+    site_key = str(stats.get("site_key") or "")
+    reasons: list[str] = []
+
+    feedback_count = int(stats.get("feedback_count") or 0)
+    last_feedback = max(
+        int(previous.get("last_evolved_feedback_count") or 0),
+        int(previous.get("last_reviewed_feedback_count") or 0),
+    )
+    if feedback_count >= APPLICATION_FEEDBACK_TOTAL_THRESHOLD and last_feedback == 0:
+        reasons.append(f"{site_key} has {feedback_count} application feedback signal(s).")
+    elif feedback_count - last_feedback >= APPLICATION_FEEDBACK_NEW_THRESHOLD:
+        reasons.append(f"{site_key} has {feedback_count - last_feedback} new application feedback signal(s) since last strategy evolution.")
+
+    matching_filtered_count = int(stats.get("matching_filtered_count") or 0)
+    last_matching_filtered = max(
+        int(previous.get("last_evolved_matching_filtered_count") or 0),
+        int(previous.get("last_reviewed_matching_filtered_count") or 0),
+    )
+    if matching_filtered_count >= MATCHING_FILTERED_TOTAL_THRESHOLD and last_matching_filtered == 0:
+        reasons.append(f"{site_key} has {matching_filtered_count} matching-policy filtered-out job(s).")
+    elif matching_filtered_count - last_matching_filtered >= MATCHING_FILTERED_NEW_THRESHOLD:
+        reasons.append(
+            f"{site_key} has {matching_filtered_count - last_matching_filtered} new matching-policy filtered-out job(s) since last strategy evolution."
+        )
+
+    rejected_count = int(stats.get("rejected_count") or 0)
+    last_rejected = max(
+        int(previous.get("last_evolved_rejected_count") or 0),
+        int(previous.get("last_reviewed_rejected_count") or 0),
+    )
+    if rejected_count >= STRATEGY_REJECTION_TOTAL_THRESHOLD and last_rejected == 0:
+        reasons.append(f"{site_key} has {rejected_count} rejected application(s) available for strategy review.")
+    elif rejected_count - last_rejected >= STRATEGY_REJECTION_NEW_THRESHOLD:
+        reasons.append(f"{site_key} has {rejected_count - last_rejected} new rejected application(s) since last strategy evolution.")
+
+    positive_keys = set(str(item) for item in stats.get("positive_progress_keys") or [] if str(item))
+    seen_positive_keys = set(str(item) for item in previous.get("last_seen_positive_progress_keys") or [] if str(item))
+    new_positive_keys = sorted(positive_keys - seen_positive_keys)
+    if new_positive_keys:
+        reasons.append(f"{site_key} has {len(new_positive_keys)} new positive-progress application signal(s) for matching-policy calibration.")
+
     return reasons
 
 
@@ -510,6 +758,47 @@ def _target_company_candidate_row(
     }
 
 
+def _application_strategy_candidate_row(
+    *,
+    workspace: Path,
+    site_store: SiteStore,
+    site_key: str,
+    stats: dict[str, Any],
+    previous: dict[str, Any],
+    reasons: list[str],
+) -> dict[str, Any]:
+    skill_path = site_store.site_skill_path(site_key)
+    target_ref = f"{_relative_or_str(skill_path, site_store.project_root)}#Matching Policy"
+    priority = "high" if int(stats.get("feedback_count") or 0) > int(previous.get("last_evolved_feedback_count") or 0) else "medium"
+    return {
+        "candidate_id": APPLICATION_STRATEGY_CANDIDATE_ID,
+        "area": "matching_policy_calibration",
+        "target_ref": target_ref,
+        "priority": priority,
+        "status": "open",
+        "created_at": now_iso(),
+        "site_key": site_key,
+        "trigger_type": "matching_policy_calibration",
+        "feedback_count": int(stats.get("feedback_count") or 0),
+        "matching_filtered_count": int(stats.get("matching_filtered_count") or 0),
+        "rejected_count": int(stats.get("rejected_count") or 0),
+        "positive_progress_count": int(stats.get("positive_progress_count") or 0),
+        "previous_counts": {
+            "feedback_count": int(previous.get("last_evolved_feedback_count") or 0),
+            "matching_filtered_count": int(previous.get("last_evolved_matching_filtered_count") or 0),
+            "rejected_count": int(previous.get("last_evolved_rejected_count") or 0),
+        },
+        "reason": " ".join(reasons).strip(),
+        "summary": f"{site_key} matching policy is ready for application-strategy evolution.",
+        "suggested_change": (
+            f"Review `{site_key}` application feedback, matching-policy filtered-out jobs, positive-progress signals, "
+            "and rejection patterns to decide whether the site or project `Matching Policy` should change."
+        ),
+        "evidence_refs": stats.get("evidence_refs") if isinstance(stats.get("evidence_refs"), list) else [],
+        "state_ref": str(_trigger_state_path(workspace)),
+    }
+
+
 def _target_company_suggested_change(*, site_key: str, area: str) -> str:
     if area == "jd_demand":
         return f"Analyze `{site_key}` retrieved jobs to summarize company skill demand, role clusters, user gaps, and preparation direction."
@@ -522,20 +811,132 @@ def _target_company_suggested_change(*, site_key: str, area: str) -> str:
     return f"Analyze `{site_key}` target-company intelligence."
 
 
-def _target_company_state_row(*, site_key: str, area: str, stats: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
-    return {
+def _site_workflow_state_row(
+    *,
+    previous: dict[str, Any],
+    site_key: str,
+    phase: str,
+    current_count: int,
+    trigger_type: str,
+    problem_key: str,
+    reasons: list[str],
+    candidate: dict[str, Any],
+    review_gate: bool,
+) -> dict[str, Any]:
+    row = {
+        "site_key": site_key,
+        "phase": phase,
+        "phase_run_count": int(current_count or 0),
+        "last_triggered_at": candidate["created_at"],
+        "last_trigger_type": trigger_type,
+        "last_reason": " ".join(reasons),
+    }
+    if review_gate:
+        row.update(
+            {
+                "last_reviewed_phase_run_count": int(current_count or 0),
+                "last_evolved_phase_run_count": int(previous.get("last_evolved_phase_run_count") or 0),
+                "last_evolution_review_card_id": str(candidate.get("evolution_review_card_id") or ""),
+                "last_reviewed_problem_key": problem_key,
+            }
+        )
+    else:
+        row.update(
+            {
+                "last_evolved_phase_run_count": int(current_count or 0),
+                "last_reviewed_phase_run_count": int(previous.get("last_reviewed_phase_run_count") or 0),
+                "last_evolution_run_id": str(candidate.get("evolution_run_id") or ""),
+            }
+        )
+    return row
+
+
+def _target_company_state_row(
+    *,
+    site_key: str,
+    area: str,
+    stats: dict[str, Any],
+    candidate: dict[str, Any],
+    previous: dict[str, Any] | None = None,
+    review_gate: bool = False,
+) -> dict[str, Any]:
+    previous = previous if isinstance(previous, dict) else {}
+    row = {
         "site_key": site_key,
         "intelligence_area": area,
-        "last_evolved_job_count": int(stats.get("job_count") or 0),
-        "last_evolved_rejected_count": int(stats.get("rejected_count") or 0),
-        "last_evolved_fast_rejection_count": int(stats.get("fast_rejection_count") or 0),
-        "last_evolved_review_count": int(stats.get("review_count") or 0),
-        "last_evolved_long_pending_count": int(stats.get("long_pending_count") or 0),
-        "last_seen_positive_progress_keys": stats.get("positive_progress_keys") if isinstance(stats.get("positive_progress_keys"), list) else [],
         "last_triggered_at": candidate["created_at"],
-        "last_evolution_run_id": str(candidate.get("evolution_run_id") or ""),
         "last_reason": str(candidate.get("reason") or ""),
     }
+    if review_gate:
+        row.update(
+            {
+                "last_reviewed_job_count": int(stats.get("job_count") or 0),
+                "last_reviewed_rejected_count": int(stats.get("rejected_count") or 0),
+                "last_reviewed_fast_rejection_count": int(stats.get("fast_rejection_count") or 0),
+                "last_reviewed_review_count": int(stats.get("review_count") or 0),
+                "last_reviewed_long_pending_count": int(stats.get("long_pending_count") or 0),
+                "last_evolved_job_count": int(previous.get("last_evolved_job_count") or 0),
+                "last_evolved_rejected_count": int(previous.get("last_evolved_rejected_count") or 0),
+                "last_evolved_fast_rejection_count": int(previous.get("last_evolved_fast_rejection_count") or 0),
+                "last_evolved_review_count": int(previous.get("last_evolved_review_count") or 0),
+                "last_evolved_long_pending_count": int(previous.get("last_evolved_long_pending_count") or 0),
+                "last_seen_positive_progress_keys": stats.get("positive_progress_keys") if isinstance(stats.get("positive_progress_keys"), list) else [],
+                "last_evolution_review_card_id": str(candidate.get("evolution_review_card_id") or ""),
+            }
+        )
+    else:
+        row.update(
+            {
+                "last_evolved_job_count": int(stats.get("job_count") or 0),
+                "last_evolved_rejected_count": int(stats.get("rejected_count") or 0),
+                "last_evolved_fast_rejection_count": int(stats.get("fast_rejection_count") or 0),
+                "last_evolved_review_count": int(stats.get("review_count") or 0),
+                "last_evolved_long_pending_count": int(stats.get("long_pending_count") or 0),
+                "last_seen_positive_progress_keys": stats.get("positive_progress_keys") if isinstance(stats.get("positive_progress_keys"), list) else [],
+                "last_evolution_run_id": str(candidate.get("evolution_run_id") or ""),
+            }
+        )
+    return row
+
+
+def _application_strategy_state_row(
+    *,
+    stats: dict[str, Any],
+    candidate: dict[str, Any],
+    previous: dict[str, Any] | None = None,
+    review_gate: bool = False,
+) -> dict[str, Any]:
+    previous = previous if isinstance(previous, dict) else {}
+    row = {
+        "site_key": str(stats.get("site_key") or ""),
+        "strategy_area": "matching_policy_calibration",
+        "last_triggered_at": candidate["created_at"],
+        "last_reason": str(candidate.get("reason") or ""),
+    }
+    if review_gate:
+        row.update(
+            {
+                "last_reviewed_feedback_count": int(stats.get("feedback_count") or 0),
+                "last_reviewed_matching_filtered_count": int(stats.get("matching_filtered_count") or 0),
+                "last_reviewed_rejected_count": int(stats.get("rejected_count") or 0),
+                "last_evolved_feedback_count": int(previous.get("last_evolved_feedback_count") or 0),
+                "last_evolved_matching_filtered_count": int(previous.get("last_evolved_matching_filtered_count") or 0),
+                "last_evolved_rejected_count": int(previous.get("last_evolved_rejected_count") or 0),
+                "last_seen_positive_progress_keys": stats.get("positive_progress_keys") if isinstance(stats.get("positive_progress_keys"), list) else [],
+                "last_evolution_review_card_id": str(candidate.get("evolution_review_card_id") or ""),
+            }
+        )
+    else:
+        row.update(
+            {
+                "last_evolved_feedback_count": int(stats.get("feedback_count") or 0),
+                "last_evolved_matching_filtered_count": int(stats.get("matching_filtered_count") or 0),
+                "last_evolved_rejected_count": int(stats.get("rejected_count") or 0),
+                "last_seen_positive_progress_keys": stats.get("positive_progress_keys") if isinstance(stats.get("positive_progress_keys"), list) else [],
+                "last_evolution_run_id": str(candidate.get("evolution_run_id") or ""),
+            }
+        )
+    return row
 
 
 def _collect_assistant_router_memory_stats(workspace: Path) -> dict[str, Any]:
@@ -734,6 +1135,204 @@ def _trigger_candidate_row(
     }
 
 
+def _attach_review_card(*, project_root: Path, workspace: Path, candidate: dict[str, Any], site_key: str, phase: str) -> None:
+    directions = _evolution_direction_options(project_root)
+    related = _related_review_context(workspace=workspace, site_key=site_key, phase=phase)
+    card = ActionCardStore(workspace).create_card(
+        card_type=ACTION_CARD_MANUAL_DECISION,
+        title=f"Choose evolution direction for {site_key}:{phase}",
+        goal=(
+            "CareerEng reached an evolution trigger. Codex should explain the trigger, list the available "
+            "evolution directions, ask the user whether to evolve now, and ask which directions to include."
+        ),
+        reason=str(candidate.get("reason") or candidate.get("summary") or "").strip(),
+        source_type="evolution_trigger",
+        source_id=_review_source_id(candidate=candidate, site_key=site_key, phase=phase),
+        source_ref=str(candidate.get("target_ref") or ""),
+        priority=str(candidate.get("priority") or "medium"),
+        related_files=_review_related_files(project_root=project_root, workspace=workspace, candidate=candidate, related=related),
+        suggested_actions=[
+            "Read this card and explain the trigger to the user in Codex chat.",
+            "Ask whether the user wants to evolve this site now.",
+            "If yes, ask which listed evolution directions should be included.",
+            "If the user wants cross-site lesson transfer, inspect the related lessons first and ask whether to include them in this site evolution.",
+            "After the user selects a concrete direction, run the existing evolution solution flow with the selected candidate id.",
+            "If the user says not now, cancel or close this card with the skip reason; do not create a proposal.",
+        ],
+        safety_notes=[
+            "Codex is the interaction layer; do not build a separate UI.",
+            "Python lists directions and related evidence only; it must not decide which lesson transfers to this site.",
+            "Do not apply a Skill change until a concrete proposal exists and the user-selected direction is clear.",
+        ],
+        done_when=[
+            "The user selected one or more evolution directions and a solution request was created, or the user explicitly skipped this evolution review.",
+            "Any cross-site lesson transfer was explicitly included or rejected by the user through Codex chat.",
+        ],
+        metadata={
+            "task": "site_evolution_review",
+            "site_key": site_key,
+            "phase": phase,
+            "trigger_candidate_id": str(candidate.get("candidate_id") or ""),
+            "trigger_area": str(candidate.get("area") or ""),
+            "trigger_type": str(candidate.get("trigger_type") or ""),
+            "target_ref": str(candidate.get("target_ref") or ""),
+            "trigger": candidate,
+            "available_directions": directions,
+            "related_review_context": related,
+            "interaction_layer": "codex_chat",
+            "selection_policy": "ask_user_before_creating_solution_run",
+        },
+        semantic_tags=[
+            "evolution_review",
+            "manual_decision",
+            "codex_interaction",
+            safe_file_stem(site_key),
+            safe_file_stem(phase),
+        ],
+        dedupe_key=_review_dedupe_key(candidate=candidate, site_key=site_key, phase=phase),
+    )
+    card_id = str(card.get("card_id") or "")
+    candidate["evolution_review_card_id"] = card_id
+    candidate["evolution_review_card_path"] = str(card.get("markdown_path") or "")
+    if card_id:
+        commands = [f"python -m careereng action-card show {card_id}"]
+        for direction in directions:
+            candidate_id = str(direction.get("candidate_id") or "").strip()
+            if candidate_id:
+                commands.append(f"python -m careereng evolution solution --card {card_id} --candidate {candidate_id}")
+        commands.append(f'python -m careereng action-card cancel {card_id} --reason "<skip reason>"')
+        ActionCardStore(workspace).update_card_metadata(
+            card_id,
+            commands=commands,
+            summary=f"Updated evolution review card commands for {site_key}:{phase}.",
+        )
+
+
+def _evolution_direction_options(project_root: Path) -> list[dict[str, str]]:
+    specs = {spec.id: spec for spec in load_candidate_specs(project_root)}
+    rows: list[dict[str, str]] = []
+    for candidate_id in EVOLUTION_REVIEW_DIRECTION_IDS:
+        spec = specs.get(candidate_id)
+        if not spec:
+            continue
+        rows.append(
+            {
+                "candidate_id": spec.id,
+                "name": spec.name,
+                "target_type": spec.target_type,
+                "target_ref": spec.target_ref,
+                "spec_path": str(spec.path),
+            }
+        )
+    rows.append(
+        {
+            "candidate_id": "",
+            "name": "Cross-site lesson review",
+            "target_type": "review_option",
+            "target_ref": "accepted lessons / memory / action cards",
+            "spec_path": "",
+        }
+    )
+    return rows
+
+
+def _related_review_context(*, workspace: Path, site_key: str, phase: str) -> dict[str, Any]:
+    lessons = BrowserControlLessonStore(workspace).accepted(phase=phase, limit=12)
+    memories = EvolutionMemoryStore(workspace).query(
+        lifecycles=["candidate", "accepted"],
+        statuses=["candidate", "accepted"],
+        limit=12,
+    )
+    cards = ActionCardStore(workspace).list_cards(status="open", limit=12)
+    return {
+        "accepted_lessons": [_lesson_brief(row) for row in lessons],
+        "evolution_memory": [_evolution_memory_brief(row) for row in memories],
+        "open_action_cards": [_action_card_brief(row) for row in cards],
+        "note": (
+            "These are candidates for Codex to inspect. Python did not decide whether any lesson applies "
+            f"to {site_key}:{phase}."
+        ),
+    }
+
+
+def _lesson_brief(row: dict[str, Any]) -> dict[str, Any]:
+    origin = row.get("evidence_origin") if isinstance(row.get("evidence_origin"), dict) else {}
+    return {
+        "lesson_id": str(row.get("lesson_id") or ""),
+        "site_key": str(origin.get("site_key") or row.get("site_key") or ""),
+        "phase": str(row.get("phase") or ""),
+        "scope": str(row.get("applicability_scope") or row.get("scope") or ""),
+        "summary": str(row.get("summary") or "")[:500],
+        "tags": row.get("applicability_tags") if isinstance(row.get("applicability_tags"), list) else row.get("applies_to") or [],
+    }
+
+
+def _evolution_memory_brief(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "memory_id": str(row.get("memory_id") or ""),
+        "candidate_id": str(row.get("candidate_id") or ""),
+        "site_key": str(row.get("site_key") or ""),
+        "phase": str(row.get("phase") or ""),
+        "lifecycle": str(row.get("lifecycle") or ""),
+        "status": str(row.get("status") or ""),
+        "summary": str(row.get("summary") or "")[:500],
+    }
+
+
+def _action_card_brief(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "card_id": str(row.get("card_id") or ""),
+        "card_type": str(row.get("card_type") or ""),
+        "priority": str(row.get("priority") or ""),
+        "title": str(row.get("title") or ""),
+        "source_type": str(row.get("source_type") or ""),
+        "source_id": str(row.get("source_id") or ""),
+    }
+
+
+def _review_related_files(*, project_root: Path, workspace: Path, candidate: dict[str, Any], related: dict[str, Any]) -> list[str]:
+    paths = [
+        project_root / "docs" / "evolution" / "EVOLUTION_STRATEGY_ROUTER.md",
+        project_root / "docs" / "evolution" / "candidates",
+        workspace / "evolution" / "browser_control" / "lessons.jsonl",
+        workspace / "evolution" / "memory" / "units.jsonl",
+        workspace / "action_cards" / "index.jsonl",
+        workspace / "evolution" / "candidates" / "open.jsonl",
+    ]
+    target_ref = str(candidate.get("target_ref") or "").split("#", 1)[0].strip()
+    if target_ref:
+        target_path = Path(target_ref)
+        paths.append(target_path if target_path.is_absolute() else project_root / target_path)
+    return [str(path) for path in paths if path.exists()]
+
+
+def _review_source_id(*, candidate: dict[str, Any], site_key: str, phase: str) -> str:
+    return ":".join(
+        item
+        for item in (
+            str(candidate.get("candidate_id") or ""),
+            safe_file_stem(site_key),
+            safe_file_stem(phase),
+            str(candidate.get("trigger_type") or ""),
+        )
+        if item
+    )
+
+
+def _review_dedupe_key(*, candidate: dict[str, Any], site_key: str, phase: str) -> str:
+    count_parts = [
+        str(candidate.get("phase_run_count") or ""),
+        str(candidate.get("job_count") or ""),
+        str(candidate.get("review_count") or ""),
+        str(candidate.get("feedback_count") or ""),
+        str(candidate.get("matching_filtered_count") or ""),
+        str(candidate.get("rejected_count") or ""),
+        str(candidate.get("positive_progress_count") or ""),
+    ]
+    count_key = "-".join(part for part in count_parts if part)
+    return f"{ACTION_CARD_MANUAL_DECISION}:site_evolution_review:{_review_source_id(candidate=candidate, site_key=site_key, phase=phase)}:{count_key}"
+
+
 def _attach_trigger_to_run(*, run_dir: Path, trigger: dict[str, Any], site_key: str, phase: str) -> None:
     trigger_path = run_dir / "trigger.json"
     write_json(trigger_path, trigger)
@@ -771,12 +1370,14 @@ def _load_trigger_state(workspace: Path) -> dict[str, Any]:
             "version": 1,
             "site_workflow": {},
             "target_company_intelligence": {},
+            "application_strategy": {},
             "assistant_router_memory_intake": {},
             "updated_at": "",
         }
     payload.setdefault("version", 1)
     payload.setdefault("site_workflow", {})
     payload.setdefault("target_company_intelligence", {})
+    payload.setdefault("application_strategy", {})
     payload.setdefault("assistant_router_memory_intake", {})
     return payload
 
@@ -810,6 +1411,22 @@ def _normalized_status(value: Any) -> str:
 
 def _normalized_stage(value: Any) -> str:
     return "_".join(str(value or "").strip().lower().replace("-", "_").split())
+
+
+def _normalized_reason_type(value: Any) -> str:
+    return "_".join(str(value or "").strip().lower().replace("-", "_").split())
+
+
+def _feedback_site_key(row: dict[str, Any]) -> str:
+    return str(row.get("site_key") or "").strip().lower()
+
+
+def _row_is_filtered_out(row: dict[str, Any]) -> bool:
+    return (
+        _normalized_status(row.get("decision_status")) == "filtered_out"
+        or _normalized_status(row.get("application_status")) == "filtered_out"
+        or _normalized_status(row.get("apply_state")) == "terminal_filtered_out"
+    )
 
 
 def _row_has_positive_progress(row: dict[str, Any]) -> bool:

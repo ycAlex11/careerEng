@@ -1055,7 +1055,11 @@ class BrowserPhaseRuntime:
                             "required": ["title", "url"],
                             "additionalProperties": False,
                         },
-                    }
+                    },
+                    "newest_first_confirmed": {
+                        "type": "boolean",
+                        "description": "True only when the current visible results order is confirmed newest/date-posted first by visible sort state, URL state, or stable phase memory.",
+                    },
                 },
                 "required": ["jobs"],
                 "additionalProperties": False,
@@ -2880,7 +2884,18 @@ class BrowserPhaseRuntime:
                 new_flags = []
         else:
             new_flags = [row.get("history_match_status") == "new" for row in history_matches]
-        saved_rows = site_store.append_jobs(site_key, jobs, session_id or "", turn_id, batch_id)
+        newest_first_confirmed = bool(arguments.get("newest_first_confirmed"))
+        if newest_first_confirmed:
+            saved_rows = site_store.append_jobs(
+                site_key,
+                jobs,
+                session_id or "",
+                turn_id,
+                batch_id,
+                newest_first_confirmed=True,
+            )
+        else:
+            saved_rows = site_store.append_jobs(site_key, jobs, session_id or "", turn_id, batch_id)
         saved_ids: list[str] = []
         new_ids: list[str] = []
         history_match_results: list[dict[str, Any]] = []
@@ -2972,6 +2987,7 @@ class BrowserPhaseRuntime:
                 "operation_success_ratio": operation_success_ratio,
                 "history_stop_success_ratio_threshold": stop_success_ratio_threshold,
                 "history_stop_min_page_jobs": stop_min_page_jobs,
+                "newest_first_confirmed": newest_first_confirmed,
                 "stop_recommended": stop_recommended,
                 "stop_reason": stop_reason,
                 "job_ids": saved_ids,

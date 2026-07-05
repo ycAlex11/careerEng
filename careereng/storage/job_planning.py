@@ -48,6 +48,22 @@ class JobPlanningStore:
         self.snapshots_dir = ensure_dir(self.jobs_dir / "search_snapshots")
         self.apply_plans_dir = ensure_dir(self.jobs_dir / "apply_plans")
 
+    @staticmethod
+    def _coerce_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        return bool(text and text not in {"0", "false", "no", "off", "none", "null"})
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return int(float(value))
+        except Exception:
+            return None
+
     def search_fingerprint(self, *, site_key: str, url: str = "", filters_summary: dict[str, Any] | None = None) -> str:
         site = safe_file_stem(site_key or "site")
         normalized_url = self._normalize_search_url(url)
@@ -425,6 +441,17 @@ class JobPlanningStore:
 
     @classmethod
     def _posted_age_observation(cls, row: dict[str, Any]) -> dict[str, Any]:
+        stored_days = cls._coerce_int(row.get("current_posted_age_days"))
+        if stored_days is not None:
+            is_lower_bound = cls._coerce_bool(row.get("current_posted_age_is_lower_bound"))
+            if stored_days >= 30:
+                stored_days = 30
+                is_lower_bound = True
+            return {
+                "days": max(0, stored_days),
+                "is_lower_bound": is_lower_bound,
+                "source": str(row.get("current_posted_age_source") or "current_posted_age"),
+            }
         return current_posted_age_observation(normalize_posted_fields(dict(row)))
 
     @classmethod

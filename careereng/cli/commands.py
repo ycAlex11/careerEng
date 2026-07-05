@@ -1928,6 +1928,7 @@ def evolution_rollback(
 def evolution_trigger_scan(
     status: str = typer.Option("active", "--status", help="Site registry status to scan; use 'all' for all sites"),
     create_runs: bool = typer.Option(True, "--create-runs/--no-create-runs", help="Create evolution run archives for triggered candidates"),
+    review_gate: bool = typer.Option(False, "--review-gate/--no-review-gate", help="Create Codex-readable review cards before concrete evolution runs"),
 ):
     """Scan local evidence and create evolution triggers."""
     normalized_status = "" if str(status or "").strip().lower() == "all" else str(status or "").strip()
@@ -1937,16 +1938,18 @@ def evolution_trigger_scan(
             workspace=_workspace_path(),
             status=normalized_status,
             create_runs=create_runs,
+            review_gate=review_gate,
         )
     except EvolutionTriggerError as exc:
         raise typer.BadParameter(str(exc)) from exc
     site_workflow = result.get("site_workflow") if isinstance(result.get("site_workflow"), dict) else {}
     target_company = result.get("target_company_intelligence") if isinstance(result.get("target_company_intelligence"), dict) else {}
     assistant_memory = result.get("assistant_router_memory_intake") if isinstance(result.get("assistant_router_memory_intake"), dict) else {}
-    lines = [f"triggered={result['triggered_count']}"]
+    lines = [f"triggered={result['triggered_count']}", f"review_gate={str(review_gate).lower()}"]
     for label, group in (
         ("site_workflow", site_workflow),
         ("target_company_intelligence", target_company),
+        ("application_strategy", result.get("application_strategy") if isinstance(result.get("application_strategy"), dict) else {}),
         ("assistant_router_memory_intake", assistant_memory),
     ):
         lines.append(
@@ -1961,7 +1964,7 @@ def evolution_trigger_scan(
             subject = row.get("site_key") or row.get("area") or row.get("candidate_id") or label
             lines.append(
                 f"- {subject}:{phase_or_area} trigger={row.get('trigger_type')} "
-                f"count={count} run={row.get('evolution_run_id') or '-'}"
+                f"count={count} run={row.get('evolution_run_id') or '-'} review_card={row.get('evolution_review_card_id') or '-'}"
             )
     typer.echo("\n".join(lines))
 

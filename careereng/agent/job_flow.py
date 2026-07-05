@@ -2217,6 +2217,7 @@ class JobFlow:
         )
 
         site_rows: list[dict[str, Any]] = []
+        ready_site_keys: list[str] = []
         for row in active_sites:
             site_key = str(row.get("site_key") or "")
             preflight = self.site_tools.preflight_site(site_key, apply_requested=effective_apply_requested)
@@ -2240,6 +2241,7 @@ class JobFlow:
                     }
                 )
                 continue
+            ready_site_keys.append(site_key)
             site_rows.append(
                 self._ready_site_row(
                     site_key=site_key,
@@ -2251,7 +2253,7 @@ class JobFlow:
                 )
             )
 
-        return self.job_store.create_batch(
+        batch = self.job_store.create_batch(
             session_id=session_id,
             turn_id=turn_id,
             user_message=user_message,
@@ -2259,6 +2261,23 @@ class JobFlow:
             operation=normalized_operation,
             sites=site_rows,
         )
+        batch_id = str(batch.get("batch_id") or "")
+        refresh_posted_age = getattr(self.site_tools.site_store, "refresh_history_posted_age_metadata", None)
+        if callable(refresh_posted_age):
+            for site_key in ready_site_keys:
+                try:
+                    result = refresh_posted_age(site_key)
+                except Exception as exc:
+                    result = {"status": "failed", "site_key": site_key, "error": str(exc)}
+                self.job_store.append_event(
+                    "history.posted_age.refreshed",
+                    {
+                        "batch_id": batch_id,
+                        "site_key": site_key,
+                        "result": result if isinstance(result, dict) else {},
+                    },
+                )
+        return batch
 
     def fail_batch(self, *, batch_id: str, error: str) -> dict[str, Any]:
         batch = self.job_store.load_batch(batch_id)
