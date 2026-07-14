@@ -17,9 +17,19 @@ from careereng.browser_controls.backends.playwright_mcp import (
     launch_playwright_mcp,
     wait_for_process,
 )
+from careereng.agent_bridge.browser import browser_tool_commands
+from careereng.agent_bridge.contracts import (
+    AGENT_BRIDGE_MODE,
+    AGENT_BRIDGE_REQUIRED_REASON,
+    AGENT_BRIDGE_STATUS,
+    agent_bridge_phase,
+    normalize_execution_mode,
+)
+from careereng.agent_bridge.work_orders import create_browser_agent_work_order
 from careereng.browser_controls.bridge import MCPToolBridge
 from careereng.browser_controls.prompting import build_phase_prompts, load_text
 from careereng.browser_controls.runtime import BrowserPhaseResult, BrowserPhaseRuntime, BrowserRuntimeConfig
+from careereng.phase_runtime.state_tools import PhaseStateToolContext, execute_state_tool, state_tool_schemas_for_phase
 from careereng.action_cards import create_site_skill_refinement_card
 from careereng.browser_context import (
     BrowserContextRegistry,
@@ -77,6 +87,8 @@ class BrowserAutomationResult:
     already_applied_count: int = 0
     authenticated_ready: bool = False
     jobs_surface_ready: bool = False
+    handoff_path: str = ""
+    handoff_markdown_path: str = ""
 
 
 @dataclass
@@ -107,6 +119,7 @@ class BrowserAutomationService:
         max_phase_steps: int,
         browser_name: str,
         executable_path: str = "",
+        execution_mode: str = "provider",
         budgets: BrowserBudgetsConfig | None = None,
         guards: BrowserGuardsConfig | None = None,
         recovery: BrowserRecoveryConfig | None = None,
@@ -115,6 +128,7 @@ class BrowserAutomationService:
         self.project_root = Path(project_root).resolve()
         self.workspace = Path(workspace).resolve()
         self.site_store = site_store
+        self.execution_mode = self._normalize_execution_mode(execution_mode)
         self.headless = bool(headless)
         self.keep_open = bool(keep_open)
         self.timeout_ms = int(timeout_ms or 45000)
@@ -190,6 +204,10 @@ class BrowserAutomationService:
         )
         self.phase_runtime: BrowserPhaseRuntime | Any | None = None
 
+    @staticmethod
+    def _normalize_execution_mode(value: str) -> str:
+        return normalize_execution_mode(value)
+
     async def _aclose_phase_runtime(self, runtime: Any) -> None:
         if runtime is None:
             return
@@ -238,6 +256,291 @@ class BrowserAutomationService:
             load_text(self._site_skill_path(site_key)),
             allowed_slugs=allowed_slugs,
         )
+
+    def _run_site_agent_bridge(
+        self,
+        *,
+        site_key: str,
+        site_name: str,
+        entry_url: str,
+        session_id: str,
+        turn_id: str,
+        batch_id: str,
+        resume: bool = False,
+        phase_slugs: tuple[str, ...] | None = None,
+        apply_target_job_ids: tuple[str, ...] | None = None,
+        continuation_context: dict[str, Any] | None = None,
+    ) -> BrowserAutomationResult:
+        active, reused_runtime = self._reserve_runtime(site_key, entry_url)
+        wait_for_process(active.runtime)
+        self.site_store.save_browser_session(
+            site_key,
+            {
+                "browser_status": AGENT_BRIDGE_STATUS,
+                "last_browser_pid": active.runtime.pid(),
+                "last_browser_opened_at": now_iso(),
+                "active_run_id": turn_id,
+                "agent_bridge_session_id": session_id,
+                "agent_bridge_batch_id": batch_id,
+                "agent_bridge_turn_id": turn_id,
+                "agent_bridge_current_phase": tuple(phase_slugs or DEFAULT_RUN_PHASES)[0],
+                "agent_bridge_apply_target_job_ids": list(apply_target_job_ids or ()),
+                "last_known_url": entry_url or active.entry_url or "",
+                "current_trace_ref": "",
+                "pending_action": AGENT_BRIDGE_STATUS,
+                "current_step_id": "agent_bridge:browser_runtime_ready",
+                "current_step_attempt": 0,
+                "current_step_status": "waiting_external_agent",
+                "expected_outcome": "The external agent should operate the retained CareerEng Playwright MCP runtime.",
+                "last_step_error": "",
+                "mcp_log_path": str(active.runtime.log_path),
+                "runtime_reused": reused_runtime,
+            },
+        )
+        self.site_store.append_event(
+            site_key,
+            "browser.agent_bridge.runtime_ready",
+            {
+                "turn_id": turn_id,
+                "batch_id": batch_id,
+                "pid": int(active.runtime.pid()),
+                "run_id": active.runtime.run_id,
+                "log_path": str(active.runtime.log_path),
+                "reused_runtime": bool(reused_runtime),
+            },
+        )
+        allowed_slugs = set(phase_slugs or DEFAULT_RUN_PHASES)
+        phases = self._phase_prompts(site_key, allowed_slugs=allowed_slugs)
+        work_order = create_browser_agent_work_order(
+            workspace=self.workspace,
+            site_store=self.site_store,
+            site_key=site_key,
+            site_name=site_name,
+            entry_url=entry_url,
+            session_id=session_id,
+            turn_id=turn_id,
+            batch_id=batch_id,
+            resume=resume,
+            phase_slugs=tuple(phase_slugs or DEFAULT_RUN_PHASES),
+            phases=phases,
+            project_skill_path=self._project_skill_path(),
+            site_skill_path=self._site_skill_path(site_key),
+            apply_target_job_ids=apply_target_job_ids,
+            continuation_context=continuation_context,
+            tool_commands=browser_tool_commands(site_key),
+        )
+        return BrowserAutomationResult(
+            site_key=site_key,
+            site_name=site_name,
+            status="blocked",
+            reason_tag=AGENT_BRIDGE_REQUIRED_REASON,
+            message=work_order.message,
+            current_phase=work_order.current_phase,
+            current_url=entry_url or "",
+            handoff_path=str(work_order.payload_path),
+            handoff_markdown_path=str(work_order.markdown_path),
+        )
+
+    def _active_runtime_for_agent_bridge(self, site_key: str) -> ActiveSiteRuntime:
+        normalized_site = str(site_key or "").strip()
+        if not normalized_site:
+            raise RuntimeError("site is required")
+        with self._lock:
+            active = self._active.get(normalized_site)
+        if active is None or not active.runtime.is_running():
+            raise RuntimeError(f"no active agent bridge browser runtime for site={normalized_site}")
+        return active
+
+    async def _list_active_browser_tools_async(self, site_key: str) -> list[dict[str, Any]]:
+        active = self._active_runtime_for_agent_bridge(site_key)
+        bridge = MCPToolBridge(active.runtime, timeout_seconds=max(30.0, self.timeout_ms / 1000.0))
+        async with bridge.open_session() as session:
+            tools = await bridge.list_tools(session)
+        rows: list[dict[str, Any]] = []
+        for tool in tools:
+            rows.append(
+                {
+                    "name": str(getattr(tool, "name", "") or ""),
+                    "description": str(getattr(tool, "description", "") or getattr(tool, "title", "") or ""),
+                    "schema": getattr(tool, "inputSchema", {}) if isinstance(getattr(tool, "inputSchema", {}), dict) else {},
+                }
+            )
+        return rows
+
+    def list_active_browser_tools(self, site_key: str) -> list[dict[str, Any]]:
+        return anyio.run(self._list_active_browser_tools_async, site_key)
+
+    async def _call_active_browser_tool_async(
+        self,
+        *,
+        site_key: str,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        turn_id: str = "",
+        phase: str = AGENT_BRIDGE_STATUS,
+    ) -> dict[str, Any]:
+        active = self._active_runtime_for_agent_bridge(site_key)
+        bridge = MCPToolBridge(active.runtime, timeout_seconds=max(30.0, self.timeout_ms / 1000.0))
+        async with bridge.open_session() as session:
+            payload = await bridge.call_tool(session, tool_name, arguments or {})
+        current_url = bridge.extract_current_url(payload) or ""
+        summary = bridge.summarize_tool_output(payload)
+        trace_ref = self.site_store.append_step_trace(
+            site_key,
+            turn_id or AGENT_BRIDGE_STATUS,
+            {
+                "phase": agent_bridge_phase(phase),
+                "step_id": f"agent_bridge:{tool_name}",
+                "attempt": 1,
+                "tool_name": tool_name,
+                "arguments": arguments or {},
+                "result": "error" if payload.get("isError") else "ok",
+                "output": summary,
+            },
+        )
+        session_update = {
+            "browser_status": AGENT_BRIDGE_STATUS,
+            "pending_action": AGENT_BRIDGE_STATUS,
+            "current_step_id": f"agent_bridge:{tool_name}",
+            "current_step_status": "tool_error" if payload.get("isError") else "tool_ok",
+            "current_trace_ref": trace_ref,
+            "last_step_error": summary[:1000] if payload.get("isError") else "",
+        }
+        if current_url:
+            session_update["last_known_url"] = current_url
+        self.site_store.save_browser_session(site_key, session_update)
+        self.site_store.append_event(
+            site_key,
+            "browser.agent_bridge.tool_called",
+            {
+                "turn_id": turn_id or AGENT_BRIDGE_STATUS,
+                "phase": agent_bridge_phase(phase),
+                "tool_name": tool_name,
+                "result": "error" if payload.get("isError") else "ok",
+                "current_url": current_url,
+                "trace_ref": trace_ref,
+            },
+        )
+        return {
+            "ok": not bool(payload.get("isError")),
+            "tool_name": tool_name,
+            "current_url": current_url,
+            "summary": summary,
+            "trace_ref": trace_ref,
+            "payload": payload,
+        }
+
+    def call_active_browser_tool(
+        self,
+        *,
+        site_key: str,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        turn_id: str = "",
+        phase: str = AGENT_BRIDGE_STATUS,
+    ) -> dict[str, Any]:
+        async def _runner() -> dict[str, Any]:
+            return await self._call_active_browser_tool_async(
+                site_key=site_key,
+                tool_name=tool_name,
+                arguments=arguments or {},
+                turn_id=turn_id,
+                phase=phase,
+            )
+
+        return anyio.run(_runner)
+
+    def _agent_bridge_session_context(self, site_key: str, *, phase: str = "") -> dict[str, Any]:
+        normalized_site = str(site_key or "").strip()
+        if not normalized_site:
+            raise RuntimeError("site is required")
+        load_session = getattr(self.site_store, "load_browser_session", None)
+        browser_session = load_session(normalized_site) if callable(load_session) else {}
+        if not isinstance(browser_session, dict):
+            browser_session = {}
+        current_phase = str(phase or browser_session.get("agent_bridge_current_phase") or AGENT_BRIDGE_STATUS).strip() or AGENT_BRIDGE_STATUS
+        return {
+            "site_key": normalized_site,
+            "phase": current_phase,
+            "batch_id": str(browser_session.get("agent_bridge_batch_id") or ""),
+            "session_id": str(browser_session.get("agent_bridge_session_id") or ""),
+            "turn_id": str(browser_session.get("agent_bridge_turn_id") or browser_session.get("active_run_id") or ""),
+            "current_url": str(browser_session.get("last_known_url") or ""),
+        }
+
+    def list_active_state_tools(self, site_key: str, *, phase: str = "") -> list[dict[str, Any]]:
+        context = self._agent_bridge_session_context(site_key, phase=phase)
+        return state_tool_schemas_for_phase(str(context.get("phase") or ""), include_phase_result=True)
+
+    def call_active_state_tool(
+        self,
+        *,
+        site_key: str,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        turn_id: str = "",
+        phase: str = "",
+    ) -> dict[str, Any]:
+        context = self._agent_bridge_session_context(site_key, phase=phase)
+        effective_turn_id = str(turn_id or context.get("turn_id") or AGENT_BRIDGE_STATUS)
+        effective_phase = str(context.get("phase") or phase or AGENT_BRIDGE_STATUS)
+        payload = execute_state_tool(
+            tool_name,
+            arguments or {},
+            PhaseStateToolContext(
+                site_store=self.site_store,
+                site_key=str(context.get("site_key") or site_key),
+                session_id=str(context.get("session_id") or ""),
+                turn_id=effective_turn_id,
+                batch_id=str(context.get("batch_id") or ""),
+                current_url=str(context.get("current_url") or ""),
+            ),
+        )
+        summary = MCPToolBridge.summarize_tool_output(payload)
+        trace_ref = self.site_store.append_step_trace(
+            str(context.get("site_key") or site_key),
+            effective_turn_id,
+            {
+                "phase": effective_phase,
+                "step_id": f"agent_bridge_state:{tool_name}",
+                "attempt": 1,
+                "tool_name": tool_name,
+                "arguments": arguments or {},
+                "result": "error" if payload.get("isError") else "ok",
+                "output": summary,
+            },
+        )
+        session_update = {
+            "browser_status": AGENT_BRIDGE_STATUS,
+            "pending_action": AGENT_BRIDGE_STATUS,
+            "current_step_id": f"agent_bridge_state:{tool_name}",
+            "current_step_status": "tool_error" if payload.get("isError") else "tool_ok",
+            "current_trace_ref": trace_ref,
+            "last_step_error": summary[:1000] if payload.get("isError") else "",
+        }
+        if str(tool_name or "").strip() == "phase_result" and not payload.get("isError"):
+            structured = payload.get("structuredContent") if isinstance(payload.get("structuredContent"), dict) else {}
+            session_update["current_step_status"] = f"phase_{str(structured.get('status') or 'result')}"
+        self.site_store.save_browser_session(str(context.get("site_key") or site_key), session_update)
+        self.site_store.append_event(
+            str(context.get("site_key") or site_key),
+            "browser.agent_bridge.state_tool_called",
+            {
+                "turn_id": effective_turn_id,
+                "phase": effective_phase,
+                "tool_name": tool_name,
+                "result": "error" if payload.get("isError") else "ok",
+                "trace_ref": trace_ref,
+            },
+        )
+        return {
+            "ok": not bool(payload.get("isError")),
+            "tool_name": tool_name,
+            "phase": effective_phase,
+            "trace_ref": trace_ref,
+            "summary": summary,
+            "payload": payload,
+        }
 
     @staticmethod
     def _phase_has_jobs_surface(phase_slug: str) -> bool:
@@ -323,24 +626,11 @@ class BrowserAutomationService:
             name = str(schema.get("name", "") or "").strip()
             if name:
                 tool_names.add(name)
-        schema = BrowserPhaseRuntime.update_phase_memory_tool()
-        response_tools.append(schema)
-        tool_names.add(str(schema.get("name") or "update_phase_memory"))
-        if phase_slug == "application_status_review":
-            schema = BrowserPhaseRuntime.record_application_reviews_tool()
+        for schema in state_tool_schemas_for_phase(phase_slug):
             response_tools.append(schema)
-            tool_names.add(str(schema.get("name") or "record_application_reviews"))
-        if phase_slug == "job_retrieval":
-            schema = BrowserPhaseRuntime.record_jobs_tool()
-            response_tools.append(schema)
-            tool_names.add(str(schema.get("name") or "record_jobs"))
-        if phase_slug == "apply":
-            schema = BrowserPhaseRuntime.update_jobs_tool()
-            response_tools.append(schema)
-            tool_names.add(str(schema.get("name") or "update_jobs"))
-            schema = BrowserPhaseRuntime.request_context_tool()
-            response_tools.append(schema)
-            tool_names.add(str(schema.get("name") or "request_context"))
+            name = str(schema.get("name") or "").strip()
+            if name:
+                tool_names.add(name)
         return response_tools, tool_names
 
     def _phase_context_session(
@@ -1230,6 +1520,19 @@ class BrowserAutomationService:
         phase_timeout_seconds_override: int | None = None,
         timeout_ms_override: int | None = None,
     ) -> BrowserAutomationResult:
+        if self.execution_mode == AGENT_BRIDGE_MODE:
+            return self._run_site_agent_bridge(
+                site_key=site_key,
+                site_name=site_name,
+                entry_url=entry_url,
+                session_id=session_id,
+                turn_id=turn_id,
+                batch_id=batch_id,
+                resume=resume,
+                phase_slugs=phase_slugs,
+                apply_target_job_ids=apply_target_job_ids,
+                continuation_context=continuation_context,
+            )
         try:
             async def _runner() -> BrowserAutomationResult:
                 return await self._run_site_async(

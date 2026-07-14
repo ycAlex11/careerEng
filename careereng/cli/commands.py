@@ -35,7 +35,13 @@ from careereng.core.runtime import build_site_services as runtime_build_site_ser
 from careereng.core.runtime import project_root_from_cwd, workspace_path as runtime_workspace_path
 from careereng.core.workspace_bootstrap import bootstrap_workspace
 from careereng.core.workspace_manager import (
+    call_agent_bridge_browser_tool,
+    call_agent_bridge_state_tool,
+    call_browser_handoff_tool,
     dispatch_manager_message,
+    list_agent_bridge_browser_tools,
+    list_agent_bridge_state_tools,
+    list_browser_handoff_tools,
     serve_workspace_manager,
     shutdown_workspace_manager,
     start_manager_jobs_batch,
@@ -62,6 +68,9 @@ from careereng.evolution import (
     scan_evolution_triggers,
 )
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore, render_lessons_markdown
+from careereng.agent_bridge.browser import browser_tool_command, legacy_browser_tool_command
+from careereng.agent_bridge.contracts import AGENT_BRIDGE_STATUS, is_agent_bridge_reason
+from careereng.agent_bridge.state import phase_result_command, state_tool_command, state_tools_command
 from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
 from careereng.integrations.assistant_bridge.context import build_assistant_context_pack
 from careereng.integrations.assistant_bridge import AssistantThreadStateStore, ingest_assistant_message
@@ -74,6 +83,7 @@ from careereng.interviews import (
     save_interview_candidates,
 )
 from careereng.metrics import build_metrics_summary, save_metrics_summary
+from careereng.mcp_server import run_mcp_server
 from careereng.resume.export import ResumeExportError, export_resume_pdf as export_resume_pdf_file
 from careereng.reporting.job_report import generate_job_batch_report
 from careereng.storage.job_store import JobStore
@@ -88,8 +98,10 @@ from careereng.utils import make_id, safe_file_stem
 
 app = typer.Typer(help="CareerEng CLI")
 action_card_app = typer.Typer(help="Action card review tasks")
+agent_bridge_app = typer.Typer(help="External agent bridge commands")
 application_summary_app = typer.Typer(help="Application lifecycle summary commands")
 assistant_app = typer.Typer(help="External AI assistant bridge commands")
+browser_handoff_app = typer.Typer(help="Codex/external-agent browser handoff commands")
 career_memory_app = typer.Typer(help="Career memory commands")
 capture_app = typer.Typer(help="Local capture commands")
 capture_audio_app = typer.Typer(help="Audio capture commands")
@@ -104,8 +116,10 @@ route_app = typer.Typer(help="Route feedback commands")
 site_app = typer.Typer(help="Site registry commands")
 taskboard_app = typer.Typer(help="Current development taskboard commands")
 app.add_typer(action_card_app, name="action-card")
+app.add_typer(agent_bridge_app, name="agent-bridge")
 app.add_typer(application_summary_app, name="application-summary")
 app.add_typer(assistant_app, name="assistant")
+app.add_typer(browser_handoff_app, name="browser-handoff")
 app.add_typer(career_memory_app, name="career-memory")
 app.add_typer(capture_app, name="capture")
 capture_app.add_typer(capture_audio_app, name="audio")
@@ -547,6 +561,51 @@ def _format_pending_solution_handoff(*, workspace: Path, batch_id: str) -> str:
     return "\n".join(lines)
 
 
+def _message_field(message: str, key: str) -> str:
+    marker = f"{key}="
+    if marker not in message:
+        return ""
+    tail = message.split(marker, 1)[1]
+    return tail.split()[0].strip()
+
+
+def _format_pending_agent_bridge(batch: dict[str, Any]) -> str:
+    sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+    for site_key in sorted(sites.keys()):
+        row = sites.get(site_key)
+        if not isinstance(row, dict):
+            continue
+        reason = str(row.get("reason_tag") or "").strip()
+        if not is_agent_bridge_reason(reason):
+            continue
+        message = str(row.get("message") or "")
+        work_order = _message_field(message, "work_order")
+        payload = _message_field(message, "payload")
+        phase = str(row.get("current_phase") or "").strip()
+        lines = [
+            "next_action=agent_bridge_browser",
+            f"site={site_key}",
+            f"phase={phase}",
+            f"browser_tools_command=python -m careereng agent-bridge browser-tools --site {site_key}",
+            f"browser_snapshot_command={browser_tool_command(site_key, 'browser_snapshot', '{}')}",
+            f"state_tools_command={state_tools_command(site_key, phase=phase)}",
+            f"state_call_command={state_tool_command(site_key, phase=phase)}",
+            f"phase_result_command={phase_result_command(site_key, phase=phase)}",
+            f"legacy_browser_tools_command=python -m careereng browser-handoff tools --site {site_key}",
+            f"legacy_browser_snapshot_command={legacy_browser_tool_command(site_key, 'browser_snapshot', '{}')}",
+        ]
+        if work_order:
+            lines.append(f"browser_work_order={work_order}")
+        if payload:
+            lines.append(f"browser_payload={payload}")
+        return "\n".join(lines)
+    return ""
+
+
+def _format_pending_browser_handoff(batch: dict[str, Any]) -> str:
+    return _format_pending_agent_bridge(batch)
+
+
 def _next_evolution_batch_id(batch: dict[str, Any]) -> str:
     payload = batch.get("evolution_loop") if isinstance(batch.get("evolution_loop"), dict) else {}
     next_batch_id = str(payload.get("next_batch_id") or "").strip()
@@ -806,7 +865,9 @@ def _dispatch_jobs_batch_with_monitor(
                 )
                 summary = _format_monitored_batch_summary(batch, workspace=workspace)
                 if status in {"waiting_user", "waiting_solution"}:
-                    handoff = _format_pending_solution_handoff(workspace=workspace, batch_id=batch_id)
+                    handoff = _format_pending_agent_bridge(batch)
+                    if not handoff:
+                        handoff = _format_pending_solution_handoff(workspace=workspace, batch_id=batch_id)
                     return f"{summary}\n{handoff}\nmanager=running"
                 shutdown_line = _shutdown_manager_after_terminal_batch(root=root, workspace=workspace)
                 return f"{summary}\n{shutdown_line}"
@@ -1565,6 +1626,241 @@ def jobs_review_status(
     )
 
 
+def _emit_agent_bridge_browser_tools(*, site: str, json_output: bool, legacy: bool = False) -> None:
+    list_tools = list_browser_handoff_tools if legacy else list_agent_bridge_browser_tools
+    response = list_tools(
+        project_root=_project_root(),
+        workspace=_workspace_path(),
+        site_key=site,
+    )
+    if json_output:
+        typer.echo(json.dumps(response, ensure_ascii=False, indent=2))
+        return
+    tools = response.get("tools") if isinstance(response.get("tools"), list) else []
+    typer.echo(f"site={response.get('site_key') or site} tools={len(tools)}")
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name") or "")
+        description = str(tool.get("description") or "").strip()
+        line = f"- {name}"
+        if description:
+            line += f": {description[:160]}"
+        typer.echo(line)
+
+
+def _emit_agent_bridge_browser_call(
+    *,
+    site: str,
+    tool: str,
+    args: str,
+    phase: str,
+    turn: str,
+    json_output: bool,
+    legacy: bool = False,
+) -> None:
+    try:
+        parsed_args = json.loads(args or "{}")
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"--args must be a JSON object: {exc}") from exc
+    if not isinstance(parsed_args, dict):
+        raise typer.BadParameter("--args must be a JSON object")
+    call_tool = call_browser_handoff_tool if legacy else call_agent_bridge_browser_tool
+    response = call_tool(
+        project_root=_project_root(),
+        workspace=_workspace_path(),
+        site_key=site,
+        tool_name=tool,
+        arguments=parsed_args,
+        turn_id=turn,
+        phase=phase,
+    )
+    if json_output:
+        typer.echo(json.dumps(response, ensure_ascii=False, indent=2))
+        return
+    result = response.get("result") if isinstance(response.get("result"), dict) else {}
+    status = "ok" if bool(result.get("ok")) else "error"
+    typer.echo(
+        f"site={response.get('site_key') or site} tool={tool} status={status} "
+        f"url={result.get('current_url') or ''} trace={result.get('trace_ref') or ''}"
+    )
+    summary = str(result.get("summary") or "").strip()
+    if summary:
+        typer.echo(summary)
+
+
+def _emit_agent_bridge_state_tools(*, site: str, phase: str, json_output: bool) -> None:
+    response = list_agent_bridge_state_tools(
+        project_root=_project_root(),
+        workspace=_workspace_path(),
+        site_key=site,
+        phase=phase,
+    )
+    if json_output:
+        typer.echo(json.dumps(response, ensure_ascii=False, indent=2))
+        return
+    tools = response.get("tools") if isinstance(response.get("tools"), list) else []
+    phase_text = str(response.get("phase") or phase or "").strip()
+    suffix = f" phase={phase_text}" if phase_text else ""
+    typer.echo(f"site={response.get('site_key') or site}{suffix} state_tools={len(tools)}")
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name") or "")
+        description = str(tool.get("description") or "").strip()
+        line = f"- {name}"
+        if description:
+            line += f": {description[:160]}"
+        typer.echo(line)
+
+
+def _emit_agent_bridge_state_call(
+    *,
+    site: str,
+    tool: str,
+    args: str,
+    phase: str,
+    turn: str,
+    json_output: bool,
+) -> None:
+    try:
+        parsed_args = json.loads(args or "{}")
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"--args must be a JSON object: {exc}") from exc
+    if not isinstance(parsed_args, dict):
+        raise typer.BadParameter("--args must be a JSON object")
+    response = call_agent_bridge_state_tool(
+        project_root=_project_root(),
+        workspace=_workspace_path(),
+        site_key=site,
+        tool_name=tool,
+        arguments=parsed_args,
+        turn_id=turn,
+        phase=phase,
+    )
+    if json_output:
+        typer.echo(json.dumps(response, ensure_ascii=False, indent=2))
+        return
+    result = response.get("result") if isinstance(response.get("result"), dict) else {}
+    status = "ok" if bool(result.get("ok")) else "error"
+    typer.echo(
+        f"site={response.get('site_key') or site} state_tool={tool} status={status} "
+        f"phase={result.get('phase') or phase or ''} trace={result.get('trace_ref') or ''}"
+    )
+    summary = str(result.get("summary") or "").strip()
+    if summary:
+        typer.echo(summary)
+
+
+@agent_bridge_app.command("browser-tools")
+def agent_bridge_browser_tools(
+    site: str = typer.Option(..., "--site", help="Site key with an active agent bridge browser runtime"),
+    json_output: bool = typer.Option(False, "--json", help="Print full JSON response"),
+):
+    """List MCP browser tools exposed by the active CareerEng agent bridge runtime."""
+    _emit_agent_bridge_browser_tools(site=site, json_output=json_output)
+
+
+@agent_bridge_app.command("browser-call")
+def agent_bridge_browser_call(
+    site: str = typer.Option(..., "--site", help="Site key with an active agent bridge browser runtime"),
+    tool: str = typer.Option(..., "--tool", help="MCP browser tool name, e.g. browser_snapshot"),
+    args: str = typer.Option("{}", "--args", help="JSON object arguments for the tool"),
+    phase: str = typer.Option(AGENT_BRIDGE_STATUS, "--phase", help="Trace phase label"),
+    turn: str = typer.Option("", "--turn", help="Optional turn ID for trace linkage"),
+    json_output: bool = typer.Option(False, "--json", help="Print full JSON response"),
+):
+    """Call one MCP browser tool through the active CareerEng agent bridge runtime."""
+    _emit_agent_bridge_browser_call(
+        site=site,
+        tool=tool,
+        args=args,
+        phase=phase,
+        turn=turn,
+        json_output=json_output,
+    )
+
+
+@agent_bridge_app.command("state-tools")
+def agent_bridge_state_tools(
+    site: str = typer.Option(..., "--site", help="Site key with an active agent bridge phase session"),
+    phase: str = typer.Option("", "--phase", help="Optional phase override, e.g. apply"),
+    json_output: bool = typer.Option(False, "--json", help="Print full JSON response"),
+):
+    """List CareerEng state tools exposed by the active phase session."""
+    _emit_agent_bridge_state_tools(site=site, phase=phase, json_output=json_output)
+
+
+@agent_bridge_app.command("state-call")
+def agent_bridge_state_call(
+    site: str = typer.Option(..., "--site", help="Site key with an active agent bridge phase session"),
+    tool: str = typer.Option(..., "--tool", help="CareerEng state tool name, e.g. update_jobs"),
+    args: str = typer.Option("{}", "--args", help="JSON object arguments for the state tool"),
+    phase: str = typer.Option("", "--phase", help="Optional phase override, e.g. apply"),
+    turn: str = typer.Option("", "--turn", help="Optional turn ID for trace linkage"),
+    json_output: bool = typer.Option(False, "--json", help="Print full JSON response"),
+):
+    """Call one CareerEng state tool through the active phase session."""
+    _emit_agent_bridge_state_call(
+        site=site,
+        tool=tool,
+        args=args,
+        phase=phase,
+        turn=turn,
+        json_output=json_output,
+    )
+
+
+@agent_bridge_app.command("phase-result")
+def agent_bridge_phase_result(
+    site: str = typer.Option(..., "--site", help="Site key with an active agent bridge phase session"),
+    status: str = typer.Option(..., "--status", help="Phase result status: done or blocked"),
+    summary: str = typer.Option(..., "--summary", help="Short phase result summary"),
+    phase: str = typer.Option("", "--phase", help="Optional phase override, e.g. apply"),
+    turn: str = typer.Option("", "--turn", help="Optional turn ID for trace linkage"),
+    json_output: bool = typer.Option(False, "--json", help="Print full JSON response"),
+):
+    """Record a phase_result through the shared CareerEng state tool path."""
+    _emit_agent_bridge_state_call(
+        site=site,
+        tool="phase_result",
+        args=json.dumps({"status": status, "summary": summary}, ensure_ascii=False),
+        phase=phase,
+        turn=turn,
+        json_output=json_output,
+    )
+
+
+@browser_handoff_app.command("tools")
+def browser_handoff_tools(
+    site: str = typer.Option(..., "--site", help="Site key with an active agent bridge browser runtime"),
+    json_output: bool = typer.Option(False, "--json", help="Print full JSON response"),
+):
+    """Legacy alias for `agent-bridge browser-tools`."""
+    _emit_agent_bridge_browser_tools(site=site, json_output=json_output, legacy=True)
+
+
+@browser_handoff_app.command("call")
+def browser_handoff_call(
+    site: str = typer.Option(..., "--site", help="Site key with an active agent bridge browser runtime"),
+    tool: str = typer.Option(..., "--tool", help="MCP browser tool name, e.g. browser_snapshot"),
+    args: str = typer.Option("{}", "--args", help="JSON object arguments for the tool"),
+    phase: str = typer.Option(AGENT_BRIDGE_STATUS, "--phase", help="Trace phase label"),
+    turn: str = typer.Option("", "--turn", help="Optional turn ID for trace linkage"),
+    json_output: bool = typer.Option(False, "--json", help="Print full JSON response"),
+):
+    """Legacy alias for `agent-bridge browser-call`."""
+    _emit_agent_bridge_browser_call(
+        site=site,
+        tool=tool,
+        args=args,
+        phase=phase,
+        turn=turn,
+        json_output=json_output,
+        legacy=True,
+    )
+
+
 @metrics_app.command("summary")
 def metrics_summary(
     batch: str = typer.Option("", "--batch", help="Batch ID, or latest"),
@@ -2162,6 +2458,27 @@ def manager_serve(
         workspace=Path(workspace).expanduser().resolve(),
         socket_path=Path(socket_path).expanduser(),
     )
+
+
+@app.command("mcp-server")
+def mcp_server(
+    project_root: str = typer.Option("", "--project-root", help="Project root; defaults to current CareerEng project"),
+    workspace: str = typer.Option("", "--workspace", help="Workspace path; defaults to configured workspace"),
+    transport: str = typer.Option("stdio", "--transport", help="stdio, sse, or streamable-http"),
+    mount_path: str = typer.Option("", "--mount-path", help="Optional HTTP mount path for non-stdio transports"),
+):
+    """Run the CareerEng MCP server for Codex or another local agent."""
+    root = Path(project_root).expanduser().resolve() if str(project_root or "").strip() else _project_root()
+    resolved_workspace = Path(workspace).expanduser().resolve() if str(workspace or "").strip() else runtime_workspace_path(root)
+    if transport not in {"stdio", "sse", "streamable-http"}:
+        raise typer.BadParameter("transport must be one of: stdio, sse, streamable-http")
+    run_mcp_server(
+        project_root=root,
+        workspace=resolved_workspace,
+        transport=transport,  # type: ignore[arg-type]
+        mount_path=str(mount_path or "").strip() or None,
+    )
+
 
 @site_app.command("add")
 def site_add(

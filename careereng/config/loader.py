@@ -49,6 +49,10 @@ router_log_enabled = true
 search_company_top_k = 10
 
 [browser]
+# provider: use the configured browser LLM API.
+# agent_bridge: keep CareerEng's Playwright MCP runtime and let an external agent such as Codex drive it.
+# codex_handoff is kept as a legacy alias for agent_bridge.
+execution_mode = "provider"
 headless = false
 keep_open = false
 timeout_ms = 45000

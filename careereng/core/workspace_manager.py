@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from careereng.agent_bridge.contracts import AGENT_BRIDGE_STATUS
 from careereng.core.runtime import build_loop
 from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
 from careereng.utils import make_id
@@ -51,6 +52,14 @@ class WorkspaceManager:
             return self._handle_start_jobs_batch(payload)
         if op == "fresh_snapshot_resume":
             return self._handle_fresh_snapshot_resume(payload)
+        if op in {"agent_bridge_browser_list_tools", "browser_handoff_list_tools"}:
+            return self._handle_agent_bridge_browser_list_tools(payload)
+        if op in {"agent_bridge_browser_call_tool", "browser_handoff_call_tool"}:
+            return self._handle_agent_bridge_browser_call_tool(payload)
+        if op == "agent_bridge_state_list_tools":
+            return self._handle_agent_bridge_state_list_tools(payload)
+        if op == "agent_bridge_state_call_tool":
+            return self._handle_agent_bridge_state_call_tool(payload)
         if op != "process_message":
             return {"ok": False, "error": f"unsupported op: {op}"}
         session_id = str(payload.get("session_id") or "cli:default")
@@ -161,6 +170,107 @@ class WorkspaceManager:
         if reply is None:
             return {"ok": True, "accepted": False, "reply": ""}
         return {"ok": True, "accepted": True, "reply": reply, "turn_id": turn_id}
+
+    def _handle_agent_bridge_browser_list_tools(self, payload: dict[str, Any]) -> dict[str, Any]:
+        site_key = str(payload.get("site_key") or "").strip()
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return {"ok": False, "error": "workspace manager is busy with another operation"}
+        try:
+            if self._background_batch_running:
+                return {"ok": False, "error": "workspace manager is busy with another job batch"}
+            browser_runner = getattr(self.loop, "browser_runner", None)
+            list_tools = getattr(browser_runner, "list_active_browser_tools", None)
+            if not callable(list_tools):
+                return {"ok": False, "error": "agent bridge browser tool listing is unavailable"}
+            tools = list_tools(site_key)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self._lock.release()
+        return {"ok": True, "site_key": site_key, "tools": tools}
+
+    def _handle_agent_bridge_browser_call_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
+        site_key = str(payload.get("site_key") or "").strip()
+        tool_name = str(payload.get("tool_name") or "").strip()
+        arguments = payload.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+        turn_id = str(payload.get("turn_id") or "").strip()
+        phase = str(payload.get("phase") or AGENT_BRIDGE_STATUS).strip() or AGENT_BRIDGE_STATUS
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return {"ok": False, "error": "workspace manager is busy with another operation"}
+        try:
+            if self._background_batch_running:
+                return {"ok": False, "error": "workspace manager is busy with another job batch"}
+            browser_runner = getattr(self.loop, "browser_runner", None)
+            call_tool = getattr(browser_runner, "call_active_browser_tool", None)
+            if not callable(call_tool):
+                return {"ok": False, "error": "agent bridge browser tool call is unavailable"}
+            result = call_tool(
+                site_key=site_key,
+                tool_name=tool_name,
+                arguments=arguments,
+                turn_id=turn_id,
+                phase=phase,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self._lock.release()
+        return {"ok": True, "site_key": site_key, "result": result}
+
+    def _handle_agent_bridge_state_list_tools(self, payload: dict[str, Any]) -> dict[str, Any]:
+        site_key = str(payload.get("site_key") or "").strip()
+        phase = str(payload.get("phase") or "").strip()
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return {"ok": False, "error": "workspace manager is busy with another operation"}
+        try:
+            if self._background_batch_running:
+                return {"ok": False, "error": "workspace manager is busy with another job batch"}
+            browser_runner = getattr(self.loop, "browser_runner", None)
+            list_tools = getattr(browser_runner, "list_active_state_tools", None)
+            if not callable(list_tools):
+                return {"ok": False, "error": "agent bridge state tool listing is unavailable"}
+            tools = list_tools(site_key, phase=phase)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self._lock.release()
+        return {"ok": True, "site_key": site_key, "phase": phase, "tools": tools}
+
+    def _handle_agent_bridge_state_call_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
+        site_key = str(payload.get("site_key") or "").strip()
+        tool_name = str(payload.get("tool_name") or "").strip()
+        arguments = payload.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+        turn_id = str(payload.get("turn_id") or "").strip()
+        phase = str(payload.get("phase") or "").strip()
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return {"ok": False, "error": "workspace manager is busy with another operation"}
+        try:
+            if self._background_batch_running:
+                return {"ok": False, "error": "workspace manager is busy with another job batch"}
+            browser_runner = getattr(self.loop, "browser_runner", None)
+            call_tool = getattr(browser_runner, "call_active_state_tool", None)
+            if not callable(call_tool):
+                return {"ok": False, "error": "agent bridge state tool call is unavailable"}
+            result = call_tool(
+                site_key=site_key,
+                tool_name=tool_name,
+                arguments=arguments,
+                turn_id=turn_id,
+                phase=phase,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self._lock.release()
+        return {"ok": True, "site_key": site_key, "result": result}
 
 
 class _ManagerRequestHandler(socketserver.StreamRequestHandler):
@@ -337,6 +447,158 @@ def start_manager_jobs_batch(
     if not bool(response.get("ok")):
         raise RuntimeError(str(response.get("error") or "workspace manager request failed"))
     return response
+
+
+def fresh_snapshot_resume(
+    *,
+    project_root: Path,
+    workspace: Path,
+    session_id: str,
+    message: str,
+    turn_id: str = "",
+) -> dict[str, Any]:
+    socket_path = ensure_workspace_manager(project_root=project_root, workspace=workspace)
+    response = _send_request(
+        socket_path,
+        {
+            "op": "fresh_snapshot_resume",
+            "session_id": session_id,
+            "message": message,
+            "turn_id": turn_id,
+        },
+        timeout=DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS,
+    )
+    if not bool(response.get("ok")):
+        raise RuntimeError(str(response.get("error") or "workspace manager request failed"))
+    return response
+
+
+def list_agent_bridge_browser_tools(
+    *,
+    project_root: Path,
+    workspace: Path,
+    site_key: str,
+) -> dict[str, Any]:
+    socket_path = ensure_workspace_manager(project_root=project_root, workspace=workspace)
+    response = _send_request(
+        socket_path,
+        {
+            "op": "agent_bridge_browser_list_tools",
+            "site_key": site_key,
+        },
+        timeout=DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS,
+    )
+    if not bool(response.get("ok")):
+        raise RuntimeError(str(response.get("error") or "workspace manager request failed"))
+    return response
+
+
+def call_agent_bridge_browser_tool(
+    *,
+    project_root: Path,
+    workspace: Path,
+    site_key: str,
+    tool_name: str,
+    arguments: dict[str, Any] | None = None,
+    turn_id: str = "",
+    phase: str = AGENT_BRIDGE_STATUS,
+) -> dict[str, Any]:
+    socket_path = ensure_workspace_manager(project_root=project_root, workspace=workspace)
+    response = _send_request(
+        socket_path,
+        {
+            "op": "agent_bridge_browser_call_tool",
+            "site_key": site_key,
+            "tool_name": tool_name,
+            "arguments": arguments or {},
+            "turn_id": turn_id,
+            "phase": phase,
+        },
+        timeout=DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS,
+    )
+    if not bool(response.get("ok")):
+        raise RuntimeError(str(response.get("error") or "workspace manager request failed"))
+    return response
+
+
+def list_agent_bridge_state_tools(
+    *,
+    project_root: Path,
+    workspace: Path,
+    site_key: str,
+    phase: str = "",
+) -> dict[str, Any]:
+    socket_path = ensure_workspace_manager(project_root=project_root, workspace=workspace)
+    response = _send_request(
+        socket_path,
+        {
+            "op": "agent_bridge_state_list_tools",
+            "site_key": site_key,
+            "phase": phase,
+        },
+        timeout=DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS,
+    )
+    if not bool(response.get("ok")):
+        raise RuntimeError(str(response.get("error") or "workspace manager request failed"))
+    return response
+
+
+def call_agent_bridge_state_tool(
+    *,
+    project_root: Path,
+    workspace: Path,
+    site_key: str,
+    tool_name: str,
+    arguments: dict[str, Any] | None = None,
+    turn_id: str = "",
+    phase: str = "",
+) -> dict[str, Any]:
+    socket_path = ensure_workspace_manager(project_root=project_root, workspace=workspace)
+    response = _send_request(
+        socket_path,
+        {
+            "op": "agent_bridge_state_call_tool",
+            "site_key": site_key,
+            "tool_name": tool_name,
+            "arguments": arguments or {},
+            "turn_id": turn_id,
+            "phase": phase,
+        },
+        timeout=DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS,
+    )
+    if not bool(response.get("ok")):
+        raise RuntimeError(str(response.get("error") or "workspace manager request failed"))
+    return response
+
+
+def list_browser_handoff_tools(
+    *,
+    project_root: Path,
+    workspace: Path,
+    site_key: str,
+) -> dict[str, Any]:
+    return list_agent_bridge_browser_tools(project_root=project_root, workspace=workspace, site_key=site_key)
+
+
+def call_browser_handoff_tool(
+    *,
+    project_root: Path,
+    workspace: Path,
+    site_key: str,
+    tool_name: str,
+    arguments: dict[str, Any] | None = None,
+    turn_id: str = "",
+    phase: str = AGENT_BRIDGE_STATUS,
+) -> dict[str, Any]:
+    return call_agent_bridge_browser_tool(
+        project_root=project_root,
+        workspace=workspace,
+        site_key=site_key,
+        tool_name=tool_name,
+        arguments=arguments,
+        turn_id=turn_id,
+        phase=phase,
+    )
 
 
 def shutdown_workspace_manager(

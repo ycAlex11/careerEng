@@ -68,6 +68,8 @@ class AgentLoop:
         self.router_log_enabled = bool(router_log_enabled)
         self.search_company_top_k = max(1, int(search_company_top_k or 1))
         self.site_parallelism = max(1, int(site_parallelism or 1))
+        # WorkspaceManager and JobFlow must address the same browser runtime.
+        self.browser_runner = browser_runner
 
         self.session_manager = SessionManager(workspace)
         self.chat_store = ChatStore(workspace)
@@ -117,7 +119,7 @@ class AgentLoop:
             job_store=self.job_store,
             application_store=self.application_store,
             site_tools=self.site_tools,
-            browser_runner=browser_runner,
+            browser_runner=self.browser_runner,
             search_strategy=self.search_strategy,
             profile_store=self.profile_store,
             cv_store=self.cv_store,

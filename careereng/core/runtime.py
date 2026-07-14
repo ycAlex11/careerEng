@@ -84,6 +84,7 @@ def build_loop(*, project_root: Path, workspace: Path | None = None) -> tuple[Ag
         project_root=project_root,
         workspace=resolved_workspace,
         site_store=site_store,
+        execution_mode=str(config.browser.execution_mode or "provider"),
         api_base=resolve_browser_api_base(config),
         api_key=str(auth.openai_api_key or ""),
         model=str(config.agent.default_model or "gpt-5"),

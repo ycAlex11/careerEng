@@ -121,6 +121,7 @@ class RetrievalConfig:
 
 @dataclass
 class BrowserConfig:
+    execution_mode: str = "provider"
     headless: bool = False
     keep_open: bool = False
     timeout_ms: int = 45000

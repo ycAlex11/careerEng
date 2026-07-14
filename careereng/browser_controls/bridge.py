@@ -21,10 +21,18 @@ class MCPToolBridge:
     _CAP_MARKER = "\n...[truncated]...\n"
 
     def __init__(self, runtime: PlaywrightMCPProcess | str, *, timeout_seconds: float = 30.0):
-        self.runtime = runtime if isinstance(runtime, PlaywrightMCPProcess) else None
-        self.endpoint_url = (
-            runtime.endpoint_url.rstrip("/") if isinstance(runtime, PlaywrightMCPProcess) else str(runtime).rstrip("/")
+        self.runtime = (
+            runtime
+            if isinstance(runtime, PlaywrightMCPProcess)
+            or (
+                hasattr(runtime, "is_running")
+                and hasattr(runtime, "list_tools_sync")
+                and hasattr(runtime, "call_tool_sync")
+            )
+            else None
         )
+        endpoint = getattr(self.runtime, "endpoint_url", "") if self.runtime is not None else ""
+        self.endpoint_url = str(endpoint or runtime).rstrip("/")
         self.timeout_seconds = max(5.0, float(timeout_seconds or 30.0))
 
     @asynccontextmanager
