@@ -9,9 +9,15 @@ from pathlib import Path
 import re
 from typing import Any
 
-from careereng.application_summary import build_application_summary
+from careereng.career.applications.summary import build_application_summary
+from careereng.evolution.artifacts import (
+    EvolutionContextStore,
+    EvolutionEvidenceStore,
+    EvolutionReviewStore,
+    OpenEvolutionCandidateStore,
+)
+from careereng.evolution.memory_units import EvolutionMemoryStore
 from careereng.evolution.schema import EvolutionEvidence, ImprovementCandidate, MemoryUnit
-from careereng.evolution.store import EvolutionStore
 from careereng.utils import now_iso, today_str
 
 
@@ -73,26 +79,30 @@ def build_evolution_review(
 
 def save_evolution_review(review: dict[str, Any], *, workspace: Path | str) -> dict[str, Path]:
     workspace_path = Path(workspace)
-    store = EvolutionStore(workspace_path)
+    evidence_store = EvolutionEvidenceStore(workspace_path)
+    candidate_store = OpenEvolutionCandidateStore(workspace_path)
+    memory_store = EvolutionMemoryStore(workspace_path)
+    context_store = EvolutionContextStore(workspace_path)
+    review_store = EvolutionReviewStore(workspace_path)
     evidence = review.get("evidence") if isinstance(review.get("evidence"), list) else []
     candidates = review.get("candidates") if isinstance(review.get("candidates"), list) else []
     memory_units = review.get("memory_units") if isinstance(review.get("memory_units"), list) else []
-    store.upsert_evidence([row for row in evidence if isinstance(row, dict)])
-    store.upsert_open_candidates([row for row in candidates if isinstance(row, dict) and str(row.get("status") or "open") == "open"])
-    store.upsert_memory_units([row for row in memory_units if isinstance(row, dict)])
+    evidence_store.upsert_many([row for row in evidence if isinstance(row, dict)])
+    candidate_store.upsert_many([row for row in candidates if isinstance(row, dict) and str(row.get("status") or "open") == "open"])
+    memory_store.upsert_many([row for row in memory_units if isinstance(row, dict)])
 
     context_text = render_evolution_context(review)
-    context_path = store.save_context_markdown(context_text)
+    context_path = context_store.save_markdown(context_text)
     review_payload = {**review, "context_pack_path": str(_relative_path(context_path, workspace_path))}
-    markdown_path = store.save_review_markdown(render_evolution_review_markdown(review_payload))
-    json_path = store.save_review_json(review_payload)
+    markdown_path = review_store.save_markdown(render_evolution_review_markdown(review_payload))
+    json_path = review_store.save_json(review_payload)
     return {
         "review_json": json_path,
         "review_markdown": markdown_path,
         "context_markdown": context_path,
-        "evidence_store": store.evidence_store.path,
-        "open_candidates_store": store.open_candidates_store.path,
-        "memory_units_store": store.memory_units_store.path,
+        "evidence_store": evidence_store.path,
+        "open_candidates_store": candidate_store.path,
+        "memory_units_store": memory_store.store.path,
     }
 
 

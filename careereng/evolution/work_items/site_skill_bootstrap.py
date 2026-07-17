@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from careereng.action_cards.schema import ACTION_CARD_CODEX_DRAFT
-from careereng.action_cards.store import ActionCardStore
+from careereng.evolution.work_items.schema import ACTION_CARD_CODEX_DRAFT
+from careereng.evolution.work_items.store import ActionCardStore
 from careereng.utils import safe_file_stem
 
 

@@ -6,7 +6,7 @@ import re
 import shlex
 from typing import Any
 
-from careereng.integrations.assistant_bridge.schema import (
+from careereng.orchestration.agent_protocol.assistant_bridge import (
     AssistantBridgeDecision,
     DATA_CATEGORY_APPLICATION_FEEDBACK,
     DATA_CATEGORY_CAREER_INTENT_STRATEGY,

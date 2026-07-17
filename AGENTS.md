@@ -4,6 +4,18 @@ CareerEng is designed to be operated by Codex or another local AI assistant.
 
 If the user uses `@career` or discusses job search, resumes, applications, interviews, target companies, career sites, reports, metrics, evolution, or CareerEng operations, read `docs/assistant_bridge/ASSISTANT_GUIDE.md`.
 
+## Architecture Contract
+
+For changes involving directories, tool declarations or implementations,
+adapters, workspace state, browser control, orchestration, or evolution
+boundaries, first read `docs/architecture/ARCHITECTURE.md`.
+
+Treat that document as the target architecture during migration. Do not extend
+legacy mixed modules merely because they are nearby. If a change alters an
+architectural boundary, dependency direction, tool contract, or workspace
+ownership rule, update the architecture contract and active taskboard before
+implementing code.
+
 ## AI-First Design Boundary
 
 CareerEng is an AI-first project. Before adding Python logic for workflow behavior, ask whether the behavior should be handled by the LLM through Skills, local memory, evidence packs, action cards, or an evolution proposal.
@@ -88,6 +100,11 @@ When listing development tasks, prefer this structure:
 - `Parking Lot`: useful ideas that are explicitly not part of the current work.
 
 When discussing tasks with the user, a simple numbered list such as `1, 2, 3` is fine because it is easier to review and revise in conversation. When saving tasks into the taskboard, convert that discussion list into the `Now / Next / Later / Parking Lot` structure instead of copying the numbered list verbatim.
+
+`workspace/taskboard/current.md` is the compact active work set. Do not append
+long progress logs or complete historical plans to it. `taskboard update`
+replaces the active board and preserves the prior version in
+`workspace/taskboard/history/`; archive only a completed or superseded board.
 
 For development tasks saved into the taskboard, include these fields when useful:
 

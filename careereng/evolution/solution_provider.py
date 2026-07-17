@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from careereng.action_cards import ActionCardError, ActionCardStore
+from careereng.evolution.work_items import ActionCardError, ActionCardStore
 from careereng.evolution.candidate_specs import CandidateSpecError
 from careereng.evolution.evidence_pack import build_solution_evidence_pack
 from careereng.evolution.proposals import FORBIDDEN_CHANGE_TYPES, SUPPORTED_CHANGE_TYPES, proposal_path_for_run

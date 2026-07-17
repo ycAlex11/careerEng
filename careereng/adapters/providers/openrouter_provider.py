@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from careereng.metrics import LLMUsageRecorder
-from careereng.providers.openai_provider import OpenAICompatibleProvider
+from careereng.platform.observability import LLMUsageRecorder
+from .openai_provider import OpenAICompatibleProvider
 
 
 class OpenRouterProvider(OpenAICompatibleProvider):

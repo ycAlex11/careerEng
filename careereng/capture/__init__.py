@@ -1,2 +1,0 @@
-"""Generic local capture helpers."""
-

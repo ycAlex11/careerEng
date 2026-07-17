@@ -8,12 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 
-from careereng.core.runtime import project_root_from_cwd, workspace_path as resolve_workspace_path
-from careereng.core.workspace_manager import (
+from careereng.adapters.bootstrap import project_root_from_cwd, workspace_path as resolve_workspace_path
+from careereng.adapters.host.workspace_manager import (
     call_agent_bridge_browser_tool,
     call_agent_bridge_state_tool,
     fresh_snapshot_resume,
@@ -21,8 +22,9 @@ from careereng.core.workspace_manager import (
     list_agent_bridge_state_tools,
     start_manager_jobs_batch,
 )
-from careereng.storage.job_store import JobStore
-from careereng.storage.site_store import SiteStore
+from careereng.adapters.external_agents.work_orders import load_active_phase_context
+from careereng.career.applications.job_store import JobStore, TERMINAL_BATCH_STATUSES
+from careereng.career.applications.site_store import SiteStore
 from careereng.utils import make_id
 
 
@@ -108,6 +110,59 @@ def _latest_batch(store: JobStore, *, session_id: str, batch_id: str) -> dict[st
     return store.latest_open_batch(session_id) or (store.list_batches(session_id=session_id)[:1] or [None])[0]
 
 
+def _active_phase_contexts(
+    *,
+    site_store: SiteStore,
+    batch: dict[str, Any] | None,
+    site_key: str = "",
+) -> list[dict[str, Any]]:
+    """Read ready external-agent phase contexts without interpreting them."""
+
+    if str((batch or {}).get("status") or "") in TERMINAL_BATCH_STATUSES:
+        return []
+    sites = batch.get("sites") if isinstance(batch, dict) and isinstance(batch.get("sites"), dict) else {}
+    requested_site = str(site_key or "").strip()
+    contexts: list[dict[str, Any]] = []
+    for raw_key, row in sites.items():
+        key = str(raw_key or "").strip()
+        if not key or (requested_site and key != requested_site):
+            continue
+        try:
+            browser_session = site_store.load_browser_session(key)
+        except Exception:
+            browser_session = {}
+        payload_path = str(browser_session.get("agent_bridge_payload_path") or "")
+        context = load_active_phase_context(payload_path)
+        if context:
+            contexts.append(context)
+    return contexts
+
+
+def _with_phase_contexts(payload: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any]:
+    enriched = dict(payload)
+    enriched["active_phase_contexts"] = contexts
+    if len(contexts) == 1:
+        enriched["active_phase_context"] = contexts[0]
+    return enriched
+
+
+def _wait_for_phase_contexts(
+    *,
+    runtime: CareerEngMCPRuntime,
+    batch_id: str,
+    timeout_seconds: float = 5.0,
+) -> list[dict[str, Any]]:
+    """Boundedly wait for a launched agent-bridge work order to become readable."""
+
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds or 0.0))
+    while True:
+        batch = runtime.job_store().load_batch(batch_id)
+        contexts = _active_phase_contexts(site_store=runtime.site_store(), batch=batch)
+        if contexts or time.monotonic() >= deadline:
+            return contexts
+        time.sleep(0.1)
+
+
 def create_mcp_server(*, project_root: Path | None = None, workspace: Path | None = None) -> FastMCP:
     runtime = CareerEngMCPRuntime.from_paths(project_root=project_root, workspace=workspace)
     server = FastMCP(
@@ -149,14 +204,14 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             except Exception:
                 browser_session = {}
             compact_sites.append(_compact_site(site, browser_session=browser_session))
-        return {
+        return _with_phase_contexts({
             "ok": True,
             "project_root": str(runtime.project_root),
             "workspace": str(runtime.workspace),
             "session_id": session_id,
             "batch": _compact_batch(batch),
             "active_sites": compact_sites,
-        }
+        }, _active_phase_contexts(site_store=site_store, batch=batch, site_key=site_key))
 
     @server.tool()
     def careereng_get_batch_status(
@@ -174,8 +229,8 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         apply_requested: bool = True,
         session_id: str = DEFAULT_SESSION_ID,
     ) -> dict[str, Any]:
-        """Start a CareerEng jobs batch through the existing workspace manager."""
-        return start_manager_jobs_batch(
+        """Start a jobs batch and return its first ready external-agent phase context."""
+        result = start_manager_jobs_batch(
             project_root=runtime.project_root,
             workspace=runtime.workspace,
             session_id=session_id,
@@ -183,6 +238,14 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             operation=operation,
             apply_requested=apply_requested,
         )
+        if not bool(result.get("accepted")):
+            return result
+        batch_id = str(result.get("batch_id") or "")
+        contexts = _wait_for_phase_contexts(
+            runtime=runtime,
+            batch_id=batch_id,
+        ) if batch_id else []
+        return _with_phase_contexts(result, contexts)
 
     @server.tool()
     def careereng_resume_after_user_action(

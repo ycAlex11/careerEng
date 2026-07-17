@@ -8,10 +8,10 @@ from pathlib import Path
 import shutil
 from typing import Any
 
-from careereng.action_cards import ActionCardError, ActionCardStore
+from careereng.evolution.work_items import ActionCardError, ActionCardStore
 from careereng.evolution.proposals import ASSISTANT_CONTEXT_TARGET, EvolutionProposalError, load_proposal
 from careereng.evolution.memory_units import EvolutionMemoryStore, build_loop_evolution_memory
-from careereng.storage.jsonl import JSONLStore
+from careereng.platform.persistence import JSONLStore
 from careereng.utils import ensure_dir, make_id, now_iso, read_json, safe_file_stem, write_json
 
 

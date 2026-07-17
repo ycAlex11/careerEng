@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
+from careereng.evolution.artifacts import EvolutionProposalArtifactStore
 
 ASSISTANT_CONTEXT_TARGET = "docs/assistant_bridge/CODEX_CONTEXT.md"
 SUPPORTED_CHANGE_TYPES = {
@@ -34,19 +34,18 @@ class EvolutionProposalError(ValueError):
 
 
 def proposal_path_for_run(run_dir: Path | str) -> Path:
-    return Path(run_dir) / "proposals" / "proposal.json"
+    return EvolutionProposalArtifactStore().proposal_path(run_dir)
 
 
 def load_proposal(run_dir: Path | str) -> dict[str, Any]:
-    path = proposal_path_for_run(run_dir)
-    if not path.exists():
-        raise EvolutionProposalError(f"Missing proposal: {path}")
+    artifact_store = EvolutionProposalArtifactStore()
+    path = artifact_store.proposal_path(run_dir)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
+        payload = artifact_store.load_json(run_dir)
+    except FileNotFoundError as exc:
+        raise EvolutionProposalError(f"Missing proposal: {path}") from exc
+    except ValueError as exc:
         raise EvolutionProposalError(f"Invalid proposal JSON: {path}") from exc
-    if not isinstance(payload, dict):
-        raise EvolutionProposalError(f"Proposal must be a JSON object: {path}")
     validate_proposal(payload)
     return payload
 

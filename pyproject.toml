@@ -19,7 +19,7 @@ dev = [
 ]
 
 [project.scripts]
-careereng = "careereng.cli.app:app"
+careereng = "careereng.adapters.cli.app:app"
 
 [build-system]
 requires = ["hatchling"]

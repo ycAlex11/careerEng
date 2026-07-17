@@ -6,10 +6,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from careereng.evolution.artifacts.paths import context_path, evidence_path, memory_units_path, open_candidates_path
 from careereng.evolution.candidate_specs import CandidateSpec, get_candidate_spec
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore, render_lessons_markdown
 from careereng.evolution.strategy_router import related_strategy_spec_payloads, strategy_family, strategy_router_payload
-from careereng.storage.jsonl import JSONLStore
+from careereng.platform.persistence import JSONLStore
 from careereng.utils import ensure_dir, make_id, now_iso, read_json, write_json
 
 
@@ -114,10 +115,10 @@ def _run_inputs(workspace: Path, *, root: Path | None = None) -> dict[str, Path]
         "assistant_guide": project_root / "docs" / "assistant_bridge" / "ASSISTANT_GUIDE.md",
         "assistant_codex_context": project_root / "docs" / "assistant_bridge" / "CODEX_CONTEXT.md",
         "evolution_strategy_router": project_root / "docs" / "evolution" / "EVOLUTION_STRATEGY_ROUTER.md",
-        "context_pack": workspace / "evolution" / "context" / "latest.md",
-        "open_candidates": workspace / "evolution" / "candidates" / "open.jsonl",
-        "evidence": workspace / "evolution" / "evidence" / "all.jsonl",
-        "memory_units": workspace / "evolution" / "memory" / "units.jsonl",
+        "context_pack": context_path(workspace),
+        "open_candidates": open_candidates_path(workspace),
+        "evidence": evidence_path(workspace),
+        "memory_units": memory_units_path(workspace),
         "browser_control_lessons": workspace / "evolution" / "browser_control" / "lessons.jsonl",
         "application_summary": workspace / "application_summary" / "application_summary.json",
         "metrics_usage": workspace / "metrics" / "llm_usage.jsonl",

@@ -7,8 +7,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-from careereng.storage.job_store import JobStore
-from careereng.storage.site_store import SiteStore
+from careereng.platform.reporting import ReportArtifactStore
+from careereng.career.applications.job_store import JobStore
+from careereng.career.applications.site_store import SiteStore
 from careereng.utils import ensure_dir, safe_file_stem, today_str
 
 
@@ -163,14 +164,28 @@ def _daily_final_report_paths(workspace: Path, report_date: str) -> tuple[Path, 
     return report_dir / "final.json", report_dir / "final.md"
 
 
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    ensure_dir(path.parent)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def _write_markdown(path: Path, text: str) -> None:
-    ensure_dir(path.parent)
-    path.write_text(text.rstrip() + "\n", encoding="utf-8")
+def _write_report_artifact(
+    *,
+    workspace: Path,
+    artifact_id: str,
+    report_type: str,
+    json_path: Path,
+    markdown_path: Path,
+    payload: dict[str, Any],
+    markdown: str,
+    metadata: dict[str, Any],
+) -> None:
+    """Persist a career report through the shared platform artifact store."""
+    ReportArtifactStore(workspace).write_json_markdown(
+        artifact_id=artifact_id,
+        domain="career_applications",
+        report_type=report_type,
+        json_path=json_path,
+        markdown_path=markdown_path,
+        payload=payload,
+        markdown=markdown,
+        metadata=metadata,
+    )
 
 
 def _report_job_entry(
@@ -707,8 +722,16 @@ def build_site_report(
         ),
     }
     json_path, md_path = _site_report_paths(workspace, site_key, batch_id, report_date)
-    _write_json(json_path, report)
-    _write_markdown(md_path, _site_markdown(report))
+    _write_report_artifact(
+        workspace=workspace,
+        artifact_id=f"career_job_batch:{batch_id}:site:{site_key}",
+        report_type="job_site",
+        json_path=json_path,
+        markdown_path=md_path,
+        payload=report,
+        markdown=_site_markdown(report),
+        metadata={"batch_id": batch_id, "site_key": site_key, "report_date": report_date},
+    )
     report["json_path"] = str(json_path)
     report["markdown_path"] = str(md_path)
     return report
@@ -826,12 +849,28 @@ def generate_job_batch_report(
         "unmatched_review_records": unmatched_review_records,
     }
     json_path, md_path = _batch_report_paths(workspace, batch_id, report_date)
-    _write_json(json_path, report)
-    _write_markdown(md_path, _batch_markdown(report))
+    _write_report_artifact(
+        workspace=workspace,
+        artifact_id=f"career_job_batch:{batch_id}",
+        report_type="job_batch",
+        json_path=json_path,
+        markdown_path=md_path,
+        payload=report,
+        markdown=_batch_markdown(report),
+        metadata={"batch_id": batch_id, "report_date": report_date},
+    )
     final_payload = _daily_final_payload(report, batch_json_path=json_path, batch_markdown_path=md_path)
     final_json_path, final_md_path = _daily_final_report_paths(workspace, report_date)
-    _write_json(final_json_path, final_payload)
-    _write_markdown(final_md_path, _daily_final_markdown(final_payload))
+    _write_report_artifact(
+        workspace=workspace,
+        artifact_id=f"career_job_daily:{report_date}",
+        report_type="job_daily",
+        json_path=final_json_path,
+        markdown_path=final_md_path,
+        payload=final_payload,
+        markdown=_daily_final_markdown(final_payload),
+        metadata={"batch_id": batch_id, "report_date": report_date},
+    )
     report["json_path"] = str(json_path)
     report["markdown_path"] = str(md_path)
     report["final_json_path"] = str(final_json_path)

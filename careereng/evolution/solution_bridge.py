@@ -11,10 +11,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from careereng.action_cards import ActionCardError, ActionCardStore
+from careereng.evolution.artifacts import EvolutionProposalArtifactStore
+from careereng.evolution.work_items import ActionCardError, ActionCardStore
 from careereng.evolution.proposals import EvolutionProposalError, proposal_path_for_run, validate_proposal
-from careereng.providers.base import LLMProvider, ProviderError
-from careereng.utils import now_iso, read_json, write_json
+from careereng.orchestration.agent_protocol.llm import LLMProvider, ProviderError
+from careereng.utils import now_iso, read_json
 
 
 class EvolutionSolutionBridgeError(ValueError):
@@ -52,7 +53,8 @@ class ProviderSolutionBridge:
         run_payload = read_json(run_json)
         if not run_payload:
             raise EvolutionSolutionBridgeError(f"Missing run.json for evolution run: {normalized_run_id}")
-        proposal_path = proposal_path_for_run(run_dir)
+        proposal_store = EvolutionProposalArtifactStore()
+        proposal_path = proposal_store.proposal_path(run_dir)
         if proposal_path.exists():
             proposal = read_json(proposal_path)
             if not isinstance(proposal, dict) or not proposal:
@@ -110,8 +112,7 @@ class ProviderSolutionBridge:
             validate_proposal(proposal)
         except EvolutionProposalError as exc:
             raise EvolutionSolutionBridgeError(str(exc)) from exc
-        proposal_path.parent.mkdir(parents=True, exist_ok=True)
-        write_json(proposal_path, proposal)
+        proposal_path = proposal_store.save_json(run_dir, proposal)
         self._mark_action_card_proposal_status(
             run_payload=run_payload,
             proposal_path=proposal_path,

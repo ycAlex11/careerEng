@@ -12,10 +12,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from careereng.evolution.artifacts import WorkflowEvolutionSummaryStore
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore
 from careereng.evolution.memory_units import RUN_LOCAL_CLOSED_FOR_SYNTHESIS, EvolutionMemoryStore
-from careereng.storage.jsonl import JSONLStore
-from careereng.utils import ensure_dir, now_iso, safe_file_stem, write_json
+from careereng.platform.persistence import JSONLStore
+from careereng.utils import now_iso, safe_file_stem
 
 
 def generate_workflow_evolution_summary(
@@ -56,11 +57,12 @@ def generate_workflow_evolution_summary(
         "sites": site_summaries,
         "next_actions": _next_actions(site_summaries),
     }
-    out_dir = ensure_dir(workspace_path / "evolution" / "workflow_summaries")
-    json_path = out_dir / f"{safe_file_stem(batch_id)}.json"
-    markdown_path = out_dir / f"{safe_file_stem(batch_id)}.md"
-    write_json(json_path, payload)
-    markdown_path.write_text(_render_markdown(payload), encoding="utf-8")
+    summary_store = WorkflowEvolutionSummaryStore(workspace_path)
+    json_path, markdown_path = summary_store.save(
+        batch_id=batch_id,
+        payload=payload,
+        markdown=_render_markdown(payload),
+    )
     payload["json_path"] = str(json_path)
     payload["markdown_path"] = str(markdown_path)
     return payload

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from careereng.integrations.assistant_bridge.schema import AssistantBridgeDecision
+from careereng.orchestration.agent_protocol.assistant_bridge import AssistantBridgeDecision
 
 
 class ProcessorAdapter(Protocol):
@@ -13,4 +13,3 @@ class ProcessorAdapter(Protocol):
 
     def classify(self, *, message: str, context: dict[str, Any]) -> AssistantBridgeDecision:
         """Classify a bridge message and return a normalized decision."""
-

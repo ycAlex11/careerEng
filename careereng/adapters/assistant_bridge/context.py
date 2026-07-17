@@ -7,8 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from careereng.integrations.assistant_bridge.intake_state import load_recent_intake_state
-from careereng.storage.jsonl import JSONLStore
+from .intake_state import load_recent_intake_state
+from careereng.platform.persistence import JSONLStore
 from careereng.utils import ensure_dir, now_iso
 
 

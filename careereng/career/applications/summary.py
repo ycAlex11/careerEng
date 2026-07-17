@@ -8,10 +8,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-from careereng.storage.job_store import JobStore
-from careereng.storage.jsonl import JSONLStore
-from careereng.storage.site_store import SiteStore
-from careereng.utils import ensure_dir, now_iso, safe_file_stem, write_json
+from careereng.career.applications.job_store import JobStore
+from careereng.platform.persistence import JSONLStore
+from careereng.career.applications.site_store import SiteStore
+from careereng.platform.reporting import ReportArtifactStore
+from careereng.utils import ensure_dir, now_iso, safe_file_stem
 
 
 APPLICATION_SUMMARY_RELATIVE_PATH = Path("application_summary") / "application_summary.json"
@@ -638,5 +639,11 @@ def build_application_summary(
 def save_application_summary(summary: dict[str, Any], *, workspace: Path | str) -> Path:
     workspace_path = Path(workspace)
     path = ensure_dir(workspace_path / APPLICATION_SUMMARY_RELATIVE_PATH.parent) / APPLICATION_SUMMARY_RELATIVE_PATH.name
-    write_json(path, summary)
+    ReportArtifactStore(workspace_path).write_json(
+        artifact_id="career_application_summary",
+        domain="career_applications",
+        report_type="application_summary",
+        json_path=path,
+        payload=summary,
+    )
     return path

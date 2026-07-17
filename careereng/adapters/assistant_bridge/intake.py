@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from careereng.integrations.assistant_bridge.processors.local import LocalProcessorAdapter
-from careereng.integrations.assistant_bridge.schema import (
+from .processors.local import LocalProcessorAdapter
+from careereng.orchestration.agent_protocol.assistant_bridge import (
     DATA_CATEGORY_APPLICATION_FEEDBACK,
     DATA_CATEGORY_CAREER_INTENT_STRATEGY,
     DATA_CATEGORY_CORRECTION,
@@ -18,8 +18,8 @@ from careereng.integrations.assistant_bridge.schema import (
     TRIGGER_NONE,
     TRIGGER_SCOPE_FOLLOWUP,
 )
-from careereng.integrations.assistant_bridge.store import AssistantBridgeStore
-from careereng.integrations.assistant_bridge.thread_state import AssistantThreadStateStore
+from .store import AssistantBridgeStore
+from .thread_state import AssistantThreadStateStore
 from careereng.utils import make_id
 
 

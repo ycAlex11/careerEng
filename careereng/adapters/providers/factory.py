@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from careereng.config.schema import AppConfig, AuthConfig
-from careereng.metrics import LLMUsageRecorder
-from careereng.providers.base import LLMProvider, ProviderError
-from careereng.providers.openai_provider import OpenAICompatibleProvider
-from careereng.providers.openrouter_provider import OpenRouterProvider
+from careereng.platform.observability import LLMUsageRecorder
+from careereng.orchestration.agent_protocol.llm import LLMProvider, ProviderError
+from .openai_provider import OpenAICompatibleProvider
+from .openrouter_provider import OpenRouterProvider
 
 
 def create_provider(config: AppConfig, auth: AuthConfig, *, workspace: Path | None = None) -> tuple[str, LLMProvider]:

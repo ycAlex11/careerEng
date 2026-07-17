@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from careereng.storage.jsonl import JSONLStore
+from careereng.platform.persistence import JSONLStore
 from careereng.utils import now_iso
 
 

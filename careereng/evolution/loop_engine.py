@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from careereng.browser_context import WorkflowMemoryStore
+from careereng.orchestration.context import WorkflowMemoryStore
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore, render_lessons_markdown
 from careereng.evolution.item_loop import plan_item_loop_transition
 from careereng.evolution.loop_control import (

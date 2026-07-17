@@ -7,14 +7,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from careereng.action_cards.schema import ACTION_CARD_MANUAL_DECISION
-from careereng.action_cards.store import ActionCardStore
+from careereng.evolution.artifacts import OpenEvolutionCandidateStore
+from careereng.evolution.work_items import ActionCardStore
+from careereng.evolution.work_items.schema import ACTION_CARD_MANUAL_DECISION
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore
 from careereng.evolution.candidate_specs import load_candidate_specs
 from careereng.evolution.memory_units import EvolutionMemoryStore
 from careereng.evolution.runs import create_evolution_run
-from careereng.storage.jsonl import JSONLStore
-from careereng.storage.site_store import SiteStore
+from careereng.platform.persistence import JSONLStore
+from careereng.career.applications.site_store import SiteStore
 from careereng.utils import ensure_dir, now_iso, read_json, safe_file_stem, write_json
 
 
@@ -226,7 +227,7 @@ def scan_site_workflow_triggers(
                 candidate["run_dir"] = str(run_result.get("run_dir") or "")
 
         if create_runs:
-            JSONLStore(workspace_path / "evolution" / "candidates" / "open.jsonl").append(candidate)
+            OpenEvolutionCandidateStore(workspace_path).append(candidate)
             previous_site_state[key] = _site_workflow_state_row(
                 previous=previous,
                 site_key=site_key,
@@ -316,7 +317,7 @@ def scan_target_company_intelligence_triggers(
                     candidate["run_dir"] = str(run_result.get("run_dir") or "")
 
             if create_runs:
-                JSONLStore(workspace_path / "evolution" / "candidates" / "open.jsonl").append(candidate)
+                OpenEvolutionCandidateStore(workspace_path).append(candidate)
                 previous_state[key] = _target_company_state_row(
                     site_key=site_key,
                     area=area,
@@ -402,7 +403,7 @@ def scan_application_strategy_triggers(
                 candidate["run_dir"] = str(run_result.get("run_dir") or "")
 
         if create_runs:
-            JSONLStore(workspace_path / "evolution" / "candidates" / "open.jsonl").append(candidate)
+            OpenEvolutionCandidateStore(workspace_path).append(candidate)
             previous_state[key] = _application_strategy_state_row(
                 stats=stats,
                 candidate=candidate,
@@ -464,7 +465,7 @@ def scan_assistant_router_memory_triggers(
             candidate["run_dir"] = str(run_result.get("run_dir") or "")
 
         if create_runs:
-            JSONLStore(workspace_path / "evolution" / "candidates" / "open.jsonl").append(candidate)
+            OpenEvolutionCandidateStore(workspace_path).append(candidate)
             previous_state.update(_assistant_router_memory_state_row(stats=stats, candidate=candidate))
         triggered.append(candidate)
 

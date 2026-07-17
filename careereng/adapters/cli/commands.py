@@ -13,28 +13,28 @@ from typing import Any
 
 import typer
 import yaml
-from careereng.action_cards import ActionCardError, ActionCardStore
-from careereng.application_summary import (
+from careereng.evolution.work_items import ActionCardError, ActionCardStore
+from careereng.career.applications import (
     build_application_summary,
     inspect_history_repairs,
     save_application_summary,
     save_history_repair_plan,
 )
-from careereng.career_memory import (
+from careereng.career.memory import (
     CareerMemoryError,
     import_memory_candidates,
     list_memory_units,
     promote_assistant_signals,
     show_memory_unit,
 )
-from careereng.capture.audio import AudioCaptureDependencyError, capture_audio_chunks, list_audio_devices
-from careereng.cleanup import build_cleanup_plan, execute_cleanup_plan
+from careereng.career.interviews.capture import AudioCaptureDependencyError, capture_audio_chunks, list_audio_devices
+from careereng.platform.maintenance import build_cleanup_plan, execute_cleanup_plan
 from careereng.config.loader import ensure_files
-from careereng.core.runtime import build_loop as runtime_build_loop
-from careereng.core.runtime import build_site_services as runtime_build_site_services
-from careereng.core.runtime import project_root_from_cwd, workspace_path as runtime_workspace_path
-from careereng.core.workspace_bootstrap import bootstrap_workspace
-from careereng.core.workspace_manager import (
+from careereng.adapters.bootstrap import build_loop as runtime_build_loop
+from careereng.adapters.bootstrap import build_site_services as runtime_build_site_services
+from careereng.adapters.bootstrap import project_root_from_cwd, workspace_path as runtime_workspace_path
+from careereng.career.profile.bootstrap import bootstrap_workspace
+from careereng.adapters.host.workspace_manager import (
     call_agent_bridge_browser_tool,
     call_agent_bridge_state_tool,
     call_browser_handoff_tool,
@@ -68,32 +68,32 @@ from careereng.evolution import (
     scan_evolution_triggers,
 )
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore, render_lessons_markdown
-from careereng.agent_bridge.browser import browser_tool_command, legacy_browser_tool_command
-from careereng.agent_bridge.contracts import AGENT_BRIDGE_STATUS, is_agent_bridge_reason
-from careereng.agent_bridge.state import phase_result_command, state_tool_command, state_tools_command
+from careereng.adapters.external_agents.browser import browser_tool_command, legacy_browser_tool_command
+from careereng.adapters.external_agents.contracts import AGENT_BRIDGE_STATUS, is_agent_bridge_reason
+from careereng.adapters.external_agents.state import phase_result_command, state_tool_command, state_tools_command
 from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
-from careereng.integrations.assistant_bridge.context import build_assistant_context_pack
-from careereng.integrations.assistant_bridge import AssistantThreadStateStore, ingest_assistant_message
-from careereng.integrations.assistant_bridge.intake_state import save_recent_intake_state
-from careereng.interviews import (
+from careereng.adapters.assistant_bridge.context import build_assistant_context_pack
+from careereng.adapters.assistant_bridge import AssistantThreadStateStore, ingest_assistant_message
+from careereng.adapters.assistant_bridge.intake_state import save_recent_intake_state
+from careereng.career.interviews import (
     InterviewStore,
     InterviewStoreError,
     build_interview_summary,
     render_interview_summary,
     save_interview_candidates,
 )
-from careereng.metrics import build_metrics_summary, save_metrics_summary
-from careereng.mcp_server import run_mcp_server
-from careereng.resume.export import ResumeExportError, export_resume_pdf as export_resume_pdf_file
-from careereng.reporting.job_report import generate_job_batch_report
-from careereng.storage.job_store import JobStore
-from careereng.storage.jsonl import JSONLStore
-from careereng.storage.intent_store import IntentStore
-from careereng.storage.profile_store import ProfileStore
-from careereng.storage.router_store import RouterStore
-from careereng.taskboard import TaskboardError, TaskboardStore
-from careereng.tools.site_bootstrap import bootstrap_site as bootstrap_site_launcher
-from careereng.tools.batch_apply_debug import BatchApplyDebugRunner
+from careereng.platform.observability import build_metrics_summary, save_metrics_summary
+from careereng.adapters.mcp import run_mcp_server
+from careereng.career.resume.export import ResumeExportError, export_resume_pdf as export_resume_pdf_file
+from careereng.career.applications import generate_job_batch_report
+from careereng.career.applications.job_store import JobStore
+from careereng.platform.persistence import JSONLStore
+from careereng.career.profile.intent_store import IntentStore
+from careereng.career.profile.store import ProfileStore
+from careereng.orchestration.engine.router_store import RouterStore
+from careereng.platform.project_state import TaskboardError, TaskboardStore
+from careereng.career.applications.site_bootstrap import bootstrap_site as bootstrap_site_launcher
+from careereng.career.applications.batch_debug import BatchApplyDebugRunner
 from careereng.utils import make_id, safe_file_stem
 
 app = typer.Typer(help="CareerEng CLI")
@@ -983,7 +983,7 @@ def taskboard_update(
     source: str = typer.Option("", "--source", help="Optional source label for the update"),
     json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
 ):
-    """Create or append to the current development taskboard."""
+    """Create or replace the compact current development taskboard."""
     try:
         result = TaskboardStore(_workspace_path()).update_from_file(input_file, source_name=source)
     except TaskboardError as exc:

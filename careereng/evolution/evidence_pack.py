@@ -11,11 +11,12 @@ import re
 from pathlib import Path
 from typing import Any
 
-from careereng.action_cards.store import ActionCardStore
+from careereng.evolution.artifacts import WorkflowEvolutionSummaryStore
+from careereng.evolution.work_items import ActionCardStore
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore
 from careereng.evolution.memory_units import RUN_LOCAL_CLOSED_FOR_SYNTHESIS, EvolutionMemoryStore
 from careereng.evolution.strategy_router import related_strategy_spec_payloads, strategy_family, strategy_router_payload
-from careereng.storage.jsonl import JSONLStore
+from careereng.platform.persistence import JSONLStore
 from careereng.utils import now_iso, read_json, safe_file_stem, write_json
 
 
@@ -273,8 +274,9 @@ def _strategy_markdown(value: Any) -> str:
 def _workflow_summary(*, workspace_path: Path, batch_id: str) -> dict[str, Any]:
     if not batch_id:
         return {}
-    json_path = workspace_path / "evolution" / "workflow_summaries" / f"{safe_file_stem(batch_id)}.json"
-    payload = read_json(json_path)
+    summary_store = WorkflowEvolutionSummaryStore(workspace_path)
+    json_path, _ = summary_store.paths_for_batch(batch_id)
+    payload = summary_store.load(batch_id)
     if not payload:
         return {"path": str(json_path), "status": "missing"}
     return {
@@ -733,14 +735,15 @@ def _source_paths(
     target_ref: str,
     trace_refs: list[str],
 ) -> dict[str, Any]:
+    workflow_summary_json, workflow_summary_md = WorkflowEvolutionSummaryStore(workspace_path).paths_for_batch(batch_id)
     return {
         "project_root": str(project_root),
         "workspace": str(workspace_path),
         "run_dir": str(run_dir),
         "strategy_router": str(project_root / "docs" / "evolution" / "EVOLUTION_STRATEGY_ROUTER.md"),
         "candidate_specs_dir": str(project_root / "docs" / "evolution" / "candidates"),
-        "workflow_summary_json": str(workspace_path / "evolution" / "workflow_summaries" / f"{safe_file_stem(batch_id)}.json"),
-        "workflow_summary_md": str(workspace_path / "evolution" / "workflow_summaries" / f"{safe_file_stem(batch_id)}.md"),
+        "workflow_summary_json": str(workflow_summary_json),
+        "workflow_summary_md": str(workflow_summary_md),
         "batch_json": str(workspace_path / "jobs" / "batches" / f"{safe_file_stem(batch_id)}.json"),
         "run_rows_jsonl": str(_run_rows_path(workspace_path=workspace_path, site_key=site_key, batch_id=batch_id)),
         "failure_snapshot": str(

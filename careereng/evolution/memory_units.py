@@ -12,8 +12,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from careereng.evolution.artifacts._jsonl import upsert_rows
+from careereng.evolution.artifacts.paths import memory_units_path
 from careereng.evolution.proposals import SUPPORTED_CHANGE_TYPES
-from careereng.storage.jsonl import JSONLStore
+from careereng.platform.persistence import JSONLStore
 from careereng.utils import now_iso, safe_file_stem
 
 
@@ -24,7 +26,7 @@ RUN_LOCAL_CLOSED_FOR_SYNTHESIS = "closed_for_synthesis"
 
 
 def evolution_memory_path(workspace: Path | str) -> Path:
-    return Path(workspace) / "evolution" / "memory" / "units.jsonl"
+    return memory_units_path(workspace)
 
 
 class EvolutionMemoryStore:
@@ -58,6 +60,11 @@ class EvolutionMemoryStore:
             next_rows.append(normalized)
         self.store.write_all(next_rows)
         return normalized
+
+    def upsert_many(self, units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Preserve the legacy bulk-upsert contract used by review imports."""
+
+        return upsert_rows(self.store, units, key="memory_id")
 
     def query(
         self,

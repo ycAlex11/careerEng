@@ -7,9 +7,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-from careereng.browser_context.registry import BrowserContextRegistry
+from careereng.orchestration.context.registry import BrowserContextRegistry
 from careereng.evolution.apply_probe import apply_probe_counters, excluded_role_violations
-from careereng.reporting import JsonMarkdownArtifact, JsonMarkdownArtifactPaths
+from careereng.platform.reporting import JsonMarkdownArtifact, JsonMarkdownArtifactPaths, ReportArtifactStore
 from careereng.utils import make_id, now_iso
 
 
@@ -55,7 +55,17 @@ class ApplyProbeReport(JsonMarkdownArtifact):
             paths=JsonMarkdownArtifactPaths(
                 json_path=run_dir / "report.json",
                 markdown_path=run_dir / "report.md",
-            )
+            ),
+            store=ReportArtifactStore(self.workspace_path),
+            artifact_id=f"evolution_apply_probe:{self.run_id}",
+            domain="evolution",
+            report_type="apply_probe",
+            metadata={
+                "run_id": self.run_id,
+                "batch_id": self.batch_id,
+                "site_key": self.site_key,
+                "phase": "apply",
+            },
         )
 
     def build_payload(self) -> dict[str, Any]:

@@ -7,11 +7,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from careereng.action_cards import ActionCardStore
-from careereng.action_cards.schema import ACTION_CARD_CODEX_REVIEW, ACTION_CARD_HUMAN_ACTION
+from careereng.evolution.artifacts import EvolutionEvidenceStore, OpenEvolutionCandidateStore
+from careereng.evolution.work_items import ActionCardStore
+from careereng.evolution.work_items.schema import ACTION_CARD_CODEX_REVIEW, ACTION_CARD_HUMAN_ACTION
 from careereng.evolution.proposals import SUPPORTED_CHANGE_TYPES
 from careereng.evolution.schema import EvolutionEvidence, ImprovementCandidate
-from careereng.evolution.store import EvolutionStore
 from careereng.utils import now_iso, safe_file_stem
 
 
@@ -382,11 +382,12 @@ def create_loop_control_artifacts(
         fingerprint=_fingerprint(fingerprint_payload),
     ).to_dict()
 
-    store = EvolutionStore(workspace_path)
-    store.upsert_evidence([evidence])
+    evidence_store = EvolutionEvidenceStore(workspace_path)
+    candidate_store = OpenEvolutionCandidateStore(workspace_path)
+    evidence_store.upsert_many([evidence])
     if action == LOOP_ACTION_TRIGGER_REFINEMENT:
-        candidate = _merge_existing_candidate_evidence(store=store, candidate=candidate, evidence_id=evidence_id)
-        store.upsert_open_candidates([candidate])
+        candidate = _merge_existing_candidate_evidence(store=candidate_store, candidate=candidate, evidence_id=evidence_id)
+        candidate_store.upsert_many([candidate])
 
     card = _create_action_card(
         workspace=workspace_path,
@@ -558,12 +559,14 @@ def _create_action_card(
     )
 
 
-def _merge_existing_candidate_evidence(*, store: EvolutionStore, candidate: dict[str, Any], evidence_id: str) -> dict[str, Any]:
+def _merge_existing_candidate_evidence(
+    *, store: OpenEvolutionCandidateStore, candidate: dict[str, Any], evidence_id: str
+) -> dict[str, Any]:
     candidate_id = str(candidate.get("candidate_id") or "")
     if not candidate_id:
         return candidate
     evidence_ids = {str(evidence_id or "").strip()} if str(evidence_id or "").strip() else set()
-    for row in store.open_candidates_store.read_all():
+    for row in store.read_all():
         if str(row.get("candidate_id") or "") != candidate_id:
             continue
         for item in row.get("evidence_ids") or []:
@@ -598,7 +601,7 @@ def _recommended_target_ref(*, recommended_target: str, project_root: Path, site
 
 
 def _previous_failed_batch_count(*, workspace: Path, site_key: str, phase: str, pattern: str, current_batch_id: str) -> int:
-    store = EvolutionStore(workspace).evidence_store
+    store = EvolutionEvidenceStore(workspace)
     batch_ids: set[str] = set()
     for row in store.read_all():
         if str(row.get("area") or "") != "loop_engineering":

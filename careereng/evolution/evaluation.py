@@ -7,10 +7,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from careereng.action_cards import ActionCardStore
-from careereng.review import build_assistant_memory_review_pack, save_review_pack
-from careereng.storage.job_store import JobStore
-from careereng.storage.jsonl import JSONLStore
+from careereng.evolution.work_items import ActionCardStore
+from careereng.evolution.reviews import build_assistant_memory_review_pack, save_review_pack
+from careereng.career.applications.job_store import JobStore
+from careereng.platform.persistence import JSONLStore
 from careereng.utils import ensure_dir, now_iso, read_json, write_json
 
 

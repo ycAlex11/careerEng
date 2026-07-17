@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from careereng.application_summary.builder import (
+from careereng.career.applications.summary import (
     DEFAULT_SUMMARY_SINCE,
     _collapse_text,
     _load_review_rows,
@@ -16,8 +16,8 @@ from careereng.application_summary.builder import (
     _registered_or_existing_site_keys,
     _row_in_scope,
 )
-from careereng.storage.site_store import SiteStore
-from careereng.storage.jsonl import JSONLStore
+from careereng.career.applications.site_store import SiteStore
+from careereng.platform.persistence import JSONLStore
 from careereng.utils import ensure_dir, now_iso, safe_file_stem, write_json
 
 

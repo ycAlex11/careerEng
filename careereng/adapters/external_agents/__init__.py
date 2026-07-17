@@ -1,6 +1,6 @@
 """External-agent bridge helpers for CareerEng."""
 
-from careereng.agent_bridge.contracts import (
+from .contracts import (
     AGENT_BRIDGE_MODE,
     AGENT_BRIDGE_REQUIRED_REASON,
     AGENT_BRIDGE_STATUS,

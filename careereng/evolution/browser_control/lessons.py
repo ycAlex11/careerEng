@@ -7,7 +7,7 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-from careereng.storage.jsonl import JSONLStore
+from careereng.platform.persistence import JSONLStore
 from careereng.utils import make_id, now_iso, safe_file_stem
 
 

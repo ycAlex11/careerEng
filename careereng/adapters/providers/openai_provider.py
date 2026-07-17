@@ -9,8 +9,8 @@ from typing import Any
 
 import httpx
 
-from careereng.metrics import LLMUsageRecorder, extract_usage
-from careereng.providers.base import LLMProvider, ProviderError, StructuredOutputResult
+from careereng.platform.observability import LLMUsageRecorder, extract_usage
+from careereng.orchestration.agent_protocol.llm import LLMProvider, ProviderError, StructuredOutputResult
 
 
 DEFAULT_PROVIDER_TIMEOUT_SECONDS = 180.0

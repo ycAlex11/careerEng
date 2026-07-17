@@ -5,15 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from careereng.action_cards.renderer import render_action_card_markdown
-from careereng.action_cards.schema import (
+from careereng.evolution.work_items.renderer import render_action_card_markdown
+from careereng.evolution.work_items.schema import (
     ACTION_CARD_CANCELLED,
     ACTION_CARD_DONE,
     ACTION_CARD_OPEN,
     ACTION_CARD_STATUSES,
     ActionCard,
 )
-from careereng.storage.jsonl import JSONLStore
+from careereng.platform.persistence import JSONLStore
 from careereng.utils import ensure_dir, make_id, now_iso
 
 
