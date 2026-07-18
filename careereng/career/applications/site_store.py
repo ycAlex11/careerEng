@@ -23,6 +23,7 @@ from careereng.career.applications.skill_policy import (
 )
 from careereng.career.applications.skill_policy.schema import file_hash
 from careereng.career.applications.job_identity import infer_site_job_id_from_url, normalize_identity_url
+from careereng.career.applications.history_view import BatchHistoryView
 from careereng.platform.persistence import JSONLStore
 from careereng.career.applications.posted_time import (
     current_posted_age_observation,
@@ -211,6 +212,7 @@ class SiteStore:
         self.site_skills_dir = ensure_dir(self.project_root / "skills" / "search" / "jobs" / "sites")
         self.sites_dir = ensure_dir(self.workspace / "sites")
         self.registry = JSONLStore(self.sites_dir / "registry.jsonl")
+        self._batch_history_views: dict[tuple[str, str], BatchHistoryView] = {}
         self._migrate_existing_sites()
 
     def site_dir(self, site_id: str) -> Path:
@@ -606,6 +608,73 @@ class SiteStore:
         if not isinstance(payload, list):
             return []
         return [row for row in payload if isinstance(row, dict)]
+
+    def begin_batch_history_view(self, site_id: str, batch_id: str) -> BatchHistoryView | None:
+        """Load one site's canonical history once for an active batch.
+
+        The view is a performance/access layer only. Durable history remains
+        the source of truth and is still written immediately by existing
+        history operations.
+        """
+
+        normalized_site = safe_file_stem(site_id)
+        normalized_batch = str(batch_id or "").strip()
+        if not normalized_site or not normalized_batch:
+            return None
+        key = (normalized_batch, normalized_site)
+        view = self._batch_history_views.get(key)
+        if view is None:
+            view = BatchHistoryView.create(
+                site_key=normalized_site,
+                batch_id=normalized_batch,
+                history_path=str(self._history_jobs_path(normalized_site)),
+                loader=lambda: self._load_history_jobs(normalized_site),
+                indexes_builder=lambda rows: self._history_resolution_indexes(normalized_site, rows),
+            )
+            self._batch_history_views[key] = view
+        view.rows()
+        return view
+
+    def end_batch_history_view(self, batch_id: str, site_id: str = "") -> None:
+        """Release only ephemeral batch views; canonical history is untouched."""
+
+        normalized_batch = str(batch_id or "").strip()
+        normalized_site = safe_file_stem(site_id) if site_id else ""
+        for key in list(self._batch_history_views):
+            if key[0] != normalized_batch:
+                continue
+            if normalized_site and key[1] != normalized_site:
+                continue
+            self._batch_history_views.pop(key, None)
+
+    def _batch_history_view(self, site_id: str, batch_id: str = "") -> BatchHistoryView | None:
+        normalized_batch = str(batch_id or "").strip()
+        if not normalized_batch:
+            return None
+        return self._batch_history_views.get((normalized_batch, safe_file_stem(site_id)))
+
+    def _history_rows_for_batch(self, site_id: str, batch_id: str = "") -> list[dict[str, Any]]:
+        view = self._batch_history_view(site_id, batch_id)
+        if view is not None:
+            return view.rows()
+        return self._load_history_jobs(site_id)
+
+    def _history_indexes_for_batch(
+        self,
+        site_id: str,
+        rows: list[dict[str, Any]],
+        batch_id: str = "",
+    ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+        view = self._batch_history_view(site_id, batch_id)
+        if view is not None and rows is view.rows():
+            return view.indexes()
+        return self._history_resolution_indexes(site_id, rows)
+
+    def _sync_batch_history_views(self, site_id: str, rows: list[dict[str, Any]]) -> None:
+        normalized_site = safe_file_stem(site_id)
+        for (_batch_id, view_site), view in self._batch_history_views.items():
+            if view_site == normalized_site:
+                view.replace_after_write(rows)
 
     @staticmethod
     def _history_apply_state_for_application_status(value: Any) -> str:
@@ -1354,6 +1423,7 @@ class SiteStore:
             + "\n",
             encoding="utf-8",
         )
+        self._sync_batch_history_views(site_id, compacted_rows)
 
     def _inspect_legacy_job_data(self, root: Path) -> tuple[bool, bool]:
         catalog = root / "jobs" / "catalog.jsonl"
@@ -2351,9 +2421,19 @@ class SiteStore:
             add("review_url_only")
         return reasons
 
-    def classify_history_matches(self, site_id: str, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        history_rows = self._load_history_jobs(site_id)
-        by_job_id, by_canonical_job_id, by_match_key = self._history_resolution_indexes(site_id, history_rows)
+    def classify_history_matches(
+        self,
+        site_id: str,
+        jobs: list[dict[str, Any]],
+        *,
+        batch_id: str = "",
+    ) -> list[dict[str, Any]]:
+        history_rows = self._history_rows_for_batch(site_id, batch_id)
+        by_job_id, by_canonical_job_id, by_match_key = self._history_indexes_for_batch(
+            site_id,
+            history_rows,
+            batch_id,
+        )
         classifications: list[dict[str, Any]] = []
         for job in jobs:
             if not isinstance(job, dict):
@@ -2402,8 +2482,17 @@ class SiteStore:
             )
         return classifications
 
-    def preview_history_new_flags(self, site_id: str, jobs: list[dict[str, Any]]) -> list[bool]:
-        return [row.get("history_match_status") == "new" for row in self.classify_history_matches(site_id, jobs)]
+    def preview_history_new_flags(
+        self,
+        site_id: str,
+        jobs: list[dict[str, Any]],
+        *,
+        batch_id: str = "",
+    ) -> list[bool]:
+        return [
+            row.get("history_match_status") == "new"
+            for row in self.classify_history_matches(site_id, jobs, batch_id=batch_id)
+        ]
 
     def _history_resolution_indexes(
         self,
@@ -2453,9 +2542,15 @@ class SiteStore:
                 return title_match
         return None
 
-    def match_history_rows(self, site_id: str, jobs: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
-        rows = self._load_history_jobs(site_id)
-        by_job_id, by_canonical_job_id, by_match_key = self._history_resolution_indexes(site_id, rows)
+    def match_history_rows(
+        self,
+        site_id: str,
+        jobs: list[dict[str, Any]],
+        *,
+        batch_id: str = "",
+    ) -> list[dict[str, Any] | None]:
+        rows = self._history_rows_for_batch(site_id, batch_id)
+        by_job_id, by_canonical_job_id, by_match_key = self._history_indexes_for_batch(site_id, rows, batch_id)
         matches: list[dict[str, Any] | None] = []
         for job in jobs:
             match_idx = self._resolve_history_row_index(
@@ -2488,8 +2583,8 @@ class SiteStore:
         JSONLStore(trace_path).append({"ts": now_iso(), **(payload or {})})
         return str(trace_path.relative_to(self.workspace))
 
-    def list_jobs(self, site_id: str) -> list[dict[str, Any]]:
-        return self._load_history_jobs(site_id)
+    def list_jobs(self, site_id: str, *, batch_id: str = "") -> list[dict[str, Any]]:
+        return self._history_rows_for_batch(site_id, batch_id)
 
     @classmethod
     def _needs_decision_metadata_normalization(
@@ -2679,8 +2774,9 @@ class SiteStore:
         current_context_versions: dict[str, Any],
         current_decision_context_hash: str,
         apply_candidate_policy: dict[str, Any] | None = None,
+        batch_id: str = "",
     ) -> list[dict[str, Any]]:
-        rows = self._load_history_jobs(site_id)
+        rows = self._history_rows_for_batch(site_id, batch_id)
         posted_policy = normalize_posted_window_policy(apply_candidate_policy)
         candidates: list[dict[str, Any]] = []
         for row in rows:

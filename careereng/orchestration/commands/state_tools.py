@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from careereng.orchestration.agent_protocol.state_tools import (
     PHASE_RESULT_TOOL,
@@ -35,6 +35,7 @@ class PhaseStateToolContext:
     current_url: str = ""
     context_session: Any | None = None
     phase_memory: Any | None = None
+    persist_phase_memory: Callable[[Any], None] | None = None
     retrieval_history_stop_success_ratio: float = 0.4
     retrieval_history_stop_min_page_jobs: int = 10
 
@@ -54,7 +55,23 @@ def execute_state_tool(tool_name: str, arguments: dict[str, Any] | None, context
     if normalized == REQUEST_CONTEXT_TOOL:
         return _request_context_payload(context_session=context.context_session, arguments=args)
     if normalized == UPDATE_PHASE_MEMORY_TOOL:
-        return _update_phase_memory_payload(phase_memory=context.phase_memory, arguments=args)
+        payload = _update_phase_memory_payload(phase_memory=context.phase_memory, arguments=args)
+        structured = payload.get("structuredContent") if isinstance(payload.get("structuredContent"), dict) else {}
+        if (
+            not payload.get("isError")
+            and str(structured.get("status") or "") == "updated"
+            and callable(context.persist_phase_memory)
+        ):
+            try:
+                context.persist_phase_memory(context.phase_memory)
+            except Exception as exc:
+                return {
+                    "isError": True,
+                    "error": f"phase memory persistence failed: {exc}",
+                    "structuredContent": {"status": "persistence_failed"},
+                    "content": [{"type": "text", "text": "### Result\n- Phase memory update could not be persisted."}],
+                }
+        return payload
     return {
         "isError": True,
         "error": f"unknown state tool: {tool_name}",
@@ -184,10 +201,18 @@ def _record_jobs_payload(*, context: PhaseStateToolContext, arguments: dict[str,
     classify_history_matches = getattr(site_store, "classify_history_matches", None)
     list_jobs = getattr(site_store, "list_jobs", None)
     preview_new_flags = getattr(site_store, "preview_history_new_flags", None)
-    before_rows = list_jobs(context.site_key) if callable(list_jobs) else []
+    if callable(list_jobs):
+        try:
+            before_rows = list_jobs(context.site_key, batch_id=context.batch_id)
+        except TypeError:
+            before_rows = list_jobs(context.site_key)
+    else:
+        before_rows = []
     before_ids = {str(row.get("job_id") or "") for row in before_rows if isinstance(row, dict)}
     if callable(classify_history_matches):
         try:
+            history_matches = list(classify_history_matches(context.site_key, jobs, batch_id=context.batch_id))
+        except TypeError:
             history_matches = list(classify_history_matches(context.site_key, jobs))
         except Exception:
             history_matches = []
@@ -195,6 +220,8 @@ def _record_jobs_payload(*, context: PhaseStateToolContext, arguments: dict[str,
         history_matches = []
     if not history_matches and callable(preview_new_flags):
         try:
+            new_flags = list(preview_new_flags(context.site_key, jobs, batch_id=context.batch_id))
+        except TypeError:
             new_flags = list(preview_new_flags(context.site_key, jobs))
         except Exception:
             new_flags = []

@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable
 
 from .contracts import AGENT_BRIDGE_MODE, AGENT_BRIDGE_STATUS
 from .state import state_tool_commands
-from careereng.orchestration.context import build_phase_context
+from careereng.orchestration.context import BrowserPhaseMemory, build_phase_context
 from careereng.platform.sessions import PhaseSession, write_phase_session
+from careereng.platform.observability import PerformanceRecorder
 from careereng.orchestration.agent_protocol.state_tools import state_tool_schemas_for_phase
 from careereng.utils import ensure_dir, make_id, now_iso, read_json, safe_file_stem, write_json
 
@@ -91,6 +93,7 @@ def advance_browser_agent_work_order(
     if not normalized_phase or not isinstance(current_phase_row, dict):
         raise ValueError(f"phase is not declared by the work order: {next_phase or '<missing>'}")
 
+    phase_memory = BrowserPhaseMemory.from_payload(session_payload.get("phase_memory"))
     phase_context = build_phase_context(
         SimpleNamespace(
             slug=str(current_phase_row.get("slug") or ""),
@@ -98,6 +101,7 @@ def advance_browser_agent_work_order(
             project_text=str(current_phase_row.get("project_text") or ""),
             site_text=str(current_phase_row.get("site_text") or ""),
         ),
+        phase_memory=phase_memory,
         continuation=(
             payload.get("continuation_context") if isinstance(payload.get("continuation_context"), dict) else {}
         ),
@@ -148,6 +152,42 @@ def advance_browser_agent_work_order(
     )
 
 
+def persist_browser_agent_phase_memory(
+    *,
+    payload_path: Path,
+    phase_session_path: Path,
+    phase_memory: dict[str, Any],
+) -> None:
+    """Persist generic run-local memory and refresh the active agent context."""
+
+    payload_path = Path(payload_path)
+    phase_session_path = Path(phase_session_path)
+    payload = read_json(payload_path)
+    session_payload = read_json(phase_session_path)
+    if not isinstance(payload, dict) or not isinstance(session_payload, dict):
+        raise ValueError("agent bridge phase session is unavailable")
+
+    memory_payload = dict(phase_memory or {})
+    memory_text = BrowserPhaseMemory.from_payload(memory_payload).phase_memory_text()
+    for row in (payload, session_payload):
+        row["updated_at"] = now_iso()
+        row["phase_memory"] = memory_payload
+        phase_context = row.get("current_phase_context")
+        if not isinstance(phase_context, dict):
+            phase_context = row.get("phase_context") if isinstance(row.get("phase_context"), dict) else {}
+        phase_context = dict(phase_context)
+        phase_context["phase_memory"] = memory_text
+        row["current_phase_context"] = phase_context
+        row["phase_context"] = phase_context
+
+    write_json(payload_path, payload)
+    write_json(phase_session_path, session_payload)
+    markdown_path = Path(str(payload.get("markdown_path") or ""))
+    if not markdown_path.is_absolute():
+        markdown_path = payload_path.parent / "work_order.md"
+    markdown_path.write_text(_render_browser_work_order(payload), encoding="utf-8")
+
+
 def create_browser_agent_work_order(
     *,
     workspace: Path,
@@ -186,8 +226,10 @@ def create_browser_agent_work_order(
     work_order_id = make_id("agent_bridge")
     state_tools = state_tool_schemas_for_phase(current_phase, include_phase_result=True)
     resolved_state_commands = state_commands or state_tool_commands(site_key, phase=current_phase)
+    phase_memory = BrowserPhaseMemory()
     phase_context = build_phase_context(
         current_phase_row,
+        phase_memory=phase_memory,
         continuation=continuation_context,
         local_state={
             "site_key": site_key,
@@ -210,6 +252,7 @@ def create_browser_agent_work_order(
         apply_target_job_ids=tuple(apply_target_job_ids or ()),
         continuation_context=continuation_context or {},
         phase_context=phase_context,
+        phase_memory=phase_memory.as_payload(),
         browser_tool_commands=tool_commands or {},
         state_tool_commands=resolved_state_commands,
         state_tools=state_tools,
@@ -234,6 +277,7 @@ def create_browser_agent_work_order(
         "continuation_context": continuation_context or {},
         "continuation_context_path": continuation_context_path,
         "current_phase_context": phase_context,
+        "phase_memory": phase_memory.as_payload(),
         "tool_commands": tool_commands or {},
         "browser_tool_commands": tool_commands or {},
         "state_tool_commands": resolved_state_commands,
@@ -255,6 +299,16 @@ def create_browser_agent_work_order(
     payload["markdown_path"] = _workspace_relative(workspace, markdown_path)
     write_json(payload_path, payload)
     markdown_path.write_text(_render_browser_work_order(payload), encoding="utf-8")
+    PerformanceRecorder(workspace).record(
+        backend="external_agent",
+        operation="agent_context",
+        site_key=site_key,
+        batch_id=batch_id,
+        phase=current_phase,
+        status="ok",
+        observation_kind="compact",
+        agent_input_bytes=len(json.dumps(phase_context, ensure_ascii=False).encode("utf-8")),
+    )
 
     site_store.save_browser_session(
         site_key,

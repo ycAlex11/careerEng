@@ -13,27 +13,50 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from careereng.adapters.external_agents.contracts import AGENT_BRIDGE_STATUS
 from careereng.adapters.bootstrap import build_loop
 from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
 from careereng.utils import make_id
+from .errors import RuntimeHostProtocolMismatchError, RuntimeHostUnavailableError
+from .protocol import RUNTIME_HOST_PROTOCOL_VERSION, protocol_version_from, runtime_host_identity, with_runtime_host_protocol
 
 
-DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS = 1800.0
+DEFAULT_RUNTIME_HOST_REQUEST_TIMEOUT_SECONDS = 1800.0
+# Compatibility for callers that have not yet migrated their import path.
+DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS = DEFAULT_RUNTIME_HOST_REQUEST_TIMEOUT_SECONDS
+
+
+def runtime_host_socket_path(workspace: Path) -> Path:
+    digest = hashlib.sha1(str(workspace.resolve()).encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"careereng-runtime-host-{digest}.sock"
 
 
 def manager_socket_path(workspace: Path) -> Path:
-    digest = hashlib.sha1(str(workspace.resolve()).encode("utf-8")).hexdigest()[:16]
-    return Path(tempfile.gettempdir()) / f"careereng-manager-{digest}.sock"
+    """Deprecated alias for the runtime-host endpoint path."""
+
+    return runtime_host_socket_path(workspace)
 
 
-class WorkspaceManager:
-    def __init__(self, *, project_root: Path, workspace: Path):
+class RuntimeHostService:
+    """Workspace-scoped owner of generic browser/session runtime resources.
+
+    The service delegates workflow execution to the injected loop. It does not
+    make site, job, form, matching, or evolution-policy decisions itself.
+    """
+
+    def __init__(
+        self,
+        *,
+        project_root: Path,
+        workspace: Path,
+        loop_factory: Callable[..., tuple[Any, Any]] | None = None,
+    ):
         self.project_root = Path(project_root).resolve()
         self.workspace = Path(workspace).resolve()
-        self.loop, _ = build_loop(project_root=self.project_root, workspace=self.workspace)
+        factory = loop_factory or build_loop
+        self.loop, _ = factory(project_root=self.project_root, workspace=self.workspace)
         self._lock = threading.Lock()
         self._background_batch_running = False
 
@@ -44,14 +67,25 @@ class WorkspaceManager:
 
     def handle_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         op = str(payload.get("op") or "process_message")
+        caller_version = protocol_version_from(payload)
+        if caller_version and caller_version != RUNTIME_HOST_PROTOCOL_VERSION:
+            return {
+                "ok": False,
+                "error": "runtime_host_protocol_mismatch",
+                "expected_protocol_version": RUNTIME_HOST_PROTOCOL_VERSION,
+                "actual_protocol_version": caller_version,
+                **runtime_host_identity(),
+            }
         if op == "ping":
-            return {"ok": True, "reply": "pong"}
+            return {"ok": True, "reply": "pong", **runtime_host_identity()}
         if op == "shutdown":
             return self._handle_shutdown(payload)
         if op == "start_jobs_batch":
             return self._handle_start_jobs_batch(payload)
         if op == "fresh_snapshot_resume":
             return self._handle_fresh_snapshot_resume(payload)
+        if op == "pause_jobs_batch":
+            return self._handle_pause_jobs_batch(payload)
         if op in {"agent_bridge_browser_list_tools", "browser_handoff_list_tools"}:
             return self._handle_agent_bridge_browser_list_tools(payload)
         if op in {"agent_bridge_browser_call_tool", "browser_handoff_call_tool"}:
@@ -170,6 +204,24 @@ class WorkspaceManager:
         if reply is None:
             return {"ok": True, "accepted": False, "reply": ""}
         return {"ok": True, "accepted": True, "reply": reply, "turn_id": turn_id}
+
+    def _handle_pause_jobs_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        batch_id = str(payload.get("batch_id") or "").strip()
+        site_key = str(payload.get("site_key") or "").strip()
+        if not batch_id:
+            return {"ok": False, "error": "batch_id is required"}
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return {"ok": False, "error": "workspace manager is busy with another operation"}
+        try:
+            if self._background_batch_running:
+                return {"ok": False, "error": "workspace manager is busy with another job batch"}
+            batch = self.loop.job_flow.pause_batch(batch_id=batch_id, site_key=site_key)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self._lock.release()
+        return {"ok": True, "accepted": True, "batch": batch}
 
     def _handle_agent_bridge_browser_list_tools(self, payload: dict[str, Any]) -> dict[str, Any]:
         site_key = str(payload.get("site_key") or "").strip()
@@ -292,6 +344,10 @@ class WorkspaceManager:
         return {"ok": True, "site_key": site_key, "result": result}
 
 
+# Legacy public type name retained for code that imports it during migration.
+WorkspaceManager = RuntimeHostService
+
+
 class _ManagerRequestHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         raw = self.rfile.readline()
@@ -303,6 +359,11 @@ class _ManagerRequestHandler(socketserver.StreamRequestHandler):
             response = {"ok": False, "error": f"invalid request: {exc}"}
         else:
             response = self.server.manager.handle_request(payload)
+        # The transport contract, not a workflow branch, owns the host identity.
+        # Every response carries it so stale MCP/CLI clients fail clearly before
+        # interpreting a browser or workflow result.
+        if isinstance(response, dict):
+            response = {**response, **runtime_host_identity()}
         self.wfile.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
         self.wfile.flush()
         if bool(response.get("shutdown")):
@@ -313,34 +374,46 @@ class _ManagerRequestHandler(socketserver.StreamRequestHandler):
             ).start()
 
 
-class _UnixManagerServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class _UnixRuntimeHostServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, socket_path: str, manager: WorkspaceManager):
-        self.manager = manager
+    def __init__(self, socket_path: str, runtime_host: RuntimeHostService):
+        self.manager = runtime_host
         super().__init__(socket_path, _ManagerRequestHandler)
 
 
-def serve_workspace_manager(*, project_root: Path, workspace: Path, socket_path: Path) -> None:
+def serve_runtime_host(*, project_root: Path, workspace: Path, socket_path: Path) -> None:
     socket_file = Path(socket_path)
     socket_file.parent.mkdir(parents=True, exist_ok=True)
     if socket_file.exists():
+        if _runtime_host_is_compatible(socket_file):
+            raise RuntimeHostUnavailableError(
+                f"CareerEng runtime host is already running for this workspace: {socket_file}"
+            )
+        # A stale local socket may be removed, but a live incompatible host must
+        # never be unlinked from under another process.
         try:
             socket_file.unlink()
         except FileNotFoundError:
             pass
-    manager = WorkspaceManager(project_root=project_root, workspace=workspace)
-    server = _UnixManagerServer(str(socket_file), manager)
+    runtime_host = RuntimeHostService(project_root=project_root, workspace=workspace)
+    server = _UnixRuntimeHostServer(str(socket_file), runtime_host)
     try:
         server.serve_forever(poll_interval=0.2)
     finally:
         server.server_close()
-        manager.close()
+        runtime_host.close()
         try:
             socket_file.unlink()
         except FileNotFoundError:
             pass
+
+
+def serve_workspace_manager(*, project_root: Path, workspace: Path, socket_path: Path) -> None:
+    """Deprecated compatibility wrapper for ``serve_runtime_host``."""
+
+    serve_runtime_host(project_root=project_root, workspace=workspace, socket_path=socket_path)
 
 
 def _send_request(socket_path: Path, payload: dict[str, Any], *, timeout: float = 3.0) -> dict[str, Any]:
@@ -361,18 +434,51 @@ def _send_request(socket_path: Path, payload: dict[str, Any], *, timeout: float 
         sock.close()
     text = data.decode("utf-8").strip()
     if not text:
-        raise RuntimeError("workspace manager returned an empty response")
+        raise RuntimeHostUnavailableError("runtime host returned an empty response")
     return json.loads(text)
 
 
-def _ping_manager(socket_path: Path) -> bool:
+def send_runtime_host_request(socket_path: Path, payload: dict[str, Any], *, timeout: float = 3.0) -> dict[str, Any]:
+    """Send one transport request to an already running runtime host."""
+
+    return _send_request(Path(socket_path), payload, timeout=timeout)
+
+
+def _runtime_host_ping_response(socket_path: Path) -> dict[str, Any] | None:
     if not socket_path.exists():
-        return False
+        return None
     try:
-        response = _send_request(socket_path, {"op": "ping"}, timeout=0.8)
+        return _send_request(socket_path, with_runtime_host_protocol({"op": "ping"}), timeout=0.8)
+    except Exception:
+        return None
+
+
+def _runtime_host_is_compatible(socket_path: Path) -> bool:
+    response = _runtime_host_ping_response(socket_path)
+    if not response:
+        return False
+    remote_version = protocol_version_from(response)
+    if remote_version and remote_version != RUNTIME_HOST_PROTOCOL_VERSION:
+        raise RuntimeHostProtocolMismatchError(
+            "CareerEng runtime host protocol mismatch "
+            f"(expected={RUNTIME_HOST_PROTOCOL_VERSION}, actual={remote_version}). "
+            "Reload/restart the local CareerEng runtime host before continuing."
+        )
+    if not remote_version:
+        raise RuntimeHostProtocolMismatchError(
+            "CareerEng runtime host did not report a protocol version. "
+            "Reload/restart the local CareerEng runtime host before continuing."
+        )
+    return bool(response.get("ok")) and str(response.get("reply") or "") == "pong"
+
+
+def _ping_manager(socket_path: Path) -> bool:
+    try:
+        return _runtime_host_is_compatible(socket_path)
+    except RuntimeHostProtocolMismatchError:
+        raise
     except Exception:
         return False
-    return bool(response.get("ok")) and str(response.get("reply") or "") == "pong"
 
 
 def _wait_for_manager_stop(socket_path: Path, *, timeout: float) -> bool:
@@ -384,10 +490,17 @@ def _wait_for_manager_stop(socket_path: Path, *, timeout: float) -> bool:
     return not _ping_manager(socket_path)
 
 
-def ensure_workspace_manager(*, project_root: Path, workspace: Path) -> Path:
-    socket_path = manager_socket_path(workspace)
-    if _ping_manager(socket_path):
+def ensure_runtime_host(*, project_root: Path, workspace: Path, autostart: bool = False) -> Path:
+    """Return the workspace host endpoint, optionally starting it in this process context."""
+
+    socket_path = runtime_host_socket_path(workspace)
+    if _runtime_host_is_compatible(socket_path):
         return socket_path
+    if not autostart:
+        raise RuntimeHostUnavailableError(
+            "CareerEng runtime host is not running. Start it in the local user environment with "
+            "`python -m careereng runtime-host serve`."
+        )
     if socket_path.exists():
         try:
             socket_path.unlink()
@@ -397,7 +510,8 @@ def ensure_workspace_manager(*, project_root: Path, workspace: Path) -> Path:
         sys.executable,
         "-m",
         "careereng",
-        "manager-serve",
+        "runtime-host",
+        "serve",
         "--project-root",
         str(project_root),
         "--workspace",
@@ -416,10 +530,16 @@ def ensure_workspace_manager(*, project_root: Path, workspace: Path) -> Path:
     )
     deadline = time.time() + 10.0
     while time.time() < deadline:
-        if _ping_manager(socket_path):
+        if _runtime_host_is_compatible(socket_path):
             return socket_path
         time.sleep(0.1)
-    raise RuntimeError(f"workspace manager did not start: {socket_path}")
+    raise RuntimeHostUnavailableError(f"runtime host did not start: {socket_path}")
+
+
+def ensure_workspace_manager(*, project_root: Path, workspace: Path) -> Path:
+    """Deprecated compatibility wrapper that preserves CLI auto-start behavior."""
+
+    return ensure_runtime_host(project_root=project_root, workspace=workspace, autostart=True)
 
 
 def dispatch_manager_message(*, project_root: Path, workspace: Path, session_id: str, message: str) -> str:
@@ -485,6 +605,24 @@ def fresh_snapshot_resume(
             "message": message,
             "turn_id": turn_id,
         },
+        timeout=DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS,
+    )
+    if not bool(response.get("ok")):
+        raise RuntimeError(str(response.get("error") or "workspace manager request failed"))
+    return response
+
+
+def pause_manager_jobs_batch(
+    *,
+    project_root: Path,
+    workspace: Path,
+    batch_id: str,
+    site_key: str = "",
+) -> dict[str, Any]:
+    socket_path = ensure_workspace_manager(project_root=project_root, workspace=workspace)
+    response = _send_request(
+        socket_path,
+        {"op": "pause_jobs_batch", "batch_id": batch_id, "site_key": site_key},
         timeout=DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS,
     )
     if not bool(response.get("ok")):
@@ -620,16 +758,14 @@ def call_browser_handoff_tool(
     )
 
 
-def shutdown_workspace_manager(
+def shutdown_runtime_host(
     *,
-    project_root: Path,
     workspace: Path,
     cancel_open_batches: bool = False,
     session_id: str | None = None,
     wait_timeout_seconds: float = 10.0,
 ) -> dict[str, Any]:
-    del project_root  # Kept for call-site symmetry with other manager helpers.
-    socket_path = manager_socket_path(workspace)
+    socket_path = runtime_host_socket_path(workspace)
     if not _ping_manager(socket_path):
         return {"ok": True, "running": False, "stopped": True, "cancelled": 0}
 
@@ -642,7 +778,7 @@ def shutdown_workspace_manager(
     response: dict[str, Any] = {}
     while True:
         try:
-            response = _send_request(socket_path, payload, timeout=3.0)
+            response = _send_request(socket_path, with_runtime_host_protocol(payload), timeout=3.0)
         except Exception:
             if not _ping_manager(socket_path):
                 return {"ok": True, "running": False, "stopped": True, "cancelled": 0}
@@ -655,5 +791,24 @@ def shutdown_workspace_manager(
             return response
         error = str(response.get("error") or "")
         if cancel_open_batches or "busy" not in error or time.time() >= deadline:
-            raise RuntimeError(error or "workspace manager shutdown failed")
+            raise RuntimeHostUnavailableError(error or "runtime host shutdown failed")
         time.sleep(0.25)
+
+
+def shutdown_workspace_manager(
+    *,
+    project_root: Path,
+    workspace: Path,
+    cancel_open_batches: bool = False,
+    session_id: str | None = None,
+    wait_timeout_seconds: float = 10.0,
+) -> dict[str, Any]:
+    """Deprecated compatibility wrapper for ``shutdown_runtime_host``."""
+
+    del project_root
+    return shutdown_runtime_host(
+        workspace=workspace,
+        cancel_open_batches=cancel_open_batches,
+        session_id=session_id,
+        wait_timeout_seconds=wait_timeout_seconds,
+    )

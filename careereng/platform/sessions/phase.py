@@ -22,6 +22,7 @@ class PhaseSession:
     apply_target_job_ids: tuple[str, ...] = ()
     continuation_context: dict[str, Any] = field(default_factory=dict)
     phase_context: dict[str, Any] = field(default_factory=dict)
+    phase_memory: dict[str, Any] = field(default_factory=dict)
     browser_tool_commands: dict[str, str] = field(default_factory=dict)
     state_tool_commands: dict[str, str] = field(default_factory=dict)
     state_tools: list[dict[str, Any]] = field(default_factory=list)
@@ -40,6 +41,7 @@ class PhaseSession:
             "apply_target_job_ids": list(self.apply_target_job_ids),
             "continuation_context": dict(self.continuation_context or {}),
             "phase_context": dict(self.phase_context or {}),
+            "phase_memory": dict(self.phase_memory or {}),
             "browser_tool_commands": dict(self.browser_tool_commands or {}),
             "state_tool_commands": dict(self.state_tool_commands or {}),
             "state_tools": list(self.state_tools or []),

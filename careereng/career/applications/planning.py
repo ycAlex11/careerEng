@@ -291,6 +291,14 @@ class ApplicationPlanningService:
                         current_context_versions=context_versions,
                         current_decision_context_hash=decision_context_hash,
                         apply_candidate_policy=apply_candidate_policy,
+                        batch_id=batch_id,
+                    )
+                except TypeError:
+                    history_candidates = history_candidates_for_apply(
+                        site_key,
+                        current_context_versions=context_versions,
+                        current_decision_context_hash=decision_context_hash,
+                        apply_candidate_policy=apply_candidate_policy,
                     )
                 except Exception:
                     history_candidates = []
@@ -309,7 +317,13 @@ class ApplicationPlanningService:
                     self.site_store.update_run_jobs(site_key, requeued_rows, session_id, turn_id, batch_id)
                     rows = self.merged_run_job_rows_for_batch(site_key, batch_id)
             match_history_rows = getattr(self.site_store, "match_history_rows", None)
-            history_matches = match_history_rows(site_key, rows) if callable(match_history_rows) else []
+            if callable(match_history_rows):
+                try:
+                    history_matches = match_history_rows(site_key, rows, batch_id=batch_id)
+                except TypeError:
+                    history_matches = match_history_rows(site_key, rows)
+            else:
+                history_matches = []
             plan = self.planning_store.write_apply_plan(
                 site_key=site_key,
                 batch_id=batch_id,

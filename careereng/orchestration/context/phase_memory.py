@@ -25,6 +25,74 @@ class BrowserPhaseMemory:
     do_not_repeat: dict[str, str] = field(default_factory=dict)
     metrics: dict[str, int] = field(default_factory=dict)
 
+    @classmethod
+    def from_payload(cls, payload: object) -> "BrowserPhaseMemory":
+        """Rebuild run-local memory from a durable phase-session payload."""
+
+        data = payload if isinstance(payload, dict) else {}
+        raw_actions = data.get("recent_actions") if isinstance(data.get("recent_actions"), list) else []
+        actions: list[PhaseActionRecord] = []
+        for item in raw_actions:
+            if not isinstance(item, dict):
+                continue
+            actions.append(
+                PhaseActionRecord(
+                    tool=str(item.get("tool") or "").strip(),
+                    action=str(item.get("action") or "").strip(),
+                    status=str(item.get("status") or "").strip(),
+                    url=str(item.get("url") or "").strip(),
+                    title=str(item.get("title") or "").strip(),
+                    outcome=str(item.get("outcome") or "").strip(),
+                )
+            )
+        def _text_map(key: str) -> dict[str, str]:
+            raw_map = data.get(key)
+            if not isinstance(raw_map, dict):
+                return {}
+            return {str(item_key): str(value) for item_key, value in raw_map.items() if str(item_key) and str(value)}
+
+        raw_metrics = data.get("metrics")
+        metrics = raw_metrics if isinstance(raw_metrics, dict) else {}
+        memory = cls(
+            recent_action_limit=max(1, int(data.get("recent_action_limit") or 4)),
+            recent_actions=actions,
+            completed=_text_map("completed"),
+            confirmed=_text_map("confirmed"),
+            pending=_text_map("pending"),
+            do_not_repeat=_text_map("do_not_repeat"),
+            metrics={
+                str(key): int(value)
+                for key, value in metrics.items()
+                if str(key) and isinstance(value, int) and value > 0
+            },
+        )
+        if len(memory.recent_actions) > memory.recent_action_limit:
+            memory.recent_actions[:] = memory.recent_actions[-memory.recent_action_limit :]
+        return memory
+
+    def as_payload(self) -> dict[str, object]:
+        """Return only serializable run-local state for a phase session."""
+
+        return {
+            "recent_action_limit": self.recent_action_limit,
+            "recent_actions": [
+                {
+                    "tool": action.tool,
+                    "action": action.action,
+                    "status": action.status,
+                    "url": action.url,
+                    "title": action.title,
+                    "outcome": action.outcome,
+                }
+                for action in self.recent_actions
+            ],
+            "completed": dict(self.completed),
+            "confirmed": dict(self.confirmed),
+            "pending": dict(self.pending),
+            "do_not_repeat": dict(self.do_not_repeat),
+            "metrics": dict(self.metrics),
+        }
+
     def record_action(
         self,
         *,

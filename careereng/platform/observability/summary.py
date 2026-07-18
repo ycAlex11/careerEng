@@ -25,8 +25,19 @@ def _metrics_path(workspace: Path) -> Path:
     return workspace / "metrics" / "llm_usage.jsonl"
 
 
+def _performance_path(workspace: Path) -> Path:
+    return workspace / "metrics" / "performance_events.jsonl"
+
+
 def _load_rows(workspace: Path) -> list[dict[str, Any]]:
     path = _metrics_path(workspace)
+    if not path.exists():
+        return []
+    return JSONLStore(path).read_all()
+
+
+def _load_performance_rows(workspace: Path) -> list[dict[str, Any]]:
+    path = _performance_path(workspace)
     if not path.exists():
         return []
     return JSONLStore(path).read_all()
@@ -74,6 +85,43 @@ def _empty_totals() -> dict[str, Any]:
     }
 
 
+def _empty_performance_totals() -> dict[str, Any]:
+    return {
+        "events": 0,
+        "elapsed_ms": 0,
+        "browser_tool_calls": 0,
+        "state_tool_calls": 0,
+        "retry_count": 0,
+        "snapshot_count": 0,
+        "compact_observation_count": 0,
+        "full_observation_count": 0,
+        "agent_input_bytes": 0,
+        "technical_error_count": 0,
+    }
+
+
+def _accumulate_performance(totals: dict[str, Any], row: dict[str, Any]) -> None:
+    totals["events"] += 1
+    totals["elapsed_ms"] += _int_value(row.get("elapsed_ms"))
+    operation = str(row.get("operation") or "")
+    tool_name = str(row.get("tool_name") or "")
+    if operation == "browser_tool":
+        totals["browser_tool_calls"] += 1
+    if operation == "state_tool":
+        totals["state_tool_calls"] += 1
+    if bool(row.get("retry")):
+        totals["retry_count"] += 1
+    if tool_name == "browser_snapshot" or str(row.get("observation_kind") or "") == "snapshot":
+        totals["snapshot_count"] += 1
+    if str(row.get("observation_kind") or "") == "compact":
+        totals["compact_observation_count"] += 1
+    if str(row.get("observation_kind") or "") == "full":
+        totals["full_observation_count"] += 1
+    totals["agent_input_bytes"] += _int_value(row.get("agent_input_bytes"))
+    if str(row.get("status") or "") == "error":
+        totals["technical_error_count"] += 1
+
+
 def _accumulate(totals: dict[str, Any], row: dict[str, Any]) -> None:
     totals["calls"] += 1
     if str(row.get("status") or "") == "ok":
@@ -114,10 +162,17 @@ def build_metrics_summary(
 ) -> dict[str, Any]:
     workspace_path = Path(workspace)
     rows = _load_rows(workspace_path)
+    performance_rows = _load_performance_rows(workspace_path)
     requested_batch = str(batch_id or "").strip()
-    resolved_batch = _latest_batch_id(rows) if requested_batch == "latest" else requested_batch
+    resolved_batch = _latest_batch_id(rows + performance_rows) if requested_batch == "latest" else requested_batch
     filtered_rows = _filter_rows(
         rows,
+        batch_id=resolved_batch,
+        site_key=str(site_key or "").strip(),
+        phase=str(phase or "").strip(),
+    )
+    filtered_performance_rows = _filter_rows(
+        performance_rows,
         batch_id=resolved_batch,
         site_key=str(site_key or "").strip(),
         phase=str(phase or "").strip(),
@@ -133,9 +188,13 @@ def build_metrics_summary(
         models[str(row.get("model") or "unknown")] += 1
         api_types[str(row.get("api_type") or "unknown")] += 1
         statuses[str(row.get("status") or "unknown")] += 1
+    performance_totals = _empty_performance_totals()
+    for row in filtered_performance_rows:
+        _accumulate_performance(performance_totals, row)
     return {
         "generated_at": now_iso(),
         "source_path": str(_metrics_path(workspace_path)),
+        "performance_source_path": str(_performance_path(workspace_path)),
         "filters": {
             "batch_id": resolved_batch,
             "site_key": str(site_key or "").strip(),
@@ -147,6 +206,10 @@ def build_metrics_summary(
         "api_types": dict(api_types),
         "statuses": dict(statuses),
         "groups": {key: _group_summary(filtered_rows, key) for key in GROUP_KEYS},
+        "performance": {
+            "totals": performance_totals,
+            "events": filtered_performance_rows,
+        },
         "error_rows": [
             {
                 "ts": str(row.get("ts") or ""),

@@ -50,6 +50,7 @@ careereng/
 
   platform/                     Shared technical infrastructure
     persistence/                Workspace access, stores, indexes, versioned documents, normalization, backups
+    runtime_host/               Workspace-scoped browser/session owner and versioned local host protocol
     web_control/                Browser runtime, profiles, MCP gateway, raw web operations
     sessions/                   Runtime ownership, session lifecycle, recovery plumbing
     reporting/                  Generic report artifact writing, indexes, events, snapshots, render helpers
@@ -63,7 +64,7 @@ careereng/
       browser_phase_runtime.py  Responses API browser-tool execution adapter
     mcp/                        CareerEng MCP server transport
     cli/                        Command-line transport
-    host/                       Local workspace-manager process transport
+    host/                       Deprecated compatibility exports for the runtime host
     external_agents/            Codex, Claude Code, and future local-agent adapters
     assistant_bridge/           Conversation ingestion and assistant-context transport
 
@@ -149,6 +150,33 @@ Legacy browser phase runners may retain a thin compatibility method that
 supplies the site profile and writes domain session status. They must delegate
 runtime ownership to `platform/sessions/` rather than maintain their own
 active-process map or profile-lock lifecycle.
+
+## Runtime Host Boundary
+
+`platform/runtime_host/` owns the workspace-scoped local process boundary for
+browser/session execution. One host owns the workspace runtime and delegates
+per-site browser/profile access to `platform/sessions/` and
+`platform/web_control/`; it does not own site policy or create one process per
+site.
+
+Its versioned protocol is intentionally generic: `ping`, batch/resume/pause,
+and browser/state tool transport. Every response includes a protocol version.
+MCP and external-agent adapters connect to an already user-owned host and must
+not start a browser-owning process from a constrained desktop sandbox. A
+missing or stale host is a recoverable infrastructure condition, reported as
+`runtime_host_unavailable` or `runtime_host_protocol_mismatch`, never as a job
+or site failure.
+
+CLI may explicitly run the lifecycle commands:
+
+```text
+python -m careereng runtime-host serve
+python -m careereng runtime-host status
+python -m careereng runtime-host stop
+```
+
+The old `adapters/host/workspace_manager.py` and hidden `manager-serve` command
+are compatibility shims only. Do not add new behavior there.
 
 ## Persistence Access Boundary
 

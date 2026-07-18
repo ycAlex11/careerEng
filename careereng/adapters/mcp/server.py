@@ -14,17 +14,11 @@ from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP
 
 from careereng.adapters.bootstrap import project_root_from_cwd, workspace_path as resolve_workspace_path
-from careereng.adapters.host.workspace_manager import (
-    call_agent_bridge_browser_tool,
-    call_agent_bridge_state_tool,
-    fresh_snapshot_resume,
-    list_agent_bridge_browser_tools,
-    list_agent_bridge_state_tools,
-    start_manager_jobs_batch,
-)
 from careereng.adapters.external_agents.work_orders import load_active_phase_context
+from careereng.adapters.external_agents.contracts import AGENT_BRIDGE_PROTOCOL_VERSION
 from careereng.career.applications.job_store import JobStore, TERMINAL_BATCH_STATUSES
 from careereng.career.applications.site_store import SiteStore
+from careereng.platform.runtime_host import RUNTIME_HOST_PROTOCOL_VERSION, runtime_host_client, runtime_host_status
 from careereng.utils import make_id
 
 
@@ -48,6 +42,11 @@ class CareerEngMCPRuntime:
 
     def site_store(self) -> SiteStore:
         return SiteStore(self.workspace, project_root=self.project_root)
+
+    def host_client(self):
+        # The desktop adapter must never create a browser-owning process inside
+        # its own sandbox. A user-owned Runtime Host is the only execution owner.
+        return runtime_host_client(project_root=self.project_root, workspace=self.workspace, autostart=False)
 
 
 def _compact_batch(batch: dict[str, Any] | None) -> dict[str, Any]:
@@ -179,9 +178,16 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         """Check that the CareerEng MCP server is reachable."""
         return {
             "ok": True,
+            "bridge_protocol_version": AGENT_BRIDGE_PROTOCOL_VERSION,
+            "runtime_host_protocol_version": RUNTIME_HOST_PROTOCOL_VERSION,
             "project_root": str(runtime.project_root),
             "workspace": str(runtime.workspace),
         }
+
+    @server.tool()
+    def careereng_runtime_host_status() -> dict[str, Any]:
+        """Check whether the user-owned local runtime host is reachable."""
+        return runtime_host_status(project_root=runtime.project_root, workspace=runtime.workspace)
 
     @server.tool()
     def careereng_get_context(
@@ -206,6 +212,8 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             compact_sites.append(_compact_site(site, browser_session=browser_session))
         return _with_phase_contexts({
             "ok": True,
+            "bridge_protocol_version": AGENT_BRIDGE_PROTOCOL_VERSION,
+            "runtime_host_protocol_version": RUNTIME_HOST_PROTOCOL_VERSION,
             "project_root": str(runtime.project_root),
             "workspace": str(runtime.workspace),
             "session_id": session_id,
@@ -230,13 +238,15 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         session_id: str = DEFAULT_SESSION_ID,
     ) -> dict[str, Any]:
         """Start a jobs batch and return its first ready external-agent phase context."""
-        result = start_manager_jobs_batch(
-            project_root=runtime.project_root,
-            workspace=runtime.workspace,
-            session_id=session_id,
-            message=message,
-            operation=operation,
-            apply_requested=apply_requested,
+        result = runtime.host_client().request(
+            "start_jobs_batch",
+            {
+                "session_id": session_id,
+                "message": message,
+                "operation": operation,
+                "apply_requested": bool(apply_requested),
+            },
+            timeout=10.0,
         )
         if not bool(result.get("accepted")):
             return result
@@ -255,21 +265,29 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
     ) -> dict[str, Any]:
         """Resume a waiting_user phase after the user completes a human-only browser action."""
         resume_message = str(message or "").strip() or f"{site_key} done"
-        return fresh_snapshot_resume(
-            project_root=runtime.project_root,
-            workspace=runtime.workspace,
-            session_id=session_id,
-            message=resume_message,
-            turn_id=make_id("turn"),
+        return runtime.host_client().request(
+            "fresh_snapshot_resume",
+            {
+                "session_id": session_id,
+                "message": resume_message,
+                "turn_id": make_id("turn"),
+            },
+        )
+
+    @server.tool()
+    def careereng_pause_jobs_batch(batch_id: str, site_key: str = "") -> dict[str, Any]:
+        """Pause a batch without converting its current site state into a blocker."""
+        return runtime.host_client().request(
+            "pause_jobs_batch",
+            {"batch_id": batch_id, "site_key": site_key},
         )
 
     @server.tool()
     def careereng_list_browser_tools(site_key: str) -> dict[str, Any]:
         """List browser tools for an active CareerEng site runtime."""
-        return list_agent_bridge_browser_tools(
-            project_root=runtime.project_root,
-            workspace=runtime.workspace,
-            site_key=site_key,
+        return runtime.host_client().request(
+            "agent_bridge_browser_list_tools",
+            {"site_key": site_key},
         )
 
     @server.tool()
@@ -281,24 +299,23 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         turn_id: str = "",
     ) -> dict[str, Any]:
         """Call one browser tool through the active CareerEng site runtime."""
-        return call_agent_bridge_browser_tool(
-            project_root=runtime.project_root,
-            workspace=runtime.workspace,
-            site_key=site_key,
-            tool_name=tool_name,
-            arguments=arguments or {},
-            turn_id=turn_id,
-            phase=phase,
+        return runtime.host_client().request(
+            "agent_bridge_browser_call_tool",
+            {
+                "site_key": site_key,
+                "tool_name": tool_name,
+                "arguments": arguments or {},
+                "turn_id": turn_id,
+                "phase": phase,
+            },
         )
 
     @server.tool()
     def careereng_list_state_tools(site_key: str, phase: str = "") -> dict[str, Any]:
         """List CareerEng state tools for an active phase session."""
-        return list_agent_bridge_state_tools(
-            project_root=runtime.project_root,
-            workspace=runtime.workspace,
-            site_key=site_key,
-            phase=phase,
+        return runtime.host_client().request(
+            "agent_bridge_state_list_tools",
+            {"site_key": site_key, "phase": phase},
         )
 
     @server.tool()
@@ -310,14 +327,15 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         turn_id: str = "",
     ) -> dict[str, Any]:
         """Call one CareerEng state tool through the active phase session."""
-        return call_agent_bridge_state_tool(
-            project_root=runtime.project_root,
-            workspace=runtime.workspace,
-            site_key=site_key,
-            tool_name=tool_name,
-            arguments=arguments or {},
-            turn_id=turn_id,
-            phase=phase,
+        return runtime.host_client().request(
+            "agent_bridge_state_call_tool",
+            {
+                "site_key": site_key,
+                "tool_name": tool_name,
+                "arguments": arguments or {},
+                "turn_id": turn_id,
+                "phase": phase,
+            },
         )
 
     @server.tool()
@@ -329,14 +347,15 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         turn_id: str = "",
     ) -> dict[str, Any]:
         """Record a phase_result through the shared CareerEng state-tool path."""
-        return call_agent_bridge_state_tool(
-            project_root=runtime.project_root,
-            workspace=runtime.workspace,
-            site_key=site_key,
-            tool_name="phase_result",
-            arguments={"status": status, "summary": summary},
-            turn_id=turn_id,
-            phase=phase,
+        return runtime.host_client().request(
+            "agent_bridge_state_call_tool",
+            {
+                "site_key": site_key,
+                "tool_name": "phase_result",
+                "arguments": {"status": status, "summary": summary},
+                "turn_id": turn_id,
+                "phase": phase,
+            },
         )
 
     return server

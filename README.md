@@ -181,30 +181,36 @@ careereng site add "Microsoft" --url https://careers.microsoft.com
 
 ## AI Assistant Usage
 
-CareerEng is designed to be operated with Codex or another AI assistant. The main entry point is simple: start a message with `@career`.
+CareerEng is designed to be operated with Codex Desktop, Claude Code, or another coding agent. Once the agent is connected to CareerEng, it can use the local workspace, current context, and browser capability instead of treating each chat as a fresh job-search session.
 
-If you are a new user, start with the Codex checklist:
-
-```text
-CODEX_QUICKSTART.md
-```
-
-Use `@career` when you want the assistant to operate CareerEng instead of only chatting about the project. The assistant sends the message into CareerEng, CareerEng classifies it, records it, and returns the suggested local action.
-
-Examples:
+For a new AI conversation, give the agent this instruction:
 
 ```text
-@career 查看一下投递情况
-@career 检查投递状态
-@career 总结一下我们的投递情况
-@career 激活高通和 AMD
-@career 停用英伟达
-@career 我想投 AI infra，需要补什么？
+Read AGENTS.md, load the current CareerEng context, inspect the active taskboard,
+then continue from the current CareerEng state. Do not scan the whole repository
+unless the context identifies a module to inspect.
 ```
 
-Codex should route these messages through the local assistant bridge. Detailed assistant rules live in `AGENTS.md` and `docs/assistant_bridge/`.
+The agent can then:
 
-The important design boundary is simple: Codex can understand the current conversation and help draft changes; CareerEng owns local storage, command execution, history, reports, and business state.
+- understand the active sites, open batches, local history, reports, metrics, Skills, memory, and taskboard;
+- start, pause, continue, or stop job batches without losing durable application history;
+- operate the local browser with the site's saved profile to review applications, retrieve jobs, and complete apply flows;
+- preserve the live page for login, CAPTCHA, MFA, or other user-only steps, then continue after the user says the step is complete;
+- use local evidence and reports to propose Skill or workflow improvements while keeping business judgment in the AI layer.
+
+You can use natural language. For example:
+
+```text
+Continue NVIDIA from the current state and show the batch report when it finishes.
+Check submitted applications for all active sites.
+Pause the current batch after the next application and keep the browser page available.
+Use my recent application outcomes to propose a matching-policy improvement.
+```
+
+Humans still control high-risk decisions and user-only browser steps. When an application needs login, verification, CAPTCHA, or MFA, complete it in the live page and tell the agent to continue. The agent resumes from the current page rather than starting the workflow over.
+
+CareerEng also keeps the existing provider/API and `@career` assistant-bridge paths for users who prefer them. They share the same workspace state, Skills, history, reports, and browser-session lifecycle.
 
 ### Assistant Context And Taskboard
 

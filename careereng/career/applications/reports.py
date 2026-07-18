@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from careereng.platform.observability import build_metrics_summary
 from careereng.platform.reporting import ReportArtifactStore
 from careereng.career.applications.job_store import JobStore
 from careereng.career.applications.site_store import SiteStore
@@ -524,6 +525,18 @@ def _batch_markdown(report: dict[str, Any]) -> str:
     reviewed_jobs = report.get("reviewed_jobs") if isinstance(report.get("reviewed_jobs"), list) else []
     lines.extend(["", "## 申请状态检查"])
     _append_review_group_lines(lines, reviewed_jobs, include_site=True)
+    metrics = report.get("metrics") if isinstance(report.get("metrics"), dict) else {}
+    usage = metrics.get("totals") if isinstance(metrics.get("totals"), dict) else {}
+    performance = metrics.get("performance") if isinstance(metrics.get("performance"), dict) else {}
+    performance_totals = performance.get("totals") if isinstance(performance.get("totals"), dict) else {}
+    lines.extend(
+        [
+            "",
+            "## 性能",
+            f"- LLM 调用: {usage.get('calls', 0)}；输入 token: {usage.get('input_tokens', 0)}；输出 token: {usage.get('output_tokens', 0)}；未知 token 调用: {usage.get('unknown_token_calls', 0)}",
+            f"- 执行事件: {performance_totals.get('events', 0)}；浏览器工具: {performance_totals.get('browser_tool_calls', 0)}；状态工具: {performance_totals.get('state_tool_calls', 0)}；snapshot: {performance_totals.get('snapshot_count', 0)}；技术错误: {performance_totals.get('technical_error_count', 0)}",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -546,6 +559,7 @@ def _daily_final_payload(report: dict[str, Any], *, batch_json_path: Path, batch
         "unmatched_review_records": (
             report.get("unmatched_review_records") if isinstance(report.get("unmatched_review_records"), list) else []
         ),
+        "metrics": report.get("metrics") if isinstance(report.get("metrics"), dict) else {},
         "batch_report": {
             "json_path": str(batch_json_path),
             "markdown_path": str(batch_markdown_path),
@@ -847,6 +861,7 @@ def generate_job_batch_report(
         "reviewed_jobs": reviewed_jobs,
         "application_review_changes": application_review_changes,
         "unmatched_review_records": unmatched_review_records,
+        "metrics": build_metrics_summary(workspace=workspace, batch_id=batch_id),
     }
     json_path, md_path = _batch_report_paths(workspace, batch_id, report_date)
     _write_report_artifact(

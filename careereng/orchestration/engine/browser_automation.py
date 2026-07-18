@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import shutil
+import time
 from typing import Any, Callable
 import anyio
 
@@ -27,6 +28,7 @@ from careereng.adapters.external_agents.work_orders import (
     advance_browser_agent_work_order,
     create_browser_agent_work_order,
     load_active_phase_context,
+    persist_browser_agent_phase_memory,
 )
 from careereng.orchestration.context.prompts import build_phase_prompts, load_text
 from careereng.orchestration.agent_protocol.browser_phase import BrowserPhaseResult
@@ -51,6 +53,7 @@ from careereng.config.schema import (
 )
 from careereng.career.resume.export import default_apply_resume_pdf_path
 from careereng.platform.persistence import JSONLStore
+from careereng.platform.observability import PerformanceRecorder
 from careereng.utils import now_iso
 
 
@@ -357,10 +360,27 @@ class BrowserAutomationService:
         turn_id: str = "",
         phase: str = AGENT_BRIDGE_STATUS,
     ) -> dict[str, Any]:
+        started = time.monotonic()
+        session_context = self._agent_bridge_session_context(site_key, phase=phase)
         active = self._active_runtime_for_agent_bridge(site_key)
         bridge = MCPToolBridge(active.runtime, timeout_seconds=max(30.0, self.timeout_ms / 1000.0))
-        async with bridge.open_session() as session:
-            payload = await bridge.call_tool(session, tool_name, arguments or {})
+        try:
+            async with bridge.open_session() as session:
+                payload = await bridge.call_tool(session, tool_name, arguments or {})
+        except Exception as exc:
+            PerformanceRecorder(self.workspace).record(
+                backend="external_agent",
+                operation="browser_tool",
+                tool_name=tool_name,
+                site_key=site_key,
+                batch_id=str(session_context.get("batch_id") or ""),
+                phase=agent_bridge_phase(phase),
+                status="error",
+                error_type=exc.__class__.__name__,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                observation_kind="full" if tool_name == "browser_snapshot" else "",
+            )
+            raise
         current_url = bridge.extract_current_url(payload) or ""
         summary = bridge.summarize_tool_output(payload)
         trace_ref = self.site_store.append_step_trace(
@@ -398,6 +418,17 @@ class BrowserAutomationService:
                 "current_url": current_url,
                 "trace_ref": trace_ref,
             },
+        )
+        PerformanceRecorder(self.workspace).record(
+            backend="external_agent",
+            operation="browser_tool",
+            tool_name=tool_name,
+            site_key=site_key,
+            batch_id=str(session_context.get("batch_id") or ""),
+            phase=agent_bridge_phase(phase),
+            status="error" if payload.get("isError") else "ok",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            observation_kind="full" if tool_name == "browser_snapshot" else "",
         )
         return {
             "ok": not bool(payload.get("isError")),
@@ -447,6 +478,29 @@ class BrowserAutomationService:
             "phase_session_path": str(browser_session.get("phase_session_path") or ""),
             "payload_path": str(browser_session.get("agent_bridge_payload_path") or ""),
         }
+
+    @staticmethod
+    def _load_agent_bridge_phase_memory(context: dict[str, Any]) -> BrowserPhaseMemory:
+        phase_session_path = Path(str(context.get("phase_session_path") or ""))
+        if not phase_session_path.is_file():
+            return BrowserPhaseMemory()
+        try:
+            payload = json.loads(phase_session_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        return BrowserPhaseMemory.from_payload(payload.get("phase_memory") if isinstance(payload, dict) else {})
+
+    @staticmethod
+    def _persist_agent_bridge_phase_memory(context: dict[str, Any], phase_memory: BrowserPhaseMemory) -> None:
+        payload_path = Path(str(context.get("payload_path") or ""))
+        phase_session_path = Path(str(context.get("phase_session_path") or ""))
+        if not payload_path.is_file() or not phase_session_path.is_file():
+            raise RuntimeError("agent bridge phase session is unavailable")
+        persist_browser_agent_phase_memory(
+            payload_path=payload_path,
+            phase_session_path=phase_session_path,
+            phase_memory=phase_memory.as_payload(),
+        )
 
     def _advance_active_agent_bridge_phase(
         self,
@@ -543,9 +597,11 @@ class BrowserAutomationService:
         turn_id: str = "",
         phase: str = "",
     ) -> dict[str, Any]:
+        started = time.monotonic()
         context = self._agent_bridge_session_context(site_key, phase=phase)
         effective_turn_id = str(turn_id or context.get("turn_id") or AGENT_BRIDGE_STATUS)
         effective_phase = str(context.get("phase") or phase or AGENT_BRIDGE_STATUS)
+        phase_memory = self._load_agent_bridge_phase_memory(context)
         payload = execute_state_tool(
             tool_name,
             arguments or {},
@@ -556,6 +612,8 @@ class BrowserAutomationService:
                 turn_id=effective_turn_id,
                 batch_id=str(context.get("batch_id") or ""),
                 current_url=str(context.get("current_url") or ""),
+                phase_memory=phase_memory,
+                persist_phase_memory=lambda memory: self._persist_agent_bridge_phase_memory(context, memory),
             ),
         )
         summary = MCPToolBridge.summarize_tool_output(payload)
@@ -602,6 +660,16 @@ class BrowserAutomationService:
                 "trace_ref": trace_ref,
                 "progression": progression,
             },
+        )
+        PerformanceRecorder(self.workspace).record(
+            backend="external_agent",
+            operation="state_tool",
+            tool_name=tool_name,
+            site_key=str(context.get("site_key") or site_key),
+            batch_id=str(context.get("batch_id") or ""),
+            phase=effective_phase,
+            status="error" if payload.get("isError") else "ok",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
         )
         return {
             "ok": not bool(payload.get("isError")),

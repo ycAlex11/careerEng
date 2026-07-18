@@ -1,4 +1,4 @@
-"""Append-only LLM usage metrics."""
+"""Append-only backend usage and execution metrics."""
 
 from __future__ import annotations
 
@@ -73,5 +73,32 @@ class LLMUsageRecorder:
         try:
             with _WRITE_LOCK:
                 JSONLStore(path).append(row)
+        except Exception:
+            return
+
+
+class PerformanceRecorder:
+    """Record backend-neutral technical execution facts.
+
+    The recorder intentionally does not classify job outcomes or make business
+    decisions. It only captures observed tool/runtime activity.
+    """
+
+    def __init__(self, workspace: Path | str | None):
+        self.workspace = Path(workspace).resolve() if workspace else None
+
+    @property
+    def path(self) -> Path | None:
+        if self.workspace is None:
+            return None
+        return self.workspace / "metrics" / "performance_events.jsonl"
+
+    def record(self, **payload: Any) -> None:
+        path = self.path
+        if path is None:
+            return
+        try:
+            with _WRITE_LOCK:
+                JSONLStore(path).append({"ts": now_iso(), **payload})
         except Exception:
             return

@@ -83,6 +83,7 @@ from careereng.career.interviews import (
     save_interview_candidates,
 )
 from careereng.platform.observability import build_metrics_summary, save_metrics_summary
+from careereng.platform.runtime_host import runtime_host_client, runtime_host_socket_path, runtime_host_status, serve_runtime_host
 from careereng.adapters.mcp import run_mcp_server
 from careereng.career.resume.export import ResumeExportError, export_resume_pdf as export_resume_pdf_file
 from careereng.career.applications import generate_job_batch_report
@@ -113,6 +114,7 @@ metrics_app = typer.Typer(help="Metrics summary commands")
 report_app = typer.Typer(help="Report review commands")
 resume_app = typer.Typer(help="Resume commands")
 route_app = typer.Typer(help="Route feedback commands")
+runtime_host_app = typer.Typer(help="User-owned local browser/runtime host commands")
 site_app = typer.Typer(help="Site registry commands")
 taskboard_app = typer.Typer(help="Current development taskboard commands")
 app.add_typer(action_card_app, name="action-card")
@@ -131,6 +133,7 @@ app.add_typer(profile_app, name="profile")
 app.add_typer(report_app, name="report")
 app.add_typer(resume_app, name="resume")
 app.add_typer(route_app, name="route")
+app.add_typer(runtime_host_app, name="runtime-host")
 app.add_typer(site_app, name="site")
 app.add_typer(taskboard_app, name="taskboard")
 
@@ -2446,14 +2449,53 @@ def batch_debug_create(
     typer.echo(f"next: python -m careereng batch-apply --site {normalized_site_key} --batch {debug_batch_id} --limit 1")
 
 
+@runtime_host_app.command("serve")
+def runtime_host_serve(
+    project_root: str = typer.Option("", "--project-root", help="Project root; defaults to the current CareerEng project"),
+    workspace: str = typer.Option("", "--workspace", help="Workspace path; defaults to configured workspace"),
+    socket_path: str = typer.Option("", "--socket-path", help="Optional Unix socket path for this host"),
+):
+    """Run the user-owned local runtime host for browser and phase execution."""
+    root = Path(project_root).expanduser().resolve() if project_root.strip() else _project_root()
+    resolved_workspace = Path(workspace).expanduser().resolve() if workspace.strip() else runtime_workspace_path(root)
+    endpoint = Path(socket_path).expanduser() if socket_path.strip() else runtime_host_socket_path(resolved_workspace)
+    serve_runtime_host(project_root=root, workspace=resolved_workspace, socket_path=endpoint)
+
+
+@runtime_host_app.command("status")
+def runtime_host_show_status(
+    project_root: str = typer.Option("", "--project-root", help="Project root; defaults to the current CareerEng project"),
+    workspace: str = typer.Option("", "--workspace", help="Workspace path; defaults to configured workspace"),
+):
+    """Show runtime-host reachability without starting a host process."""
+    root = Path(project_root).expanduser().resolve() if project_root.strip() else _project_root()
+    resolved_workspace = Path(workspace).expanduser().resolve() if workspace.strip() else runtime_workspace_path(root)
+    typer.echo(json.dumps(runtime_host_status(project_root=root, workspace=resolved_workspace), ensure_ascii=False, indent=2))
+
+
+@runtime_host_app.command("stop")
+def runtime_host_stop(
+    project_root: str = typer.Option("", "--project-root", help="Project root; defaults to the current CareerEng project"),
+    workspace: str = typer.Option("", "--workspace", help="Workspace path; defaults to configured workspace"),
+    cancel_open_batches: bool = typer.Option(False, "--cancel-open-batches", help="Also cancel open batches before stopping"),
+):
+    """Stop the user-owned local runtime host."""
+    root = Path(project_root).expanduser().resolve() if project_root.strip() else _project_root()
+    resolved_workspace = Path(workspace).expanduser().resolve() if workspace.strip() else runtime_workspace_path(root)
+    response = runtime_host_client(project_root=root, workspace=resolved_workspace, autostart=False).shutdown(
+        cancel_open_batches=cancel_open_batches,
+    )
+    typer.echo(json.dumps(response, ensure_ascii=False, indent=2))
+
+
 @app.command("manager-serve", hidden=True)
 def manager_serve(
     project_root: str = typer.Option(..., "--project-root", help="Project root"),
     workspace: str = typer.Option(..., "--workspace", help="Workspace path"),
     socket_path: str = typer.Option(..., "--socket-path", help="Unix socket path"),
 ):
-    """Run the hidden workspace manager server."""
-    serve_workspace_manager(
+    """Deprecated compatibility alias for ``runtime-host serve``."""
+    serve_runtime_host(
         project_root=Path(project_root).expanduser().resolve(),
         workspace=Path(workspace).expanduser().resolve(),
         socket_path=Path(socket_path).expanduser(),

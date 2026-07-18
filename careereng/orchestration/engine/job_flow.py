@@ -187,12 +187,16 @@ class JobFlow:
     def _compute_batch_status(self, batch: dict[str, Any]) -> str:
         if str(batch.get("status") or "") == "cancelled":
             return "cancelled"
+        if str(batch.get("status") or "") == "paused":
+            return "paused"
         sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
         rows = [row for row in sites.values() if isinstance(row, dict)]
         operation = self._normalize_operation(str(batch.get("operation") or ""))
         apply_requested = bool(batch.get("apply_requested"))
         if any(str(row.get("status") or "") in {"queued", "running"} for row in rows):
             return "running"
+        if any(str(row.get("status") or "") == "paused" for row in rows):
+            return "paused"
         if operation == self.OPERATION_JOB_SEARCH and apply_requested:
             for row in rows:
                 row_status = str(row.get("status") or "")
@@ -398,6 +402,30 @@ class JobFlow:
                 "final_markdown_path": str(report.get("final_markdown_path") or ""),
             },
         )
+        if str(batch.get("status") or "") in {"completed", "partial_completed", "failed", "cancelled"}:
+            end_history_view = getattr(self.site_tools.site_store, "end_batch_history_view", None)
+            if callable(end_history_view):
+                for site_key in (batch.get("sites") or {}):
+                    end_history_view(str(batch.get("batch_id") or ""), site_id=str(site_key or ""))
+            self._release_terminal_browser_resources(batch)
+
+    def _release_terminal_browser_resources(self, batch: dict[str, Any]) -> None:
+        """Release retained browser runtimes after a batch no longer supports resume."""
+        finish_site = getattr(self.browser_runner, "finish_site", None)
+        if not callable(finish_site):
+            return
+        for site_key in (batch.get("sites") or {}):
+            try:
+                finish_site(str(site_key or ""))
+            except Exception as exc:
+                self.job_store.append_event(
+                    "browser.runtime_release.failed",
+                    {
+                        "batch_id": str(batch.get("batch_id") or ""),
+                        "site_key": str(site_key or ""),
+                        "error": str(exc),
+                    },
+                )
 
     def _generate_workflow_evolution_summary_if_possible(self, batch: dict[str, Any]) -> None:
         batch_id = str(batch.get("batch_id") or "")
@@ -2308,6 +2336,20 @@ class JobFlow:
                         "result": result if isinstance(result, dict) else {},
                     },
                 )
+        begin_history_view = getattr(self.site_tools.site_store, "begin_batch_history_view", None)
+        if callable(begin_history_view):
+            for site_key in ready_site_keys:
+                try:
+                    begin_history_view(site_key, batch_id)
+                except Exception as exc:
+                    self.job_store.append_event(
+                        "history.batch_view.unavailable",
+                        {
+                            "batch_id": batch_id,
+                            "site_key": site_key,
+                            "error": str(exc),
+                        },
+                    )
         return batch
 
     def fail_batch(self, *, batch_id: str, error: str) -> dict[str, Any]:
@@ -2505,6 +2547,69 @@ class JobFlow:
             return "当前没有已注册的 active sites。请先完成公司注册。"
         return self.run_batch(str(batch.get("batch_id") or ""))
 
+    def pause_batch(self, *, batch_id: str, site_key: str = "") -> dict[str, Any]:
+        """Persist a user pause without turning it into a business outcome."""
+
+        batch = self.job_store.load_batch(str(batch_id or ""))
+        if not batch:
+            raise FileNotFoundError(f"job batch not found: {batch_id}")
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        requested_site = str(site_key or "").strip()
+        updated_sites: dict[str, dict[str, Any]] = {}
+        for key, row in sites.items():
+            if not isinstance(row, dict):
+                continue
+            if requested_site and key != requested_site:
+                continue
+            session = self.site_tools.site_store.load_browser_session(key)
+            phase = str(row.get("current_phase") or session.get("agent_bridge_current_phase") or session.get("resume_phase") or "")
+            current_url = str(session.get("last_known_url") or row.get("current_url") or row.get("entry_url") or "")
+            continuation = {
+                "kind": "user_paused",
+                "batch_id": str(batch.get("batch_id") or ""),
+                "site_key": key,
+                "phase": phase,
+                "last_known_url": current_url,
+                "apply_target_job_ids": list(session.get("agent_bridge_apply_target_job_ids") or []),
+            }
+            updated = dict(row)
+            updated.update(
+                {
+                    "status": "paused",
+                    "current_phase": phase,
+                    "current_url": current_url,
+                    "continuation": continuation,
+                    "message": "Paused by user; resume from the current live page with a fresh snapshot.",
+                }
+            )
+            updated_sites[key] = updated
+            self.site_tools.site_store.save_browser_session(
+                key,
+                {
+                    "browser_status": "paused",
+                    "pending_action": "paused",
+                    "resume_phase": phase,
+                    "last_known_url": current_url,
+                },
+            )
+        if requested_site and not updated_sites:
+            raise ValueError(f"site is not in batch: {requested_site}")
+        if not updated_sites:
+            raise ValueError("batch has no resumable sites")
+        sites.update(updated_sites)
+        batch["sites"] = sites
+        batch["status"] = "paused"
+        saved = self.job_store.save_batch(batch)
+        self.job_store.append_event(
+            "batch.paused",
+            {
+                "batch_id": str(saved.get("batch_id") or ""),
+                "site_key": requested_site,
+                "site_count": len(updated_sites),
+            },
+        )
+        return saved
+
     def _parse_resume_signal(self, message: str) -> tuple[str, str] | None:
         raw = message.strip()
         match = re.match(
@@ -2530,7 +2635,7 @@ class JobFlow:
         current = sites.get(site_key)
         if not isinstance(current, dict):
             return None
-        if str(current.get("status") or "") not in {"blocked_login", "blocked"}:
+        if str(current.get("status") or "") not in {"blocked_login", "blocked", "paused"}:
             return None
         if not self.browser_runner:
             replacement = self._disabled_site_row(
@@ -2596,6 +2701,8 @@ class JobFlow:
                     operation=str(batch.get("operation") or self.OPERATION_JOB_SEARCH),
                 )
         batch = self.job_store.update_site(batch, site_key, replacement)
+        if str(batch.get("status") or "") == "paused":
+            batch["status"] = "running"
         batch["status"] = self._compute_batch_status(batch)
         batch = self.job_store.save_batch(batch)
         if str(batch.get("status") or "") != "waiting_user":
