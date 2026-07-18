@@ -16,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from careereng.adapters.bootstrap import project_root_from_cwd, workspace_path as resolve_workspace_path
 from careereng.adapters.external_agents.work_orders import load_active_phase_context
 from careereng.adapters.external_agents.contracts import AGENT_BRIDGE_PROTOCOL_VERSION
+from careereng.orchestration.agent_protocol.runtime_lifecycle import release_site_payload
 from careereng.career.applications.job_store import JobStore, TERMINAL_BATCH_STATUSES
 from careereng.career.applications.site_store import SiteStore
 from careereng.platform.runtime_host import RUNTIME_HOST_PROTOCOL_VERSION, runtime_host_client, runtime_host_status
@@ -281,6 +282,13 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             "pause_jobs_batch",
             {"batch_id": batch_id, "site_key": site_key},
         )
+
+    @server.tool()
+    def careereng_release_site(site_key: str) -> dict[str, Any]:
+        """Release one retained site browser/runtime without changing CareerEng workflow state."""
+
+        request = release_site_payload(site_key=site_key)
+        return runtime.host_client().release_site(site_key=request["site_key"])
 
     @server.tool()
     def careereng_list_browser_tools(site_key: str) -> dict[str, Any]:

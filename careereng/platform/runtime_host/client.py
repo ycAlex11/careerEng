@@ -8,6 +8,7 @@ from typing import Any
 
 from .errors import RuntimeHostError, RuntimeHostProtocolMismatchError, RuntimeHostUnavailableError
 from .protocol import RUNTIME_HOST_PROTOCOL_VERSION, protocol_version_from, with_runtime_host_protocol
+from careereng.orchestration.agent_protocol.runtime_lifecycle import RELEASE_SITE_OPERATION, release_site_payload
 from .service import (
     DEFAULT_RUNTIME_HOST_REQUEST_TIMEOUT_SECONDS,
     ensure_runtime_host,
@@ -86,6 +87,11 @@ class RuntimeHostClient:
             raise
         except Exception as exc:
             raise RuntimeHostUnavailableError(str(exc)) from exc
+
+    def release_site(self, *, site_key: str) -> dict[str, Any]:
+        """Release one retained site runtime through the shared host contract."""
+
+        return self.request(RELEASE_SITE_OPERATION, release_site_payload(site_key=site_key))
 
     @staticmethod
     def _validate_response(response: dict[str, Any]) -> None:

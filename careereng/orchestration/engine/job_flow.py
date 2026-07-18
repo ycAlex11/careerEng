@@ -26,6 +26,7 @@ from careereng.evolution.loop_engine import ApplyLoopEngine
 from careereng.evolution.reports import create_apply_probe_report
 from careereng.evolution.workflow_summary import generate_workflow_evolution_summary
 from careereng.orchestration.engine import ContinuationRegistry, ContinuationRequest
+from careereng.orchestration.engine.runtime_lifecycle import SiteRuntimeLifecycle, is_non_resumable_site_terminal
 from careereng.career.applications.reports import generate_job_batch_report
 from careereng.career.applications.application_store import ApplicationStore
 from careereng.career.applications.job_store import JobStore
@@ -92,6 +93,7 @@ class JobFlow:
         self.application_store = application_store
         self.site_tools = site_tools
         self.browser_runner = browser_runner
+        self.runtime_lifecycle = SiteRuntimeLifecycle(browser_runner)
         self.search_strategy = search_strategy
         self.profile_store = profile_store
         self.cv_store = cv_store
@@ -411,12 +413,9 @@ class JobFlow:
 
     def _release_terminal_browser_resources(self, batch: dict[str, Any]) -> None:
         """Release retained browser runtimes after a batch no longer supports resume."""
-        finish_site = getattr(self.browser_runner, "finish_site", None)
-        if not callable(finish_site):
-            return
         for site_key in (batch.get("sites") or {}):
             try:
-                finish_site(str(site_key or ""))
+                self.runtime_lifecycle.release_site(str(site_key or ""))
             except Exception as exc:
                 self.job_store.append_event(
                     "browser.runtime_release.failed",
@@ -426,6 +425,25 @@ class JobFlow:
                         "error": str(exc),
                     },
                 )
+
+    def _release_site_if_non_resumable(self, *, batch_id: str, site_key: str, site: dict[str, Any]) -> None:
+        """Release only after orchestration has persisted a terminal site outcome."""
+
+        if not is_non_resumable_site_terminal(site):
+            return
+        try:
+            released = self.runtime_lifecycle.release_site(site_key)
+        except Exception as exc:
+            self.job_store.append_event(
+                "browser.runtime_release.failed",
+                {"batch_id": batch_id, "site_key": site_key, "error": str(exc)},
+            )
+            return
+        if released:
+            self.job_store.append_event(
+                "browser.runtime_released",
+                {"batch_id": batch_id, "site_key": site_key, "scope": "site_terminal"},
+            )
 
     def _generate_workflow_evolution_summary_if_possible(self, batch: dict[str, Any]) -> None:
         batch_id = str(batch.get("batch_id") or "")
@@ -2436,10 +2454,16 @@ class JobFlow:
                 batch = self.job_store.update_site(latest or batch, site_key, updated)
                 batch["status"] = self._compute_batch_status(batch)
                 batch = self.job_store.save_batch(batch)
-                if generate_report:
-                    self._generate_batch_report_if_possible(batch)
                 latest_sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
                 latest_row = latest_sites.get(site_key)
+                if isinstance(latest_row, dict):
+                    self._release_site_if_non_resumable(
+                        batch_id=batch_id,
+                        site_key=site_key,
+                        site=latest_row,
+                    )
+                if generate_report:
+                    self._generate_batch_report_if_possible(batch)
                 return dict(latest_row) if isinstance(latest_row, dict) else dict(updated)
 
         def _job(site_key: str, current: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -2705,6 +2729,13 @@ class JobFlow:
             batch["status"] = "running"
         batch["status"] = self._compute_batch_status(batch)
         batch = self.job_store.save_batch(batch)
+        latest_site = (batch.get("sites") or {}).get(site_key) if isinstance(batch.get("sites"), dict) else None
+        if isinstance(latest_site, dict):
+            self._release_site_if_non_resumable(
+                batch_id=str(batch.get("batch_id") or ""),
+                site_key=site_key,
+                site=latest_site,
+            )
         if str(batch.get("status") or "") != "waiting_user":
             self._generate_batch_report_if_possible(batch)
         return self._format_batch_summary(batch)

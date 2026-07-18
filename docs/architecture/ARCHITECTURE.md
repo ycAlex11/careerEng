@@ -160,7 +160,10 @@ per-site browser/profile access to `platform/sessions/` and
 site.
 
 Its versioned protocol is intentionally generic: `ping`, batch/resume/pause,
-and browser/state tool transport. Every response includes a protocol version.
+browser/state tool transport, and `release_site`. `release_site` accepts only
+runtime lifecycle identifiers such as `site_key`; it releases one retained
+site runtime/profile without reading or interpreting jobs, applications,
+Skills, matching, or batch policy. Every response includes a protocol version.
 MCP and external-agent adapters connect to an already user-owned host and must
 not start a browser-owning process from a constrained desktop sandbox. A
 missing or stale host is a recoverable infrastructure condition, reported as
@@ -173,10 +176,34 @@ CLI may explicitly run the lifecycle commands:
 python -m careereng runtime-host serve
 python -m careereng runtime-host status
 python -m careereng runtime-host stop
+python -m careereng runtime-host release-site --site <site_key>
 ```
 
 The old `adapters/host/workspace_manager.py` and hidden `manager-serve` command
 are compatibility shims only. Do not add new behavior there.
+
+## CLI Adapter Loading
+
+`adapters/cli/` is an external transport boundary, not a mixed implementation
+module. Command groups live in focused `*_commands.py` modules and import only
+their owning capability. The entrypoint routes by the requested command group
+so lightweight commands such as `runtime-host status` and
+`runtime-host release-site` do not import career history, workflow, evolution,
+resume, or interview modules.
+
+The CLI groups are adapters only. They call shared platform/career/evolution
+contracts and do not reimplement those operations. `commands.py` is a thin
+compatibility aggregator for callers that import its Typer app; it must not
+receive command implementations or business helpers.
+
+The independently routed groups currently cover runtime lifecycle, project
+state, profile/resume/career-memory, interviews/capture, assistant and
+external-agent bridge operations, MCP hosting, and evolution work items/runs.
+Application summary, report, site-registry, and non-runtime batch-management
+commands are also routed independently. The remaining job-execution commands
+stay in `commands.py` only until their owning adapter is extracted. A command group
+may import its owning domain capabilities, but must never import a sibling CLI
+adapter or depend on `commands.py` for implementation.
 
 ## Persistence Access Boundary
 

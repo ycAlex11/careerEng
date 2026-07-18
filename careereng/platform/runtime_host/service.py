@@ -16,11 +16,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from careereng.adapters.external_agents.contracts import AGENT_BRIDGE_STATUS
-from careereng.adapters.bootstrap import build_loop
-from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
+from careereng.orchestration.agent_protocol.runtime_lifecycle import RELEASE_SITE_OPERATION, release_site_payload
 from careereng.utils import make_id
 from .errors import RuntimeHostProtocolMismatchError, RuntimeHostUnavailableError
 from .protocol import RUNTIME_HOST_PROTOCOL_VERSION, protocol_version_from, runtime_host_identity, with_runtime_host_protocol
+
+
+# Compatibility injection point for unit tests. Production imports the concrete
+# workflow builder only when a browser-owning host is actually constructed.
+build_loop: Callable[..., tuple[Any, Any]] | None = None
 
 
 DEFAULT_RUNTIME_HOST_REQUEST_TIMEOUT_SECONDS = 1800.0
@@ -55,7 +59,16 @@ class RuntimeHostService:
     ):
         self.project_root = Path(project_root).resolve()
         self.workspace = Path(workspace).resolve()
-        factory = loop_factory or build_loop
+        if loop_factory is None and not callable(build_loop):
+            # Building a workflow imports providers and career capabilities. Keep
+            # it deferred so runtime lifecycle clients remain lightweight.
+            from careereng.adapters.bootstrap import build_loop as default_build_loop
+
+            factory = default_build_loop
+        elif loop_factory is None:
+            factory = build_loop
+        else:
+            factory = loop_factory
         self.loop, _ = factory(project_root=self.project_root, workspace=self.workspace)
         self._lock = threading.Lock()
         self._background_batch_running = False
@@ -86,6 +99,8 @@ class RuntimeHostService:
             return self._handle_fresh_snapshot_resume(payload)
         if op == "pause_jobs_batch":
             return self._handle_pause_jobs_batch(payload)
+        if op == RELEASE_SITE_OPERATION:
+            return self._handle_release_site(payload)
         if op in {"agent_bridge_browser_list_tools", "browser_handoff_list_tools"}:
             return self._handle_agent_bridge_browser_list_tools(payload)
         if op in {"agent_bridge_browser_call_tool", "browser_handoff_call_tool"}:
@@ -164,6 +179,8 @@ class RuntimeHostService:
         def _worker() -> None:
             with self._lock:
                 try:
+                    from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
+
                     BatchEvolutionOrchestrator(self.loop.job_flow).run_batch_with_outer_loop(batch_id)
                 except BaseException as exc:  # pragma: no cover - defensive manager boundary
                     try:
@@ -222,6 +239,28 @@ class RuntimeHostService:
         finally:
             self._lock.release()
         return {"ok": True, "accepted": True, "batch": batch}
+
+    def _handle_release_site(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Release one retained site runtime without interpreting workflow state."""
+
+        try:
+            request = release_site_payload(site_key=str(payload.get("site_key") or ""))
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return {"ok": False, "error": "workspace manager is busy with another operation"}
+        try:
+            browser_runner = getattr(self.loop, "browser_runner", None)
+            finish_site = getattr(browser_runner, "finish_site", None)
+            if not callable(finish_site):
+                return {"ok": False, "error": "site runtime release is unavailable"}
+            finish_site(request["site_key"])
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self._lock.release()
+        return {"ok": True, "released": True, **request}
 
     def _handle_agent_bridge_browser_list_tools(self, payload: dict[str, Any]) -> dict[str, Any]:
         site_key = str(payload.get("site_key") or "").strip()
