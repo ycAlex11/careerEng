@@ -87,6 +87,21 @@ def runtime_host_release_site(
     typer.echo(json.dumps(response, ensure_ascii=False, indent=2))
 
 
+@runtime_host_app.command("cancel-batch")
+def runtime_host_cancel_batch(
+    batch_id: str = typer.Option(..., "--batch", help="Exact batch ID to cancel"),
+    project_root: str = typer.Option("", "--project-root", help="Project root; defaults to the current CareerEng project"),
+    workspace: str = typer.Option("", "--workspace", help="Workspace path; defaults to configured workspace"),
+):
+    """Cancel one batch and release only the runtimes it owns."""
+
+    root, resolved_workspace = _resolve_paths(project_root=project_root, workspace=workspace)
+    response = runtime_host_client(project_root=root, workspace=resolved_workspace, autostart=False).request(
+        "cancel_jobs_batch", {"batch_id": batch_id, "reason": "runtime_host_cancel_batch"}
+    )
+    typer.echo(json.dumps(response, ensure_ascii=False, indent=2))
+
+
 def serve_legacy_manager(*, project_root: str, workspace: str, socket_path: str) -> None:
     """Compatibility implementation for the hidden legacy manager command."""
 

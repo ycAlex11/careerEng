@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import threading
 
-from careereng.platform.web_control import PlaywrightMCPProcess, launch_playwright_mcp
+from careereng.platform.web_control import PlaywrightMCPProcess, launch_playwright_mcp, reclaim_profile_processes
 from careereng.utils import now_iso
 
 from .browser_profile_owner import BrowserProfileOwnerError, BrowserProfileOwnerRegistry
@@ -143,6 +143,23 @@ class BrowserRuntimeRegistry:
             self._stop_lease(lease)
         return lease
 
+    def release_or_reclaim(self, *, site_key: str, profile_dir: Path | str) -> bool:
+        """Release a live lease or recover children left by an earlier release.
+
+        Profile ownership keeps this generic and site-isolated. A running foreign
+        owner is never reclaimed by this process.
+        """
+
+        lease = self.release(site_key)
+        if lease is not None:
+            return True
+        resolved_profile = Path(profile_dir).resolve()
+        if not self.profile_owners.can_reclaim(profile_dir=resolved_profile):
+            return False
+        cleanup = reclaim_profile_processes(resolved_profile)
+        lock_released = self.profile_owners.release_if_reclaimable(profile_dir=resolved_profile)
+        return bool(cleanup.terminated_pids or lock_released)
+
     def release_all(self) -> list[BrowserRuntimeLease]:
         with self._lock:
             leases = list(self._active.values())
@@ -155,6 +172,9 @@ class BrowserRuntimeRegistry:
         try:
             lease.runtime.stop()
         finally:
+            # The MCP server normally closes Chrome. Reclaim any child that did
+            # not exit with the stdio owner before releasing the profile lock.
+            reclaim_profile_processes(lease.runtime.profile_dir)
             self.profile_owners.release(
                 profile_dir=lease.runtime.profile_dir,
                 run_id=lease.runtime.run_id,

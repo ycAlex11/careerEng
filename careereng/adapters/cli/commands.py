@@ -18,6 +18,7 @@ from careereng.adapters.cli.application_commands import (
     application_summary_app,
     batch_apply,
     batch_clear,
+    batch_cancel,
     batch_debug_create,
     batch_list,
     batch_stop,
@@ -59,6 +60,7 @@ app.command("mcp-server")(mcp_server)
 app.command("run")(run)
 app.command("batch-list")(batch_list)
 app.command("batch-clear")(batch_clear)
+app.command("batch-cancel")(batch_cancel)
 app.command("batch-stop")(batch_stop)
 app.command("batch-apply")(batch_apply)
 app.command("batch-debug-create")(batch_debug_create)

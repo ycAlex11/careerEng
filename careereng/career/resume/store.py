@@ -86,3 +86,15 @@ class CVStore:
                 except Exception:
                     continue
         return ""
+
+    def has_current_text(self) -> bool:
+        """Return whether a current CV artifact exists without reading its body."""
+
+        self.ensure_initialized()
+        metadata = read_json(self.metadata_path)
+        active_name = str(metadata.get("active_file") or "")
+        if active_name:
+            active_path = self.current_dir / active_name
+            if active_path.is_file():
+                return True
+        return bool(self._current_files())

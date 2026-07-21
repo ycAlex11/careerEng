@@ -16,14 +16,14 @@ apply_enabled: true
 
 - Apple retrieval should use the accepted China/software/newest/team-filter strategy unless a later accepted evolution run replaces it.
 - Record the current visible Apple results page before opening job details or deciding whether to stop.
-- Use project-level pagination/history stop policy after the current page is recorded.
+- Use the project-level pagination/history stop policy after the current page is recorded, including the required confirmation page when a real next-page control exists.
 - Treat Apple internships and new-grad roles as hard exclusions even when they appear inside otherwise valid result pages.
 
 ### Application Review Policy
 
 - Apple application review requires a signed-in Apple Careers profile surface.
 - Treat `Submissions -> Active` as realtime and inspect every reachable Active page.
-- Treat `Submissions -> Archived` as historical and stop early only when the current page is already covered by matched terminal local history, has no unmatched rows, and shows no status changes.
+- Treat `Submissions -> Archived` as the project-level inactive/historical area. Inspect it once after `Active`; then apply the project-level historical pagination and coverage policy.
 
 ## Matching Policy
 
@@ -86,8 +86,7 @@ apply_enabled: true
 - From a clearly signed-in Apple Careers page, open `Profile`.
 - On Apple's `Your Roles` page (`/app/en-us/profile/roles`), treat `Submissions` as one submitted-application review surface:
   - Prefer the currently visible submitted-role list. Record visible rows from the current `Submissions` surface before any tab or pagination action.
-  - `Active` is the primary live area. `Archived` is an optional historical supplement only when it is clearly visible and can be opened once without revisiting an already-inspected area.
-  - Do not switch back and forth between `Active` and `Archived`, and do not click either tab only to confirm progress after rows were already recorded.
+  - `Active` maps to the primary live area and `Archived` maps to the inactive/historical area. Inspect each reachable area once, without switching back to an already-inspected area.
   - If the current `Submissions` surface has no application rows, treat it as complete when there is no usable pagination or load-more control visible for that same surface.
   - Do not call `record_application_reviews` with an empty list until the current visible `Submissions` surface has been inspected and is empty or unavailable.
 - Look for visible application, submitted role, saved role, recently viewed role, or profile application-history surfaces.
@@ -103,12 +102,11 @@ apply_enabled: true
 
 ### Completion Or Blocked
 
-- On `/app/en-us/profile/roles`, the phase is complete after the current visible `Submissions` surface has been inspected and recorded or found empty with no same-surface pagination remaining.
-- If `Archived` was not already open and opening it would revisit a completed area, create a tab loop, or leave the current recorded surface without clear new rows, skip it and finish the phase.
+- On `/app/en-us/profile/roles`, the phase is complete only after each reachable `Submissions` area (`Active` and `Archived`) has been inspected and recorded or found empty with no same-area pagination remaining.
 - If no Apple submitted applications are visible in any required area and no pagination remains, recording zero application reviews is a valid completion. After recording zero reviews, immediately call `phase_result` with `status=done`.
 - Do not loop through saved roles, recently viewed roles, or profile tabs when no submitted-application list is visible.
 - Do not click `Active` and `Archived` repeatedly after zero visible application rows have already been established.
-- After any successful `record_application_reviews` call for the current Apple `Submissions` surface, immediately call `phase_result` with `status=done` unless a real same-surface `Next Page` or load-more control is visible and has not been inspected. Do not click `Active` or `Archived` again after recording the current surface.
+- After recording one `Submissions` area, continue to the other required uninspected area. After both are complete, call `phase_result` with `status=done`.
 - Do not create history rows for Apple dashboard records that are not already in local history; record them through application review only.
 
 ## Channel Discovery

@@ -24,6 +24,7 @@ from careereng.career.applications.skill_policy import (
 from careereng.career.applications.skill_policy.schema import file_hash
 from careereng.career.applications.job_identity import infer_site_job_id_from_url, normalize_identity_url
 from careereng.career.applications.history_view import BatchHistoryView
+from careereng.platform.observability import PerformanceRecorder
 from careereng.platform.persistence import JSONLStore
 from careereng.career.applications.posted_time import (
     current_posted_age_observation,
@@ -609,7 +610,13 @@ class SiteStore:
             return []
         return [row for row in payload if isinstance(row, dict)]
 
-    def begin_batch_history_view(self, site_id: str, batch_id: str) -> BatchHistoryView | None:
+    def begin_batch_history_view(
+        self,
+        site_id: str,
+        batch_id: str,
+        *,
+        event_action: str = "load",
+    ) -> BatchHistoryView | None:
         """Load one site's canonical history once for an active batch.
 
         The view is a performance/access layer only. Durable history remains
@@ -623,6 +630,7 @@ class SiteStore:
             return None
         key = (normalized_batch, normalized_site)
         view = self._batch_history_views.get(key)
+        created = view is None
         if view is None:
             view = BatchHistoryView.create(
                 site_key=normalized_site,
@@ -632,7 +640,23 @@ class SiteStore:
                 indexes_builder=lambda rows: self._history_resolution_indexes(normalized_site, rows),
             )
             self._batch_history_views[key] = view
+        previous_revision = view.rows_view.revision
         view.rows()
+        self._record_history_view_event(
+            action=str(event_action or "load") if created else ("refresh" if previous_revision != view.rows_view.revision else "hit"),
+            site_id=normalized_site,
+            batch_id=normalized_batch,
+        )
+        return view
+
+    def refresh_batch_history_view(self, site_id: str, batch_id: str) -> BatchHistoryView | None:
+        """Refresh a batch/site view from canonical history after a write."""
+
+        view = self.begin_batch_history_view(site_id, batch_id)
+        if view is None:
+            return None
+        view.replace_after_write(self._load_history_jobs(site_id))
+        self._record_history_view_event(action="refresh", site_id=site_id, batch_id=batch_id)
         return view
 
     def end_batch_history_view(self, batch_id: str, site_id: str = "") -> None:
@@ -646,6 +670,7 @@ class SiteStore:
             if normalized_site and key[1] != normalized_site:
                 continue
             self._batch_history_views.pop(key, None)
+            self._record_history_view_event(action="release", site_id=key[1], batch_id=key[0])
 
     def _batch_history_view(self, site_id: str, batch_id: str = "") -> BatchHistoryView | None:
         normalized_batch = str(batch_id or "").strip()
@@ -655,6 +680,10 @@ class SiteStore:
 
     def _history_rows_for_batch(self, site_id: str, batch_id: str = "") -> list[dict[str, Any]]:
         view = self._batch_history_view(site_id, batch_id)
+        if view is None and str(batch_id or "").strip():
+            # Runtime hosts are process-scoped. A resumed host reconstructs the
+            # shared view lazily from canonical history before downstream work.
+            view = self.begin_batch_history_view(site_id, batch_id, event_action="rehydrate")
         if view is not None:
             return view.rows()
         return self._load_history_jobs(site_id)
@@ -675,6 +704,16 @@ class SiteStore:
         for (_batch_id, view_site), view in self._batch_history_views.items():
             if view_site == normalized_site:
                 view.replace_after_write(rows)
+                self._record_history_view_event(action="refresh", site_id=view_site, batch_id=_batch_id)
+
+    def _record_history_view_event(self, *, action: str, site_id: str, batch_id: str) -> None:
+        PerformanceRecorder(self.workspace).record(
+            backend="local",
+            operation="history_view",
+            status=str(action or ""),
+            site_key=safe_file_stem(site_id),
+            batch_id=str(batch_id or ""),
+        )
 
     @staticmethod
     def _history_apply_state_for_application_status(value: Any) -> str:
@@ -2428,7 +2467,9 @@ class SiteStore:
         *,
         batch_id: str = "",
     ) -> list[dict[str, Any]]:
-        history_rows = self._history_rows_for_batch(site_id, batch_id)
+        # Application review itself establishes the latest canonical state;
+        # the shared batch view is created/refreshed immediately afterwards.
+        history_rows = self._load_history_jobs(site_id)
         by_job_id, by_canonical_job_id, by_match_key = self._history_indexes_for_batch(
             site_id,
             history_rows,
@@ -3048,7 +3089,7 @@ class SiteStore:
         return updated_rows
 
     def promote_run_jobs_to_history(self, site_id: str, batch_id: str) -> list[dict[str, Any]]:
-        history_rows = self._load_history_jobs(site_id)
+        history_rows = self._history_rows_for_batch(site_id, batch_id)
         history_index: dict[str, dict[str, Any]] = {
             str(row.get("job_id") or ""): dict(row)
             for row in history_rows
@@ -3546,6 +3587,10 @@ class SiteStore:
 
         if changed:
             self._write_history_jobs(site_id, history_rows)
+        if batch_id:
+            # Downstream filtering/retrieval/apply share the canonical state
+            # just observed during application-status review.
+            self.refresh_batch_history_view(site_id, batch_id)
         return {
             "recorded_count": recorded_count,
             "matched_count": matched_count,

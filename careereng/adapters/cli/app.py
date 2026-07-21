@@ -31,6 +31,7 @@ _LAZY_COMMAND_GROUPS = {
     "site": ("careereng.adapters.cli.application_commands", "application_cli_app", False),
     "batch-list": ("careereng.adapters.cli.application_commands", "application_cli_app", False),
     "batch-clear": ("careereng.adapters.cli.application_commands", "application_cli_app", False),
+    "batch-cancel": ("careereng.adapters.cli.application_commands", "application_cli_app", False),
     "batch-stop": ("careereng.adapters.cli.application_commands", "application_cli_app", False),
     "batch-apply": ("careereng.adapters.cli.application_commands", "application_cli_app", False),
     "batch-debug-create": ("careereng.adapters.cli.application_commands", "application_cli_app", False),

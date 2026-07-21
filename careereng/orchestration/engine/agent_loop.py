@@ -24,7 +24,6 @@ from careereng.orchestration.engine.response_templates import (
 )
 from careereng.orchestration.engine.route_decider import RouteDecider
 from careereng.orchestration.engine.router import detect_search_request, is_no, is_yes, parse_yes_no_reason
-from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
 from careereng.orchestration.agent_protocol.llm import LLMProvider, ProviderError
 from careereng.platform.sessions import SessionManager
 from careereng.career.applications.application_store import ApplicationStore
@@ -593,7 +592,9 @@ class AgentLoop:
         )
         if not batch:
             return "当前没有已注册的 active sites。请先完成公司注册。"
-        return BatchEvolutionOrchestrator(self.job_flow).run_batch_with_outer_loop(str(batch.get("batch_id") or ""))
+        # Normal execution is independent of evolution. Terminal evidence may
+        # later open an explicit Codex/user evolution review.
+        return self.job_flow.run_batch(str(batch.get("batch_id") or ""))
 
     def _interrupt_search_pending_if_needed(self, session_id: str, message: str) -> None:
         state = self.session_manager.get_state(session_id)

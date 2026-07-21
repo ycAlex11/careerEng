@@ -166,3 +166,32 @@ class BrowserProfileOwnerRegistry:
                 pass
             if not run_id or _OWNED_RUNS.get(key) == run_id:
                 _OWNED_RUNS.pop(key, None)
+
+    def release_if_reclaimable(self, *, profile_dir: Path) -> bool:
+        """Remove a lock only when this process owns it or its owner is gone."""
+
+        lock_path = self.lock_path(profile_dir)
+        key = self._key(lock_path)
+        with _GUARD_LOCK:
+            current = self._read(lock_path)
+            if not current:
+                return False
+            owner_pid = int(current.get("owner_pid") or 0)
+            if owner_pid and owner_pid != os.getpid() and self._process_is_alive(owner_pid):
+                return False
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                return False
+            _OWNED_RUNS.pop(key, None)
+            return True
+
+    def can_reclaim(self, *, profile_dir: Path) -> bool:
+        """Whether a caller may safely reclaim this dedicated profile runtime."""
+
+        lock_path = self.lock_path(profile_dir)
+        current = self._read(lock_path)
+        if not current:
+            return True
+        owner_pid = int(current.get("owner_pid") or 0)
+        return not owner_pid or owner_pid == os.getpid() or not self._process_is_alive(owner_pid)

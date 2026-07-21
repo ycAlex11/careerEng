@@ -97,6 +97,15 @@ def _empty_performance_totals() -> dict[str, Any]:
         "full_observation_count": 0,
         "agent_input_bytes": 0,
         "technical_error_count": 0,
+        "cache_lookups": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "cache_reads": 0,
+        "cache_proposals": 0,
+        "cache_validations": 0,
+        "cache_stale_or_retired": 0,
+        "browser_sequences": 0,
+        "browser_sequence_steps": 0,
     }
 
 
@@ -109,6 +118,26 @@ def _accumulate_performance(totals: dict[str, Any], row: dict[str, Any]) -> None
         totals["browser_tool_calls"] += 1
     if operation == "state_tool":
         totals["state_tool_calls"] += 1
+    if operation == "browser_sequence":
+        totals["browser_sequences"] += 1
+        totals["browser_sequence_steps"] += _int_value(row.get("sequence_step_count"))
+    if operation == "cache":
+        action = str(row.get("cache_action") or "")
+        if action == "lookup":
+            totals["cache_lookups"] += 1
+        elif action == "hit":
+            totals["cache_hits"] += 1
+        elif action == "miss":
+            totals["cache_misses"] += 1
+        elif action == "read":
+            totals["cache_reads"] += 1
+        elif action == "proposed":
+            totals["cache_proposals"] += 1
+        elif action == "validated":
+            totals["cache_validations"] += 1
+            status = str(row.get("cache_validation_status") or "")
+            if status in {"stale", "retired"}:
+                totals["cache_stale_or_retired"] += 1
     if bool(row.get("retry")):
         totals["retry_count"] += 1
     if tool_name == "browser_snapshot" or str(row.get("observation_kind") or "") == "snapshot":

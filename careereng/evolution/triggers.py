@@ -15,6 +15,7 @@ from careereng.evolution.candidate_specs import load_candidate_specs
 from careereng.evolution.memory_units import EvolutionMemoryStore
 from careereng.evolution.runs import create_evolution_run
 from careereng.platform.persistence import JSONLStore
+from careereng.career.applications.job_store import JobStore
 from careereng.career.applications.site_store import SiteStore
 from careereng.utils import ensure_dir, now_iso, read_json, safe_file_stem, write_json
 
@@ -142,6 +143,120 @@ def scan_evolution_triggers(
             + int(application_strategy.get("triggered_count") or 0)
             + int(assistant_memory.get("triggered_count") or 0)
         ),
+    }
+
+
+def create_site_batch_evolution_reviews(
+    *,
+    project_root: Path | str,
+    workspace: Path | str,
+    batch: dict[str, Any],
+    site_run_threshold: int = 5,
+) -> dict[str, Any]:
+    """Create Codex-facing review cards from terminal site-batch evidence.
+
+    This is intentionally structural: it counts persisted terminal runs and
+    exposes their evidence. Codex and the user decide whether, and how, to
+    evolve Skills, matching policy, profile strategy, or infrastructure.
+    """
+
+    root = Path(project_root)
+    workspace_path = Path(workspace)
+    batch_id = str(batch.get("batch_id") or "").strip()
+    batch_status = str(batch.get("status") or "").strip()
+    if not batch_id or batch_status not in {"completed", "partial_completed", "failed"}:
+        return {"generated_at": now_iso(), "triggered_count": 0, "triggered": []}
+
+    threshold = max(1, int(site_run_threshold or 1))
+    job_store = JobStore(workspace_path)
+    site_store = SiteStore(workspace_path, project_root=root)
+    state = _load_trigger_state(workspace_path)
+    previous_by_site = state.setdefault("site_batch_review", {})
+    batches = job_store.list_batches()
+    sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+    triggered: list[dict[str, Any]] = []
+
+    for site_key, current_site in sites.items():
+        if not isinstance(current_site, dict) or str(current_site.get("status") or "") == "cancelled":
+            continue
+        site_key = str(site_key or "").strip()
+        if not site_key:
+            continue
+        effective_runs = [
+            row
+            for row in batches
+            if _is_effective_site_batch_run(row, site_key)
+        ]
+        effective_count = len(effective_runs)
+        previous = previous_by_site.get(site_key) if isinstance(previous_by_site.get(site_key), dict) else {}
+        last_reviewed_count = int(previous.get("last_reviewed_effective_run_count") or 0)
+        failure_triggered = _site_batch_failed(batch_status=batch_status, site=current_site)
+        reasons: list[str] = []
+        trigger_type = ""
+        if effective_count - last_reviewed_count >= threshold:
+            trigger_type = "scheduled"
+            reasons.append(
+                f"{site_key} completed {effective_count - last_reviewed_count} effective site batch run(s) since its last evolution review."
+            )
+        if failure_triggered and str(previous.get("last_failed_batch_id") or "") != batch_id:
+            trigger_type = "problem_driven" if not trigger_type else "scheduled_and_problem_driven"
+            reasons.append(f"{site_key} has a failed terminal result in batch {batch_id}.")
+        if not trigger_type:
+            continue
+
+        skill_path = site_store.site_skill_path(site_key)
+        candidate = {
+            "candidate_id": SITE_WORKFLOW_CANDIDATE_ID,
+            "area": "site_batch_evolution_review",
+            "target_ref": _relative_or_str(skill_path, root),
+            "priority": "high" if failure_triggered else "medium",
+            "status": "open",
+            "created_at": now_iso(),
+            "site_key": site_key,
+            "phase": "batch",
+            "trigger_type": trigger_type,
+            "batch_id": batch_id,
+            "batch_status": batch_status,
+            "phase_run_count": effective_count,
+            "effective_site_run_count": effective_count,
+            "last_reviewed_effective_run_count": last_reviewed_count,
+            "reason": " ".join(reasons),
+            "summary": f"{site_key} reached a site-batch evolution review trigger.",
+            "suggested_change": (
+                "Use the batch report, workflow summary, browser traces, and existing lessons to decide with the user "
+                "whether to evolve site Skill, matching strategy, user/profile strategy, or generic infrastructure."
+            ),
+            "proposal_scopes": ["site_skill", "matching_policy", "profile_strategy", "infrastructure"],
+            "evidence_refs": _site_batch_evidence_refs(workspace_path, batch_id),
+            "state_ref": str(_trigger_state_path(workspace_path)),
+        }
+        _attach_review_card(
+            project_root=root,
+            workspace=workspace_path,
+            candidate=candidate,
+            site_key=site_key,
+            phase="batch",
+        )
+        OpenEvolutionCandidateStore(workspace_path).append(candidate)
+        previous_by_site[site_key] = {
+            "last_reviewed_effective_run_count": effective_count if trigger_type.startswith("scheduled") else last_reviewed_count,
+            "last_failed_batch_id": batch_id if failure_triggered else str(previous.get("last_failed_batch_id") or ""),
+            "last_triggered_at": candidate["created_at"],
+            "last_trigger_type": trigger_type,
+            "last_candidate_id": SITE_WORKFLOW_CANDIDATE_ID,
+        }
+        triggered.append(candidate)
+
+    if triggered:
+        state["updated_at"] = now_iso()
+        write_json(_trigger_state_path(workspace_path), state)
+    return {
+        "generated_at": now_iso(),
+        "candidate_id": SITE_WORKFLOW_CANDIDATE_ID,
+        "site_run_threshold": threshold,
+        "triggered_count": len(triggered),
+        "triggered": triggered,
+        "state_path": str(_trigger_state_path(workspace_path)),
     }
 
 
@@ -1234,6 +1349,15 @@ def _evolution_direction_options(project_root: Path) -> list[dict[str, str]]:
             "spec_path": "",
         }
     )
+    rows.append(
+        {
+            "candidate_id": "",
+            "name": "Generic infrastructure review",
+            "target_type": "review_option",
+            "target_ref": "generic orchestration / persistence / protocol / observability evidence",
+            "spec_path": "",
+        }
+    )
     return rows
 
 
@@ -1373,6 +1497,7 @@ def _load_trigger_state(workspace: Path) -> dict[str, Any]:
             "target_company_intelligence": {},
             "application_strategy": {},
             "assistant_router_memory_intake": {},
+            "site_batch_review": {},
             "updated_at": "",
         }
     payload.setdefault("version", 1)
@@ -1380,7 +1505,42 @@ def _load_trigger_state(workspace: Path) -> dict[str, Any]:
     payload.setdefault("target_company_intelligence", {})
     payload.setdefault("application_strategy", {})
     payload.setdefault("assistant_router_memory_intake", {})
+    payload.setdefault("site_batch_review", {})
     return payload
+
+
+def _is_effective_site_batch_run(batch: dict[str, Any], site_key: str) -> bool:
+    """Count persisted terminal site runs, never user-cancelled work."""
+
+    if str(batch.get("status") or "") == "cancelled":
+        return False
+    sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+    site = sites.get(site_key)
+    if not isinstance(site, dict):
+        return False
+    return str(site.get("status") or "") in {"completed", "partial_completed", "failed", "skipped"}
+
+
+def _site_batch_failed(*, batch_status: str, site: dict[str, Any]) -> bool:
+    if batch_status == "failed":
+        return True
+    if str(site.get("status") or "") == "failed":
+        return True
+    retrieve = site.get("retrieve") if isinstance(site.get("retrieve"), dict) else {}
+    apply = site.get("apply") if isinstance(site.get("apply"), dict) else {}
+    return str(retrieve.get("status") or "") == "failed" or str(apply.get("status") or "") == "failed"
+
+
+def _site_batch_evidence_refs(workspace: Path, batch_id: str) -> list[str]:
+    """Expose persisted evidence locations without interpreting their content."""
+
+    paths = [
+        workspace / "jobs" / "batches" / f"{batch_id}.json",
+        workspace / "reports" / "job_batches" / f"{batch_id}.md",
+        workspace / "evolution" / "workflow_summaries" / f"{batch_id}.md",
+        workspace / "jobs" / "events.jsonl",
+    ]
+    return [str(path) for path in paths if path.exists()]
 
 
 def _trigger_state_path(workspace: Path) -> Path:

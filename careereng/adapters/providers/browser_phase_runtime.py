@@ -20,8 +20,12 @@ from careereng.orchestration.agent_protocol.browser_phase import BrowserPhaseRes
 from careereng.platform.web_control import MCPToolBridge
 from careereng.orchestration.context.prompts import PhasePrompt
 from careereng.evolution.browser_control.events import append_phase_event
-from careereng.platform.observability import LLMUsageRecorder, extract_usage
+from careereng.platform.observability import LLMUsageRecorder, PerformanceRecorder, extract_usage
 from careereng.orchestration.agent_protocol.state_tools import (
+    CACHE_LOOKUP_TOOL,
+    CACHE_PROPOSE_TOOL,
+    CACHE_READ_TOOL,
+    CACHE_VALIDATE_TOOL,
     phase_result_tool_schema,
     record_application_reviews_tool_schema,
     record_jobs_tool_schema,
@@ -29,11 +33,18 @@ from careereng.orchestration.agent_protocol.state_tools import (
     update_jobs_tool_schema,
     update_phase_memory_tool_schema,
 )
+from careereng.orchestration.agent_protocol.browser_sequence import BROWSER_SEQUENCE_TOOL, browser_sequence_tool_schema
 from careereng.orchestration.commands.state_tools import execute_state_tool
 from careereng.orchestration.context import PhaseContext, build_phase_context
 from careereng.orchestration.commands.state_tools import (
     PhaseStateToolContext,
 )
+from careereng.orchestration.engine.phase_orchestration import (
+    is_pagination_action,
+    phase_completion_gate,
+    retrieval_pagination_gate,
+)
+from careereng.platform.web_control import execute_browser_sequence
 
 
 @dataclass(frozen=True)
@@ -792,38 +803,6 @@ class BrowserPhaseRuntime:
         )
 
     @staticmethod
-    def _job_retrieval_history_stop_confirmation_message(
-        *,
-        current_url: str,
-        history_stop_streak: int,
-        required_streak: int,
-    ) -> str:
-        url_line = f"Current page URL: {current_url}\n" if current_url else ""
-        return (
-            "Runtime note: the current retrieval page reached the operation-success history stop condition.\n"
-            f"{url_line}"
-            f"Consecutive history-stop pages: {max(1, int(history_stop_streak or 0))}/{max(2, int(required_streak or 2))}\n"
-            "This is the first confirmation page, so one more pagination step is allowed. If the next recorded page also reaches this condition, "
-            "finish job_retrieval instead of paginating again."
-        )
-
-    @staticmethod
-    def _job_retrieval_history_stop_required_message(
-        *,
-        current_url: str,
-        history_stop_streak: int,
-        required_streak: int,
-    ) -> str:
-        url_line = f"Current page URL: {current_url}\n" if current_url else ""
-        return (
-            "Runtime note: consecutive retrieval pages reached the operation-success history stop condition.\n"
-            f"{url_line}"
-            f"Consecutive history-stop pages: {max(2, int(history_stop_streak or 0))}/{max(2, int(required_streak or 2))}\n"
-            "Do not paginate again for history-based stopping. Finish job_retrieval with phase_result as done, unless the active skill has a stronger "
-            "current-page reason to continue that must be recorded first."
-        )
-
-    @staticmethod
     def _same_url_no_progress_message(*, phase: PhasePrompt, current_url: str, tool_calls: int, tokens: int) -> str:
         url_line = f"Current page URL: {current_url}\n" if current_url else ""
         token_line = f"Same-page no-progress tokens: {tokens}\n" if tokens > 0 else ""
@@ -1034,6 +1013,10 @@ class BrowserPhaseRuntime:
         return update_phase_memory_tool_schema()
 
     @staticmethod
+    def browser_sequence_tool() -> dict[str, Any]:
+        return browser_sequence_tool_schema()
+
+    @staticmethod
     def _extract_output_items(response: dict[str, Any]) -> list[dict[str, Any]]:
         output = response.get("output")
         if not isinstance(output, list):
@@ -1161,21 +1144,6 @@ class BrowserPhaseRuntime:
             "stop_recommended": bool(structured.get("stop_recommended")),
             "stop_reason": str(structured.get("stop_reason") or "").strip(),
         }
-
-    @staticmethod
-    def _record_jobs_policy_applies(
-        policy: dict[str, Any],
-        *,
-        current_url: str,
-        current_page_key: str,
-    ) -> bool:
-        if not isinstance(policy, dict) or not policy:
-            return False
-        policy_page_key = str(policy.get("page_key") or "").strip()
-        if policy_page_key and current_page_key and policy_page_key == current_page_key:
-            return True
-        policy_url = str(policy.get("current_url") or "").strip()
-        return bool(policy_url and current_url and policy_url == current_url)
 
     @staticmethod
     def _structured_positive_count(structured: dict[str, Any], *keys: str) -> bool:
@@ -2535,19 +2503,6 @@ class BrowserPhaseRuntime:
                 return rule
         return ""
 
-    @classmethod
-    def _looks_like_pagination_action(cls, name: str, arguments: dict[str, Any] | None) -> bool:
-        normalized = str(name or "").strip().lower()
-        if normalized not in cls.PAGE_SETTLE_ACTION_TOOLS or not isinstance(arguments, dict):
-            return False
-        haystack = " ".join(
-            str(arguments.get(key) or "")
-            for key in ("element", "key", "keys", "text", "button")
-        ).strip().lower()
-        if not haystack:
-            return False
-        return bool(re.search(r"\b(next|previous|prev|pagination|page\b|load more|show more|more jobs)\b", haystack))
-
     @staticmethod
     def _job_retrieval_empty_extraction_message(*, current_url: str, page_label: str) -> str:
         page_line = f"Current page label: {page_label}\n" if page_label else ""
@@ -2672,6 +2627,7 @@ class BrowserPhaseRuntime:
         batch_id: str,
         current_url: str,
         arguments: dict[str, Any],
+        phase_memory: BrowserPhaseMemory | None = None,
     ) -> dict[str, Any]:
         return execute_state_tool(
             "record_jobs",
@@ -2683,6 +2639,8 @@ class BrowserPhaseRuntime:
                 turn_id=turn_id,
                 batch_id=batch_id,
                 current_url=current_url,
+                phase_slug="job_retrieval",
+                phase_memory=phase_memory,
                 retrieval_history_stop_success_ratio=float(self.config.retrieval_history_stop_success_ratio or 0.0),
                 retrieval_history_stop_min_page_jobs=int(self.config.retrieval_history_stop_min_page_jobs or 1),
             ),
@@ -2851,8 +2809,6 @@ class BrowserPhaseRuntime:
         response_runtime_error_count = 0
         max_response_turn_timeouts = max(1, int(self.config.recovery_max_attempts or 0))
         last_record_jobs_policy: dict[str, Any] = {}
-        retrieval_history_stop_streak = 0
-        retrieval_history_stop_pagination_violation_count = 0
         same_url_no_progress_key = ""
         same_url_no_progress_tool_calls = 0
         same_url_no_progress_tokens = 0
@@ -3380,6 +3336,15 @@ class BrowserPhaseRuntime:
                         break
 
                 if name == "phase_result":
+                    completion_gate = phase_completion_gate(
+                        phase_slug=phase.slug,
+                        result_status=str(arguments.get("status") or ""),
+                        phase_memory=phase_memory,
+                    )
+                    if not completion_gate.allowed:
+                        history_items = [self._context_item(completion_gate.message)]
+                        retry_requested = True
+                        break
                     return BrowserPhaseResult(
                         status=str(arguments.get("status") or "blocked"),
                         reason_tag="phase_result",
@@ -3645,87 +3610,22 @@ class BrowserPhaseRuntime:
                         ]
                         retry_requested = True
                         break
-                if (
-                    phase.slug == "job_retrieval"
-                    and self._looks_like_pagination_action(name, arguments if isinstance(arguments, dict) else None)
-                    and self._record_jobs_policy_applies(
-                        last_record_jobs_policy,
-                        current_url=current_url,
-                        current_page_key=current_page_key,
-                    )
-                ):
-                    if bool(last_record_jobs_policy.get("stop_recommended")):
-                        history_stop_streak = max(1, int(last_record_jobs_policy.get("history_stop_streak") or 1))
-                        required_history_stop_streak = 2
-                        if history_stop_streak >= required_history_stop_streak:
-                            retrieval_history_stop_pagination_violation_count += 1
-                            summary = (
-                                "Job retrieval blocked pagination because two consecutive pages reached the "
-                                "operation-success history stop condition."
-                            )
-                            self._record_browser_control_event(
-                                site_store=site_store,
-                                event_type="ignored_history_stop_required",
-                                batch_id=batch_id,
-                                site_key=site_key,
-                                phase=phase,
-                                turn_id=turn_id,
-                                current_url=current_url,
-                                guard_name="retrieval_history_stop_required",
-                                trigger_values={
-                                    "attempted_tool": name,
-                                    "attempted_arguments": arguments,
-                                    "history_stop_streak": history_stop_streak,
-                                    "required_history_stop_streak": required_history_stop_streak,
-                                    "violation_count": retrieval_history_stop_pagination_violation_count,
-                                },
-                                last_record_jobs_policy=last_record_jobs_policy,
-                                trace_ref=trace_ref,
-                                summary=summary,
-                            )
-                            return BrowserPhaseResult(
-                                status="done",
-                                reason_tag="retrieval_history_stop_required",
-                                summary=summary,
-                                current_url=current_url,
-                                step_count=step_count,
-                                trace_ref=trace_ref,
-                                raw_text=output_text,
-                                recorded_count=len(recorded_job_ids),
-                                new_count=len(new_job_ids),
-                            )
-                        summary = (
-                            "Job retrieval history policy recommended stopping on one page; pagination is allowed once "
-                            "to confirm the condition on the next recorded page."
-                        )
-                        self._record_browser_control_event(
-                            site_store=site_store,
-                            event_type="history_stop_confirmation_required",
-                            batch_id=batch_id,
-                            site_key=site_key,
-                            phase=phase,
-                            turn_id=turn_id,
+                if phase.slug == "job_retrieval" and is_pagination_action(name, arguments if isinstance(arguments, dict) else None):
+                    pagination_gate = retrieval_pagination_gate(phase_slug=phase.slug, phase_memory=phase_memory)
+                    if not pagination_gate.allowed:
+                        return BrowserPhaseResult(
+                            status="done",
+                            reason_tag="retrieval_history_stop_required",
+                            summary=pagination_gate.message,
                             current_url=current_url,
-                            guard_name="retrieval_history_stop_confirmation",
-                            trigger_values={
-                                "attempted_tool": name,
-                                "attempted_arguments": arguments,
-                                "history_stop_streak": history_stop_streak,
-                                "required_history_stop_streak": required_history_stop_streak,
-                            },
-                            last_record_jobs_policy=last_record_jobs_policy,
+                            step_count=step_count,
                             trace_ref=trace_ref,
-                            summary=summary,
+                            raw_text=output_text,
+                            recorded_count=len(recorded_job_ids),
+                            new_count=len(new_job_ids),
                         )
-                        history_items.append(
-                            self._context_item(
-                                self._job_retrieval_history_stop_confirmation_message(
-                                    current_url=current_url,
-                                    history_stop_streak=history_stop_streak,
-                                    required_streak=required_history_stop_streak,
-                                )
-                            )
-                        )
+                    if pagination_gate.message:
+                        history_items.append(self._context_item(pagination_gate.message))
                 do_not_repeat_reason = self._phase_memory_do_not_repeat_violation(
                     phase_memory=phase_memory,
                     tool_name=name,
@@ -3776,6 +3676,7 @@ class BrowserPhaseRuntime:
                 executed_tool_this_turn = True
                 step_count += 1
                 for attempt in range(1, max(1, int(self.config.max_step_retries or 0)) + 2):
+                    tool_started = time.monotonic()
                     site_store.save_browser_session(
                         site_key,
                         {
@@ -3797,6 +3698,7 @@ class BrowserPhaseRuntime:
                                 batch_id=batch_id,
                                 current_url=current_url,
                                 arguments=arguments if isinstance(arguments, dict) else {},
+                                phase_memory=phase_memory,
                             )
                         elif name == "update_jobs":
                             payload = self._update_jobs_payload(
@@ -3825,6 +3727,34 @@ class BrowserPhaseRuntime:
                             payload = self._update_phase_memory_payload(
                                 phase_memory=phase_memory,
                                 arguments=arguments if isinstance(arguments, dict) else {},
+                            )
+                        elif name in {CACHE_LOOKUP_TOOL, CACHE_READ_TOOL, CACHE_PROPOSE_TOOL, CACHE_VALIDATE_TOOL}:
+                            local_state = active_phase_context.local_state if isinstance(active_phase_context.local_state, dict) else {}
+                            payload = execute_state_tool(
+                                name,
+                                arguments if isinstance(arguments, dict) else {},
+                                PhaseStateToolContext(
+                                    site_store=site_store,
+                                    site_key=site_key,
+                                    session_id=session_id,
+                                    turn_id=turn_id,
+                                    batch_id=batch_id,
+                                    current_url=current_url,
+                                    workspace=self.config.metrics_workspace,
+                                    cache_scope={"site_key": site_key, "phase": phase.slug},
+                                    cache_dependency_versions=(
+                                        local_state.get("cache_dependency_versions")
+                                        if isinstance(local_state.get("cache_dependency_versions"), dict)
+                                        else {}
+                                    ),
+                                ),
+                            )
+                        elif name == BROWSER_SEQUENCE_TOOL:
+                            payload = await execute_browser_sequence(
+                                steps=(arguments or {}).get("steps"),
+                                call_browser_tool=lambda tool_name, tool_arguments: bridge.call_tool(
+                                    session, tool_name, tool_arguments
+                                ),
                             )
                         else:
                             payload = await bridge.call_tool(session, name, arguments if isinstance(arguments, dict) else {})
@@ -3859,13 +3789,25 @@ class BrowserPhaseRuntime:
                             current_url=current_url,
                             page_key=recorded_page_key,
                         )
-                        if bool(last_record_jobs_policy.get("stop_recommended")):
-                            retrieval_history_stop_streak += 1
-                        else:
-                            retrieval_history_stop_streak = 0
-                        last_record_jobs_policy["history_stop_streak"] = retrieval_history_stop_streak
-                        retrieval_history_stop_pagination_violation_count = 0
-                    current_url = MCPToolBridge.extract_current_url(payload) or current_url or str(entry_url or "")
+                    sequence_last_payload = payload.get("last_payload") if name == BROWSER_SEQUENCE_TOOL and isinstance(payload, dict) else {}
+                    current_url = (
+                        MCPToolBridge.extract_current_url(sequence_last_payload)
+                        or MCPToolBridge.extract_current_url(payload)
+                        or current_url
+                        or str(entry_url or "")
+                    )
+                    if name == BROWSER_SEQUENCE_TOOL and self.config.metrics_workspace:
+                        PerformanceRecorder(self.config.metrics_workspace).record(
+                            backend="provider",
+                            operation="browser_sequence",
+                            tool_name=BROWSER_SEQUENCE_TOOL,
+                            site_key=site_key,
+                            batch_id=batch_id,
+                            phase=phase.slug,
+                            status="error" if bool(payload.get("isError")) else "ok",
+                            elapsed_ms=int((time.monotonic() - tool_started) * 1000),
+                            sequence_step_count=len((arguments or {}).get("steps") or []),
+                        )
 
                     trace_ref = site_store.append_step_trace(
                         site_key,

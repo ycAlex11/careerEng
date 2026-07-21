@@ -14,6 +14,8 @@ class AgentConfig:
     related_history_k: int = 6
     relatedness_threshold: float = 0.7
     site_parallelism: int = 2
+    # Codex-worker slots. Zero keeps the existing site_parallelism behavior.
+    agent_parallelism: int = 0
     router_confidence_threshold: float = 0.75
     router_log_enabled: bool = True
     search_company_top_k: int = 10
@@ -104,8 +106,16 @@ class EvolutionApplyProbeConfig:
 
 
 @dataclass
+class EvolutionBatchReviewConfig:
+    """Structural cadence for asking the user to review site evolution."""
+
+    site_run_threshold: int = 5
+
+
+@dataclass
 class EvolutionConfig:
     apply_probe: EvolutionApplyProbeConfig = field(default_factory=EvolutionApplyProbeConfig)
+    batch_review: EvolutionBatchReviewConfig = field(default_factory=EvolutionBatchReviewConfig)
 
 
 @dataclass

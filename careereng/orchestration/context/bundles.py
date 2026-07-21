@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from careereng.orchestration.context.phase_memory import BrowserPhaseMemory
 from careereng.orchestration.context.registry import BrowserContextRegistry
+from careereng.orchestration.context.resources import build_apply_initial_facts, render_apply_facts
 from careereng.career.resume.export import default_apply_resume_pdf_path
 
 
@@ -132,6 +133,8 @@ class BrowserContextSession:
     bundle_texts: dict[str, str]
     base_items: list[dict[str, str]]
     phase_memory: BrowserPhaseMemory | None = None
+    bundle_loader: Callable[[str], str] | None = None
+    available_bundle_names: list[str] = field(default_factory=list)
     _attached_bundles: list[str] = field(default_factory=list)
 
     @classmethod
@@ -148,7 +151,16 @@ class BrowserContextSession:
         phase_memory: BrowserPhaseMemory | None = None,
         continuation_context: dict[str, Any] | None = None,
     ) -> "BrowserContextSession":
-        bundle_texts = {name: registry.bundle_item_text(name) for name in registry.available_bundles()}
+        available_bundle_names = registry.available_bundles()
+        # Lightweight facts are useful for ordinary form fields. Full bundles
+        # remain descriptors until request_context explicitly materializes one.
+        resume_pdf_path = str(staged_resume_pdf_path or "").strip() or str(default_apply_resume_pdf_path(workspace))
+        initial_apply_facts = build_apply_initial_facts(
+            registry=registry,
+            staged_resume_pdf_path=resume_pdf_path,
+            target_job_ids=target_job_ids,
+        )
+        bundle_texts = {"apply_facts": render_apply_facts(initial_apply_facts)} if initial_apply_facts else {}
         load_run_context = getattr(site_store, "load_run_context", None)
         if callable(load_run_context):
             try:
@@ -208,7 +220,6 @@ class BrowserContextSession:
                 ),
             }
         )
-        resume_pdf_path = str(staged_resume_pdf_path or "").strip() or str(default_apply_resume_pdf_path(workspace))
         items.append(
             {
                 "role": "user",
@@ -273,7 +284,13 @@ class BrowserContextSession:
         if "apply_facts" in bundle_texts:
             items.append({"role": "user", "content": bundle_texts["apply_facts"]})
         items.append({"role": "user", "content": registry.available_bundles_item_text()})
-        return cls(bundle_texts=bundle_texts, base_items=items, phase_memory=phase_memory)
+        return cls(
+            bundle_texts=bundle_texts,
+            base_items=items,
+            phase_memory=phase_memory,
+            bundle_loader=registry.bundle_item_text,
+            available_bundle_names=available_bundle_names,
+        )
 
     @classmethod
     def for_phase(
@@ -314,7 +331,7 @@ class BrowserContextSession:
     def request_bundle(self, *, bundle: str, reason: str = "") -> dict[str, Any]:
         normalized = str(bundle or "").strip().lower()
         reason_text = str(reason or "").strip()
-        available_bundles = sorted(self.bundle_texts.keys())
+        available_bundles = sorted(set(self.available_bundle_names) | set(self.bundle_texts.keys()))
         if not normalized:
             return {
                 "isError": False,
@@ -336,7 +353,7 @@ class BrowserContextSession:
                     }
                 ],
             }
-        if normalized not in self.bundle_texts:
+        if normalized not in available_bundles:
             return {
                 "isError": False,
                 "structuredContent": {
@@ -357,6 +374,8 @@ class BrowserContextSession:
                     }
                 ],
             }
+        if normalized not in self.bundle_texts and callable(self.bundle_loader):
+            self.bundle_texts[normalized] = str(self.bundle_loader(normalized) or "")
         if normalized not in self._attached_bundles:
             self._attached_bundles.append(normalized)
             status = "attached"

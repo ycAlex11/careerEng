@@ -5,6 +5,7 @@ from __future__ import annotations
 
 PROVIDER_MODE = "provider"
 AGENT_BRIDGE_MODE = "agent_bridge"
+CODEX_APP_SERVER_MODE = "codex_app_server"
 LEGACY_CODEX_HANDOFF_MODE = "codex_handoff"
 
 AGENT_BRIDGE_STATUS = "agent_bridge"
@@ -33,6 +34,8 @@ AGENT_BRIDGE_ALIASES = {
 
 def normalize_execution_mode(value: str) -> str:
     mode = str(value or PROVIDER_MODE).strip().lower().replace("-", "_")
+    if mode in {CODEX_APP_SERVER_MODE, "codex_appserver", "codex_workers"}:
+        return CODEX_APP_SERVER_MODE
     if mode in {alias.replace("-", "_") for alias in AGENT_BRIDGE_ALIASES}:
         return AGENT_BRIDGE_MODE
     return PROVIDER_MODE

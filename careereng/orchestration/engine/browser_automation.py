@@ -13,12 +13,15 @@ import anyio
 
 from careereng.platform.web_control import (
     MCPToolBridge,
+    execute_browser_sequence,
     wait_for_process,
 )
+from careereng.platform.cache import CacheArtifactStore
 from careereng.platform.sessions import BrowserProfileOwnerError, BrowserRuntimeLease, BrowserRuntimeRegistry
 from careereng.adapters.external_agents.browser import browser_tool_commands
 from careereng.adapters.external_agents.contracts import (
     AGENT_BRIDGE_MODE,
+    CODEX_APP_SERVER_MODE,
     AGENT_BRIDGE_REQUIRED_REASON,
     AGENT_BRIDGE_STATUS,
     agent_bridge_phase,
@@ -28,21 +31,35 @@ from careereng.adapters.external_agents.work_orders import (
     advance_browser_agent_work_order,
     create_browser_agent_work_order,
     load_active_phase_context,
+    persist_browser_agent_checkpoint,
     persist_browser_agent_phase_memory,
+    refresh_browser_agent_work_order,
+    set_browser_agent_work_order_state,
 )
 from careereng.orchestration.context.prompts import build_phase_prompts, load_text
 from careereng.orchestration.agent_protocol.browser_phase import BrowserPhaseResult
 from careereng.orchestration.agent_protocol.state_tools import state_tool_schemas_for_phase
+from careereng.orchestration.agent_protocol.browser_sequence import (
+    BROWSER_SEQUENCE_PHASES,
+    BROWSER_SEQUENCE_TOOL,
+    browser_sequence_tool_schema,
+)
 from careereng.orchestration.commands.state_tools import execute_state_tool
 from careereng.orchestration.context import build_phase_context
 from careereng.orchestration.engine import PhaseSequenceCompletion, advance_phase_sequence
+from careereng.orchestration.engine.phase_orchestration import (
+    is_pagination_action,
+    retrieval_pagination_gate,
+)
 from careereng.orchestration.commands.state_tools import PhaseStateToolContext
 from careereng.evolution.work_items import create_site_skill_refinement_card
 from careereng.orchestration.context import (
     BrowserContextRegistry,
     BrowserContextSession,
     BrowserPhaseMemory,
+    ContextResourceResolver,
     WorkflowMemoryStore,
+    build_apply_initial_facts,
     extract_failure_snapshot_from_trace,
 )
 from careereng.config.schema import (
@@ -148,6 +165,8 @@ class BrowserAutomationService:
             default_timeout_ms=self.timeout_ms,
         )
         self._browser_context_registry = BrowserContextRegistry(self.workspace)
+        self._context_resource_scopes: set[tuple[str, str]] = set()
+        self._cache_store = CacheArtifactStore(self.workspace)
         same_url_policy = getattr(self.guards, "same_url_no_progress", None)
         if isinstance(same_url_policy, dict):
             same_url_tool_limit = int(
@@ -224,6 +243,23 @@ class BrowserAutomationService:
     def _project_skill_path(self) -> Path:
         return self.project_root / "skills" / "search" / "jobs" / "SKILL.md"
 
+    def _cache_dependency_versions(self, site_key: str) -> dict[str, str]:
+        versions = getattr(self.site_store, "decision_context_versions", None)
+        if not callable(versions):
+            return {}
+        try:
+            result = versions(site_key)
+        except Exception:
+            return {}
+        return result if isinstance(result, dict) else {}
+
+    def _cache_candidates(self, *, site_key: str, phase_slug: str, batch_id: str) -> list[dict[str, Any]]:
+        return self._cache_store.lookup(
+            scope={"site_key": site_key, "phase": phase_slug},
+            dependency_versions=self._cache_dependency_versions(site_key),
+            batch_id=batch_id,
+        )
+
     def _site_skill_path(self, site_key: str) -> Path:
         load_skill = getattr(self.site_store, "load_skill", None)
         if callable(load_skill):
@@ -258,6 +294,7 @@ class BrowserAutomationService:
         continuation_context: dict[str, Any] | None = None,
     ) -> BrowserAutomationResult:
         active, reused_runtime = self._reserve_runtime(site_key, entry_url)
+        prior_session = self.site_store.load_browser_session(site_key)
         self.site_store.save_browser_session(
             site_key,
             {
@@ -296,24 +333,62 @@ class BrowserAutomationService:
         )
         allowed_slugs = set(phase_slugs or DEFAULT_RUN_PHASES)
         phases = self._phase_prompts(site_key, allowed_slugs=allowed_slugs)
-        work_order = create_browser_agent_work_order(
-            workspace=self.workspace,
-            site_store=self.site_store,
-            site_key=site_key,
-            site_name=site_name,
-            entry_url=entry_url,
-            session_id=session_id,
-            turn_id=turn_id,
-            batch_id=batch_id,
-            resume=resume,
-            phase_slugs=tuple(phase_slugs or DEFAULT_RUN_PHASES),
-            phases=phases,
-            project_skill_path=self._project_skill_path(),
-            site_skill_path=self._site_skill_path(site_key),
-            apply_target_job_ids=apply_target_job_ids,
-            continuation_context=continuation_context,
-            tool_commands=browser_tool_commands(site_key),
-        )
+        apply_initial_facts: dict[str, Any] = {}
+        if any(phase.slug == "apply" for phase in phases):
+            try:
+                staged_resume_pdf = self._stage_apply_resume_pdf(runtime_output_dir=active.runtime.output_dir)
+            except Exception as exc:
+                return BrowserAutomationResult(
+                    site_key=site_key,
+                    site_name=site_name,
+                    status="failed",
+                    reason_tag="resume_pdf_unavailable",
+                    message=str(exc),
+                )
+            self._browser_context_registry.refresh_if_changed()
+            apply_initial_facts = build_apply_initial_facts(
+                registry=self._browser_context_registry,
+                staged_resume_pdf_path=str(staged_resume_pdf),
+                target_job_ids=apply_target_job_ids,
+            )
+            self.site_store.save_browser_session(
+                site_key,
+                {"staged_resume_pdf_path": str(staged_resume_pdf)},
+            )
+        existing_payload_path = Path(str(prior_session.get("agent_bridge_payload_path") or ""))
+        existing_phase_session_path = Path(str(prior_session.get("phase_session_path") or ""))
+        same_batch = str(prior_session.get("agent_bridge_batch_id") or "") == str(batch_id or "")
+        common_kwargs = {
+            "workspace": self.workspace,
+            "entry_url": entry_url,
+            "phase_slugs": tuple(phase_slugs or DEFAULT_RUN_PHASES),
+            "phases": phases,
+            "apply_target_job_ids": apply_target_job_ids,
+            "continuation_context": continuation_context,
+            "tool_commands": browser_tool_commands(site_key),
+            "cache_candidates": self._cache_candidates(site_key=site_key, phase_slug=phases[0].slug if phases else "", batch_id=batch_id),
+            "cache_dependency_versions": self._cache_dependency_versions(site_key),
+            "apply_initial_facts": apply_initial_facts,
+        }
+        if same_batch and existing_payload_path.is_file() and existing_phase_session_path.is_file():
+            work_order = refresh_browser_agent_work_order(
+                payload_path=existing_payload_path,
+                phase_session_path=existing_phase_session_path,
+                **common_kwargs,
+            )
+        else:
+            work_order = create_browser_agent_work_order(
+                site_store=self.site_store,
+                site_key=site_key,
+                site_name=site_name,
+                session_id=session_id,
+                turn_id=turn_id,
+                batch_id=batch_id,
+                resume=resume,
+                project_skill_path=self._project_skill_path(),
+                site_skill_path=self._site_skill_path(site_key),
+                **common_kwargs,
+            )
         return BrowserAutomationResult(
             site_key=site_key,
             site_name=site_name,
@@ -362,6 +437,19 @@ class BrowserAutomationService:
     ) -> dict[str, Any]:
         started = time.monotonic()
         session_context = self._agent_bridge_session_context(site_key, phase=phase)
+        effective_phase = agent_bridge_phase(phase)
+        phase_memory = self._load_agent_bridge_phase_memory(session_context)
+        if is_pagination_action(tool_name, arguments):
+            pagination_gate = retrieval_pagination_gate(phase_slug=effective_phase, phase_memory=phase_memory)
+            if not pagination_gate.allowed:
+                return {
+                    "ok": False,
+                    "tool_name": tool_name,
+                    "current_url": str(session_context.get("current_url") or ""),
+                    "summary": pagination_gate.message,
+                    "error": "retrieval_history_stop_required",
+                    "payload": {"isError": True, "error": "retrieval_history_stop_required"},
+                }
         active = self._active_runtime_for_agent_bridge(site_key)
         bridge = MCPToolBridge(active.runtime, timeout_seconds=max(30.0, self.timeout_ms / 1000.0))
         try:
@@ -374,7 +462,7 @@ class BrowserAutomationService:
                 tool_name=tool_name,
                 site_key=site_key,
                 batch_id=str(session_context.get("batch_id") or ""),
-                phase=agent_bridge_phase(phase),
+                phase=effective_phase,
                 status="error",
                 error_type=exc.__class__.__name__,
                 elapsed_ms=int((time.monotonic() - started) * 1000),
@@ -387,13 +475,24 @@ class BrowserAutomationService:
             site_key,
             turn_id or AGENT_BRIDGE_STATUS,
             {
-                "phase": agent_bridge_phase(phase),
+                "phase": effective_phase,
                 "step_id": f"agent_bridge:{tool_name}",
                 "attempt": 1,
                 "tool_name": tool_name,
                 "arguments": arguments or {},
                 "result": "error" if payload.get("isError") else "ok",
                 "output": summary,
+            },
+        )
+        self._persist_agent_bridge_checkpoint(
+            session_context,
+            {
+                "phase": effective_phase,
+                "tool_name": tool_name,
+                "trace_ref": trace_ref,
+                "current_url": current_url,
+                "status": "error" if payload.get("isError") else "ok",
+                "recorded_at": now_iso(),
             },
         )
         session_update = {
@@ -412,7 +511,7 @@ class BrowserAutomationService:
             "browser.agent_bridge.tool_called",
             {
                 "turn_id": turn_id or AGENT_BRIDGE_STATUS,
-                "phase": agent_bridge_phase(phase),
+                "phase": effective_phase,
                 "tool_name": tool_name,
                 "result": "error" if payload.get("isError") else "ok",
                 "current_url": current_url,
@@ -425,7 +524,7 @@ class BrowserAutomationService:
             tool_name=tool_name,
             site_key=site_key,
             batch_id=str(session_context.get("batch_id") or ""),
-            phase=agent_bridge_phase(phase),
+            phase=effective_phase,
             status="error" if payload.get("isError") else "ok",
             elapsed_ms=int((time.monotonic() - started) * 1000),
             observation_kind="full" if tool_name == "browser_snapshot" else "",
@@ -438,6 +537,128 @@ class BrowserAutomationService:
             "trace_ref": trace_ref,
             "payload": payload,
         }
+
+    async def _run_active_browser_sequence_async(
+        self,
+        *,
+        site_key: str,
+        steps: list[dict[str, Any]],
+        turn_id: str = "",
+        phase: str = AGENT_BRIDGE_STATUS,
+    ) -> dict[str, Any]:
+        """Run agent-supplied browser actions in order without site interpretation."""
+
+        started = time.monotonic()
+        context = self._agent_bridge_session_context(site_key, phase=phase)
+        effective_phase = agent_bridge_phase(phase)
+        phase_memory = self._load_agent_bridge_phase_memory(context)
+        if any(
+            is_pagination_action(str(step.get("tool_name") or step.get("tool") or ""), step.get("arguments") if isinstance(step.get("arguments"), dict) else {})
+            for step in steps
+            if isinstance(step, dict)
+        ):
+            pagination_gate = retrieval_pagination_gate(phase_slug=effective_phase, phase_memory=phase_memory)
+            if not pagination_gate.allowed:
+                return {
+                    "ok": False,
+                    "tool_name": BROWSER_SEQUENCE_TOOL,
+                    "current_url": str(context.get("current_url") or ""),
+                    "summary": pagination_gate.message,
+                    "error": "retrieval_history_stop_required",
+                    "payload": {"isError": True, "error": "retrieval_history_stop_required"},
+                }
+        active = self._active_runtime_for_agent_bridge(site_key)
+        bridge = MCPToolBridge(active.runtime, timeout_seconds=max(30.0, self.timeout_ms / 1000.0))
+        async with bridge.open_session() as session:
+            payload = await execute_browser_sequence(
+                steps=steps,
+                call_browser_tool=lambda name, arguments: bridge.call_tool(session, name, arguments),
+            )
+        last_payload = payload.get("last_payload") if isinstance(payload.get("last_payload"), dict) else {}
+        current_url = bridge.extract_current_url(last_payload)
+        summary = json.dumps(
+            {
+                "completed": payload.get("completed") or 0,
+                "error": payload.get("error") or "",
+                "steps": [
+                    {"tool_name": row.get("tool_name"), "is_error": row.get("is_error")}
+                    for row in payload.get("steps", [])
+                    if isinstance(row, dict)
+                ],
+            },
+            ensure_ascii=False,
+        )
+        trace_ref = self.site_store.append_step_trace(
+            site_key,
+            turn_id or AGENT_BRIDGE_STATUS,
+            {
+                "phase": effective_phase,
+                "step_id": "agent_bridge:browser_sequence",
+                "attempt": 1,
+                "tool_name": BROWSER_SEQUENCE_TOOL,
+                "arguments": {"steps": steps},
+                "result": "error" if payload.get("isError") else "ok",
+                "output": summary,
+            },
+        )
+        self._persist_agent_bridge_checkpoint(
+            context,
+            {
+                "phase": effective_phase,
+                "tool_name": BROWSER_SEQUENCE_TOOL,
+                "trace_ref": trace_ref,
+                "current_url": current_url,
+                "status": "error" if payload.get("isError") else "ok",
+                "recorded_at": now_iso(),
+            },
+        )
+        self.site_store.save_browser_session(
+            site_key,
+            {
+                "current_step_id": "agent_bridge:browser_sequence",
+                "current_step_status": "tool_error" if payload.get("isError") else "tool_ok",
+                "current_trace_ref": trace_ref,
+                "last_step_error": str(payload.get("error") or "")[:1000],
+                **({"last_known_url": current_url} if current_url else {}),
+            },
+        )
+        PerformanceRecorder(self.workspace).record(
+            backend="external_agent",
+            operation="browser_sequence",
+            tool_name=BROWSER_SEQUENCE_TOOL,
+            site_key=site_key,
+            batch_id=str(context.get("batch_id") or ""),
+            phase=effective_phase,
+            status="error" if payload.get("isError") else "ok",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            sequence_step_count=len(steps),
+        )
+        return {
+            "ok": not bool(payload.get("isError")),
+            "tool_name": BROWSER_SEQUENCE_TOOL,
+            "current_url": current_url,
+            "summary": summary,
+            "trace_ref": trace_ref,
+            "payload": payload,
+        }
+
+    def run_active_browser_sequence(
+        self,
+        *,
+        site_key: str,
+        steps: list[dict[str, Any]],
+        turn_id: str = "",
+        phase: str = AGENT_BRIDGE_STATUS,
+    ) -> dict[str, Any]:
+        async def _runner() -> dict[str, Any]:
+            return await self._run_active_browser_sequence_async(
+                site_key=site_key,
+                steps=steps,
+                turn_id=turn_id,
+                phase=phase,
+            )
+
+        return anyio.run(_runner)
 
     def call_active_browser_tool(
         self,
@@ -480,6 +701,20 @@ class BrowserAutomationService:
         }
 
     @staticmethod
+    def _agent_bridge_apply_initial_facts(context: dict[str, Any]) -> dict[str, Any]:
+        payload_path = Path(str(context.get("payload_path") or ""))
+        if not payload_path.is_file():
+            return {}
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        phase_context = payload.get("current_phase_context") if isinstance(payload, dict) else {}
+        if isinstance(phase_context, dict) and isinstance(phase_context.get("apply_facts"), dict):
+            return dict(phase_context["apply_facts"])
+        return dict(payload.get("apply_initial_facts") or {}) if isinstance(payload, dict) else {}
+
+    @staticmethod
     def _load_agent_bridge_phase_memory(context: dict[str, Any]) -> BrowserPhaseMemory:
         phase_session_path = Path(str(context.get("phase_session_path") or ""))
         if not phase_session_path.is_file():
@@ -500,6 +735,18 @@ class BrowserAutomationService:
             payload_path=payload_path,
             phase_session_path=phase_session_path,
             phase_memory=phase_memory.as_payload(),
+        )
+
+    @staticmethod
+    def _persist_agent_bridge_checkpoint(context: dict[str, Any], checkpoint: dict[str, Any]) -> None:
+        payload_path = Path(str(context.get("payload_path") or ""))
+        phase_session_path = Path(str(context.get("phase_session_path") or ""))
+        if not payload_path.is_file() or not phase_session_path.is_file():
+            return
+        persist_browser_agent_checkpoint(
+            payload_path=payload_path,
+            phase_session_path=phase_session_path,
+            checkpoint=checkpoint,
         )
 
     def _advance_active_agent_bridge_phase(
@@ -552,6 +799,11 @@ class BrowserAutomationService:
                 },
             )
         if transition.action == "continue_current":
+            set_browser_agent_work_order_state(
+                payload_path=payload_path,
+                phase_session_path=phase_session_path,
+                worker_state="waiting_user",
+            )
             transition_payload["active_phase_context"] = load_active_phase_context(payload_path)
             return (
                 transition_payload,
@@ -564,6 +816,11 @@ class BrowserAutomationService:
                 },
             )
         if transition.action == "complete_sequence":
+            set_browser_agent_work_order_state(
+                payload_path=payload_path,
+                phase_session_path=phase_session_path,
+                worker_state="transitioning",
+            )
             completion = PhaseSequenceCompletion(
                 site_key=str(context.get("site_key") or site_key),
                 batch_id=str(context.get("batch_id") or ""),
@@ -602,6 +859,19 @@ class BrowserAutomationService:
         effective_turn_id = str(turn_id or context.get("turn_id") or AGENT_BRIDGE_STATUS)
         effective_phase = str(context.get("phase") or phase or AGENT_BRIDGE_STATUS)
         phase_memory = self._load_agent_bridge_phase_memory(context)
+        cache_versions = self._cache_dependency_versions(str(context.get("site_key") or site_key))
+        context_resources = None
+        if effective_phase == "apply":
+            self._retain_context_resource_scope(site_key=str(context.get("site_key") or site_key), batch_id=str(context.get("batch_id") or ""))
+            self._browser_context_registry.refresh_if_changed()
+            context_resources = ContextResourceResolver.create(
+                workspace=self.workspace,
+                site_store=self.site_store,
+                site_key=str(context.get("site_key") or site_key),
+                batch_id=str(context.get("batch_id") or ""),
+                registry=self._browser_context_registry,
+                apply_initial_facts=self._agent_bridge_apply_initial_facts(context),
+            )
         payload = execute_state_tool(
             tool_name,
             arguments or {},
@@ -612,8 +882,13 @@ class BrowserAutomationService:
                 turn_id=effective_turn_id,
                 batch_id=str(context.get("batch_id") or ""),
                 current_url=str(context.get("current_url") or ""),
+                phase_slug=effective_phase,
+                context_session=context_resources,
                 phase_memory=phase_memory,
                 persist_phase_memory=lambda memory: self._persist_agent_bridge_phase_memory(context, memory),
+                workspace=self.workspace,
+                cache_scope={"site_key": str(context.get("site_key") or site_key), "phase": effective_phase},
+                cache_dependency_versions=cache_versions,
             ),
         )
         summary = MCPToolBridge.summarize_tool_output(payload)
@@ -680,6 +955,32 @@ class BrowserAutomationService:
             "payload": payload,
             "progression": progression,
         }
+
+    def read_active_context_resource(
+        self,
+        *,
+        site_key: str,
+        resource_id: str,
+        phase: str = "",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Read an agent-selected resource from the retained site/batch scope."""
+
+        context = self._agent_bridge_session_context(site_key, phase=phase)
+        self._retain_context_resource_scope(
+            site_key=str(context.get("site_key") or site_key),
+            batch_id=str(context.get("batch_id") or ""),
+        )
+        self._browser_context_registry.refresh_if_changed()
+        resolver = ContextResourceResolver.create(
+            workspace=self.workspace,
+            site_store=self.site_store,
+            site_key=str(context.get("site_key") or site_key),
+            batch_id=str(context.get("batch_id") or ""),
+            registry=self._browser_context_registry,
+            apply_initial_facts=self._agent_bridge_apply_initial_facts(context),
+        )
+        return resolver.read(resource_id, reason=reason)
 
     @staticmethod
     def _phase_has_jobs_surface(phase_slug: str) -> bool:
@@ -770,6 +1071,9 @@ class BrowserAutomationService:
             name = str(schema.get("name") or "").strip()
             if name:
                 tool_names.add(name)
+        if phase_slug in BROWSER_SEQUENCE_PHASES:
+            response_tools.append(browser_sequence_tool_schema())
+            tool_names.add(BROWSER_SEQUENCE_TOOL)
         return response_tools, tool_names
 
     def _phase_context_session(
@@ -784,7 +1088,8 @@ class BrowserAutomationService:
         continuation_context: dict[str, Any] | None = None,
     ) -> BrowserContextSession | None:
         if phase_slug == "apply":
-            self._browser_context_registry.refresh()
+            self._retain_context_resource_scope(site_key=site_key, batch_id=batch_id)
+            self._browser_context_registry.refresh_if_changed()
             return BrowserContextSession.for_apply(
                 registry=self._browser_context_registry,
                 workspace=self.workspace,
@@ -1020,9 +1325,13 @@ class BrowserAutomationService:
             timeout_ms=timeout_ms,
         )
 
-    def _release_runtime(self, site_key: str) -> None:
-        self._runtime_registry.release(site_key)
+    def _release_runtime(self, site_key: str) -> bool:
+        released = self._runtime_registry.release_or_reclaim(
+            site_key=site_key,
+            profile_dir=self.site_store.browser_profile_dir(site_key),
+        )
         self.site_store.save_browser_session(site_key, {"browser_status": "stopped", "active_run_id": ""})
+        return released
 
     async def _run_site_async(
         self,
@@ -1240,7 +1549,13 @@ class BrowserAutomationService:
                                         "session_id": session_id,
                                         "turn_id": turn_id,
                                         "apply_target_job_ids": list(apply_target_job_ids or ()),
+                                        "cache_dependency_versions": self._cache_dependency_versions(site_key),
                                     },
+                                    cache_candidates=self._cache_candidates(
+                                        site_key=site_key,
+                                        phase_slug=phase.slug,
+                                        batch_id=batch_id,
+                                    ),
                                 ),
                                 apply_staged_resume_pdf_path=apply_staged_resume_pdf_path,
                                 )
@@ -1468,7 +1783,7 @@ class BrowserAutomationService:
         phase_timeout_seconds_override: int | None = None,
         timeout_ms_override: int | None = None,
     ) -> BrowserAutomationResult:
-        if self.execution_mode == AGENT_BRIDGE_MODE:
+        if self.execution_mode in {AGENT_BRIDGE_MODE, CODEX_APP_SERVER_MODE}:
             return self._run_site_agent_bridge(
                 site_key=site_key,
                 site_name=site_name,
@@ -1526,5 +1841,18 @@ class BrowserAutomationService:
                 message=message[:4000],
             )
 
-    def finish_site(self, site_key: str) -> None:
-        self._release_runtime(site_key)
+    def finish_site(self, site_key: str) -> bool:
+        released = self._release_runtime(site_key)
+        normalized_site = str(site_key or "").strip()
+        self._context_resource_scopes = {
+            scope for scope in self._context_resource_scopes if scope[0] != normalized_site
+        }
+        if not self._context_resource_scopes:
+            self._browser_context_registry.release_loaded_bundles()
+        return released
+
+    def _retain_context_resource_scope(self, *, site_key: str, batch_id: str) -> None:
+        normalized_site = str(site_key or "").strip()
+        normalized_batch = str(batch_id or "").strip()
+        if normalized_site and normalized_batch:
+            self._context_resource_scopes.add((normalized_site, normalized_batch))

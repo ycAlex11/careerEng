@@ -55,6 +55,7 @@ careereng/
     sessions/                   Runtime ownership, session lifecycle, recovery plumbing
     reporting/                  Generic report artifact writing, indexes, events, snapshots, render helpers
     observability/              Metrics, traces, and generic operational summaries
+    cache/                      Workspace-backed reusable runtime artifacts and compatibility indexes
     project_state/              Taskboard and assistant/project-level state
     maintenance/                Cleanup, repair, diagnostics
 
@@ -64,8 +65,9 @@ careereng/
       browser_phase_runtime.py  Responses API browser-tool execution adapter
     mcp/                        CareerEng MCP server transport
     cli/                        Command-line transport
+    codex/                      Codex App Server transport, thread bindings, worker lifecycle
     host/                       Deprecated compatibility exports for the runtime host
-    external_agents/            Codex, Claude Code, and future local-agent adapters
+    external_agents/            Generic work-order audit/recovery and future external-agent contracts
     assistant_bridge/           Conversation ingestion and assistant-context transport
 
   config/                       Configuration loading and validation
@@ -104,7 +106,7 @@ workspace/
   jobs/ applications/ sites/
   evolution/ action_cards/
   taskboard/ sessions/ metrics/ reports/
-  tmp/ debug/
+  cache/ tmp/ debug/
 ```
 
 The first migration does not require moving every existing workspace path.
@@ -124,6 +126,22 @@ The persistence primitive owns replacement, snapshots, events, and archival.
 Each domain owns its own document schema, rendering, and business transitions.
 For example, `workspace/taskboard/current.md` is an active work plan, not an
 append-only implementation log; detailed progress belongs in history.
+
+## Runtime Cache Boundary
+
+`platform/cache/` persists generic runtime artifacts in `workspace/cache/`:
+artifact payloads, a compact index, and immutable cache events. Its supported
+artifact kinds are runtime capabilities, phase context, mappings, and explicit
+browser sequences. The platform only checks structural compatibility (scope
+and declared dependency-version equality); it does not decide that a cached
+artifact is semantically safe for a live page.
+
+The agent receives compact compatible candidates in phase context and can use
+`cache_lookup`, `cache_read`, `cache_propose`, and `cache_validate`. The
+LLM/Skill decides whether to read, reuse, validate, stale, or retire an
+artifact. Cache validation events are indexed into evolution evidence packs so
+later evolution can decide whether to promote a repeated result into a lesson,
+Skill patch, or infrastructure proposal.
 
 ## Report Artifact Boundary
 
@@ -241,6 +259,22 @@ the relevant `career/` or `evolution/` capability, which may schedule the next
 persisted work item. This keeps raw browser control independent of job plans
 and other business state.
 
+Backend-neutral phase progression belongs in
+`orchestration/engine/phase_orchestration.py`. Provider loops and external
+agent workers must consume this shared state rather than reimplement phase
+completion behavior. For example, a retrieval history-stop result is evidence,
+not a terminal command: the shared engine tracks any required confirmation
+progress while the active Skill remains responsible for site pagination and
+workflow policy.
+
+For `codex_app_server`, creating a work order is not sufficient to call a
+batch browser-active. The runtime host must successfully start a scoped Codex
+worker thread for every active site. A worker starts from its work-item
+directory, not the project root; on App Server startup timeout the host drops
+that transport and retries with a fresh connection before it marks the worker
+unavailable. This keeps startup bounded and prevents a stale App Server from
+blocking all sites.
+
 Python provides orchestration, persistence, validation, safety, recovery
 plumbing, metrics, evidence packaging, patch application, and rollback.
 LLM/Skills provide business reasoning, matching policy, site workflow, form
@@ -272,7 +306,8 @@ CareerEng has two kinds of agent-visible capability.
 ### 1. CareerEng Control and State Tools
 
 Examples: `update_jobs`, `record_application_reviews`, `request_context`,
-`update_phase_memory`, `phase_result`, batch/session resume operations.
+`update_phase_memory`, `cache_lookup`, `cache_read`, `cache_propose`,
+`cache_validate`, `phase_result`, batch/session resume operations.
 
 ```text
 orchestration/agent_protocol/
@@ -293,7 +328,8 @@ declarations and command path.
 
 ### 2. Raw Web Capabilities
 
-Examples: snapshot, click, type, upload, navigation, and browser inspection.
+Examples: snapshot, click, type, upload, navigation, browser inspection, and
+an explicit `browser_sequence` of agent-supplied raw browser calls.
 
 ```text
 platform/web_control/
@@ -304,17 +340,79 @@ Raw browser schemas are discovered from the connected browser MCP where
 possible. Do not hand-copy each browser tool schema into provider or Codex
 adapters. Raw web control never decides what a site action means.
 
+`browser_sequence` is declared in `orchestration/agent_protocol/` and executed
+by `platform/web_control/`. It runs only the ordered steps supplied by the
+agent, stops on the first technical error, and returns raw results. It must not
+infer page stability, required fields, job policy, or a site-specific flow.
+
 ### External-Agent Phase Context Delivery
 
 Provider execution receives the current phase context directly in its request.
-External agents receive the equivalent assembled context through the CareerEng
-MCP response when a batch starts, a phase advances, or the agent queries the
-active batch. The context contains the current phase's project/site Skill
-slice, continuation, phase memory, local state, and state-tool schemas.
+External agents may query assembled context through the CareerEng MCP response
+when a batch starts, a phase advances, or the agent queries the active batch.
+Bounded worker threads use the narrower work-item protocol instead: they start
+with only a durable `work_item_id`, fetch a scope and context catalog through
+`careereng_get_work_item_context`, then explicitly read only required
+resources through `careereng_read_work_item_resource`. The catalog can expose
+the current phase's project/site Skill slice, continuation, phase memory,
+local state, compatible cache candidates, and state-tool schemas without
+eagerly placing them in a worker's first prompt. During apply it can also
+describe `apply_facts`, `full_cv`, `full_persona`, and the site-only batch
+history view. Those bodies are resolved only after the worker requests them;
+the resolver is shared by provider and Codex paths and caches only within the
+active runtime scope.
+
+The initial `apply` envelope is also backend-neutral. It contains only staged
+resume path/basename, lightweight form facts, and target identifiers. Full CV,
+persona, and site history remain explicit lazy resources. Browser executors
+persist an action checkpoint containing only tool name, trace reference, URL,
+and technical result; the LLM decides whether it needs another observation or
+recovery step.
 
 `workspace/agent_bridge/.../payload.json` and `work_order.md` remain durable
 recovery and audit artifacts. They are not the normal, file-reading-only
 delivery mechanism for an external agent.
+
+## Codex Worker Lifecycle
+
+When `browser.execution_mode = "codex_app_server"`, the Codex App Server owns
+the live agent execution lifecycle:
+
+```text
+CareerEng batch/site work item
+  -> assembled phase context + durable work-order audit artifact
+  -> adapters/codex/ starts or resumes one Codex thread for that site
+  -> Codex thread receives a work_item_id and pulls scoped MCP context
+  -> Codex thread uses CareerEng MCP/browser/state tools
+  -> Codex App Server emits turn lifecycle events
+  -> CareerEng records thread/turn linkage and updates batch evidence
+```
+
+One `site + batch` has one active worker at a time. `orchestration/engine/site_work_items.py`
+owns generic queue and slot semantics, while
+`orchestration/engine/agent_workers.py` owns retained external-agent thread
+lifecycle. `adapters/codex/` only translates a claimed item to Codex App Server
+RPC/events. A future Claude Code adapter supplies the same thread transport
+contract rather than another lifecycle state machine.
+`agent.agent_parallelism` limits active Codex workers and falls back to
+`agent.site_parallelism` when unset. A batch is an aggregation, report, and
+evidence container, not a global browser lock.
+
+`platform/runtime_host/` serializes raw browser/state operations per site only.
+It must never serialize unrelated sites through a workspace-wide runtime lock.
+Waiting-user, approval, cancellation, and release events are scoped to the
+owning site work item and Codex thread. Provider execution remains a separate
+adapter path.
+
+The work order files remain audit and recovery artifacts, not worker startup
+instructions. A worker must not scan project files to reconstruct scope. After
+it records a phase result that advances the work item, it refreshes the same
+work-item context and continues on its existing Codex thread. A user-blocked
+phase preserves that thread, retained browser, and batch-scoped history view;
+terminal or cancelled site work releases them without clearing durable cache
+artifacts. Runtime records
+only lifecycle, resource-read, tool, cache, and token-usage facts; it does not
+choose context resources or workflow strategy for the worker.
 
 ## Adding a New Tool
 

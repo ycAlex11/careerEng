@@ -12,7 +12,12 @@ from typing import Any
 
 from careereng.evolution.work_items import ActionCardStore
 from careereng.evolution.work_items.schema import ACTION_CARD_CODEX_REVIEW
-from careereng.adapters.external_agents.contracts import is_agent_bridge_reason
+from careereng.adapters.external_agents.contracts import (
+    AGENT_BRIDGE_MODE,
+    CODEX_APP_SERVER_MODE,
+    is_agent_bridge_reason,
+    normalize_execution_mode,
+)
 from careereng.orchestration.engine.fresh_resume import build_fresh_snapshot_resume_plan
 from careereng.config.schema import BrowserBudgetsConfig
 from careereng.career.applications import ApplicationPlanningService
@@ -27,6 +32,7 @@ from careereng.evolution.reports import create_apply_probe_report
 from careereng.evolution.workflow_summary import generate_workflow_evolution_summary
 from careereng.orchestration.engine import ContinuationRegistry, ContinuationRequest
 from careereng.orchestration.engine.runtime_lifecycle import SiteRuntimeLifecycle, is_non_resumable_site_terminal
+from careereng.orchestration.engine.site_work_items import SiteWorkItem, SiteWorkItemScheduler
 from careereng.career.applications.reports import generate_job_batch_report
 from careereng.career.applications.application_store import ApplicationStore
 from careereng.career.applications.job_store import JobStore
@@ -413,7 +419,10 @@ class JobFlow:
 
     def _release_terminal_browser_resources(self, batch: dict[str, Any]) -> None:
         """Release retained browser runtimes after a batch no longer supports resume."""
-        for site_key in (batch.get("sites") or {}):
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        for site_key, site in sites.items():
+            if not isinstance(site, dict) or not is_non_resumable_site_terminal(site):
+                continue
             try:
                 self.runtime_lifecycle.release_site(str(site_key or ""))
             except Exception as exc:
@@ -440,6 +449,14 @@ class JobFlow:
             )
             return
         if released:
+            self.site_tools.site_store.save_browser_session(
+                site_key,
+                {
+                    "pending_action": "",
+                    "agent_bridge_current_phase": "",
+                    "current_step_status": "site_terminal",
+                },
+            )
             self.job_store.append_event(
                 "browser.runtime_released",
                 {"batch_id": batch_id, "site_key": site_key, "scope": "site_terminal"},
@@ -649,6 +666,30 @@ class JobFlow:
                 },
             }
         if status == "blocked":
+            if is_agent_bridge_reason(reason_tag):
+                return {
+                    "site_key": site_key,
+                    "site_name": site_name,
+                    "operation": normalized_operation,
+                    "status": "running",
+                    "reason_tag": reason_tag,
+                    "message": message or "External agent worker owns the current phase.",
+                    "entry_url": entry_url,
+                    "current_phase": current_phase,
+                    "current_url": current_url,
+                    "trace_ref": trace_ref,
+                    "step_count": step_count,
+                    "skill_path": skill_path,
+                    "retrieve": {
+                        "status": "running" if normalized_operation != self.OPERATION_APPLICATION_STATUS_REVIEW else "skipped",
+                        "count": retrieved_count,
+                    },
+                    "apply": {
+                        "status": "pending" if allow_apply and normalized_operation == self.OPERATION_JOB_SEARCH else "skipped",
+                        "attempted": 0,
+                        "submitted": 0,
+                    },
+                }
             return {
                 "site_key": site_key,
                 "site_name": site_name,
@@ -756,7 +797,10 @@ class JobFlow:
             "timeout_ms_override": timeout_ms_override,
         }
         if continuation_context:
-            run_kwargs["continuation_context"] = continuation_context
+            intent_only = set(continuation_context) == {"run_intent"}
+            execution_mode = normalize_execution_mode(str(getattr(self.browser_runner, "execution_mode", "") or ""))
+            if not intent_only or execution_mode in {AGENT_BRIDGE_MODE, CODEX_APP_SERVER_MODE}:
+                run_kwargs["continuation_context"] = continuation_context
         result = self.browser_runner.run_site(**run_kwargs)
         if not self._phase_requires_auth_recovery(result):
             return result
@@ -799,7 +843,10 @@ class JobFlow:
             "timeout_ms_override": timeout_ms_override,
         }
         if continuation_context:
-            recovery_kwargs["continuation_context"] = continuation_context
+            intent_only = set(continuation_context) == {"run_intent"}
+            execution_mode = normalize_execution_mode(str(getattr(self.browser_runner, "execution_mode", "") or ""))
+            if not intent_only or execution_mode in {AGENT_BRIDGE_MODE, CODEX_APP_SERVER_MODE}:
+                recovery_kwargs["continuation_context"] = continuation_context
         return self.browser_runner.run_site(**recovery_kwargs)
 
     def _run_job_rows(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
@@ -1772,6 +1819,44 @@ class JobFlow:
         )
         return self._save_external_phase_completion(batch, site_key=site_key, updated=updated)
 
+    def record_external_phase_progress(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        phase: str,
+        result_status: str,
+        next_phase: str = "",
+        summary: str = "",
+    ) -> dict[str, Any]:
+        """Persist an external agent's declared phase state without strategy."""
+
+        batch = self.job_store.load_batch(batch_id)
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        current = sites.get(site_key)
+        if not isinstance(current, dict):
+            return {"handled": False, "reason": "missing_site", "batch_id": batch_id}
+        normalized_status = str(result_status or "").strip().lower()
+        browser_session = self.site_tools.site_store.load_browser_session(site_key)
+        current_url = str(browser_session.get("last_known_url") or current.get("current_url") or "")
+        updated = {
+            **current,
+            "status": "blocked" if normalized_status == "blocked" else "running",
+            "reason_tag": "external_agent_phase_progress",
+            "message": str(summary or current.get("message") or ""),
+            "current_phase": str(next_phase or phase or current.get("current_phase") or ""),
+            "current_url": current_url,
+        }
+        batch = self.job_store.update_site(batch, site_key, updated)
+        batch["status"] = self._compute_batch_status(batch)
+        batch = self.job_store.save_batch(batch)
+        return {
+            "handled": True,
+            "batch_id": str(batch.get("batch_id") or ""),
+            "batch_status": str(batch.get("status") or ""),
+            "site": dict((batch.get("sites") or {}).get(site_key) or {}),
+        }
+
     def _continue_external_apply_target(
         self,
         *,
@@ -1946,6 +2031,13 @@ class JobFlow:
         batch = self.job_store.update_site(batch, site_key, updated)
         batch["status"] = self._compute_batch_status(batch)
         batch = self.job_store.save_batch(batch)
+        saved_site = (batch.get("sites") or {}).get(site_key)
+        if isinstance(saved_site, dict):
+            self._release_site_if_non_resumable(
+                batch_id=str(batch.get("batch_id") or ""),
+                site_key=site_key,
+                site=saved_site,
+            )
         self._generate_batch_report_if_possible(batch)
         return {
             "handled": True,
@@ -2354,20 +2446,6 @@ class JobFlow:
                         "result": result if isinstance(result, dict) else {},
                     },
                 )
-        begin_history_view = getattr(self.site_tools.site_store, "begin_batch_history_view", None)
-        if callable(begin_history_view):
-            for site_key in ready_site_keys:
-                try:
-                    begin_history_view(site_key, batch_id)
-                except Exception as exc:
-                    self.job_store.append_event(
-                        "history.batch_view.unavailable",
-                        {
-                            "batch_id": batch_id,
-                            "site_key": site_key,
-                            "error": str(exc),
-                        },
-                    )
         return batch
 
     def fail_batch(self, *, batch_id: str, error: str) -> dict[str, Any]:
@@ -2481,6 +2559,12 @@ class JobFlow:
                 turn_id=turn_id,
                 batch_id=batch_id,
                 phase_slugs=phase_slugs,
+                continuation_context={
+                    "run_intent": {
+                        "operation": normalized_operation,
+                        "apply_requested": effective_apply_requested,
+                    },
+                },
             )
             if self._is_batch_cancelled(batch_id):
                 return site_key, self._cancelled_site_row(current)
@@ -2531,13 +2615,26 @@ class JobFlow:
             for site_key, row in (batch.get("sites") or {}).items()
             if site_key in runnable_keys and isinstance(row, dict)
         ]
-        workers = min(self.site_parallelism, max(1, len(runnable_rows)))
         if runnable_rows:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(_job, site_key, row) for site_key, row in runnable_rows]
-                for future in concurrent.futures.as_completed(futures):
-                    site_key, updated = future.result()
-                    _save_site_snapshot(site_key, updated, generate_report=True)
+            scheduler = SiteWorkItemScheduler(worker_limit=self.site_parallelism)
+            for site_key, row in runnable_rows:
+                scheduler.enqueue(SiteWorkItem(site_key=site_key, batch_id=batch_id, payload=row))
+
+            # The scheduler owns generic site slots. The provider remains only the
+            # executor for a claimed item, matching the Codex coordinator contract.
+            while ready := scheduler.claim_ready():
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(ready)) as pool:
+                    futures = {
+                        pool.submit(_job, item.site_key, item.payload): item.site_key
+                        for item in ready
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        site_key = futures[future]
+                        try:
+                            completed_site_key, updated = future.result()
+                            _save_site_snapshot(completed_site_key, updated, generate_report=True)
+                        finally:
+                            scheduler.complete(site_key)
 
         latest_batch = self.job_store.load_batch(batch_id) if batch_id else batch
         if str((latest_batch or {}).get("status") or "") == "cancelled":
@@ -2634,6 +2731,16 @@ class JobFlow:
         )
         return saved
 
+    def cancel_batch(self, *, batch_id: str, reason: str = "user_requested_cancel") -> dict[str, Any]:
+        """Close one batch and release all of its terminal scoped resources."""
+
+        saved = self.job_store.cancel_batch(batch_id, reason=reason)
+        sites = saved.get("sites") if isinstance(saved.get("sites"), dict) else {}
+        for site_key in sites:
+            self.site_tools.site_store.end_batch_history_view(str(saved.get("batch_id") or ""), str(site_key))
+        self._release_terminal_browser_resources(saved)
+        return saved
+
     def _parse_resume_signal(self, message: str) -> tuple[str, str] | None:
         raw = message.strip()
         match = re.match(
@@ -2647,19 +2754,38 @@ class JobFlow:
         decision = match.group(2).strip().lower()
         return site_key, decision
 
-    def handle_resume_message(self, *, session_id: str, message: str, turn_id: str) -> str | None:
-        parsed = self._parse_resume_signal(message)
+    def resolve_resume_site_key(self, *, session_id: str, message: str, site_key: str = "") -> str:
+        """Resolve one resumable site without performing the resume itself."""
+
+        explicit_site_key = str(site_key or "").strip().lower()
+        parsed = (explicit_site_key, "done") if explicit_site_key else self._parse_resume_signal(message)
         if not parsed:
+            return ""
+        resolved_site_key, _decision = parsed
+        batch = self.job_store.latest_open_batch(session_id)
+        if not batch:
+            return ""
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        current = sites.get(resolved_site_key)
+        if not isinstance(current, dict):
+            return ""
+        if (
+            str(current.get("status") or "") not in {"blocked_login", "blocked", "paused"}
+            and not is_agent_bridge_reason(str(current.get("reason_tag") or ""))
+        ):
+            return ""
+        return resolved_site_key
+
+    def handle_resume_message(self, *, session_id: str, message: str, turn_id: str, site_key: str = "") -> str | None:
+        site_key = self.resolve_resume_site_key(session_id=session_id, message=message, site_key=site_key)
+        if not site_key:
             return None
-        site_key, _decision = parsed
         batch = self.job_store.latest_open_batch(session_id)
         if not batch:
             return None
         sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
         current = sites.get(site_key)
         if not isinstance(current, dict):
-            return None
-        if str(current.get("status") or "") not in {"blocked_login", "blocked", "paused"}:
             return None
         if not self.browser_runner:
             replacement = self._disabled_site_row(

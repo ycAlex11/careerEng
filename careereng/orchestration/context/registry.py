@@ -8,7 +8,7 @@ from typing import Any
 
 from careereng.career.profile.store import ProfileStore
 from careereng.career.resume.store import CVStore
-from careereng.utils import parse_front_matter
+from careereng.utils import parse_front_matter, read_json
 
 
 class BrowserContextRegistry:
@@ -19,7 +19,9 @@ class BrowserContextRegistry:
         self.persona_doc: dict[str, Any] = {}
         self.application_profile_doc: dict[str, Any] = {}
         self.cv_text: str = ""
+        self._cv_loaded = False
         self.apply_facts: dict[str, Any] = {}
+        self._source_signature: tuple[tuple[str, int, int], ...] = ()
         self.refresh()
 
     def refresh(self) -> None:
@@ -33,12 +35,63 @@ class BrowserContextRegistry:
         except Exception:
             application_profile = {}
         self.application_profile_doc = application_profile if isinstance(application_profile, dict) else {}
+        # Full CV text is intentionally lazy. Most phases do not need it, and
+        # both provider and external-agent paths must pay the same cost only
+        # when the agent explicitly requests the full_cv resource.
+        self.cv_text = ""
+        self._cv_loaded = False
+        self.apply_facts = self._build_apply_facts(self.persona_doc, self.application_profile_doc)
+        self._source_signature = self._current_source_signature()
+
+    def refresh_if_changed(self) -> bool:
+        """Refresh metadata only when profile/CV artifacts changed on disk."""
+
+        if self._current_source_signature() == self._source_signature:
+            return False
+        self.refresh()
+        return True
+
+    def release_loaded_bundles(self) -> None:
+        """Drop large in-memory resource bodies after their final batch scope ends."""
+
+        self.cv_text = ""
+        self._cv_loaded = False
+
+    def _current_source_signature(self) -> tuple[tuple[str, int, int], ...]:
+        paths = [
+            self.workspace / "profile" / "profile.md",
+            self.workspace / "profile" / "application_profile.md",
+            self.cv_store.metadata_path,
+        ]
+        metadata = read_json(self.cv_store.metadata_path)
+        active_name = str(metadata.get("active_file") or "") if isinstance(metadata, dict) else ""
+        if active_name:
+            paths.append(self.cv_store.current_dir / active_name)
+        signature: list[tuple[str, int, int]] = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            signature.append((str(path), int(stat.st_mtime_ns), int(stat.st_size)))
+        return tuple(signature)
+
+    def _load_cv_text(self) -> str:
+        if self._cv_loaded:
+            return self.cv_text
         try:
             cv_text = self.cv_store.load_current_text()
         except Exception:
             cv_text = ""
         self.cv_text = str(cv_text or "").strip()
-        self.apply_facts = self._build_apply_facts(self.persona_doc, self.application_profile_doc)
+        self._cv_loaded = True
+        return self.cv_text
+
+    def _has_current_cv(self) -> bool:
+        try:
+            return bool(self.cv_store.has_current_text())
+        except Exception:
+            return False
 
     def _load_application_profile(self) -> dict[str, Any]:
         path = self.workspace / "profile" / "application_profile.md"
@@ -90,7 +143,9 @@ class BrowserContextRegistry:
         bundles: list[str] = []
         if self.apply_facts:
             bundles.append("apply_facts")
-        if self.cv_text:
+        if self._cv_loaded and self.cv_text:
+            bundles.append("full_cv")
+        elif self._has_current_cv():
             bundles.append("full_cv")
         if self.persona_doc:
             bundles.append("full_persona")
@@ -107,7 +162,7 @@ class BrowserContextRegistry:
                 + json.dumps(self.apply_facts, ensure_ascii=False, indent=2)
             )
         if normalized == "full_cv":
-            return f"Full CV text (requested bundle `full_cv`):\n{self.cv_text}"
+            return f"Full CV text (requested bundle `full_cv`):\n{self._load_cv_text()}"
         if normalized == "full_persona":
             return (
                 "Full persona profile data (requested bundle `full_persona`):\n"

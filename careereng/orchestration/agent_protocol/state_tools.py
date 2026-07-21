@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from careereng.platform.cache import CACHE_KINDS
+
 
 PHASE_RESULT_TOOL = "phase_result"
 RECORD_JOBS_TOOL = "record_jobs"
@@ -17,6 +19,10 @@ UPDATE_JOBS_TOOL = "update_jobs"
 RECORD_APPLICATION_REVIEWS_TOOL = "record_application_reviews"
 REQUEST_CONTEXT_TOOL = "request_context"
 UPDATE_PHASE_MEMORY_TOOL = "update_phase_memory"
+CACHE_LOOKUP_TOOL = "cache_lookup"
+CACHE_READ_TOOL = "cache_read"
+CACHE_PROPOSE_TOOL = "cache_propose"
+CACHE_VALIDATE_TOOL = "cache_validate"
 
 STATE_TOOL_NAMES = {
     PHASE_RESULT_TOOL,
@@ -25,7 +31,13 @@ STATE_TOOL_NAMES = {
     RECORD_APPLICATION_REVIEWS_TOOL,
     REQUEST_CONTEXT_TOOL,
     UPDATE_PHASE_MEMORY_TOOL,
+    CACHE_LOOKUP_TOOL,
+    CACHE_READ_TOOL,
+    CACHE_PROPOSE_TOOL,
+    CACHE_VALIDATE_TOOL,
 }
+
+CACHE_TOOL_PHASES = frozenset({"channel_discovery", "job_retrieval", "job_filtering", "apply"})
 
 
 def normalize_tool_name(value: str) -> str:
@@ -256,6 +268,87 @@ def update_phase_memory_tool_schema() -> dict[str, Any]:
     }
 
 
+def cache_lookup_tool_schema() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": CACHE_LOOKUP_TOOL,
+        "description": (
+            "Find compatible reusable cache candidates for the current site and phase. "
+            "Use a live-page fingerprint when the current page has been observed."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "page_fingerprint": {"type": "string"},
+                "kinds": {"type": "array", "items": {"type": "string", "enum": sorted(CACHE_KINDS)}},
+            },
+            "required": ["page_fingerprint", "kinds"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def cache_read_tool_schema() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": CACHE_READ_TOOL,
+        "description": "Read the full content of one compatible cache candidate after deciding it may help this live phase.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cache_id": {"type": "string"},
+                "page_fingerprint": {"type": "string"},
+            },
+            "required": ["cache_id", "page_fingerprint"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def cache_propose_tool_schema() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": CACHE_PROPOSE_TOOL,
+        "description": (
+            "Propose a reusable cache candidate from verified current evidence. This creates a candidate only; "
+            "it does not change Skills or decide that the cache is valid for future pages."
+        ),
+        "strict": False,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": sorted(CACHE_KINDS)},
+                "page_fingerprint": {"type": "string"},
+                "dependency_keys": {"type": "array", "items": {"type": "string"}},
+                "summary": {"type": "string"},
+                "source_refs": {"type": "array", "items": {"type": "string"}},
+                "content": {"type": "object", "additionalProperties": True},
+            },
+            "required": ["kind", "page_fingerprint", "content"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def cache_validate_tool_schema() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": CACHE_VALIDATE_TOOL,
+        "description": "Record whether an existing cache candidate was validated, stale, or retired by current live evidence.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cache_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["validated", "stale", "retired"]},
+                "summary": {"type": "string"},
+            },
+            "required": ["cache_id", "status", "summary"],
+            "additionalProperties": False,
+        },
+    }
 @dataclass(frozen=True)
 class StateToolSpec:
     """One static CareerEng tool and the phases where it is available."""
@@ -301,6 +394,10 @@ DEFAULT_STATE_TOOL_REGISTRY = StateToolRegistry(
     (
         StateToolSpec(PHASE_RESULT_TOOL, phase_result_tool_schema),
         StateToolSpec(UPDATE_PHASE_MEMORY_TOOL, update_phase_memory_tool_schema, always_available=True),
+        StateToolSpec(CACHE_LOOKUP_TOOL, cache_lookup_tool_schema, CACHE_TOOL_PHASES),
+        StateToolSpec(CACHE_READ_TOOL, cache_read_tool_schema, CACHE_TOOL_PHASES),
+        StateToolSpec(CACHE_PROPOSE_TOOL, cache_propose_tool_schema, CACHE_TOOL_PHASES),
+        StateToolSpec(CACHE_VALIDATE_TOOL, cache_validate_tool_schema, CACHE_TOOL_PHASES),
         StateToolSpec(
             RECORD_APPLICATION_REVIEWS_TOOL,
             record_application_reviews_tool_schema,

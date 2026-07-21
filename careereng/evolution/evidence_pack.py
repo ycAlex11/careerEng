@@ -65,6 +65,12 @@ def build_solution_evidence_pack(
         site_row=(batch_state.get("sites") or {}).get(site_key) if isinstance(batch_state.get("sites"), dict) else {},
         failure_snapshot=failure_snapshot,
     )
+    cache_events = _cache_events(
+        workspace_path=workspace_path,
+        site_key=site_key,
+        phase=phase,
+        batch_id=batch_id,
+    )
 
     payload = {
         "pack_id": f"solution_evidence_pack:{run_payload.get('run_id') or ''}",
@@ -91,6 +97,7 @@ def build_solution_evidence_pack(
         },
         "failure_snapshot": failure_snapshot,
         "trace_excerpts": [_trace_excerpt(workspace_path=workspace_path, ref=ref) for ref in trace_refs],
+        "cache_events": cache_events,
         "skill_sections": _skill_sections(
             project_root=root,
             target_ref=target_ref,
@@ -128,6 +135,7 @@ def build_solution_evidence_pack(
         run_rows_total=len(run_rows),
         failure_examples=len(selected_rows),
         trace_refs=trace_refs,
+        cache_events=cache_events,
     )
 
     json_path = run_path / "evidence_pack.json"
@@ -223,6 +231,7 @@ def render_solution_evidence_pack_markdown(payload: dict[str, Any]) -> str:
             lines.append("")
             lines.append(_json_block(trace.get("events")))
             lines.append("")
+    lines.extend(["## Cache Validation Events", "", _json_block(payload.get("cache_events")), ""])
     lines.extend(["", "## Relevant Skill Sections", ""])
     skill_sections = payload.get("skill_sections") if isinstance(payload.get("skill_sections"), list) else []
     if not skill_sections:
@@ -451,6 +460,35 @@ def _trace_excerpt(*, workspace_path: Path, ref: str) -> dict[str, Any]:
             }
         )
     return {"ref": ref, "path": str(path), "status": "found", "event_count": len(rows), "events": events}
+
+
+def _cache_events(*, workspace_path: Path, site_key: str, phase: str, batch_id: str) -> dict[str, Any]:
+    """Expose structurally related cache events for LLM evidence selection."""
+
+    path = workspace_path / "cache" / "events.jsonl"
+    if not path.exists():
+        return {"path": str(path), "status": "missing", "events": []}
+    rows = JSONLStore(path).read_all()
+    selected: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if site_key and str(row.get("site_key") or "") != site_key:
+            continue
+        if phase and str(row.get("phase") or "") != phase:
+            continue
+        if batch_id and str(row.get("batch_id") or "") != batch_id:
+            continue
+        selected.append(
+            {
+                "ts": str(row.get("ts") or ""),
+                "action": str(row.get("action") or ""),
+                "cache_id": str(row.get("cache_id") or ""),
+                "page_fingerprint": str(row.get("page_fingerprint") or ""),
+                "payload": _compact_json_value(row.get("payload")),
+            }
+        )
+    return {"path": str(path), "status": "found", "event_count": len(selected), "events": selected[-30:]}
 
 
 def _resolve_workspace_path(workspace_path: Path, ref: str) -> Path:
@@ -759,6 +797,8 @@ def _source_paths(
         "accepted_browser_control_lessons": str(workspace_path / "evolution" / "browser_control" / "lessons.jsonl"),
         "evolution_memory_units": str(workspace_path / "evolution" / "memory" / "units.jsonl"),
         "action_cards_index": str(workspace_path / "action_cards" / "index.jsonl"),
+        "cache_index": str(workspace_path / "cache" / "index.jsonl"),
+        "cache_events": str(workspace_path / "cache" / "events.jsonl"),
         "trace_refs": trace_refs,
     }
 
@@ -770,6 +810,7 @@ def _evidence_index(
     run_rows_total: int,
     failure_examples: int,
     trace_refs: list[str],
+    cache_events: dict[str, Any],
 ) -> dict[str, Any]:
     related_specs = strategy.get("related_specs") if isinstance(strategy.get("related_specs"), list) else []
     router = strategy.get("router") if isinstance(strategy.get("router"), dict) else {}
@@ -786,6 +827,7 @@ def _evidence_index(
             "run_rows_total": int(run_rows_total or 0),
             "failure_examples_in_starter_excerpt": int(failure_examples or 0),
             "trace_refs_indexed": len(trace_refs),
+            "cache_events_in_starter_excerpt": int(cache_events.get("event_count") or 0),
         },
         "data_sources": [
             {"name": name, "path": value}

@@ -10,7 +10,9 @@ from careereng.platform.runtime_host.service import (
     DEFAULT_RUNTIME_HOST_REQUEST_TIMEOUT_SECONDS,
     RuntimeHostService,
     WorkspaceManager,
+    cancel_manager_jobs_batch,
     call_agent_bridge_browser_tool,
+    run_agent_bridge_browser_sequence,
     call_agent_bridge_state_tool,
     call_browser_handoff_tool,
     dispatch_manager_message,
@@ -59,10 +61,10 @@ def start_manager_jobs_batch(*, project_root, workspace, session_id: str, messag
     )
 
 
-def fresh_snapshot_resume(*, project_root, workspace, session_id: str, message: str, turn_id: str = ""):
+def fresh_snapshot_resume(*, project_root, workspace, session_id: str, message: str, turn_id: str = "", site_key: str = ""):
     return _legacy_client(project_root=project_root, workspace=workspace).request(
         "fresh_snapshot_resume",
-        {"session_id": session_id, "message": message, "turn_id": turn_id},
+        {"session_id": session_id, "message": message, "turn_id": turn_id, "site_key": site_key},
     )
 
 
@@ -84,6 +86,13 @@ def call_agent_bridge_browser_tool(*, project_root, workspace, site_key: str, to
     return _legacy_client(project_root=project_root, workspace=workspace).request(
         "agent_bridge_browser_call_tool",
         {"site_key": site_key, "tool_name": tool_name, "arguments": arguments or {}, "turn_id": turn_id, "phase": phase},
+    )
+
+
+def run_agent_bridge_browser_sequence(*, project_root, workspace, site_key: str, steps: list[dict], turn_id: str = "", phase: str = "agent_bridge"):
+    return _legacy_client(project_root=project_root, workspace=workspace).request(
+        "agent_bridge_browser_run_sequence",
+        {"site_key": site_key, "steps": steps, "turn_id": turn_id, "phase": phase},
     )
 
 
@@ -129,7 +138,9 @@ __all__ = [
     "DEFAULT_RUNTIME_HOST_REQUEST_TIMEOUT_SECONDS",
     "RuntimeHostService",
     "WorkspaceManager",
+    "cancel_manager_jobs_batch",
     "call_agent_bridge_browser_tool",
+    "run_agent_bridge_browser_sequence",
     "call_agent_bridge_state_tool",
     "call_browser_handoff_tool",
     "dispatch_manager_message",

@@ -154,6 +154,36 @@ class JobStore:
             record_interrupted_batches(workspace=self.workspace, batches=cleared, reason_tag=f"batch_{status}")
         return cleared
 
+    def cancel_batch(self, batch_id: str, *, reason: str = "user_requested_cancel") -> dict[str, Any]:
+        """Cancel one open batch without touching unrelated site work."""
+
+        payload = self.load_batch(str(batch_id or ""))
+        if not payload:
+            raise FileNotFoundError(f"job batch not found: {batch_id}")
+        if str(payload.get("status") or "") in TERMINAL_BATCH_STATUSES:
+            return payload
+        payload = dict(payload)
+        payload["status"] = "cancelled"
+        payload["closed_at"] = now_iso()
+        payload = self._mark_running_site_state_cancelled(payload, status="cancelled")
+        sites = payload.get("sites") if isinstance(payload.get("sites"), dict) else {}
+        for site_key, site in sites.items():
+            if not isinstance(site, dict):
+                continue
+            if str(site.get("status") or "") in {"completed", "cancelled"}:
+                continue
+            updated = dict(site)
+            updated["status"] = "cancelled"
+            updated["message"] = "Cancelled by user."
+            sites[site_key] = updated
+        saved = self.save_batch(payload)
+        self.append_event(
+            "batch.cancelled",
+            {"batch_id": str(saved.get("batch_id") or ""), "reason": str(reason or "user_requested_cancel")},
+        )
+        record_interrupted_batches(workspace=self.workspace, batches=[saved], reason_tag="batch_cancelled")
+        return saved
+
     def update_site(self, batch: dict[str, Any], site_key: str, patch: dict[str, Any]) -> dict[str, Any]:
         batch = dict(batch or {})
         sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}

@@ -17,6 +17,7 @@ from careereng.config.schema import (
     BrowserRetrievalPolicyConfig,
     SameUrlNoProgressGuardConfig,
     EvolutionApplyProbeConfig,
+    EvolutionBatchReviewConfig,
     EvolutionConfig,
     PathsConfig,
     ProviderConfig,
@@ -44,6 +45,7 @@ max_history_messages = 50
 related_history_k = 6
 relatedness_threshold = 0.7
 site_parallelism = 2
+agent_parallelism = 0
 router_confidence_threshold = 0.75
 router_log_enabled = true
 search_company_top_k = 10
@@ -52,6 +54,7 @@ search_company_top_k = 10
 # provider: use the configured browser LLM API.
 # agent_bridge: keep CareerEng's Playwright MCP runtime and let an external agent such as Codex drive it.
 # codex_handoff is kept as a legacy alias for agent_bridge.
+# codex_app_server creates a Codex worker thread per active site work item.
 execution_mode = "provider"
 headless = false
 keep_open = false
@@ -114,6 +117,9 @@ sleep_seconds = 2.0
 [evolution.apply_probe]
 max_attempted = 8
 unsuccessful_threshold = 5
+
+[evolution.batch_review]
+site_run_threshold = 5
 
 [retrieval.stop_policy]
 history_stop_success_ratio = 0.4
@@ -313,6 +319,7 @@ def load_config(project_root: Path) -> AppConfig:
     recovery_keys = set(asdict(BrowserRecoveryConfig()).keys())
     retrieval_policy_keys = set(asdict(BrowserRetrievalPolicyConfig()).keys())
     apply_probe_keys = set(asdict(EvolutionApplyProbeConfig()).keys())
+    batch_review_keys = set(asdict(EvolutionBatchReviewConfig()).keys())
     stop_policy_keys = set(asdict(RetrievalStopPolicyConfig()).keys())
     loaded_apply_probe_config = False
     loaded_retrieval_stop_policy_config = False
@@ -389,6 +396,11 @@ def load_config(project_root: Path) -> AppConfig:
                 for key, value in apply_probe.items():
                     if key in apply_probe_keys:
                         payload["evolution"]["apply_probe"][key] = value
+            batch_review = evolution.get("batch_review")
+            if isinstance(batch_review, dict):
+                for key, value in batch_review.items():
+                    if key in batch_review_keys:
+                        payload["evolution"]["batch_review"][key] = value
 
         retrieval = loaded.get("retrieval")
         if isinstance(retrieval, dict):
@@ -427,6 +439,7 @@ def load_config(project_root: Path) -> AppConfig:
     browser_retrieval_policy_payload = browser_payload.pop("retrieval_policy", {})
     evolution_payload = dict(payload["evolution"])
     evolution_apply_probe_payload = dict(evolution_payload.get("apply_probe") or {})
+    evolution_batch_review_payload = dict(evolution_payload.get("batch_review") or {})
     retrieval_payload = dict(payload["retrieval"])
     retrieval_stop_policy_payload = dict(retrieval_payload.get("stop_policy") or {})
 
@@ -477,7 +490,10 @@ def load_config(project_root: Path) -> AppConfig:
             recovery=BrowserRecoveryConfig(**browser_recovery_payload),
             retrieval_policy=BrowserRetrievalPolicyConfig(**browser_retrieval_policy_payload),
         ),
-        evolution=EvolutionConfig(apply_probe=EvolutionApplyProbeConfig(**evolution_apply_probe_payload)),
+        evolution=EvolutionConfig(
+            apply_probe=EvolutionApplyProbeConfig(**evolution_apply_probe_payload),
+            batch_review=EvolutionBatchReviewConfig(**evolution_batch_review_payload),
+        ),
         retrieval=RetrievalConfig(stop_policy=RetrievalStopPolicyConfig(**retrieval_stop_policy_payload)),
         paths=PathsConfig(**payload["paths"]),
         providers=ProvidersConfig(

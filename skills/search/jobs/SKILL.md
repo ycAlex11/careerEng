@@ -25,6 +25,7 @@ apply_candidate_policy:
 
 - Retrieve jobs page by page from the current live results surface.
 - Record the full current page before any pagination stop decision.
+- If a real next-page, page-number, `Show more`, or `Load more` control is available after the first results page, inspect and record one confirmation page before history coverage, date-window, or other retrieval-stop rules may finish retrieval. Do not finish retrieval from the first page solely because it matches local history.
 - Interpret the structured `posted_window_days` policy as a strict upper bound: within `30` days means posted age `0-29`; `30 days`, `30+ days`, or older is outside the apply-candidate window.
 - When a site exposes relative posting age such as `Posted 13 Days Ago`, record the exact visible label and treat it as an observation made at the current run time; future runs should recompute the current posting age from the observation time instead of assuming the old label is still current.
 - When a site exposes an absolute posting date, record the absolute date and still preserve the visible label when available.
@@ -177,7 +178,7 @@ If the site groups applications into `active`, `inactive`, or similar sections, 
 
 The default workflow is: open the site's own submitted-application surface, read visible application records, record their current status, then finish this phase.
 
-If the current site skill defines a more specific `Application Status Review` workflow, entry point, grouping rule, or status interpretation, use the site skill first.
+Site skills may define the entry point, native labels, and status mapping for this workflow. They must not omit a reachable active/current or inactive/historical area required by this project policy.
 
 This phase is read-only. Do not submit, edit, withdraw, or modify any application.
 
@@ -188,6 +189,8 @@ For sites with application tabs, sections, filters, or grouped areas such as `Ac
 - After an area has been inspected, mark it mentally complete and do not open it again.
 - Do not switch between already-inspected areas to verify progress.
 - Pagination belongs to the current area only; do not use another area as a continuation signal.
+
+When both a current/realtime area and a historical/inactive area are reachable, inspect each area once before the review phase can finish. A site skill may map its native tab names to these two areas, but cannot mark either one optional.
 
 Record only applications inside the review window.
 

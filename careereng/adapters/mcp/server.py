@@ -15,6 +15,7 @@ from mcp.server.fastmcp import FastMCP
 
 from careereng.adapters.bootstrap import project_root_from_cwd, workspace_path as resolve_workspace_path
 from careereng.adapters.external_agents.work_orders import load_active_phase_context
+from careereng.orchestration.agent_protocol.work_items import build_work_item_context, read_work_item_resource, work_item_id_from_payload
 from careereng.adapters.external_agents.contracts import AGENT_BRIDGE_PROTOCOL_VERSION
 from careereng.orchestration.agent_protocol.runtime_lifecycle import release_site_payload
 from careereng.career.applications.job_store import JobStore, TERMINAL_BATCH_STATUSES
@@ -146,6 +147,55 @@ def _with_phase_contexts(payload: dict[str, Any], contexts: list[dict[str, Any]]
     return enriched
 
 
+def _active_work_item_payload(runtime: CareerEngMCPRuntime, work_item_id: str) -> dict[str, Any]:
+    """Resolve an active persisted work item without exposing its file path."""
+
+    requested = str(work_item_id or "").strip()
+    if not requested:
+        raise ValueError("work_item_id is required")
+    for site in runtime.site_store().list_sites(status="active"):
+        site_key = str(site.get("site_key") or site.get("site_id") or "").strip()
+        if not site_key:
+            continue
+        session = runtime.site_store().load_browser_session(site_key)
+        payload_path = Path(str(session.get("agent_bridge_payload_path") or ""))
+        if not payload_path.is_file():
+            continue
+        from careereng.utils import read_json
+
+        payload = read_json(payload_path)
+        if isinstance(payload, dict) and work_item_id_from_payload(payload) == requested:
+            return payload
+    raise ValueError("active work item was not found")
+
+
+def _active_work_item_scope(runtime: CareerEngMCPRuntime, work_item_id: str) -> dict[str, Any]:
+    """Resolve the immutable execution scope for one active worker item."""
+
+    payload = _active_work_item_payload(runtime, work_item_id)
+    context = build_work_item_context(payload)
+    scope = context.get("scope") if isinstance(context.get("scope"), dict) else {}
+    site_key = str(scope.get("site_key") or "").strip()
+    batch_id = str(scope.get("batch_id") or "").strip()
+    phase = str((context.get("objective") or {}).get("phase") or "").strip()
+    if not site_key or not batch_id or not phase:
+        raise ValueError("active work item has incomplete execution scope")
+    batch = runtime.job_store().load_batch(batch_id)
+    if str(batch.get("status") or "") in TERMINAL_BATCH_STATUSES:
+        raise ValueError("work item batch is terminal")
+    sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+    site = sites.get(site_key) if isinstance(sites.get(site_key), dict) else {}
+    if not site:
+        raise ValueError("work item site is not active in its batch")
+    return {
+        "work_item_id": str(context.get("work_item_id") or ""),
+        "site_key": site_key,
+        "batch_id": batch_id,
+        "phase": phase,
+        "turn_id": str(scope.get("turn_id") or ""),
+    }
+
+
 def _wait_for_phase_contexts(
     *,
     runtime: CareerEngMCPRuntime,
@@ -223,6 +273,80 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         }, _active_phase_contexts(site_store=site_store, batch=batch, site_key=site_key))
 
     @server.tool()
+    def careereng_get_work_item_context(work_item_id: str) -> dict[str, Any]:
+        """Return a bounded work-item scope, context catalog, and MCP capabilities."""
+        try:
+            payload = _active_work_item_payload(runtime, work_item_id)
+            context = build_work_item_context(payload)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        from careereng.platform.observability import PerformanceRecorder
+
+        PerformanceRecorder(runtime.workspace).record(
+            backend="external_agent",
+            operation="work_item_context",
+            site_key=str(context.get("scope", {}).get("site_key") or ""),
+            batch_id=str(context.get("scope", {}).get("batch_id") or ""),
+            phase=str(context.get("objective", {}).get("phase") or ""),
+            status="ok",
+            context_catalog_size=len(context.get("context_catalog") or []),
+        )
+        return {"ok": True, **context}
+
+    @server.tool()
+    def careereng_read_work_item_resource(work_item_id: str, resource_id: str) -> dict[str, Any]:
+        """Read one scoped context resource selected by a CareerEng worker."""
+        try:
+            payload = _active_work_item_payload(runtime, work_item_id)
+            context = build_work_item_context(payload)
+            requested = str(resource_id or "").strip()
+            catalog_ids = {
+                str(row.get("resource_id") or "")
+                for row in context.get("context_catalog") or []
+                if isinstance(row, dict)
+            }
+            if requested not in catalog_ids:
+                raise ValueError(f"work-item resource is not available: {requested or '<missing>'}")
+            if requested in {"apply_facts", "full_cv", "full_persona", "history_view"}:
+                scope = _active_work_item_scope(runtime, work_item_id)
+                response = runtime.host_client().request(
+                    "agent_bridge_read_context_resource",
+                    {
+                        "site_key": scope["site_key"],
+                        "resource_id": requested,
+                        "phase": scope["phase"],
+                    },
+                )
+                if not response.get("ok"):
+                    return {"ok": False, "error": str(response.get("error") or "context resource unavailable")}
+                resource_result = response.get("result") if isinstance(response.get("result"), dict) else {}
+                value = resource_result.get("content") if isinstance(resource_result.get("content"), list) else resource_result
+                resource = {
+                    "work_item_id": scope["work_item_id"],
+                    "resource_id": requested,
+                    "value": value,
+                    "result": resource_result,
+                }
+            else:
+                resource = read_work_item_resource(payload, requested)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        from careereng.platform.observability import PerformanceRecorder
+
+        value = resource.get("value")
+        PerformanceRecorder(runtime.workspace).record(
+            backend="external_agent",
+            operation="work_item_resource_read",
+            site_key=str(context.get("scope", {}).get("site_key") or ""),
+            batch_id=str(context.get("scope", {}).get("batch_id") or ""),
+            phase=str(context.get("objective", {}).get("phase") or ""),
+            status="ok",
+            resource_id=str(resource.get("resource_id") or ""),
+            resource_bytes=len(str(value).encode("utf-8")),
+        )
+        return {"ok": True, **resource}
+
+    @server.tool()
     def careereng_get_batch_status(
         batch_id: str = "latest",
         session_id: str = DEFAULT_SESSION_ID,
@@ -272,6 +396,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 "session_id": session_id,
                 "message": resume_message,
                 "turn_id": make_id("turn"),
+                "site_key": site_key,
             },
         )
 
@@ -281,6 +406,14 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         return runtime.host_client().request(
             "pause_jobs_batch",
             {"batch_id": batch_id, "site_key": site_key},
+        )
+
+    @server.tool()
+    def careereng_cancel_jobs_batch(batch_id: str, reason: str = "user_requested_cancel") -> dict[str, Any]:
+        """Cancel exactly one active batch and release only its site runtimes."""
+        return runtime.host_client().request(
+            "cancel_jobs_batch",
+            {"batch_id": batch_id, "reason": reason},
         )
 
     @server.tool()
@@ -313,6 +446,24 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 "site_key": site_key,
                 "tool_name": tool_name,
                 "arguments": arguments or {},
+                "turn_id": turn_id,
+                "phase": phase,
+            },
+        )
+
+    @server.tool()
+    def careereng_run_browser_sequence(
+        site_key: str,
+        steps: list[dict[str, Any]],
+        phase: str = "external-agent-bridge",
+        turn_id: str = "",
+    ) -> dict[str, Any]:
+        """Execute explicit ordered browser actions through the retained site runtime."""
+        return runtime.host_client().request(
+            "agent_bridge_browser_run_sequence",
+            {
+                "site_key": site_key,
+                "steps": steps,
                 "turn_id": turn_id,
                 "phase": phase,
             },
@@ -364,6 +515,112 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 "turn_id": turn_id,
                 "phase": phase,
             },
+        )
+
+    @server.tool()
+    def careereng_work_item_list_browser_tools(work_item_id: str) -> dict[str, Any]:
+        """List browser tools available only inside one active worker scope."""
+        try:
+            scope = _active_work_item_scope(runtime, work_item_id)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        result = runtime.host_client().request(
+            "agent_bridge_browser_list_tools",
+            {"site_key": scope["site_key"]},
+        )
+        return {**result, "work_item_id": scope["work_item_id"]}
+
+    @server.tool()
+    def careereng_work_item_call_browser_tool(
+        work_item_id: str,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Call one browser tool inside the immutable scope of a worker item."""
+        try:
+            scope = _active_work_item_scope(runtime, work_item_id)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        result = runtime.host_client().request(
+            "agent_bridge_browser_call_tool",
+            {
+                "site_key": scope["site_key"],
+                "tool_name": tool_name,
+                "arguments": arguments or {},
+                "turn_id": scope["turn_id"],
+                "phase": scope["phase"],
+            },
+        )
+        return {**result, "work_item_id": scope["work_item_id"]}
+
+    @server.tool()
+    def careereng_work_item_run_browser_sequence(
+        work_item_id: str,
+        steps: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Run explicit browser steps only inside the immutable worker scope."""
+        try:
+            scope = _active_work_item_scope(runtime, work_item_id)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        result = runtime.host_client().request(
+            "agent_bridge_browser_run_sequence",
+            {
+                "site_key": scope["site_key"],
+                "steps": steps,
+                "turn_id": scope["turn_id"],
+                "phase": scope["phase"],
+            },
+        )
+        return {**result, "work_item_id": scope["work_item_id"]}
+
+    @server.tool()
+    def careereng_work_item_list_state_tools(work_item_id: str) -> dict[str, Any]:
+        """List state tools available only for the current work-item phase."""
+        try:
+            scope = _active_work_item_scope(runtime, work_item_id)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        result = runtime.host_client().request(
+            "agent_bridge_state_list_tools",
+            {"site_key": scope["site_key"], "phase": scope["phase"]},
+        )
+        return {**result, "work_item_id": scope["work_item_id"]}
+
+    @server.tool()
+    def careereng_work_item_call_state_tool(
+        work_item_id: str,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Call a state tool only inside the immutable worker scope."""
+        try:
+            scope = _active_work_item_scope(runtime, work_item_id)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        result = runtime.host_client().request(
+            "agent_bridge_state_call_tool",
+            {
+                "site_key": scope["site_key"],
+                "tool_name": tool_name,
+                "arguments": arguments or {},
+                "turn_id": scope["turn_id"],
+                "phase": scope["phase"],
+            },
+        )
+        return {**result, "work_item_id": scope["work_item_id"]}
+
+    @server.tool()
+    def careereng_work_item_phase_result(
+        work_item_id: str,
+        status: Literal["done", "blocked"],
+        summary: str,
+    ) -> dict[str, Any]:
+        """Write the terminal result of exactly one active worker phase."""
+        return careereng_work_item_call_state_tool(
+            work_item_id=work_item_id,
+            tool_name="phase_result",
+            arguments={"status": status, "summary": summary},
         )
 
     return server

@@ -444,6 +444,18 @@ def batch_clear(session: str = typer.Option("", "--session", "-s", help="Optiona
         typer.echo(f"{row.get('batch_id')}\t{row.get('session_id')}\t{row.get('status')}")
 
 
+@application_cli_app.command("batch-cancel")
+def batch_cancel(batch: str = typer.Option(..., "--batch", help="Exact job batch ID to cancel")) -> None:
+    """Cancel one batch without clearing other open batches."""
+    response = runtime_host_client(
+        project_root=_project_root(), workspace=_workspace_path(), autostart=False
+    ).request("cancel_jobs_batch", {"batch_id": batch, "reason": "cli_batch_cancel"})
+    if not bool(response.get("ok")):
+        raise typer.BadParameter(str(response.get("error") or "batch cancellation failed"))
+    saved = response.get("batch") if isinstance(response.get("batch"), dict) else {}
+    typer.echo(f"batch={saved.get('batch_id') or batch} status={saved.get('status') or 'cancelled'}")
+
+
 @application_cli_app.command("batch-stop")
 def batch_stop(session: str = typer.Option("", "--session", "-s", help="Optional session ID filter")) -> None:
     """Cancel open batches and request a clean runtime-host shutdown."""

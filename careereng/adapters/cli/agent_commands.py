@@ -12,6 +12,7 @@ from careereng.adapters.assistant_bridge.context import build_assistant_context_
 from careereng.adapters.assistant_bridge.intake_state import save_recent_intake_state
 from careereng.adapters.host.workspace_manager import (
     call_agent_bridge_browser_tool,
+    run_agent_bridge_browser_sequence,
     call_agent_bridge_state_tool,
     call_browser_handoff_tool,
     list_agent_bridge_browser_tools,
@@ -211,6 +212,16 @@ def _json_args(value: str) -> dict:
     return parsed
 
 
+def _json_steps(value: str) -> list[dict]:
+    try:
+        parsed = json.loads(value or "[]")
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"--steps must be a JSON array: {exc}") from exc
+    if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
+        raise typer.BadParameter("--steps must be a JSON array of objects")
+    return parsed
+
+
 def _emit_tools(
     *,
     site: str,
@@ -264,6 +275,32 @@ def agent_bridge_browser_tools(site: str = typer.Option(..., "--site"), json_out
 @agent_bridge_app.command("browser-call")
 def agent_bridge_browser_call(site: str = typer.Option(..., "--site"), tool: str = typer.Option(..., "--tool"), args: str = typer.Option("{}", "--args"), phase: str = typer.Option(AGENT_BRIDGE_STATUS, "--phase"), turn: str = typer.Option("", "--turn"), json_output: bool = typer.Option(False, "--json")) -> None:
     _emit_call(site=site, tool=tool, args=args, phase=phase, turn=turn, json_output=json_output)
+
+
+@agent_bridge_app.command("browser-sequence")
+def agent_bridge_browser_sequence(
+    site: str = typer.Option(..., "--site"),
+    steps: str = typer.Option(..., "--steps"),
+    phase: str = typer.Option(AGENT_BRIDGE_STATUS, "--phase"),
+    turn: str = typer.Option("", "--turn"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Execute explicit browser actions in order through the retained site runtime."""
+    response = run_agent_bridge_browser_sequence(
+        project_root=_project_root(),
+        workspace=_workspace_path(),
+        site_key=site,
+        steps=_json_steps(steps),
+        turn_id=turn,
+        phase=phase,
+    )
+    if json_output:
+        _emit(response)
+        return
+    result = response.get("result") if isinstance(response.get("result"), dict) else {}
+    typer.echo(f"site={response.get('site_key') or site} tool=browser_sequence status={'ok' if result.get('ok') else 'error'} trace={result.get('trace_ref') or ''}")
+    if result.get("summary"):
+        typer.echo(str(result["summary"]))
 
 
 @agent_bridge_app.command("state-tools")

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
+
+from careereng.platform.cache import CacheArtifactError, CacheArtifactStore
 
 from careereng.orchestration.agent_protocol.state_tools import (
     PHASE_RESULT_TOOL,
@@ -12,6 +15,10 @@ from careereng.orchestration.agent_protocol.state_tools import (
     REQUEST_CONTEXT_TOOL,
     UPDATE_JOBS_TOOL,
     UPDATE_PHASE_MEMORY_TOOL,
+    CACHE_LOOKUP_TOOL,
+    CACHE_READ_TOOL,
+    CACHE_PROPOSE_TOOL,
+    CACHE_VALIDATE_TOOL,
     normalize_tool_name,
     phase_result_tool_schema,
     record_application_reviews_tool_schema,
@@ -23,6 +30,10 @@ from careereng.orchestration.agent_protocol.state_tools import (
     update_phase_memory_tool_schema,
 )
 from careereng.orchestration.agent_protocol.results import phase_result_payload
+from careereng.orchestration.engine.phase_orchestration import (
+    phase_completion_gate,
+    record_retrieval_history_evidence,
+)
 
 
 @dataclass
@@ -33,11 +44,15 @@ class PhaseStateToolContext:
     turn_id: str = ""
     batch_id: str = ""
     current_url: str = ""
+    phase_slug: str = ""
     context_session: Any | None = None
     phase_memory: Any | None = None
     persist_phase_memory: Callable[[Any], None] | None = None
     retrieval_history_stop_success_ratio: float = 0.4
     retrieval_history_stop_min_page_jobs: int = 10
+    workspace: Path | str | None = None
+    cache_scope: dict[str, Any] | None = None
+    cache_dependency_versions: dict[str, Any] | None = None
 
 
 
@@ -45,9 +60,43 @@ def execute_state_tool(tool_name: str, arguments: dict[str, Any] | None, context
     normalized = normalize_tool_name(tool_name)
     args = arguments if isinstance(arguments, dict) else {}
     if normalized == PHASE_RESULT_TOOL:
-        return phase_result_payload(args)
+        payload = phase_result_payload(args)
+        structured = payload.get("structuredContent") if isinstance(payload.get("structuredContent"), dict) else {}
+        gate = phase_completion_gate(
+            phase_slug=str(getattr(context, "phase_slug", "") or ""),
+            result_status=str(structured.get("status") or ""),
+            phase_memory=getattr(context, "phase_memory", None),
+        )
+        if gate.allowed:
+            return payload
+        return {
+            "isError": True,
+            "error": "retrieval_confirmation_required",
+            "structuredContent": {"status": "continue_current", "reason": "retrieval_confirmation_required"},
+            "content": [{"type": "text", "text": gate.message}],
+        }
     if normalized == RECORD_JOBS_TOOL:
-        return _record_jobs_payload(context=context, arguments=args)
+        payload = _record_jobs_payload(context=context, arguments=args)
+        structured = payload.get("structuredContent") if isinstance(payload.get("structuredContent"), dict) else {}
+        transition = record_retrieval_history_evidence(context.phase_memory, structured)
+        if isinstance(structured, dict):
+            structured["retrieval_orchestration"] = transition.as_dict()
+        if callable(context.persist_phase_memory) and context.phase_memory is not None:
+            try:
+                context.persist_phase_memory(context.phase_memory)
+            except Exception as exc:
+                return {
+                    "isError": True,
+                    "error": f"phase memory persistence failed: {exc}",
+                    "structuredContent": {"status": "persistence_failed"},
+                    "content": [{"type": "text", "text": "### Result\n- Retrieval progress could not be persisted."}],
+                }
+        if transition.message:
+            payload["content"] = [
+                *[item for item in payload.get("content") or [] if isinstance(item, dict)],
+                {"type": "text", "text": transition.message},
+            ]
+        return payload
     if normalized == UPDATE_JOBS_TOOL:
         return _update_jobs_payload(context=context, arguments=args)
     if normalized == RECORD_APPLICATION_REVIEWS_TOOL:
@@ -72,12 +121,136 @@ def execute_state_tool(tool_name: str, arguments: dict[str, Any] | None, context
                     "content": [{"type": "text", "text": "### Result\n- Phase memory update could not be persisted."}],
                 }
         return payload
+    if normalized == CACHE_LOOKUP_TOOL:
+        return _cache_lookup_payload(context=context, arguments=args)
+    if normalized == CACHE_READ_TOOL:
+        return _cache_read_payload(context=context, arguments=args)
+    if normalized == CACHE_PROPOSE_TOOL:
+        return _cache_propose_payload(context=context, arguments=args)
+    if normalized == CACHE_VALIDATE_TOOL:
+        return _cache_validate_payload(context=context, arguments=args)
     return {
         "isError": True,
         "error": f"unknown state tool: {tool_name}",
         "structuredContent": {"tool_name": normalized},
         "content": [{"type": "text", "text": f"Unknown state tool: {tool_name}"}],
     }
+
+
+def _cache_store(context: PhaseStateToolContext) -> CacheArtifactStore:
+    if not context.workspace:
+        raise CacheArtifactError("cache workspace is unavailable for this phase")
+    return CacheArtifactStore(context.workspace)
+
+
+def _cache_scope(context: PhaseStateToolContext, *, page_fingerprint: Any = "") -> dict[str, str]:
+    raw = context.cache_scope if isinstance(context.cache_scope, dict) else {}
+    return {
+        "site_key": str(raw.get("site_key") or context.site_key or "").strip(),
+        "phase": str(raw.get("phase") or "").strip(),
+        "page_fingerprint": str(page_fingerprint or raw.get("page_fingerprint") or "").strip(),
+    }
+
+
+def _cache_dependency_versions(context: PhaseStateToolContext, keys: Any = None) -> dict[str, str]:
+    available = context.cache_dependency_versions if isinstance(context.cache_dependency_versions, dict) else {}
+    requested = [str(key).strip() for key in keys if str(key).strip()] if isinstance(keys, list) else []
+    if not requested:
+        requested = list(available.keys())
+    return {key: str(available.get(key) or "").strip() for key in requested if str(available.get(key) or "").strip()}
+
+
+def _cache_payload(*, status: str, data: dict[str, Any], message: str) -> dict[str, Any]:
+    return {
+        "isError": False,
+        "structuredContent": {"status": status, **data},
+        "content": [{"type": "text", "text": message}],
+    }
+
+
+def _cache_error(exc: Exception) -> dict[str, Any]:
+    return {
+        "isError": True,
+        "error": str(exc),
+        "structuredContent": {"status": "cache_error"},
+        "content": [{"type": "text", "text": f"Cache operation failed: {exc}"}],
+    }
+
+
+def _cache_lookup_payload(*, context: PhaseStateToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        scope = _cache_scope(context, page_fingerprint=arguments.get("page_fingerprint"))
+        candidates = _cache_store(context).lookup(
+            scope=scope,
+            dependency_versions=_cache_dependency_versions(context),
+            kinds=arguments.get("kinds"),
+            batch_id=context.batch_id,
+            turn_id=context.turn_id,
+        )
+        return _cache_payload(
+            status="lookup",
+            data={"candidates": candidates, "scope": scope},
+            message=f"Cache candidates: {len(candidates)}",
+        )
+    except Exception as exc:
+        return _cache_error(exc)
+
+
+def _cache_read_payload(*, context: PhaseStateToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        artifact = _cache_store(context).read(
+            str(arguments.get("cache_id") or ""),
+            scope=_cache_scope(context, page_fingerprint=arguments.get("page_fingerprint")),
+            dependency_versions=_cache_dependency_versions(context),
+            batch_id=context.batch_id,
+            turn_id=context.turn_id,
+        )
+        return _cache_payload(
+            status="read",
+            data={"artifact": artifact},
+            message=f"Cache artifact loaded: {artifact.get('cache_id')}",
+        )
+    except Exception as exc:
+        return _cache_error(exc)
+
+
+def _cache_propose_payload(*, context: PhaseStateToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        artifact = _cache_store(context).propose(
+            kind=str(arguments.get("kind") or ""),
+            scope=_cache_scope(context, page_fingerprint=arguments.get("page_fingerprint")),
+            dependency_versions=_cache_dependency_versions(context, arguments.get("dependency_keys")),
+            content=arguments.get("content") if isinstance(arguments.get("content"), dict) else {},
+            summary=str(arguments.get("summary") or ""),
+            source_refs=arguments.get("source_refs") if isinstance(arguments.get("source_refs"), list) else [],
+            batch_id=context.batch_id,
+            turn_id=context.turn_id,
+        )
+        return _cache_payload(
+            status="proposed",
+            data={"artifact": artifact},
+            message=f"Cache candidate proposed: {artifact.get('cache_id')}",
+        )
+    except Exception as exc:
+        return _cache_error(exc)
+
+
+def _cache_validate_payload(*, context: PhaseStateToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        artifact = _cache_store(context).validate(
+            str(arguments.get("cache_id") or ""),
+            status=str(arguments.get("status") or ""),
+            summary=str(arguments.get("summary") or ""),
+            batch_id=context.batch_id,
+            turn_id=context.turn_id,
+        )
+        return _cache_payload(
+            status="validated",
+            data={"artifact": artifact},
+            message=f"Cache artifact {artifact.get('cache_id')} marked {artifact.get('validation', {}).get('status')}",
+        )
+    except Exception as exc:
+        return _cache_error(exc)
 
 
 def _normalize_record_job(job: dict[str, Any]) -> dict[str, Any]:

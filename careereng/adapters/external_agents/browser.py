@@ -18,6 +18,7 @@ def browser_tool_commands(site_key: str) -> dict[str, str]:
         "tools": f"python -m careereng agent-bridge browser-tools --site {site_key}",
         "snapshot": browser_tool_command(site_key, "browser_snapshot", "{}"),
         "call": browser_tool_command(site_key),
+        "sequence": f"python -m careereng agent-bridge browser-sequence --site {site_key} --steps '<json_steps>'",
         "legacy_tools": f"python -m careereng browser-handoff tools --site {site_key}",
         "legacy_snapshot": legacy_browser_tool_command(site_key, "browser_snapshot", "{}"),
         "legacy_call": legacy_browser_tool_command(site_key),

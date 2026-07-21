@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from careereng.orchestration.agent_protocol.runtime_lifecycle import release_site_payload
@@ -13,18 +13,13 @@ class SiteRuntimeLifecycle:
     """Release resources only after orchestration has made its terminal decision."""
 
     browser_runner: Any | None
-    _released_site_keys: set[str] = field(default_factory=set)
-
     def release_site(self, site_key: str) -> bool:
         normalized_site_key = release_site_payload(site_key=site_key)["site_key"]
-        if normalized_site_key in self._released_site_keys:
-            return False
         finish_site = getattr(self.browser_runner, "finish_site", None)
         if not callable(finish_site):
             return False
-        finish_site(normalized_site_key)
-        self._released_site_keys.add(normalized_site_key)
-        return True
+        result = finish_site(normalized_site_key)
+        return result is not False
 
 
 def is_non_resumable_site_terminal(site: dict[str, Any]) -> bool:

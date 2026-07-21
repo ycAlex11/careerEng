@@ -13,6 +13,7 @@ from .state import state_tool_commands
 from careereng.orchestration.context import BrowserPhaseMemory, build_phase_context
 from careereng.platform.sessions import PhaseSession, write_phase_session
 from careereng.platform.observability import PerformanceRecorder
+from careereng.platform.cache import CacheArtifactStore
 from careereng.orchestration.agent_protocol.state_tools import state_tool_schemas_for_phase
 from careereng.utils import ensure_dir, make_id, now_iso, read_json, safe_file_stem, write_json
 
@@ -94,6 +95,13 @@ def advance_browser_agent_work_order(
         raise ValueError(f"phase is not declared by the work order: {next_phase or '<missing>'}")
 
     phase_memory = BrowserPhaseMemory.from_payload(session_payload.get("phase_memory"))
+    cache_dependency_versions = payload.get("cache_dependency_versions") if isinstance(payload.get("cache_dependency_versions"), dict) else {}
+    cache_candidates = CacheArtifactStore(workspace).lookup(
+        scope={"site_key": str(payload.get("site_key") or ""), "phase": normalized_phase},
+        dependency_versions=cache_dependency_versions,
+        batch_id=str(payload.get("batch_id") or ""),
+        turn_id=str(payload.get("turn_id") or ""),
+    )
     phase_context = build_phase_context(
         SimpleNamespace(
             slug=str(current_phase_row.get("slug") or ""),
@@ -112,14 +120,29 @@ def advance_browser_agent_work_order(
             "session_id": str(payload.get("session_id") or ""),
             "turn_id": str(payload.get("turn_id") or ""),
             "apply_target_job_ids": list(payload.get("apply_target_job_ids") or []),
+            "run_intent": payload.get("run_intent") if isinstance(payload.get("run_intent"), dict) else {},
+            "cache_dependency_versions": cache_dependency_versions,
         },
+        cache_candidates=cache_candidates,
     ).as_dict()
+    if normalized_phase == "apply":
+        apply_facts = payload.get("apply_initial_facts")
+        if isinstance(apply_facts, dict) and apply_facts:
+            phase_context["apply_facts"] = dict(apply_facts)
     state_commands = state_tool_commands(str(payload.get("site_key") or ""), phase=normalized_phase)
     state_tools = state_tool_schemas_for_phase(normalized_phase, include_phase_result=True)
 
+    work_item_id = str(payload.get("work_order_id") or payload.get("handoff_id") or "").strip()
+    if not work_item_id:
+        raise ValueError("external-agent work order has no stable work_item_id")
+    # A work item owns one site task for the lifetime of its batch. Advancing a
+    # phase refreshes its scoped context in place; it must not replace the
+    # Codex thread that is carrying the task's live reasoning state.
     payload.update(
         {
             "updated_at": now_iso(),
+            "context_revision": int(payload.get("context_revision") or 0) + 1,
+            "worker_state": "active",
             "current_phase": normalized_phase,
             "current_phase_context": phase_context,
             "state_tool_commands": state_commands,
@@ -128,6 +151,9 @@ def advance_browser_agent_work_order(
     )
     session_payload.update(
         {
+            "updated_at": now_iso(),
+            "context_revision": int(session_payload.get("context_revision") or 0) + 1,
+            "worker_state": "active",
             "current_phase": normalized_phase,
             "phase_context": phase_context,
             "state_tool_commands": state_commands,
@@ -150,6 +176,124 @@ def advance_browser_agent_work_order(
             f"Continue with the retained browser runtime using {markdown_path}."
         ),
     )
+
+
+def refresh_browser_agent_work_order(
+    *,
+    workspace: Path,
+    payload_path: Path,
+    phase_session_path: Path,
+    entry_url: str,
+    phase_slugs: tuple[str, ...],
+    phases: Iterable[Any],
+    apply_target_job_ids: tuple[str, ...] | None = None,
+    continuation_context: dict[str, Any] | None = None,
+    tool_commands: dict[str, str] | None = None,
+    cache_candidates: list[dict[str, Any]] | None = None,
+    cache_dependency_versions: dict[str, Any] | None = None,
+    apply_initial_facts: dict[str, Any] | None = None,
+) -> AgentBridgeWorkOrder:
+    """Reuse a site-batch work item for the next declared browser sequence."""
+
+    workspace = Path(workspace).resolve()
+    payload_path = Path(payload_path)
+    phase_session_path = Path(phase_session_path)
+    payload = read_json(payload_path)
+    session_payload = read_json(phase_session_path)
+    if not isinstance(payload, dict) or not isinstance(session_payload, dict):
+        raise ValueError("agent bridge work order is unavailable")
+    phase_rows = list(phases)
+    current_phase_row = phase_rows[0] if phase_rows else None
+    current_phase = str(getattr(current_phase_row, "slug", "") or (phase_slugs[0] if phase_slugs else "")).strip()
+    if not current_phase or current_phase_row is None:
+        raise ValueError("refreshed agent bridge work order requires a declared first phase")
+    versions = dict(cache_dependency_versions or payload.get("cache_dependency_versions") or {})
+    phase_memory = BrowserPhaseMemory()
+    phase_context = build_phase_context(
+        current_phase_row,
+        phase_memory=phase_memory,
+        continuation=continuation_context,
+        local_state={
+            "site_key": str(payload.get("site_key") or ""),
+            "entry_url": str(entry_url or ""),
+            "batch_id": str(payload.get("batch_id") or ""),
+            "session_id": str(payload.get("session_id") or ""),
+            "turn_id": str(payload.get("turn_id") or ""),
+            "apply_target_job_ids": list(apply_target_job_ids or ()),
+            "run_intent": dict(payload.get("run_intent") or {}),
+            "cache_dependency_versions": versions,
+        },
+        cache_candidates=cache_candidates,
+    ).as_dict()
+    resolved_apply_facts = dict(apply_initial_facts or payload.get("apply_initial_facts") or {})
+    if current_phase == "apply" and resolved_apply_facts:
+        phase_context["apply_facts"] = resolved_apply_facts
+    state_commands = state_tool_commands(str(payload.get("site_key") or ""), phase=current_phase)
+    state_tools = state_tool_schemas_for_phase(current_phase, include_phase_result=True)
+    phase_payload = [
+        {
+            "slug": str(getattr(phase, "slug", "") or ""),
+            "title": str(getattr(phase, "title", "") or ""),
+            "project_text": str(getattr(phase, "project_text", "") or ""),
+            "site_text": str(getattr(phase, "site_text", "") or ""),
+        }
+        for phase in phase_rows
+    ]
+    now = now_iso()
+    for row in (payload, session_payload):
+        row.update(
+            {
+                "updated_at": now,
+                "context_revision": int(row.get("context_revision") or 0) + 1,
+                "worker_state": "active",
+                "entry_url": str(entry_url or ""),
+                "phase_slugs": list(phase_slugs),
+                "current_phase": current_phase,
+                "apply_target_job_ids": list(apply_target_job_ids or ()),
+                "continuation_context": dict(continuation_context or {}),
+                "phase_context": phase_context,
+                "current_phase_context": phase_context,
+                "phase_memory": phase_memory.as_payload(),
+                "browser_tool_commands": dict(tool_commands or payload.get("browser_tool_commands") or {}),
+                "state_tool_commands": state_commands,
+                "state_tools": state_tools,
+                "apply_initial_facts": resolved_apply_facts,
+            }
+        )
+    payload["phases"] = phase_payload
+    payload["cache_dependency_versions"] = versions
+    write_json(payload_path, payload)
+    write_json(phase_session_path, session_payload)
+    markdown_path = Path(str(payload.get("markdown_path") or ""))
+    if not markdown_path.is_absolute():
+        markdown_path = payload_path.parent / "work_order.md"
+    markdown_path.write_text(_render_browser_work_order(payload), encoding="utf-8")
+    return AgentBridgeWorkOrder(
+        payload_path=payload_path,
+        markdown_path=markdown_path,
+        current_phase=current_phase,
+        message=f"External-agent site-batch work item refreshed for phase={current_phase}.",
+    )
+
+
+def set_browser_agent_work_order_state(
+    *,
+    payload_path: Path,
+    phase_session_path: Path,
+    worker_state: str,
+) -> None:
+    """Persist lifecycle state without changing the work-item scope."""
+
+    payload = read_json(Path(payload_path))
+    session_payload = read_json(Path(phase_session_path))
+    if not isinstance(payload, dict) or not isinstance(session_payload, dict):
+        raise ValueError("agent bridge work order is unavailable")
+    updated_at = now_iso()
+    for row in (payload, session_payload):
+        row["worker_state"] = str(worker_state or "").strip()
+        row["updated_at"] = updated_at
+    write_json(Path(payload_path), payload)
+    write_json(Path(phase_session_path), session_payload)
 
 
 def persist_browser_agent_phase_memory(
@@ -188,6 +332,42 @@ def persist_browser_agent_phase_memory(
     markdown_path.write_text(_render_browser_work_order(payload), encoding="utf-8")
 
 
+def persist_browser_agent_checkpoint(
+    *,
+    payload_path: Path,
+    phase_session_path: Path,
+    checkpoint: dict[str, Any],
+) -> None:
+    """Persist an executor-observed checkpoint without interpreting the page.
+
+    This is intentionally transport-neutral: the browser executor records what
+    it just did, while the next agent turn decides whether it needs a new
+    observation or a recovery action.
+    """
+
+    payload_path = Path(payload_path)
+    phase_session_path = Path(phase_session_path)
+    payload = read_json(payload_path)
+    session_payload = read_json(phase_session_path)
+    if not isinstance(payload, dict) or not isinstance(session_payload, dict):
+        raise ValueError("agent bridge phase session is unavailable")
+
+    normalized_checkpoint = dict(checkpoint or {})
+    for row in (payload, session_payload):
+        row["updated_at"] = now_iso()
+        row["last_browser_checkpoint"] = normalized_checkpoint
+        phase_context = row.get("current_phase_context")
+        if not isinstance(phase_context, dict):
+            phase_context = row.get("phase_context") if isinstance(row.get("phase_context"), dict) else {}
+        phase_context = dict(phase_context)
+        phase_context["browser_checkpoint"] = normalized_checkpoint
+        row["current_phase_context"] = phase_context
+        row["phase_context"] = phase_context
+
+    write_json(payload_path, payload)
+    write_json(phase_session_path, session_payload)
+
+
 def create_browser_agent_work_order(
     *,
     workspace: Path,
@@ -208,6 +388,9 @@ def create_browser_agent_work_order(
     tool_commands: dict[str, str] | None = None,
     state_commands: dict[str, str] | None = None,
     agent_name: str = "codex",
+    cache_candidates: list[dict[str, Any]] | None = None,
+    cache_dependency_versions: dict[str, Any] | None = None,
+    apply_initial_facts: dict[str, Any] | None = None,
 ) -> AgentBridgeWorkOrder:
     workspace = Path(workspace).resolve()
     phase_rows = list(phases)
@@ -227,6 +410,11 @@ def create_browser_agent_work_order(
     state_tools = state_tool_schemas_for_phase(current_phase, include_phase_result=True)
     resolved_state_commands = state_commands or state_tool_commands(site_key, phase=current_phase)
     phase_memory = BrowserPhaseMemory()
+    run_intent = {}
+    if isinstance(continuation_context, dict):
+        candidate = continuation_context.get("run_intent")
+        if isinstance(candidate, dict):
+            run_intent = dict(candidate)
     phase_context = build_phase_context(
         current_phase_row,
         phase_memory=phase_memory,
@@ -238,8 +426,14 @@ def create_browser_agent_work_order(
             "session_id": session_id,
             "turn_id": turn_id,
             "apply_target_job_ids": list(apply_target_job_ids or ()),
+            "run_intent": run_intent,
+            "cache_dependency_versions": dict(cache_dependency_versions or {}),
         },
+        cache_candidates=cache_candidates,
     ).as_dict()
+    resolved_apply_facts = dict(apply_initial_facts or {})
+    if current_phase == "apply" and resolved_apply_facts:
+        phase_context["apply_facts"] = resolved_apply_facts
     phase_session = PhaseSession(
         site_key=site_key,
         site_name=site_name,
@@ -271,13 +465,18 @@ def create_browser_agent_work_order(
         "turn_id": turn_id,
         "batch_id": batch_id,
         "resume": bool(resume),
+        "context_revision": 1,
+        "worker_state": "active",
         "phase_slugs": list(phase_slugs),
         "current_phase": current_phase,
         "apply_target_job_ids": list(apply_target_job_ids or ()),
+        "run_intent": run_intent,
         "continuation_context": continuation_context or {},
         "continuation_context_path": continuation_context_path,
         "current_phase_context": phase_context,
         "phase_memory": phase_memory.as_payload(),
+        "cache_dependency_versions": dict(cache_dependency_versions or {}),
+        "apply_initial_facts": resolved_apply_facts,
         "tool_commands": tool_commands or {},
         "browser_tool_commands": tool_commands or {},
         "state_tool_commands": resolved_state_commands,
@@ -384,6 +583,9 @@ def _render_browser_work_order(payload: dict[str, Any]) -> str:
     project_skill_text = str(phase_context.get("project_skill") or "").strip()
     site_skill_text = str(phase_context.get("site_skill") or "").strip()
     phase_memory_text = str(phase_context.get("phase_memory") or "").strip()
+    apply_facts = phase_context.get("apply_facts") if isinstance(phase_context.get("apply_facts"), dict) else {}
+    browser_checkpoint = phase_context.get("browser_checkpoint") if isinstance(phase_context.get("browser_checkpoint"), dict) else {}
+    cache_candidates = phase_context.get("cache_candidates") if isinstance(phase_context.get("cache_candidates"), list) else []
     continuation_payload = phase_context.get("continuation") if isinstance(phase_context.get("continuation"), dict) else {}
     local_state = phase_context.get("local_state") if isinstance(phase_context.get("local_state"), dict) else {}
     tool_commands = payload.get("tool_commands") if isinstance(payload.get("tool_commands"), dict) else {}
@@ -395,6 +597,7 @@ def _render_browser_work_order(payload: dict[str, Any]) -> str:
     preferred_tools = str(tool_commands.get("tools") or "").strip()
     preferred_snapshot = str(tool_commands.get("snapshot") or "").strip()
     preferred_call = str(tool_commands.get("call") or "").strip()
+    preferred_sequence = str(tool_commands.get("sequence") or "").strip()
     legacy_tools = str(tool_commands.get("legacy_tools") or "").strip()
     state_commands = payload.get("state_tool_commands") if isinstance(payload.get("state_tool_commands"), dict) else {}
     tool_command_lines = []
@@ -404,6 +607,8 @@ def _render_browser_work_order(payload: dict[str, Any]) -> str:
         tool_command_lines.append(f"- Snapshot: `{preferred_snapshot}`")
     if preferred_call:
         tool_command_lines.append(f"- Call tool: `{preferred_call}`")
+    if preferred_sequence:
+        tool_command_lines.append(f"- Sequence: `{preferred_sequence}`")
     if legacy_tools:
         tool_command_lines.append(f"- Legacy alias: `{legacy_tools}`")
     tool_command_text = "\n".join(tool_command_lines) or "- `(not available)`"
@@ -440,6 +645,12 @@ def _render_browser_work_order(payload: dict[str, Any]) -> str:
         f"{project_skill_text or '(none)'}\n\n"
         "### Current Phase Memory\n\n"
         f"{phase_memory_text or '(none)'}\n\n"
+        "### Lightweight Apply Facts\n\n"
+        f"{json.dumps(apply_facts, ensure_ascii=False, indent=2) if apply_facts else '(request `apply_facts` only if the current phase needs it)'}\n\n"
+        "### Recent Browser Checkpoint\n\n"
+        f"{json.dumps(browser_checkpoint, ensure_ascii=False, indent=2) if browser_checkpoint else '(none)'}\n\n"
+        "### Compatible Cache Candidates\n\n"
+        f"{json.dumps(cache_candidates, ensure_ascii=False, indent=2) if cache_candidates else '(none)'}\n\n"
         "## Required Reading\n\n"
         f"- Project Skill: `{payload.get('project_skill_path')}`\n"
         f"- Site Skill: `{payload.get('site_skill_path')}`\n"

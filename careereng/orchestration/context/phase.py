@@ -29,6 +29,7 @@ class PhaseContext:
     phase_memory: str = ""
     continuation: dict[str, Any] = field(default_factory=dict)
     local_state: dict[str, Any] = field(default_factory=dict)
+    cache_candidates: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def combined_guidance(self) -> str:
@@ -47,6 +48,7 @@ class PhaseContext:
             "phase_memory": self.phase_memory,
             "continuation": dict(self.continuation or {}),
             "local_state": dict(self.local_state or {}),
+            "cache_candidates": [dict(item) for item in self.cache_candidates if isinstance(item, dict)],
         }
 
 
@@ -56,6 +58,7 @@ def build_phase_context(
     phase_memory: Any | None = None,
     continuation: dict[str, Any] | None = None,
     local_state: dict[str, Any] | None = None,
+    cache_candidates: list[dict[str, Any]] | None = None,
 ) -> PhaseContext:
     """Build a driver-neutral context without deciding phase business policy."""
 
@@ -67,4 +70,5 @@ def build_phase_context(
         phase_memory=_phase_memory_text(phase_memory),
         continuation=dict(continuation or {}),
         local_state=dict(local_state or {}),
+        cache_candidates=[dict(item) for item in cache_candidates or [] if isinstance(item, dict)],
     )
