@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any
 
 from careereng.evolution.work_items import create_site_skill_bootstrap_card
+from careereng.career.applications.site_modes import (
+    EXECUTION_BLOCKED,
+    execution_mode_for_site_mode,
+    normalize_site_mode,
+)
 from careereng.career.resume.export import default_apply_resume_pdf_path, ensure_default_resume_pdf
 from careereng.career.applications.site_store import SiteStore
 
@@ -44,13 +49,12 @@ class SiteTools:
     def _site_skill_state(self, site_id: str) -> dict[str, Any]:
         skill = self.site_store.load_skill(site_id)
         meta = skill.get("front_matter") if isinstance(skill.get("front_matter"), dict) else {}
-        status = str(meta.get("status") or "draft").strip().lower() or "draft"
-        if status not in {"draft", "ready"}:
-            status = "draft"
+        status = normalize_site_mode(meta.get("status"))
         return {
             "exists": bool(skill.get("exists")),
             "path": str(skill.get("path") or ""),
             "status": status,
+            "execution_mode": execution_mode_for_site_mode(status),
             "apply_enabled": bool(meta.get("apply_enabled")),
             "allow_anonymous_discovery": bool(meta.get("allow_anonymous_discovery")),
             "front_matter": meta,
@@ -174,13 +178,14 @@ class SiteTools:
                 "entry_url": entry_url,
                 "skill_path": skill_path,
             }
-        if skill.get("status") != "ready":
+        execution_mode = str(skill.get("execution_mode") or EXECUTION_BLOCKED)
+        if execution_mode == EXECUTION_BLOCKED:
             return {
                 "site_key": site_id,
                 "site_name": canonical,
                 "status": "skipped",
-                "reason_tag": "skill_not_ready",
-                "message": "site skill is not ready",
+                "reason_tag": "site_initialization_incomplete",
+                "message": "site Skill is still draft and cannot execute",
                 "entry_url": entry_url,
                 "skill_path": skill_path,
             }
@@ -188,6 +193,8 @@ class SiteTools:
             "site_key": site_id,
             "site_name": canonical,
             "status": "ready",
+            "execution_mode": execution_mode,
+            "site_mode": str(skill.get("status") or "draft"),
             "reason_tag": "",
             "message": "",
             "entry_url": entry_url,

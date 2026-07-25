@@ -14,8 +14,21 @@ from careereng.orchestration.context import BrowserPhaseMemory, build_phase_cont
 from careereng.platform.sessions import PhaseSession, write_phase_session
 from careereng.platform.observability import PerformanceRecorder
 from careereng.platform.cache import CacheArtifactStore
+from careereng.evolution.memory_units import active_run_local_guidance
 from careereng.orchestration.agent_protocol.state_tools import state_tool_schemas_for_phase
 from careereng.utils import ensure_dir, make_id, now_iso, read_json, safe_file_stem, write_json
+
+
+def _active_phase_evolution_guidance(*, workspace: Path, site_key: str, batch_id: str, phase: str) -> str:
+    try:
+        return active_run_local_guidance(
+            workspace=workspace,
+            site_key=site_key,
+            batch_id=batch_id,
+            phase=phase,
+        )
+    except Exception:
+        return ""
 
 
 @dataclass(frozen=True)
@@ -122,13 +135,15 @@ def advance_browser_agent_work_order(
             "apply_target_job_ids": list(payload.get("apply_target_job_ids") or []),
             "run_intent": payload.get("run_intent") if isinstance(payload.get("run_intent"), dict) else {},
             "cache_dependency_versions": cache_dependency_versions,
+            "active_run_local_guidance": _active_phase_evolution_guidance(
+                workspace=workspace,
+                site_key=str(payload.get("site_key") or ""),
+                batch_id=str(payload.get("batch_id") or ""),
+                phase=normalized_phase,
+            ),
         },
         cache_candidates=cache_candidates,
     ).as_dict()
-    if normalized_phase == "apply":
-        apply_facts = payload.get("apply_initial_facts")
-        if isinstance(apply_facts, dict) and apply_facts:
-            phase_context["apply_facts"] = dict(apply_facts)
     state_commands = state_tool_commands(str(payload.get("site_key") or ""), phase=normalized_phase)
     state_tools = state_tool_schemas_for_phase(normalized_phase, include_phase_result=True)
 
@@ -222,12 +237,16 @@ def refresh_browser_agent_work_order(
             "apply_target_job_ids": list(apply_target_job_ids or ()),
             "run_intent": dict(payload.get("run_intent") or {}),
             "cache_dependency_versions": versions,
+            "active_run_local_guidance": _active_phase_evolution_guidance(
+                workspace=workspace,
+                site_key=str(payload.get("site_key") or ""),
+                batch_id=str(payload.get("batch_id") or ""),
+                phase=current_phase,
+            ),
         },
         cache_candidates=cache_candidates,
     ).as_dict()
     resolved_apply_facts = dict(apply_initial_facts or payload.get("apply_initial_facts") or {})
-    if current_phase == "apply" and resolved_apply_facts:
-        phase_context["apply_facts"] = resolved_apply_facts
     state_commands = state_tool_commands(str(payload.get("site_key") or ""), phase=current_phase)
     state_tools = state_tool_schemas_for_phase(current_phase, include_phase_result=True)
     phase_payload = [
@@ -292,6 +311,46 @@ def set_browser_agent_work_order_state(
     for row in (payload, session_payload):
         row["worker_state"] = str(worker_state or "").strip()
         row["updated_at"] = updated_at
+    write_json(Path(payload_path), payload)
+    write_json(Path(phase_session_path), session_payload)
+
+
+def activate_browser_agent_evolution_solution(
+    *,
+    payload_path: Path,
+    phase_session_path: Path,
+    run_id: str,
+    solution_request: str,
+    proposal_output_path: str,
+) -> None:
+    """Make an already-created evolution request the next turn of one worker.
+
+    The browser work item keeps its stable identity and retained Codex thread.
+    This only refreshes its context so the generic worker coordinator starts a
+    follow-up turn after the current browser turn completes.
+    """
+
+    payload = read_json(Path(payload_path))
+    session_payload = read_json(Path(phase_session_path))
+    if not isinstance(payload, dict) or not isinstance(session_payload, dict):
+        raise ValueError("agent bridge work order is unavailable")
+    request = {
+        "run_id": str(run_id or "").strip(),
+        "solution_request": str(solution_request or "").strip(),
+        "proposal_output_path": str(proposal_output_path or "").strip(),
+    }
+    if not request["run_id"] or not request["solution_request"] or not request["proposal_output_path"]:
+        raise ValueError("evolution solution handoff requires run_id and artifact paths")
+    now = now_iso()
+    for row in (payload, session_payload):
+        row.update(
+            {
+                "updated_at": now,
+                "context_revision": int(row.get("context_revision") or 0) + 1,
+                "worker_state": "active",
+                "evolution_solution": request,
+            }
+        )
     write_json(Path(payload_path), payload)
     write_json(Path(phase_session_path), session_payload)
 
@@ -428,12 +487,16 @@ def create_browser_agent_work_order(
             "apply_target_job_ids": list(apply_target_job_ids or ()),
             "run_intent": run_intent,
             "cache_dependency_versions": dict(cache_dependency_versions or {}),
+            "active_run_local_guidance": _active_phase_evolution_guidance(
+                workspace=workspace,
+                site_key=site_key,
+                batch_id=batch_id,
+                phase=current_phase,
+            ),
         },
         cache_candidates=cache_candidates,
     ).as_dict()
     resolved_apply_facts = dict(apply_initial_facts or {})
-    if current_phase == "apply" and resolved_apply_facts:
-        phase_context["apply_facts"] = resolved_apply_facts
     phase_session = PhaseSession(
         site_key=site_key,
         site_name=site_name,
@@ -457,6 +520,7 @@ def create_browser_agent_work_order(
         "handoff_id": work_order_id,  # Legacy readers may still expect this field.
         "created_at": now_iso(),
         "execution_mode": AGENT_BRIDGE_MODE,
+        "execution_backend": str(run_intent.get("execution_backend") or "codex"),
         "agent_name": str(agent_name or "external_agent"),
         "site_key": site_key,
         "site_name": site_name,
@@ -583,9 +647,14 @@ def _render_browser_work_order(payload: dict[str, Any]) -> str:
     project_skill_text = str(phase_context.get("project_skill") or "").strip()
     site_skill_text = str(phase_context.get("site_skill") or "").strip()
     phase_memory_text = str(phase_context.get("phase_memory") or "").strip()
-    apply_facts = phase_context.get("apply_facts") if isinstance(phase_context.get("apply_facts"), dict) else {}
+    apply_runtime_hints = payload.get("apply_initial_facts") if isinstance(payload.get("apply_initial_facts"), dict) else {}
+    if not apply_runtime_hints and isinstance(phase_context.get("apply_facts"), dict):
+        # Read-only compatibility for older persisted work orders. New work
+        # orders never place profile facts in the phase context.
+        apply_runtime_hints = dict(phase_context["apply_facts"])
     browser_checkpoint = phase_context.get("browser_checkpoint") if isinstance(phase_context.get("browser_checkpoint"), dict) else {}
     cache_candidates = phase_context.get("cache_candidates") if isinstance(phase_context.get("cache_candidates"), list) else []
+    cache_protocol = str(phase_context.get("cache_protocol") or "").strip()
     continuation_payload = phase_context.get("continuation") if isinstance(phase_context.get("continuation"), dict) else {}
     local_state = phase_context.get("local_state") if isinstance(phase_context.get("local_state"), dict) else {}
     tool_commands = payload.get("tool_commands") if isinstance(payload.get("tool_commands"), dict) else {}
@@ -646,11 +715,15 @@ def _render_browser_work_order(payload: dict[str, Any]) -> str:
         "### Current Phase Memory\n\n"
         f"{phase_memory_text or '(none)'}\n\n"
         "### Lightweight Apply Facts\n\n"
-        f"{json.dumps(apply_facts, ensure_ascii=False, indent=2) if apply_facts else '(request `apply_facts` only if the current phase needs it)'}\n\n"
+        "`apply_facts` is available on demand through the work-item context. Request it only when the live form needs profile data; it is refreshed when the source profile changes.\n\n"
+        "### Apply Execution Hints\n\n"
+        f"{json.dumps(apply_runtime_hints, ensure_ascii=False, indent=2) if apply_runtime_hints else '(none)'}\n\n"
         "### Recent Browser Checkpoint\n\n"
         f"{json.dumps(browser_checkpoint, ensure_ascii=False, indent=2) if browser_checkpoint else '(none)'}\n\n"
         "### Compatible Cache Candidates\n\n"
         f"{json.dumps(cache_candidates, ensure_ascii=False, indent=2) if cache_candidates else '(none)'}\n\n"
+        "### Cache Protocol\n\n"
+        f"{cache_protocol or '(none)'}\n\n"
         "## Required Reading\n\n"
         f"- Project Skill: `{payload.get('project_skill_path')}`\n"
         f"- Site Skill: `{payload.get('site_skill_path')}`\n"
@@ -664,6 +737,8 @@ def _render_browser_work_order(payload: dict[str, Any]) -> str:
         "- Do not add site-specific workflow or form-filling decisions to Python runtime code.\n"
         "- Use the browser tool commands to observe and operate the existing CareerEng Playwright MCP runtime.\n"
         "- Use the CareerEng state tool commands to persist jobs, application reviews, phase memory, and phase results instead of editing history files directly.\n"
+        "- You are the cache decision-maker for this site worker. Follow the cache protocol through cache_lookup, cache_read, cache_propose, and cache_validate; only live evidence decides whether a candidate is reusable.\n"
+        "- Propose cache only for cross-thread/backend reusable results, never for private data, raw snapshots, or thread-only reasoning.\n"
         "- If the browser work reveals a workflow gap, create or update an evolution proposal/action card instead of silently continuing with the same failed strategy.\n"
         "- If human-only input is required, leave the browser state resumable and report the exact blocker.\n\n"
         "## Machine Payload\n\n"

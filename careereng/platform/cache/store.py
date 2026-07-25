@@ -126,6 +126,7 @@ class CacheArtifactStore:
         content: dict[str, Any],
         summary: str = "",
         source_refs: Iterable[str] | None = None,
+        proposal: dict[str, Any] | None = None,
         batch_id: str = "",
         turn_id: str = "",
     ) -> dict[str, Any]:
@@ -148,6 +149,7 @@ class CacheArtifactStore:
             "dependency_versions": self._normalize_versions(dependency_versions),
             "summary": str(summary or "").strip()[:1000],
             "source_refs": self._normalize_refs(source_refs),
+            "proposal": deepcopy(proposal) if isinstance(proposal, dict) else {},
             "content": deepcopy(content),
             "validation": {
                 "status": "candidate",
@@ -214,6 +216,39 @@ class CacheArtifactStore:
             payload={"status": normalized_status, "summary": validation["last_result"]},
         )
         return self._index_payload(self._index_row(artifact))
+
+    def site_evidence(self, site_key: str, *, limit: int = 20) -> dict[str, Any]:
+        """Return mechanical cache facts for one site's later human/agent review."""
+
+        normalized_site = safe_file_stem(site_key)
+        index_rows = [
+            row
+            for row in self._index_rows()
+            if str((row.get("scope") or {}).get("site_key") or "") == normalized_site
+        ]
+        event_rows = [
+            row
+            for row in self.events_store.read_all()
+            if str(row.get("site_key") or "") == normalized_site
+        ]
+        status_counts: dict[str, int] = {}
+        for row in index_rows:
+            validation = row.get("validation") if isinstance(row.get("validation"), dict) else {}
+            status = str(validation.get("status") or "candidate")
+            status_counts[status] = int(status_counts.get(status) or 0) + 1
+        action_counts: dict[str, int] = {}
+        for row in event_rows:
+            action = str(row.get("action") or "unknown")
+            action_counts[action] = int(action_counts.get(action) or 0) + 1
+        recent = sorted(index_rows, key=lambda row: str(row.get("updated_at") or ""), reverse=True)[: max(0, int(limit or 0))]
+        return {
+            "site_key": normalized_site,
+            "artifact_count": len(index_rows),
+            "validation_status_counts": status_counts,
+            "event_action_counts": action_counts,
+            "recent_artifacts": [self._index_payload(row) for row in recent],
+            "evidence_refs": [str(self.index_store.path), str(self.events_store.path)],
+        }
 
     def _increment_uses(self, cache_id: str, *, result: str) -> None:
         artifact = read_json(self._artifact_path(cache_id))

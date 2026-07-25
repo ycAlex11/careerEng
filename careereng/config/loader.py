@@ -19,6 +19,8 @@ from careereng.config.schema import (
     EvolutionApplyProbeConfig,
     EvolutionBatchReviewConfig,
     EvolutionConfig,
+    EvolutionLoopConfig,
+    ExecutionConfig,
     PathsConfig,
     ProviderConfig,
     ProvidersConfig,
@@ -45,7 +47,6 @@ max_history_messages = 50
 related_history_k = 6
 relatedness_threshold = 0.7
 site_parallelism = 2
-agent_parallelism = 0
 router_confidence_threshold = 0.75
 router_log_enabled = true
 search_company_top_k = 10
@@ -61,11 +62,19 @@ keep_open = false
 timeout_ms = 45000
 slow_mo_ms = 0
 reasoning_effort = "high"
-site_parallelism = 2
 browser_name = "chrome"
 # Optional browser executable for Playwright MCP, for example Chrome for Testing.
 executable_path = ""
 mcp_port_start = 8931
+
+[execution]
+# Both transports may be available, but every runtime host selects exactly one.
+# CareerEng never changes this choice because a provider call fails or a Codex
+# worker is unavailable. Existing config files without this section continue to
+# derive the choice from browser.execution_mode.
+provider_enabled = true
+codex_enabled = true
+selected_backend = "provider"
 
 [browser.budgets]
 phase_timeout_seconds = 180
@@ -120,6 +129,12 @@ unsuccessful_threshold = 5
 
 [evolution.batch_review]
 site_run_threshold = 5
+
+[evolution.loops]
+# New-site exploration and its outer synthesis cadence. The agent decides
+# whether an attempt succeeded; these are only structural boundaries.
+inner_attempt_limit = 3
+outer_batch_limit = 3
 
 [retrieval.stop_policy]
 history_stop_success_ratio = 0.4
@@ -306,6 +321,7 @@ def load_config(project_root: Path) -> AppConfig:
     payload = {
         "agent": AgentConfig().__dict__.copy(),
         "browser": asdict(BrowserConfig()),
+        "execution": asdict(ExecutionConfig()),
         "evolution": asdict(EvolutionConfig()),
         "retrieval": asdict(RetrievalConfig()),
         "paths": PathsConfig().__dict__.copy(),
@@ -320,9 +336,12 @@ def load_config(project_root: Path) -> AppConfig:
     retrieval_policy_keys = set(asdict(BrowserRetrievalPolicyConfig()).keys())
     apply_probe_keys = set(asdict(EvolutionApplyProbeConfig()).keys())
     batch_review_keys = set(asdict(EvolutionBatchReviewConfig()).keys())
+    loop_keys = set(asdict(EvolutionLoopConfig()).keys())
     stop_policy_keys = set(asdict(RetrievalStopPolicyConfig()).keys())
     loaded_apply_probe_config = False
+    loaded_evolution_loop_config = False
     loaded_retrieval_stop_policy_config = False
+    loaded_execution_config = False
     try:
         text = cpath.read_text(encoding="utf-8")
         if tomllib is not None:
@@ -388,6 +407,18 @@ def load_config(project_root: Path) -> AppConfig:
                 if key in payload["browser"] and key not in {"budgets", "guards", "retrieval_policy"}:
                     payload["browser"][key] = value
 
+        execution = loaded.get("execution")
+        if isinstance(execution, dict):
+            loaded_execution_config = True
+            for key, value in execution.items():
+                if key in payload["execution"]:
+                    payload["execution"][key] = value
+
+    if not loaded_execution_config:
+        # Existing files used browser.execution_mode as the sole explicit
+        # backend selection. Keep that choice until users add [execution].
+        payload["execution"]["selected_backend"] = ""
+
         evolution = loaded.get("evolution")
         if isinstance(evolution, dict):
             apply_probe = evolution.get("apply_probe")
@@ -401,6 +432,12 @@ def load_config(project_root: Path) -> AppConfig:
                 for key, value in batch_review.items():
                     if key in batch_review_keys:
                         payload["evolution"]["batch_review"][key] = value
+            loops = evolution.get("loops")
+            if isinstance(loops, dict):
+                loaded_evolution_loop_config = True
+                for key, value in loops.items():
+                    if key in loop_keys:
+                        payload["evolution"]["loops"][key] = value
 
         retrieval = loaded.get("retrieval")
         if isinstance(retrieval, dict):
@@ -440,6 +477,7 @@ def load_config(project_root: Path) -> AppConfig:
     evolution_payload = dict(payload["evolution"])
     evolution_apply_probe_payload = dict(evolution_payload.get("apply_probe") or {})
     evolution_batch_review_payload = dict(evolution_payload.get("batch_review") or {})
+    evolution_loops_payload = dict(evolution_payload.get("loops") or {})
     retrieval_payload = dict(payload["retrieval"])
     retrieval_stop_policy_payload = dict(retrieval_payload.get("stop_policy") or {})
 
@@ -470,6 +508,23 @@ def load_config(project_root: Path) -> AppConfig:
         )
         or 0
     )
+    # Existing loop engines consume BrowserBudgetsConfig. Keep that execution
+    # contract while making the reusable evolution-loop cadence configurable
+    # from the dedicated evolution section.
+    if loaded_evolution_loop_config:
+        browser_budgets_payload["inner_max_failures"] = int(
+            evolution_loops_payload.get("inner_attempt_limit", EvolutionLoopConfig().inner_attempt_limit) or 1
+        )
+        browser_budgets_payload["outer_max_attempts"] = int(
+            evolution_loops_payload.get("outer_batch_limit", EvolutionLoopConfig().outer_batch_limit) or 1
+        )
+    else:
+        evolution_loops_payload["inner_attempt_limit"] = int(
+            browser_budgets_payload.get("inner_max_failures", EvolutionLoopConfig().inner_attempt_limit) or 1
+        )
+        evolution_loops_payload["outer_batch_limit"] = int(
+            browser_budgets_payload.get("outer_max_attempts", EvolutionLoopConfig().outer_batch_limit) or 1
+        )
     if not loaded_retrieval_stop_policy_config:
         for key in stop_policy_keys:
             retrieval_stop_policy_payload[key] = browser_retrieval_policy_payload.get(
@@ -490,9 +545,11 @@ def load_config(project_root: Path) -> AppConfig:
             recovery=BrowserRecoveryConfig(**browser_recovery_payload),
             retrieval_policy=BrowserRetrievalPolicyConfig(**browser_retrieval_policy_payload),
         ),
+        execution=ExecutionConfig(**payload["execution"]),
         evolution=EvolutionConfig(
             apply_probe=EvolutionApplyProbeConfig(**evolution_apply_probe_payload),
             batch_review=EvolutionBatchReviewConfig(**evolution_batch_review_payload),
+            loops=EvolutionLoopConfig(**evolution_loops_payload),
         ),
         retrieval=RetrievalConfig(stop_policy=RetrievalStopPolicyConfig(**retrieval_stop_policy_payload)),
         paths=PathsConfig(**payload["paths"]),

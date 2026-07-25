@@ -44,11 +44,19 @@ def advance_phase_sequence(
             current_phase=current,
             reason="current phase is not present in the declared sequence",
         )
-    if status == "blocked":
+    if status == "waiting_user":
         return PhaseTransition(
             action="continue_current",
             current_phase=current,
-            reason="the current phase is waiting for external or user input",
+            reason="the current phase is waiting for a user-supplied fact",
+        )
+    if status == "blocked":
+        # Backwards compatibility for old provider work orders. New agent
+        # work should use waiting_user for resumable user interaction.
+        return PhaseTransition(
+            action="continue_current",
+            current_phase=current,
+            reason="legacy blocked phase result is waiting for external or user input",
         )
     if status != "done":
         return PhaseTransition(

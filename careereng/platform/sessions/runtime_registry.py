@@ -158,7 +158,7 @@ class BrowserRuntimeRegistry:
             return False
         cleanup = reclaim_profile_processes(resolved_profile)
         lock_released = self.profile_owners.release_if_reclaimable(profile_dir=resolved_profile)
-        return bool(cleanup.terminated_pids or lock_released)
+        return bool(cleanup.terminated_pids or getattr(cleanup, "removed_lock_paths", ()) or lock_released)
 
     def release_all(self) -> list[BrowserRuntimeLease]:
         with self._lock:

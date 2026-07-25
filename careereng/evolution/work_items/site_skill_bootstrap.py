@@ -43,7 +43,7 @@ def create_site_skill_bootstrap_card(
         goal=(
             "Draft or refine the target site AI Skill so the site can be tested through "
             "session_preparation, application_status_review, channel_discovery, job_filtering, "
-            "and job_retrieval before apply is enabled."
+            "and job_retrieval."
         ),
         reason=(
             "A registered site has only a new site AI Skill. Codex should use existing site "
@@ -64,7 +64,7 @@ def create_site_skill_bootstrap_card(
             "Use `workspace/profile/application_profile.md` as the canonical source for reusable application-form facts.",
             "Keep site-specific navigation, filtering, login, review, and retrieval behavior in the site AI Skill.",
             "Define success and stop conditions for session preparation, application-status review, and job retrieval.",
-            "Keep apply_enabled false until the user explicitly approves apply behavior for this site.",
+            "Keep apply_enabled aligned with the user's explicit authorization for this site; it is independent from Skill maturity.",
         ],
         safety_notes=[
             "Do not add local browser-action DSLs or Python selector semantics.",
@@ -73,7 +73,7 @@ def create_site_skill_bootstrap_card(
         ],
         done_when=[
             "The target site AI Skill has concrete instructions for login readiness, status review, and retrieval.",
-            "The first test target is retrieval/status review, not automatic apply.",
+            "The first test scope follows the user's declared apply authorization.",
             "The action card is closed with the refined changes or a reason it cannot be refined yet.",
         ],
         metadata={
@@ -95,7 +95,7 @@ def create_site_skill_bootstrap_card(
                 "job_filtering",
                 "job_retrieval",
             ],
-            "apply_enabled_policy": "keep_false_until_user_approval",
+            "apply_enabled_policy": "independent_user_authorization",
         },
         semantic_tags=[
             "site_skill",
@@ -103,7 +103,7 @@ def create_site_skill_bootstrap_card(
             "workflow_transfer",
             "codex_draft",
             "browser_workflow",
-            "non_apply_test",
+            "exploration",
         ],
         dedupe_key=f"{ACTION_CARD_CODEX_DRAFT}:{SITE_SKILL_BOOTSTRAP_TASK}:{normalized_site_key}",
     )

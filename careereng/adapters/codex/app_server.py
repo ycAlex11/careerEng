@@ -163,7 +163,7 @@ class CodexAppServerClient:
         self,
         *,
         cwd: Path,
-        approval_policy: str = "on-request",
+        approval_policy: str = "never",
         sandbox: str = "workspace-write",
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
@@ -246,21 +246,26 @@ class CodexAppServerClient:
                 continue
             if not isinstance(payload, dict):
                 continue
+            method = str(payload.get("method") or "")
             response_id = payload.get("id")
+            if method:
+                # With the fixed non-interactive approval policy, App Server
+                # notifications remain transport telemetry. They never change
+                # CareerEng's user-wait or workflow state.
+                params = payload.get("params")
+                event = CodexAppServerEvent(
+                    method=method,
+                    params=params if isinstance(params, dict) else {},
+                )
+                self._events.put(event)
+                if self.event_callback is not None:
+                    self.event_callback(event)
+                continue
             if isinstance(response_id, int):
                 with self._pending_lock:
                     response_queue = self._pending.get(response_id)
                 if response_queue is not None:
                     response_queue.put(payload)
-                continue
-            method = str(payload.get("method") or "")
-            if not method:
-                continue
-            params = payload.get("params")
-            event = CodexAppServerEvent(method=method, params=params if isinstance(params, dict) else {})
-            self._events.put(event)
-            if self.event_callback is not None:
-                self.event_callback(event)
 
     def _read_stderr(self) -> None:
         process = self._process

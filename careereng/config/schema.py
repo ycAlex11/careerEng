@@ -14,8 +14,6 @@ class AgentConfig:
     related_history_k: int = 6
     relatedness_threshold: float = 0.7
     site_parallelism: int = 2
-    # Codex-worker slots. Zero keeps the existing site_parallelism behavior.
-    agent_parallelism: int = 0
     router_confidence_threshold: float = 0.75
     router_log_enabled: bool = True
     search_company_top_k: int = 10
@@ -113,9 +111,22 @@ class EvolutionBatchReviewConfig:
 
 
 @dataclass
+class EvolutionLoopConfig:
+    """Configuration-only limits for reusable evolution loop scopes.
+
+    Python records these boundaries but leaves success, continuation, and
+    proposed changes to the active external agent and its Skills.
+    """
+
+    inner_attempt_limit: int = 3
+    outer_batch_limit: int = 3
+
+
+@dataclass
 class EvolutionConfig:
     apply_probe: EvolutionApplyProbeConfig = field(default_factory=EvolutionApplyProbeConfig)
     batch_review: EvolutionBatchReviewConfig = field(default_factory=EvolutionBatchReviewConfig)
+    loops: EvolutionLoopConfig = field(default_factory=EvolutionLoopConfig)
 
 
 @dataclass
@@ -137,7 +148,6 @@ class BrowserConfig:
     timeout_ms: int = 45000
     slow_mo_ms: int = 0
     reasoning_effort: str = "high"
-    site_parallelism: int = 2
     browser_name: str = "chrome"
     executable_path: str = ""
     mcp_port_start: int = 8931
@@ -175,9 +185,19 @@ class ProvidersConfig:
 
 
 @dataclass
+class ExecutionConfig:
+    """Availability and explicit selection of browser-execution transports."""
+
+    provider_enabled: bool = True
+    codex_enabled: bool = True
+    selected_backend: str = "provider"
+
+
+@dataclass
 class AppConfig:
     agent: AgentConfig
     browser: BrowserConfig
+    execution: ExecutionConfig
     evolution: EvolutionConfig
     retrieval: RetrievalConfig
     paths: PathsConfig

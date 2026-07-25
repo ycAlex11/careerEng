@@ -6,6 +6,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+_CACHE_PROTOCOL = (
+    "You, the current site worker, own cache decisions. Cache candidates are provisional, site- and fingerprint-scoped evidence rather than rules. "
+    "Propose only a result that a future worker can reuse after a lightweight live check, and include a reuse reason, preconditions, "
+    "page fingerprint, expected benefit, and evidence. When a compatible candidate is available, decide whether to read it, then validate "
+    "it as validated, stale, or retired after live evidence. Do not cache private data, raw snapshots, or thread-only reasoning, and do not "
+    "treat a cache hit as authority over the current page."
+)
+
+
 def _phase_memory_text(value: Any | None) -> str:
     if value is None:
         return ""
@@ -30,6 +39,7 @@ class PhaseContext:
     continuation: dict[str, Any] = field(default_factory=dict)
     local_state: dict[str, Any] = field(default_factory=dict)
     cache_candidates: list[dict[str, Any]] = field(default_factory=list)
+    cache_protocol: str = _CACHE_PROTOCOL
 
     @property
     def combined_guidance(self) -> str:
@@ -49,6 +59,7 @@ class PhaseContext:
             "continuation": dict(self.continuation or {}),
             "local_state": dict(self.local_state or {}),
             "cache_candidates": [dict(item) for item in self.cache_candidates if isinstance(item, dict)],
+            "cache_protocol": self.cache_protocol,
         }
 
 

@@ -507,6 +507,14 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 
 Use loop-control fields whenever the current loop item exposes a reusable gap that should affect the surrounding loop. Do not wait until multiple jobs fail with the same issue.
 
+### Declared Site Loop Scope
+
+Read the work item's `run_intent.evolution_scope` before deciding whether the current run is a stable execution or an active evolution loop. This scope is structural: it states the configured inner/outer limits and trigger, but it does not decide site strategy for you.
+
+- For `execution_mode = exploration`, treat the live site as a site-workflow evolution attempt. Use the same evidence, proposal, materialized-change, and validation discipline as any other loop; `apply_enabled` alone decides whether a real application may be submitted.
+- For `execution_mode = stable`, follow the normal site Skill. If a later refinement review is started, its work item will carry the same generic loop scope with a refinement trigger; do not infer that a ready site has become a new site.
+- Do not use `draft` as a reason to invent a browser strategy. Draft sites are not runnable until CareerEng creates an executable exploration work item.
+
 - `loop_control_action = trigger_refinement`: use when the live page exposes a reusable site/project Skill gap, such as a repeated form-field policy that should be added to a Skill before processing more jobs.
 - `loop_control_action = request_user_input`: use when a required answer is a real user fact that is missing locally and must not be guessed.
 - `loop_control_action = retry_recovery`: use only when the likely issue is page freshness, network, or snapshot/tool state and the runtime should recover rather than change Skills.
@@ -549,6 +557,14 @@ Loop-control continuation semantics:
 - If the current apply context already includes `apply_carry_forward`, start the next job's first live-page read from that carried guidance instead of restarting from a blank apply search.
 - Treat `apply_carry_forward` as the default first route for the next job on this site, not as optional background advice.
 - If the fresh current live page clearly disproves the carried guidance, adapt on that current page, finish the current job correctly, and replace `apply_carry_forward` when the current job reaches a terminal state.
+
+### Reusable Cache Evidence
+
+- Cache is optional, provisional evidence for a later live page. It never overrides the current page, Skill, user instruction, or required fresh observation.
+- After a live operation confirms a reusable page observation, field mapping, runtime capability, or browser sequence, call `cache_propose` with the current site/phase fingerprint and concise verified content.
+- When compatible candidates are available, inspect the current page first, then use `cache_read` only when a candidate may help. After using or rejecting it, call `cache_validate` with `validated`, `stale`, or `retired` and concise live evidence.
+- Do not create a cache candidate from a guess, a failed operation, raw DOM dumps, secrets, or user-specific form answers that should remain in profile/CV context.
+- Candidate creation and validation are evidence for later site evolution; they do not automatically modify a Skill or start evolution.
 
 ### Recovery Rules
 

@@ -11,6 +11,7 @@ from careereng.orchestration.engine.agent_workers import (
     SiteAgentWorkerCoordinator,
     worker_record_from_payload,
 )
+from careereng.platform.sessions import SiteWorkerSessionStore
 
 from .app_server import CodexAppServerClient, CodexAppServerEvent
 from .thread_state import bind_work_order_thread, load_work_order_binding
@@ -76,6 +77,8 @@ class CodexWorkerCoordinator(SiteAgentWorkerCoordinator):
         project_root: Path,
         worker_limit: int,
         app_server_factory: Callable[[Callable[[CodexAppServerEvent], None]], CodexAppServerClient],
+        workspace: Path | None = None,
+        max_effective_batches_per_session: int = 5,
         on_record: Callable[[CodexWorkerRecord], None] | None = None,
         on_usage: Callable[[CodexWorkerRecord, dict[str, Any]], None] | None = None,
     ):
@@ -90,6 +93,11 @@ class CodexWorkerCoordinator(SiteAgentWorkerCoordinator):
                 thread_id=record.thread_id,
                 turn_id=record.turn_id,
                 status=record.status,
+                worker_session_id=record.worker_session_id,
+                session_batch_ordinal=record.session_batch_ordinal,
+                session_reused=record.session_reused,
+                session_rotation_reason=record.session_rotation_reason,
+                last_error=record.last_error,
             )
 
         super().__init__(
@@ -98,6 +106,9 @@ class CodexWorkerCoordinator(SiteAgentWorkerCoordinator):
             transport_factory=transport_factory,
             load_binding=load_work_order_binding,
             bind_record=bind_record,
+            session_store=SiteWorkerSessionStore(workspace or (Path(project_root) / "workspace")),
+            backend="codex_app_server",
+            max_effective_batches_per_session=max_effective_batches_per_session,
             on_record=on_record,
             on_usage=on_usage,
         )

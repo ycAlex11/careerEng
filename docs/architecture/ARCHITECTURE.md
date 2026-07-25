@@ -136,12 +136,61 @@ browser sequences. The platform only checks structural compatibility (scope
 and declared dependency-version equality); it does not decide that a cached
 artifact is semantically safe for a live page.
 
-The agent receives compact compatible candidates in phase context and can use
-`cache_lookup`, `cache_read`, `cache_propose`, and `cache_validate`. The
-LLM/Skill decides whether to read, reuse, validate, stale, or retire an
+The active site worker receives compact compatible candidates in phase context
+and can use `cache_lookup`, `cache_read`, `cache_propose`, and
+`cache_validate`. A new artifact remains a provisional candidate across
+same-site batches; a hit is never an instruction to act without current
+live-page validation. The worker must provide reuse rationale, preconditions,
+page fingerprint, expected benefit, and evidence when proposing a candidate.
+The LLM/Skill decides whether to read, reuse, validate, stale, or retire an
 artifact. Cache validation events are indexed into evolution evidence packs so
-later evolution can decide whether to promote a repeated result into a lesson,
-Skill patch, or infrastructure proposal.
+later user-approved evolution can decide whether to promote a repeated result
+into a lesson, Skill patch, or infrastructure proposal.
+
+## Site Mode And Evolution Boundary
+
+Site Skill front matter carries one structural execution mode and one separate
+user authorization flag:
+
+- `status: draft` means the site has only been initialized. It cannot execute
+  until an agent has made the site strategy runnable.
+- `status: exploration` means the site executes through the shared evolution
+  loop engine. It is used for new-site discovery or an explicitly requested
+  re-exploration of an existing site.
+- `status: ready` means the site executes its normal workflow. A configured
+  site-run threshold may still start the same shared loop engine for
+  refinement; a ready site does not need to be demoted to exploration.
+- `apply_enabled` is independent of `status`. It is the user's authorization
+  for real application submission, not a proxy for Skill maturity.
+
+All evolution paths use one loop-engine contract: evidence, proposal,
+materialized change, validation, and synthesis. Configuration supplies
+only structural limits and trigger cadence. Codex/another agent, guided by
+Skills and evidence, chooses what changed, whether it worked, and whether a
+site is ready to stop evolving. Python persists state, enforces scope and
+limits, and advances the declared lifecycle without encoding site policy.
+
+When an exploration batch reaches a terminal site result, orchestration creates
+an action card, evidence pack, and Codex solution request before any readiness
+transition. The owning site worker consumes that request as its next turn on
+the retained thread, then applies the proposal and either starts the existing
+follow-up batch path or finishes. The proposal must carry an explicit
+`site_mode_update` decision (`ready` or `exploration`); applying it snapshots
+the target Skill front matter. This handoff is triggered only for the terminal
+batch being processed and never retroactively rewrites historical batches.
+
+Every browser phase exposes `record_evolution_signal` through the shared
+agent protocol. A worker supplies the failure pattern, evidence, refinement
+request, and optionally an explicit `run_local_overlay`. The loop engine
+records that input through the existing evidence, candidate, action-card, and
+memory stores. A materialized overlay in `EvolutionMemoryStore` is the only
+run-local execution source; legacy apply-loop summaries remain historical
+records and are never injected as strategy. An overlay is injected only into
+the next work item for the same batch, site, and phase. This keeps exploration, refinement, API
+providers, and external-agent workers on one contract rather than creating an
+apply-only evolution path. At the outer boundary, synthesis reads the generic
+site evolution container and closes all active run-local scopes for that site
+batch after the applied synthesis has consumed their evidence.
 
 ## Report Artifact Boundary
 
@@ -156,6 +205,12 @@ the shared artifact store. Their existing output paths remain domain-owned;
 the report index is a cross-domain discovery aid rather than a replacement for
 the source artifact layout.
 
+Job reports present metrics primarily per `site_key`: each site report contains
+its own token, phase, tool, snapshot/retry, cache, and outcome aggregates. The
+batch report retains only a cross-site aggregate and batch wall-clock. Site
+durations are never summed and presented as the wall-clock duration of a
+parallel batch.
+
 ## Runtime Session Boundary
 
 `platform/sessions/` owns persistent session messages/state, browser-profile
@@ -164,10 +219,35 @@ starts, reuses, releases, and protects a local browser MCP process for a
 caller-provided profile; it does not know a site's phase sequence, matching
 policy, or browser outcome semantics.
 
+Profile release is a single generic lifecycle operation. After all processes
+using the exact dedicated profile have stopped, it removes only that profile's
+orphaned Chromium `SingletonLock`, `SingletonSocket`, and `SingletonCookie`
+entries, then releases the CareerEng ownership record. It must never remove
+locks while a process still uses the profile, and it must report whether
+resources were actually released.
+
 Legacy browser phase runners may retain a thin compatibility method that
 supplies the site profile and writes domain session status. They must delegate
 runtime ownership to `platform/sessions/` rather than maintain their own
 active-process map or profile-lock lifecycle.
+
+`SiteWorkerSession` is a separate continuity boundary for external agents. It
+may retain one agent thread across inner-loop attempts, user pauses, and
+eligible consecutive site batches. A phase completion, a single batch
+completion, or `waiting_user` does not destroy that thread. Browser runtime
+release is independent from thread retention. A worker session ends only on
+explicit session close, a declared review/loop boundary that has completed its
+outer synthesis, or confirmed unrecoverable transport loss; a replacement
+thread then resumes from persisted CareerEng state.
+
+`batch` is the durable unit of a user run. While it is unfinished, additional
+sites join that batch; a new site does not create a new batch merely because it
+uses exploration, a different browser profile, Codex, or a provider. A site
+worker is host-local and temporary. Its in-memory capacity wait list is not a
+durable workflow status: after a host restart, the host rebuilds eligible work
+from persisted unfinished batch/site records and their current work item.
+Only the user can request an explicitly isolated batch, or a new batch begins
+after the prior one has ended.
 
 ## Runtime Host Boundary
 
@@ -176,6 +256,19 @@ browser/session execution. One host owns the workspace runtime and delegates
 per-site browser/profile access to `platform/sessions/` and
 `platform/web_control/`; it does not own site policy or create one process per
 site.
+
+One healthy host can serve several unfinished batches and several concurrent
+site workers up to configured capacity. A completed, cancelled, or otherwise
+non-resumable site releases only its own worker and browser runtime. A host
+closes only after the workspace has no unfinished batch. If a host disappears,
+its successor reuses the durable batch/site/current-work-item records and the
+eligible retained agent thread; a host restart never creates a new batch or
+rotates a thread by itself.
+
+`agent.site_parallelism` is the one configured site-worker limit for every
+backend. Provider workers use it to bound remote LLM/browser phase work;
+Codex workers use it to bound site-specific Codex threads. Provider rate
+limits remain adapter transport concerns and never change batch membership.
 
 Its versioned protocol is intentionally generic: `ping`, batch/resume/pause,
 browser/state tool transport, and `release_site`. `release_site` accepts only
@@ -381,19 +474,31 @@ the live agent execution lifecycle:
 ```text
 CareerEng batch/site work item
   -> assembled phase context + durable work-order audit artifact
-  -> adapters/codex/ starts or resumes one Codex thread for that site
+  -> orchestration binds it to its retained SiteWorkerSession
+  -> adapters/codex/ starts or resumes that session's Codex thread
   -> Codex thread receives a work_item_id and pulls scoped MCP context
   -> Codex thread uses CareerEng MCP/browser/state tools
   -> Codex App Server emits turn lifecycle events
   -> CareerEng records thread/turn linkage and updates batch evidence
 ```
 
-One `site + batch` has one active worker at a time. `orchestration/engine/site_work_items.py`
-owns generic queue and slot semantics, while
-`orchestration/engine/agent_workers.py` owns retained external-agent thread
-lifecycle. `adapters/codex/` only translates a claimed item to Codex App Server
-RPC/events. A future Claude Code adapter supplies the same thread transport
-contract rather than another lifecycle state machine.
+One `site + batch` has one active work item at a time. A persisted
+`SiteWorkerSession` may bind consecutive effective work items for the same
+site and backend to one external-agent thread. The session is a bounded
+continuity layer, not a replacement for batches: each batch keeps independent
+history, report, metrics, and evidence. Cancellation does not consume the
+configured effective-run boundary. At that boundary CareerEng creates an
+evolution synthesis task; it does not automatically make a business decision.
+
+`orchestration/engine/site_work_items.py` owns generic queue and slot
+semantics, `orchestration/engine/agent_workers.py` owns retained external-agent
+thread lifecycle, and `platform/sessions/site_workers.py` persists session and
+thread bindings. The same configuration exposes the new-site exploration loop
+limits and recurring review cadence. These are structural counts only; Codex
+and Skills decide success, continuation, cache value, and proposed evolution.
+`adapters/codex/` only translates a claimed item to Codex App Server RPC/events.
+A future Claude Code adapter supplies the same thread transport contract rather
+than another lifecycle state machine.
 `agent.agent_parallelism` limits active Codex workers and falls back to
 `agent.site_parallelism` when unset. A batch is an aggregation, report, and
 evidence container, not a global browser lock.
@@ -401,8 +506,8 @@ evidence container, not a global browser lock.
 `platform/runtime_host/` serializes raw browser/state operations per site only.
 It must never serialize unrelated sites through a workspace-wide runtime lock.
 Waiting-user, approval, cancellation, and release events are scoped to the
-owning site work item and Codex thread. Provider execution remains a separate
-adapter path.
+owning site work item and Codex thread. Provider execution uses the same
+batch/evidence/proposal/apply continuation, but has no retained remote thread.
 
 The work order files remain audit and recovery artifacts, not worker startup
 instructions. A worker must not scan project files to reconstruct scope. After

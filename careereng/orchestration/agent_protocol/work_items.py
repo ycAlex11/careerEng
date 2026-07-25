@@ -18,7 +18,7 @@ _RESOURCE_DESCRIPTIONS = {
     "cache_candidates": "Validated local cache candidates for this scoped phase.",
     "local_state": "Non-business identifiers and retained runtime scope for this phase.",
     "state_tools": "CareerEng state-tool schemas allowed for the current phase.",
-    "apply_facts": "Lightweight structured profile facts, available on demand during apply.",
+    "apply_facts": "Current lightweight profile facts, available on demand during apply; re-read after user/profile changes.",
     "full_cv": "Current full CV text, available on demand when detailed evidence is needed.",
     "full_persona": "Current detailed persona/profile data, available on demand.",
     "history_view": "Current site-only batch history view, available on demand.",

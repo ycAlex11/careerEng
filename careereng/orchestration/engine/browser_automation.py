@@ -59,7 +59,6 @@ from careereng.orchestration.context import (
     BrowserPhaseMemory,
     ContextResourceResolver,
     WorkflowMemoryStore,
-    build_apply_initial_facts,
     extract_failure_snapshot_from_trace,
 )
 from careereng.config.schema import (
@@ -136,10 +135,12 @@ class BrowserAutomationService:
         recovery: BrowserRecoveryConfig | None = None,
         retrieval_policy: BrowserRetrievalPolicyConfig | None = None,
         phase_runtime_factory: Callable[[dict[str, Any]], Any] | None = None,
+        evolution_signal_recorder: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ):
         self.project_root = Path(project_root).resolve()
         self.workspace = Path(workspace).resolve()
         self.site_store = site_store
+        self._evolution_signal_recorder = evolution_signal_recorder
         self.execution_mode = self._normalize_execution_mode(execution_mode)
         self.headless = bool(headless)
         self.keep_open = bool(keep_open)
@@ -345,12 +346,20 @@ class BrowserAutomationService:
                     reason_tag="resume_pdf_unavailable",
                     message=str(exc),
                 )
-            self._browser_context_registry.refresh_if_changed()
-            apply_initial_facts = build_apply_initial_facts(
-                registry=self._browser_context_registry,
-                staged_resume_pdf_path=str(staged_resume_pdf),
-                target_job_ids=apply_target_job_ids,
-            )
+            # Keep only execution hints in the persisted work item. Profile
+            # facts remain an on-demand resource so a resumed agent gets the
+            # user's latest values instead of a stale copied payload.
+            apply_initial_facts = {
+                "staged_resume": {
+                    "path": str(staged_resume_pdf),
+                    "filename": Path(staged_resume_pdf).name,
+                },
+                "apply_target_job_ids": [
+                    str(job_id or "").strip()
+                    for job_id in (apply_target_job_ids or ())
+                    if str(job_id or "").strip()
+                ],
+            }
             self.site_store.save_browser_session(
                 site_key,
                 {"staged_resume_pdf_path": str(staged_resume_pdf)},
@@ -845,6 +854,34 @@ class BrowserAutomationService:
         context = self._agent_bridge_session_context(site_key, phase=phase)
         return state_tool_schemas_for_phase(str(context.get("phase") or ""), include_phase_result=True)
 
+    def set_evolution_signal_recorder(self, recorder: Callable[[dict[str, Any]], dict[str, Any]] | None) -> None:
+        """Attach the generic evolution engine after the workflow is built."""
+
+        self._evolution_signal_recorder = recorder
+
+    def _record_active_evolution_signal(
+        self,
+        *,
+        context: dict[str, Any],
+        phase: str,
+        turn_id: str,
+        signal: dict[str, Any],
+    ) -> dict[str, Any]:
+        recorder = self._evolution_signal_recorder
+        if not callable(recorder):
+            raise RuntimeError("evolution signal recorder is unavailable")
+        return recorder(
+            {
+                "site_key": str(context.get("site_key") or ""),
+                "batch_id": str(context.get("batch_id") or ""),
+                "phase": str(phase or ""),
+                "turn_id": str(turn_id or ""),
+                "trace_ref": str(context.get("current_trace_ref") or ""),
+                "current_url": str(context.get("current_url") or ""),
+                "signal": dict(signal or {}),
+            }
+        )
+
     def call_active_state_tool(
         self,
         *,
@@ -889,6 +926,12 @@ class BrowserAutomationService:
                 workspace=self.workspace,
                 cache_scope={"site_key": str(context.get("site_key") or site_key), "phase": effective_phase},
                 cache_dependency_versions=cache_versions,
+                record_evolution_signal=lambda signal: self._record_active_evolution_signal(
+                    context=context,
+                    phase=effective_phase,
+                    turn_id=effective_turn_id,
+                    signal=signal,
+                ),
             ),
         )
         summary = MCPToolBridge.summarize_tool_output(payload)
@@ -1104,6 +1147,10 @@ class BrowserAutomationService:
         return BrowserContextSession.for_phase(
             phase_memory=phase_memory,
             continuation_context=continuation_context,
+            workspace=self.workspace,
+            site_key=site_key,
+            batch_id=batch_id,
+            phase=phase_slug,
         )
 
     def _session_preparation_context_items(self, site_key: str) -> list[dict[str, str]]:
@@ -1155,7 +1202,7 @@ class BrowserAutomationService:
         turn_id: str,
         phase_result: BrowserPhaseResult,
     ) -> None:
-        if str(phase_result.status or "").strip().lower() not in {"done", "blocked", "failed"}:
+        if str(phase_result.status or "").strip().lower() not in {"done", "waiting_user", "blocked", "failed"}:
             return
         try:
             WorkflowMemoryStore(self.workspace).update_phase(

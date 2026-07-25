@@ -368,12 +368,19 @@ def _proposal_skeleton(
             "proposed_changes": [
                 {
                     "change_id": "change_1",
+                    "change_type": "site_mode_update",
+                    "site_key": str(context.get("site_key") or ""),
+                    "mode": "ready",
+                    "summary": "Replace with Codex's evidence-backed readiness decision.",
+                },
+                {
+                    "change_id": "change_2",
                     "change_type": "skill_patch",
-                    "summary": "Durable site-skill refinement supported by batch-level evidence.",
+                    "summary": "Optional durable site-skill refinement supported by batch-level evidence.",
                     "target_file": str(context.get("target_ref") or candidate.get("target_ref") or ""),
                     "target_section": "Apply",
                     "patch_strategy": "replace_section",
-                    "replacement_markdown": "Replace this with the complete updated Markdown section.",
+                    "replacement_markdown": "Replace this with the complete updated Markdown section when the evidence supports a Skill change.",
                     "source_evidence_id": context.get("evidence_id") or "",
                     "confidence": 0.7,
                 }

@@ -15,6 +15,11 @@ def bind_work_order_thread(
     thread_id: str,
     turn_id: str = "",
     status: str,
+    worker_session_id: str = "",
+    session_batch_ordinal: int = 0,
+    session_reused: bool = False,
+    session_rotation_reason: str = "",
+    last_error: str = "",
 ) -> dict[str, Any]:
     """Record an adapter-owned thread id without introducing a second store."""
 
@@ -27,6 +32,11 @@ def bind_work_order_thread(
         "turn_id": str(turn_id),
         "status": str(status),
         "updated_at": now_iso(),
+        "worker_session_id": str(worker_session_id or ""),
+        "session_batch_ordinal": int(session_batch_ordinal or 0),
+        "session_reused": bool(session_reused),
+        "session_rotation_reason": str(session_rotation_reason or ""),
+        "last_error": str(last_error or ""),
     }
     for target in (payload, phase_session):
         target["codex_thread"] = binding

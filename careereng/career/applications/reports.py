@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from careereng.platform.observability import build_metrics_summary
+from careereng.platform.observability import build_metrics_summary, metrics_report_projection
 from careereng.platform.reporting import ReportArtifactStore
+from careereng.platform.sessions import SiteWorkerSessionStore
 from careereng.career.applications.job_store import JobStore
 from careereng.career.applications.site_store import SiteStore
 from careereng.utils import ensure_dir, safe_file_stem, today_str
@@ -146,6 +148,33 @@ def _batch_report_date(batch: dict[str, Any]) -> str:
     if match:
         return match.group(0)
     return today_str()
+
+
+def _batch_wall_clock(batch: dict[str, Any]) -> dict[str, Any]:
+    started_at = str(batch.get("created_at") or "").strip()
+    ended_at = str(batch.get("updated_at") or "").strip()
+    elapsed_ms = 0
+    if started_at and ended_at:
+        try:
+            start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            end = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+            elapsed_ms = max(0, int((end - start).total_seconds() * 1000))
+        except ValueError:
+            pass
+    return {"started_at": started_at, "ended_at": ended_at, "elapsed_ms": elapsed_ms}
+
+
+def _performance_line(metrics: dict[str, Any]) -> str:
+    usage = metrics.get("usage") if isinstance(metrics.get("usage"), dict) else {}
+    performance = metrics.get("performance") if isinstance(metrics.get("performance"), dict) else {}
+    totals = performance.get("totals") if isinstance(performance.get("totals"), dict) else {}
+    return (
+        f"耗时 {totals.get('elapsed_ms', 0)}ms，"
+        f"LLM token {usage.get('total_tokens', 0)}，"
+        f"浏览器工具 {totals.get('browser_tool_calls', 0)}，"
+        f"snapshot {totals.get('snapshot_count', 0)}，"
+        f"cache hit/miss {totals.get('cache_hits', 0)}/{totals.get('cache_misses', 0)}"
+    )
 
 
 def _site_report_paths(workspace: Path, site_key: str, batch_id: str, report_date: str) -> tuple[Path, Path]:
@@ -474,6 +503,10 @@ def _site_markdown(report: dict[str, Any]) -> str:
     lines.extend(["", "## 申请状态检查"])
     reviewed_jobs = review.get("reviewed_jobs") if isinstance(review.get("reviewed_jobs"), list) else []
     _append_review_group_lines(lines, reviewed_jobs, include_site=False)
+    metrics = report.get("metrics") if isinstance(report.get("metrics"), dict) else {}
+    worker_sessions = report.get("worker_session_evidence") if isinstance(report.get("worker_session_evidence"), dict) else {}
+    session_rows = worker_sessions.get("sessions") if isinstance(worker_sessions.get("sessions"), list) else []
+    lines.extend(["", "## 性能", f"- {_performance_line(metrics)}", f"- Worker sessions: {len(session_rows)}"])
     return "\n".join(lines)
 
 
@@ -509,6 +542,11 @@ def _batch_markdown(report: dict[str, Any]) -> str:
             f"状态变化 {site.get('application_review', {}).get('changed_count', 0)}"
         )
 
+    lines.extend(["", "## Site 性能"])
+    for site in site_reports:
+        metrics = site.get("metrics") if isinstance(site.get("metrics"), dict) else {}
+        lines.append(f"- {site.get('site_name') or site.get('site_key')}: {_performance_line(metrics)}")
+
     new_submitted_jobs = report.get("new_submitted_jobs") if isinstance(report.get("new_submitted_jobs"), list) else []
     new_unsubmitted_jobs = (
         report.get("new_unsubmitted_jobs") if isinstance(report.get("new_unsubmitted_jobs"), list) else []
@@ -526,13 +564,15 @@ def _batch_markdown(report: dict[str, Any]) -> str:
     lines.extend(["", "## 申请状态检查"])
     _append_review_group_lines(lines, reviewed_jobs, include_site=True)
     metrics = report.get("metrics") if isinstance(report.get("metrics"), dict) else {}
-    usage = metrics.get("totals") if isinstance(metrics.get("totals"), dict) else {}
+    usage = metrics.get("usage") if isinstance(metrics.get("usage"), dict) else {}
     performance = metrics.get("performance") if isinstance(metrics.get("performance"), dict) else {}
     performance_totals = performance.get("totals") if isinstance(performance.get("totals"), dict) else {}
+    wall_clock = metrics.get("batch_wall_clock") if isinstance(metrics.get("batch_wall_clock"), dict) else {}
     lines.extend(
         [
             "",
-            "## 性能",
+            "## 性能（Batch 汇总）",
+            f"- Wall-clock: {wall_clock.get('elapsed_ms', 0)}ms",
             f"- LLM 调用: {usage.get('calls', 0)}；输入 token: {usage.get('input_tokens', 0)}；输出 token: {usage.get('output_tokens', 0)}；未知 token 调用: {usage.get('unknown_token_calls', 0)}",
             f"- 执行事件: {performance_totals.get('events', 0)}；浏览器工具: {performance_totals.get('browser_tool_calls', 0)}；状态工具: {performance_totals.get('state_tool_calls', 0)}；snapshot: {performance_totals.get('snapshot_count', 0)}；技术错误: {performance_totals.get('technical_error_count', 0)}",
         ]
@@ -705,6 +745,8 @@ def build_site_report(
     )
     retrieve = site_row.get("retrieve") if isinstance(site_row.get("retrieve"), dict) else {}
     apply = site_row.get("apply") if isinstance(site_row.get("apply"), dict) else {}
+    metrics = metrics_report_projection(build_metrics_summary(workspace=workspace, batch_id=batch_id, site_key=site_key))
+    worker_session_evidence = SiteWorkerSessionStore(workspace).site_evidence(site_key)
     report = {
         "batch_id": batch_id,
         "report_date": report_date,
@@ -734,6 +776,8 @@ def build_site_report(
         "application_review_changes": (
             application_review.get("review_changes") if isinstance(application_review.get("review_changes"), list) else []
         ),
+        "metrics": metrics,
+        "worker_session_evidence": worker_session_evidence,
     }
     json_path, md_path = _site_report_paths(workspace, site_key, batch_id, report_date)
     _write_report_artifact(
@@ -848,6 +892,8 @@ def generate_job_batch_report(
             if isinstance(row, dict):
                 unmatched_review_records.append({"site_key": site_key, "site_name": site_name, **row})
 
+    batch_metrics = metrics_report_projection(build_metrics_summary(workspace=workspace, batch_id=batch_id))
+    batch_metrics["batch_wall_clock"] = _batch_wall_clock(batch)
     report = {
         "batch_id": batch_id,
         "report_date": report_date,
@@ -861,7 +907,7 @@ def generate_job_batch_report(
         "reviewed_jobs": reviewed_jobs,
         "application_review_changes": application_review_changes,
         "unmatched_review_records": unmatched_review_records,
-        "metrics": build_metrics_summary(workspace=workspace, batch_id=batch_id),
+        "metrics": batch_metrics,
     }
     json_path, md_path = _batch_report_paths(workspace, batch_id, report_date)
     _write_report_artifact(

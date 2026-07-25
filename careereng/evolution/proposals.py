@@ -14,6 +14,7 @@ SUPPORTED_CHANGE_TYPES = {
     "routing_example_append",
     "memory_unit_append",
     "assistant_context_update",
+    "site_mode_update",
 }
 FORBIDDEN_CHANGE_TYPES = {
     "python_code_patch",
@@ -87,6 +88,10 @@ def _validate_change(change: dict[str, Any], *, idx: int) -> None:
             raise EvolutionProposalError(
                 f"Change #{idx} assistant_context_update can only target {ASSISTANT_CONTEXT_TARGET}."
             )
+    elif change_type == "site_mode_update":
+        _require(change, idx=idx, fields=("site_key", "mode"))
+        if str(change.get("mode") or "").strip().lower() not in {"ready", "exploration"}:
+            raise EvolutionProposalError(f"Change #{idx} site_mode_update mode must be ready or exploration.")
 
 
 def _require(change: dict[str, Any], *, idx: int, fields: tuple[str, ...]) -> None:

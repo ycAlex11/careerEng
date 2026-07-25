@@ -13,8 +13,12 @@ from careereng.evolution.work_items.schema import ACTION_CARD_MANUAL_DECISION
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore
 from careereng.evolution.candidate_specs import load_candidate_specs
 from careereng.evolution.memory_units import EvolutionMemoryStore
+from careereng.evolution.loop_engine import build_site_loop_scope
 from careereng.evolution.runs import create_evolution_run
+from careereng.platform.cache import CacheArtifactStore
+from careereng.platform.observability import build_metrics_summary, metrics_report_projection
 from careereng.platform.persistence import JSONLStore
+from careereng.platform.sessions import SiteWorkerSessionStore
 from careereng.career.applications.job_store import JobStore
 from careereng.career.applications.site_store import SiteStore
 from careereng.utils import ensure_dir, now_iso, read_json, safe_file_stem, write_json
@@ -152,6 +156,8 @@ def create_site_batch_evolution_reviews(
     workspace: Path | str,
     batch: dict[str, Any],
     site_run_threshold: int = 5,
+    inner_attempt_limit: int = 3,
+    outer_batch_limit: int = 3,
 ) -> dict[str, Any]:
     """Create Codex-facing review cards from terminal site-batch evidence.
 
@@ -205,6 +211,11 @@ def create_site_batch_evolution_reviews(
             continue
 
         skill_path = site_store.site_skill_path(site_key)
+        cache_evidence = CacheArtifactStore(workspace_path).site_evidence(site_key)
+        worker_session_evidence = SiteWorkerSessionStore(workspace_path).site_evidence(site_key)
+        site_metrics = metrics_report_projection(
+            build_metrics_summary(workspace=workspace_path, batch_id=batch_id, site_key=site_key)
+        )
         candidate = {
             "candidate_id": SITE_WORKFLOW_CANDIDATE_ID,
             "area": "site_batch_evolution_review",
@@ -223,11 +234,26 @@ def create_site_batch_evolution_reviews(
             "reason": " ".join(reasons),
             "summary": f"{site_key} reached a site-batch evolution review trigger.",
             "suggested_change": (
-                "Use the batch report, workflow summary, browser traces, and existing lessons to decide with the user "
-                "whether to evolve site Skill, matching strategy, user/profile strategy, or generic infrastructure."
+                "Use the site report, workflow summary, browser traces, cache validation evidence, and site metrics to decide with the user "
+                "whether to evolve site Skill, matching strategy, user/profile strategy, cache assets, or generic infrastructure."
             ),
-            "proposal_scopes": ["site_skill", "matching_policy", "profile_strategy", "infrastructure"],
-            "evidence_refs": _site_batch_evidence_refs(workspace_path, batch_id),
+            "proposal_scopes": ["site_skill", "matching_policy", "profile_strategy", "cache", "infrastructure"],
+            "loop_scope": build_site_loop_scope(
+                site_key=site_key,
+                site_mode="ready",
+                execution_mode="stable",
+                inner_attempt_limit=inner_attempt_limit,
+                outer_batch_limit=outer_batch_limit,
+            ),
+            "site_metrics": site_metrics,
+            "cache_evidence": cache_evidence,
+            "worker_session_evidence": worker_session_evidence,
+            "evidence_refs": _site_batch_evidence_refs(
+                workspace_path,
+                batch_id,
+                site_key=site_key,
+                cache_evidence=cache_evidence,
+            ),
             "state_ref": str(_trigger_state_path(workspace_path)),
         }
         _attach_review_card(
@@ -1343,6 +1369,15 @@ def _evolution_direction_options(project_root: Path) -> list[dict[str, str]]:
     rows.append(
         {
             "candidate_id": "",
+            "name": "Cache evidence review",
+            "target_type": "review_option",
+            "target_ref": "workspace/cache artifacts, validation events, and site metrics",
+            "spec_path": "",
+        }
+    )
+    rows.append(
+        {
+            "candidate_id": "",
             "name": "Cross-site lesson review",
             "target_type": "review_option",
             "target_ref": "accepted lessons / memory / action cards",
@@ -1428,6 +1463,10 @@ def _review_related_files(*, project_root: Path, workspace: Path, candidate: dic
     if target_ref:
         target_path = Path(target_ref)
         paths.append(target_path if target_path.is_absolute() else project_root / target_path)
+    for ref in candidate.get("evidence_refs") or []:
+        path = Path(str(ref or "").strip())
+        if path.exists():
+            paths.append(path)
     return [str(path) for path in paths if path.exists()]
 
 
@@ -1531,16 +1570,37 @@ def _site_batch_failed(*, batch_status: str, site: dict[str, Any]) -> bool:
     return str(retrieve.get("status") or "") == "failed" or str(apply.get("status") or "") == "failed"
 
 
-def _site_batch_evidence_refs(workspace: Path, batch_id: str) -> list[str]:
+def _site_batch_evidence_refs(
+    workspace: Path,
+    batch_id: str,
+    *,
+    site_key: str = "",
+    cache_evidence: dict[str, Any] | None = None,
+) -> list[str]:
     """Expose persisted evidence locations without interpreting their content."""
 
     paths = [
         workspace / "jobs" / "batches" / f"{batch_id}.json",
-        workspace / "reports" / "job_batches" / f"{batch_id}.md",
         workspace / "evolution" / "workflow_summaries" / f"{batch_id}.md",
         workspace / "jobs" / "events.jsonl",
+        workspace / "metrics" / "llm_usage.jsonl",
+        workspace / "metrics" / "performance_events.jsonl",
     ]
-    return [str(path) for path in paths if path.exists()]
+    normalized_site = safe_file_stem(site_key)
+    if normalized_site:
+        paths.extend(
+            [
+                workspace / "sites" / normalized_site / "jobs" / "runs" / f"{batch_id}.jsonl",
+                workspace / "sites" / normalized_site / "jobs" / "runs" / f"{batch_id}.context.json",
+            ]
+        )
+        paths.extend((workspace / "reports" / "jobs").glob(f"**/sites/{normalized_site}/{batch_id}.json"))
+    refs = [str(path) for path in paths if path.exists()]
+    for ref in (cache_evidence or {}).get("evidence_refs") or []:
+        value = str(ref or "").strip()
+        if value and value not in refs:
+            refs.append(value)
+    return refs
 
 
 def _trigger_state_path(workspace: Path) -> Path:

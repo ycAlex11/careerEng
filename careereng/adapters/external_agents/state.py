@@ -16,7 +16,7 @@ def state_tools_command(site_key: str, *, phase: str = "") -> str:
     return f"python -m careereng agent-bridge state-tools --site {site_key}{phase_arg}"
 
 
-def phase_result_command(site_key: str, *, status: str = "<done|blocked>", summary: str = "<summary>", phase: str = "") -> str:
+def phase_result_command(site_key: str, *, status: str = "<done|waiting_user|blocked>", summary: str = "<summary>", phase: str = "") -> str:
     phase_arg = f" --phase {phase}" if phase else ""
     return (
         "python -m careereng agent-bridge phase-result "

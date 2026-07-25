@@ -8,17 +8,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import time
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 
 from careereng.adapters.bootstrap import project_root_from_cwd, workspace_path as resolve_workspace_path
-from careereng.adapters.external_agents.work_orders import load_active_phase_context
 from careereng.orchestration.agent_protocol.work_items import build_work_item_context, read_work_item_resource, work_item_id_from_payload
 from careereng.adapters.external_agents.contracts import AGENT_BRIDGE_PROTOCOL_VERSION
 from careereng.orchestration.agent_protocol.runtime_lifecycle import release_site_payload
 from careereng.career.applications.job_store import JobStore, TERMINAL_BATCH_STATUSES
+from careereng.career.applications.site_modes import SITE_MODES
 from careereng.career.applications.site_store import SiteStore
 from careereng.platform.runtime_host import RUNTIME_HOST_PROTOCOL_VERSION, runtime_host_client, runtime_host_status
 from careereng.utils import make_id
@@ -60,6 +59,7 @@ def _compact_batch(batch: dict[str, Any] | None) -> dict[str, Any]:
         "session_id": str(batch.get("session_id") or ""),
         "turn_id": str(batch.get("turn_id") or ""),
         "operation": str(batch.get("operation") or ""),
+        "execution_backend": str(batch.get("execution_backend") or ""),
         "apply_requested": bool(batch.get("apply_requested")),
         "status": str(batch.get("status") or ""),
         "created_at": str(batch.get("created_at") or ""),
@@ -111,42 +111,6 @@ def _latest_batch(store: JobStore, *, session_id: str, batch_id: str) -> dict[st
     return store.latest_open_batch(session_id) or (store.list_batches(session_id=session_id)[:1] or [None])[0]
 
 
-def _active_phase_contexts(
-    *,
-    site_store: SiteStore,
-    batch: dict[str, Any] | None,
-    site_key: str = "",
-) -> list[dict[str, Any]]:
-    """Read ready external-agent phase contexts without interpreting them."""
-
-    if str((batch or {}).get("status") or "") in TERMINAL_BATCH_STATUSES:
-        return []
-    sites = batch.get("sites") if isinstance(batch, dict) and isinstance(batch.get("sites"), dict) else {}
-    requested_site = str(site_key or "").strip()
-    contexts: list[dict[str, Any]] = []
-    for raw_key, row in sites.items():
-        key = str(raw_key or "").strip()
-        if not key or (requested_site and key != requested_site):
-            continue
-        try:
-            browser_session = site_store.load_browser_session(key)
-        except Exception:
-            browser_session = {}
-        payload_path = str(browser_session.get("agent_bridge_payload_path") or "")
-        context = load_active_phase_context(payload_path)
-        if context:
-            contexts.append(context)
-    return contexts
-
-
-def _with_phase_contexts(payload: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any]:
-    enriched = dict(payload)
-    enriched["active_phase_contexts"] = contexts
-    if len(contexts) == 1:
-        enriched["active_phase_context"] = contexts[0]
-    return enriched
-
-
 def _active_work_item_payload(runtime: CareerEngMCPRuntime, work_item_id: str) -> dict[str, Any]:
     """Resolve an active persisted work item without exposing its file path."""
 
@@ -196,31 +160,16 @@ def _active_work_item_scope(runtime: CareerEngMCPRuntime, work_item_id: str) -> 
     }
 
 
-def _wait_for_phase_contexts(
-    *,
-    runtime: CareerEngMCPRuntime,
-    batch_id: str,
-    timeout_seconds: float = 5.0,
-) -> list[dict[str, Any]]:
-    """Boundedly wait for a launched agent-bridge work order to become readable."""
-
-    deadline = time.monotonic() + max(0.0, float(timeout_seconds or 0.0))
-    while True:
-        batch = runtime.job_store().load_batch(batch_id)
-        contexts = _active_phase_contexts(site_store=runtime.site_store(), batch=batch)
-        if contexts or time.monotonic() >= deadline:
-            return contexts
-        time.sleep(0.1)
-
-
 def create_mcp_server(*, project_root: Path | None = None, workspace: Path | None = None) -> FastMCP:
     runtime = CareerEngMCPRuntime.from_paths(project_root=project_root, workspace=workspace)
     server = FastMCP(
         "careereng",
         instructions=(
             "CareerEng MCP tools expose local CareerEng workflow capabilities to Codex. "
-            "Use these tools as orchestration/state/browser plumbing only; business judgment "
-            "must stay in Skills, memory, evolution proposals, and the LLM."
+            "Top-level tools are monitoring and lifecycle controls only. Browser and state "
+            "execution is allowed only through careereng_work_item_* tools bound to one active "
+            "worker item. Business judgment must stay in Skills, memory, evolution proposals, "
+            "and the LLM."
         ),
     )
 
@@ -246,7 +195,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         batch_id: str = "latest",
         site_key: str = "",
     ) -> dict[str, Any]:
-        """Return compact local CareerEng session, batch, site, and browser-session context."""
+        """Return compact monitoring context without executable phase instructions."""
         job_store = runtime.job_store()
         site_store = runtime.site_store()
         batch = _latest_batch(job_store, session_id=session_id, batch_id=batch_id)
@@ -261,7 +210,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             except Exception:
                 browser_session = {}
             compact_sites.append(_compact_site(site, browser_session=browser_session))
-        return _with_phase_contexts({
+        return {
             "ok": True,
             "bridge_protocol_version": AGENT_BRIDGE_PROTOCOL_VERSION,
             "runtime_host_protocol_version": RUNTIME_HOST_PROTOCOL_VERSION,
@@ -270,7 +219,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             "session_id": session_id,
             "batch": _compact_batch(batch),
             "active_sites": compact_sites,
-        }, _active_phase_contexts(site_store=site_store, batch=batch, site_key=site_key))
+        }
 
     @server.tool()
     def careereng_get_work_item_context(work_item_id: str) -> dict[str, Any]:
@@ -361,8 +310,10 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         operation: str = "job_search",
         apply_requested: bool = True,
         session_id: str = DEFAULT_SESSION_ID,
+        backend: Literal["provider", "codex"] | str = "",
+        separate_batch: bool = False,
     ) -> dict[str, Any]:
-        """Start a jobs batch and return its first ready external-agent phase context."""
+        """Start a jobs batch on the explicitly selected configured backend."""
         result = runtime.host_client().request(
             "start_jobs_batch",
             {
@@ -370,17 +321,14 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 "message": message,
                 "operation": operation,
                 "apply_requested": bool(apply_requested),
+                "backend": str(backend or ""),
+                "separate_batch": bool(separate_batch),
             },
             timeout=10.0,
         )
         if not bool(result.get("accepted")):
             return result
-        batch_id = str(result.get("batch_id") or "")
-        contexts = _wait_for_phase_contexts(
-            runtime=runtime,
-            batch_id=batch_id,
-        ) if batch_id else []
-        return _with_phase_contexts(result, contexts)
+        return result
 
     @server.tool()
     def careereng_resume_after_user_action(
@@ -409,6 +357,37 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         )
 
     @server.tool()
+    def careereng_set_site_mode(
+        site_key: str,
+        mode: str,
+        apply_enabled: bool | None = None,
+    ) -> dict[str, Any]:
+        """Set draft/exploration/ready without deleting site history or browser state."""
+
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode not in SITE_MODES:
+            return {"ok": False, "error": f"unsupported site mode: {mode}"}
+        site = runtime.site_store().find_site(site_key)
+        if not site:
+            return {"ok": False, "error": f"site not found: {site_key}"}
+        resolved_key = str(site.get("site_key") or site_key)
+        try:
+            skill = runtime.site_store().set_skill_mode(
+                resolved_key,
+                mode=normalized_mode,
+                apply_enabled=apply_enabled,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        metadata = skill.get("front_matter") if isinstance(skill.get("front_matter"), dict) else {}
+        return {
+            "ok": True,
+            "site_key": resolved_key,
+            "mode": str(metadata.get("status") or ""),
+            "apply_enabled": bool(metadata.get("apply_enabled")),
+        }
+
+    @server.tool()
     def careereng_cancel_jobs_batch(batch_id: str, reason: str = "user_requested_cancel") -> dict[str, Any]:
         """Cancel exactly one active batch and release only its site runtimes."""
         return runtime.host_client().request(
@@ -422,100 +401,6 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
 
         request = release_site_payload(site_key=site_key)
         return runtime.host_client().release_site(site_key=request["site_key"])
-
-    @server.tool()
-    def careereng_list_browser_tools(site_key: str) -> dict[str, Any]:
-        """List browser tools for an active CareerEng site runtime."""
-        return runtime.host_client().request(
-            "agent_bridge_browser_list_tools",
-            {"site_key": site_key},
-        )
-
-    @server.tool()
-    def careereng_call_browser_tool(
-        site_key: str,
-        tool_name: str,
-        arguments: dict[str, Any] | None = None,
-        phase: str = "external-agent-bridge",
-        turn_id: str = "",
-    ) -> dict[str, Any]:
-        """Call one browser tool through the active CareerEng site runtime."""
-        return runtime.host_client().request(
-            "agent_bridge_browser_call_tool",
-            {
-                "site_key": site_key,
-                "tool_name": tool_name,
-                "arguments": arguments or {},
-                "turn_id": turn_id,
-                "phase": phase,
-            },
-        )
-
-    @server.tool()
-    def careereng_run_browser_sequence(
-        site_key: str,
-        steps: list[dict[str, Any]],
-        phase: str = "external-agent-bridge",
-        turn_id: str = "",
-    ) -> dict[str, Any]:
-        """Execute explicit ordered browser actions through the retained site runtime."""
-        return runtime.host_client().request(
-            "agent_bridge_browser_run_sequence",
-            {
-                "site_key": site_key,
-                "steps": steps,
-                "turn_id": turn_id,
-                "phase": phase,
-            },
-        )
-
-    @server.tool()
-    def careereng_list_state_tools(site_key: str, phase: str = "") -> dict[str, Any]:
-        """List CareerEng state tools for an active phase session."""
-        return runtime.host_client().request(
-            "agent_bridge_state_list_tools",
-            {"site_key": site_key, "phase": phase},
-        )
-
-    @server.tool()
-    def careereng_call_state_tool(
-        site_key: str,
-        tool_name: str,
-        arguments: dict[str, Any] | None = None,
-        phase: str = "",
-        turn_id: str = "",
-    ) -> dict[str, Any]:
-        """Call one CareerEng state tool through the active phase session."""
-        return runtime.host_client().request(
-            "agent_bridge_state_call_tool",
-            {
-                "site_key": site_key,
-                "tool_name": tool_name,
-                "arguments": arguments or {},
-                "turn_id": turn_id,
-                "phase": phase,
-            },
-        )
-
-    @server.tool()
-    def careereng_phase_result(
-        site_key: str,
-        status: Literal["done", "blocked"],
-        summary: str,
-        phase: str = "",
-        turn_id: str = "",
-    ) -> dict[str, Any]:
-        """Record a phase_result through the shared CareerEng state-tool path."""
-        return runtime.host_client().request(
-            "agent_bridge_state_call_tool",
-            {
-                "site_key": site_key,
-                "tool_name": "phase_result",
-                "arguments": {"status": status, "summary": summary},
-                "turn_id": turn_id,
-                "phase": phase,
-            },
-        )
 
     @server.tool()
     def careereng_work_item_list_browser_tools(work_item_id: str) -> dict[str, Any]:
@@ -613,7 +498,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
     @server.tool()
     def careereng_work_item_phase_result(
         work_item_id: str,
-        status: Literal["done", "blocked"],
+        status: Literal["done", "waiting_user", "blocked"],
         summary: str,
     ) -> dict[str, Any]:
         """Write the terminal result of exactly one active worker phase."""
@@ -621,6 +506,22 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             work_item_id=work_item_id,
             tool_name="phase_result",
             arguments={"status": status, "summary": summary},
+        )
+
+    @server.tool()
+    def careereng_complete_evolution_solution(work_item_id: str, run_id: str) -> dict[str, Any]:
+        """Continue one worker after it has written and applied its current evolution proposal."""
+        try:
+            scope = _active_work_item_scope(runtime, work_item_id)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return runtime.host_client().request(
+            "agent_bridge_evolution_solution_complete",
+            {
+                "site_key": scope["site_key"],
+                "batch_id": scope["batch_id"],
+                "run_id": str(run_id or ""),
+            },
         )
 
     return server

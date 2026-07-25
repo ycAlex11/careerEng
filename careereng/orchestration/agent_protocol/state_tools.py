@@ -23,6 +23,7 @@ CACHE_LOOKUP_TOOL = "cache_lookup"
 CACHE_READ_TOOL = "cache_read"
 CACHE_PROPOSE_TOOL = "cache_propose"
 CACHE_VALIDATE_TOOL = "cache_validate"
+RECORD_EVOLUTION_SIGNAL_TOOL = "record_evolution_signal"
 
 STATE_TOOL_NAMES = {
     PHASE_RESULT_TOOL,
@@ -35,7 +36,45 @@ STATE_TOOL_NAMES = {
     CACHE_READ_TOOL,
     CACHE_PROPOSE_TOOL,
     CACHE_VALIDATE_TOOL,
+    RECORD_EVOLUTION_SIGNAL_TOOL,
 }
+
+
+def record_evolution_signal_tool_schema() -> dict[str, Any]:
+    """Declare agent-authored evolution evidence for any active phase.
+
+    The worker chooses whether a live result warrants refinement and supplies
+    the meaning. Runtime only persists the declared scope and evidence.
+    """
+
+    return {
+        "type": "function",
+        "name": RECORD_EVOLUTION_SIGNAL_TOOL,
+        "description": (
+            "Record a structured evolution signal when the current strategy cannot continue unchanged. "
+            "Use run_local_overlay only when you can state the concrete temporary strategy that the next "
+            "same-site phase should validate; otherwise record evidence without inventing a solution."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["trigger_refinement", "request_user_input", "pause_site", "pause_batch"],
+                },
+                "failure_pattern": {"type": "string"},
+                "evidence": {"type": "string"},
+                "refinement_hint": {"type": "string"},
+                "recommended_target": {"type": "string"},
+                "resume_policy": {"type": "string"},
+                "current_item_ref": {"type": "string"},
+                "run_local_overlay": {"type": "string"},
+            },
+            "required": ["action", "failure_pattern", "evidence", "refinement_hint"],
+            "additionalProperties": False,
+        },
+    }
 
 CACHE_TOOL_PHASES = frozenset({"channel_discovery", "job_retrieval", "job_filtering", "apply"})
 
@@ -48,12 +87,17 @@ def phase_result_tool_schema() -> dict[str, Any]:
     return {
         "type": "function",
         "name": PHASE_RESULT_TOOL,
-        "description": "Report that the current phase is done or blocked.",
+        "description": (
+            "Report that the current phase is done, waiting for a real user fact, or legacy blocked. "
+            "Use waiting_user when the current page can continue after the user supplies a fact. "
+            "For a terminal apply job, write update_jobs and continue the apply phase instead of using "
+            "phase_result as a job-level blocker."
+        ),
         "strict": True,
         "parameters": {
             "type": "object",
             "properties": {
-                "status": {"type": "string", "enum": ["done", "blocked"]},
+                "status": {"type": "string", "enum": ["done", "waiting_user", "blocked"]},
                 "summary": {"type": "string"},
             },
             "required": ["status", "summary"],
@@ -274,7 +318,7 @@ def cache_lookup_tool_schema() -> dict[str, Any]:
         "name": CACHE_LOOKUP_TOOL,
         "description": (
             "Find compatible reusable cache candidates for the current site and phase. "
-            "Use a live-page fingerprint when the current page has been observed."
+            "Use a live-page fingerprint after observing the current page. A hit is provisional evidence, not an instruction to act."
         ),
         "strict": True,
         "parameters": {
@@ -293,7 +337,7 @@ def cache_read_tool_schema() -> dict[str, Any]:
     return {
         "type": "function",
         "name": CACHE_READ_TOOL,
-        "description": "Read the full content of one compatible cache candidate after deciding it may help this live phase.",
+        "description": "Read one compatible provisional cache candidate after deciding it may help this live phase; verify it against current live evidence before use.",
         "strict": True,
         "parameters": {
             "type": "object",
@@ -312,8 +356,8 @@ def cache_propose_tool_schema() -> dict[str, Any]:
         "type": "function",
         "name": CACHE_PROPOSE_TOOL,
         "description": (
-            "Propose a reusable cache candidate from verified current evidence. This creates a candidate only; "
-            "it does not change Skills or decide that the cache is valid for future pages."
+            "After completing a reusable live-page observation, mapping, capability, or browser sequence, propose it as a provisional cache candidate. "
+            "This never changes Skills or makes the candidate authoritative for future pages."
         ),
         "strict": False,
         "parameters": {
@@ -324,9 +368,21 @@ def cache_propose_tool_schema() -> dict[str, Any]:
                 "dependency_keys": {"type": "array", "items": {"type": "string"}},
                 "summary": {"type": "string"},
                 "source_refs": {"type": "array", "items": {"type": "string"}},
+                "reuse_reason": {"type": "string"},
+                "preconditions": {"type": "object", "additionalProperties": True},
+                "expected_benefit": {"type": "string"},
+                "evidence": {"type": "array", "items": {"type": "string"}},
                 "content": {"type": "object", "additionalProperties": True},
             },
-            "required": ["kind", "page_fingerprint", "content"],
+            "required": [
+                "kind",
+                "page_fingerprint",
+                "reuse_reason",
+                "preconditions",
+                "expected_benefit",
+                "evidence",
+                "content",
+            ],
             "additionalProperties": False,
         },
     }
@@ -336,7 +392,7 @@ def cache_validate_tool_schema() -> dict[str, Any]:
     return {
         "type": "function",
         "name": CACHE_VALIDATE_TOOL,
-        "description": "Record whether an existing cache candidate was validated, stale, or retired by current live evidence.",
+        "description": "After reading or reusing an existing candidate, record whether current live evidence validated it, made it stale, or retired it.",
         "strict": True,
         "parameters": {
             "type": "object",
@@ -394,6 +450,7 @@ DEFAULT_STATE_TOOL_REGISTRY = StateToolRegistry(
     (
         StateToolSpec(PHASE_RESULT_TOOL, phase_result_tool_schema),
         StateToolSpec(UPDATE_PHASE_MEMORY_TOOL, update_phase_memory_tool_schema, always_available=True),
+        StateToolSpec(RECORD_EVOLUTION_SIGNAL_TOOL, record_evolution_signal_tool_schema, always_available=True),
         StateToolSpec(CACHE_LOOKUP_TOOL, cache_lookup_tool_schema, CACHE_TOOL_PHASES),
         StateToolSpec(CACHE_READ_TOOL, cache_read_tool_schema, CACHE_TOOL_PHASES),
         StateToolSpec(CACHE_PROPOSE_TOOL, cache_propose_tool_schema, CACHE_TOOL_PHASES),

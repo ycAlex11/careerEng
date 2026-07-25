@@ -20,6 +20,7 @@ from careereng.adapters.external_agents.contracts import (
 )
 from careereng.orchestration.engine.fresh_resume import build_fresh_snapshot_resume_plan
 from careereng.config.schema import BrowserBudgetsConfig
+from careereng.config.execution import execution_backend_from_mode, normalize_execution_backend
 from careereng.career.applications import ApplicationPlanningService
 from careereng.evolution.capabilities import EvolutionCapabilityStore
 from careereng.evolution.loop_control import (
@@ -27,7 +28,7 @@ from careereng.evolution.loop_control import (
     LOOP_ACTION_TRIGGER_REFINEMENT,
     loop_control_from_row,
 )
-from careereng.evolution.loop_engine import ApplyLoopEngine
+from careereng.evolution.loop_engine import EvolutionLoopEngine
 from careereng.evolution.reports import create_apply_probe_report
 from careereng.evolution.workflow_summary import generate_workflow_evolution_summary
 from careereng.orchestration.engine import ContinuationRegistry, ContinuationRequest
@@ -35,7 +36,7 @@ from careereng.orchestration.engine.runtime_lifecycle import SiteRuntimeLifecycl
 from careereng.orchestration.engine.site_work_items import SiteWorkItem, SiteWorkItemScheduler
 from careereng.career.applications.reports import generate_job_batch_report
 from careereng.career.applications.application_store import ApplicationStore
-from careereng.career.applications.job_store import JobStore
+from careereng.career.applications.job_store import JobStore, TERMINAL_BATCH_STATUSES
 from careereng.career.applications.site_tools import SiteTools
 
 
@@ -99,6 +100,9 @@ class JobFlow:
         self.application_store = application_store
         self.site_tools = site_tools
         self.browser_runner = browser_runner
+        self.execution_backend = normalize_execution_backend(
+            getattr(browser_runner, "execution_backend", "")
+        ) or execution_backend_from_mode(getattr(browser_runner, "execution_mode", "provider"))
         self.runtime_lifecycle = SiteRuntimeLifecycle(browser_runner)
         self.search_strategy = search_strategy
         self.profile_store = profile_store
@@ -121,7 +125,7 @@ class JobFlow:
             handler=self._resume_apply_item_loop,
         )
         self.capability_store = EvolutionCapabilityStore(job_store.workspace)
-        self.loop_engine = ApplyLoopEngine(
+        self.loop_engine = EvolutionLoopEngine(
             project_root=project_root,
             workspace=job_store.workspace,
             site_store=getattr(site_tools, "site_store", None),
@@ -133,6 +137,9 @@ class JobFlow:
             apply_counters_from_run=self._apply_counters_from_run,
             apply_counter_payload=self._apply_counter_payload,
         )
+        set_signal_recorder = getattr(self.browser_runner, "set_evolution_signal_recorder", None)
+        if callable(set_signal_recorder):
+            set_signal_recorder(self.loop_engine.record_phase_signal)
 
     @property
     def APPLY_JOB_PHASE_TIMEOUT_SECONDS(self) -> int:
@@ -210,7 +217,7 @@ class JobFlow:
                 row_status = str(row.get("status") or "")
                 retrieve_status = str((row.get("retrieve") or {}).get("status") or "")
                 apply_status = str((row.get("apply") or {}).get("status") or "")
-                if row_status in {"blocked_login", "blocked", "waiting_solution", "failed", "skipped"}:
+                if row_status in {"blocked_login", "blocked", "waiting_user", "waiting_solution", "failed", "skipped"}:
                     continue
                 if apply_status == "running" or (apply_status == "pending" and retrieve_status == "done"):
                     return "running"
@@ -220,7 +227,7 @@ class JobFlow:
             for row in rows
         ):
             return "waiting_solution"
-        if any(str(row.get("status") or "") in {"blocked_login", "blocked"} for row in rows):
+        if any(str(row.get("status") or "") in {"blocked_login", "blocked", "waiting_user"} for row in rows):
             return "waiting_user"
         if any(
             str((row.get("apply") or {}).get("status") or "") in {"failed", "blocked"}
@@ -492,7 +499,7 @@ class JobFlow:
 
     @staticmethod
     def _loop_control_payload_from_site_row(row: dict[str, Any]) -> dict[str, Any]:
-        return ApplyLoopEngine.loop_control_payload_from_site_row(row)
+        return EvolutionLoopEngine.loop_control_payload_from_site_row(row)
 
     def _disabled_site_row(
         self,
@@ -529,9 +536,21 @@ class JobFlow:
         entry_url: str,
         skill_path: str,
         allow_apply: bool,
+        execution_mode: str = "stable",
+        site_mode: str = "ready",
         operation: str = OPERATION_JOB_SEARCH,
     ) -> dict[str, Any]:
         normalized_operation = self._normalize_operation(operation)
+        scope_builder = getattr(self.loop_engine, "site_loop_scope", None)
+        evolution_scope = (
+            scope_builder(
+                site_key=site_key,
+                site_mode=site_mode,
+                execution_mode=execution_mode,
+            )
+            if callable(scope_builder)
+            else {}
+        )
         return {
             "site_key": site_key,
             "site_name": site_name,
@@ -540,6 +559,9 @@ class JobFlow:
             "reason_tag": "",
             "entry_url": entry_url,
             "skill_path": skill_path,
+            "execution_mode": str(execution_mode or "stable"),
+            "site_mode": str(site_mode or "ready"),
+            "evolution_scope": evolution_scope,
             "retrieve": {
                 "status": "skipped" if normalized_operation == self.OPERATION_APPLICATION_STATUS_REVIEW else "running",
                 "count": 0,
@@ -667,7 +689,17 @@ class JobFlow:
             }
         if status == "blocked":
             if is_agent_bridge_reason(reason_tag):
+                retrieve = dict(existing.get("retrieve") or {})
+                apply = dict(existing.get("apply") or {})
+                if normalized_operation != self.OPERATION_APPLICATION_STATUS_REVIEW:
+                    retrieve["status"] = str(retrieve.get("status") or "running")
+                    retrieve["count"] = max(int(retrieve.get("count") or 0), retrieved_count)
+                if allow_apply and normalized_operation == self.OPERATION_JOB_SEARCH:
+                    apply["status"] = "running" if current_phase == "apply" else str(apply.get("status") or "pending")
+                    apply.setdefault("attempted", 0)
+                    apply.setdefault("submitted", 0)
                 return {
+                    **existing,
                     "site_key": site_key,
                     "site_name": site_name,
                     "operation": normalized_operation,
@@ -680,15 +712,8 @@ class JobFlow:
                     "trace_ref": trace_ref,
                     "step_count": step_count,
                     "skill_path": skill_path,
-                    "retrieve": {
-                        "status": "running" if normalized_operation != self.OPERATION_APPLICATION_STATUS_REVIEW else "skipped",
-                        "count": retrieved_count,
-                    },
-                    "apply": {
-                        "status": "pending" if allow_apply and normalized_operation == self.OPERATION_JOB_SEARCH else "skipped",
-                        "attempted": 0,
-                        "submitted": 0,
-                    },
+                    "retrieve": retrieve if normalized_operation != self.OPERATION_APPLICATION_STATUS_REVIEW else {"status": "skipped", "count": 0},
+                    "apply": apply if allow_apply and normalized_operation == self.OPERATION_JOB_SEARCH else {"status": "skipped", "attempted": 0, "submitted": 0},
                 }
             return {
                 "site_key": site_key,
@@ -1138,7 +1163,7 @@ class JobFlow:
 
     @staticmethod
     def _compact_trace_output(event: dict[str, Any]) -> str:
-        return ApplyLoopEngine.compact_trace_output(event)
+        return EvolutionLoopEngine.compact_trace_output(event)
 
     def _loop_next_iteration_guidance(
         self,
@@ -1147,7 +1172,7 @@ class JobFlow:
         trace_context: dict[str, list[str]],
         job_row: dict[str, Any],
     ) -> str:
-        return ApplyLoopEngine.loop_next_iteration_guidance(
+        return EvolutionLoopEngine.loop_next_iteration_guidance(
             control=control,
             trace_context=trace_context,
             job_row=job_row,
@@ -1397,7 +1422,7 @@ class JobFlow:
 
     @staticmethod
     def _run_local_proposal_validation_result(*, row: dict[str, Any], proposal_pattern: str = "") -> str:
-        return ApplyLoopEngine._run_local_proposal_validation_result(row=row, proposal_pattern=proposal_pattern)
+        return EvolutionLoopEngine._run_local_proposal_validation_result(row=row, proposal_pattern=proposal_pattern)
 
     def _record_run_local_proposal_validation(
         self,
@@ -1435,7 +1460,7 @@ class JobFlow:
 
     @staticmethod
     def _loop_control_gap_type(control: dict[str, Any]) -> str:
-        return ApplyLoopEngine.loop_control_gap_type(control)
+        return EvolutionLoopEngine.loop_control_gap_type(control)
 
     @staticmethod
     def _loop_control_is_human_only_gap(control: dict[str, Any]) -> bool:
@@ -1507,11 +1532,11 @@ class JobFlow:
 
     @staticmethod
     def _loop_memory_avoid_patterns(*, pattern: str, evidence: str) -> list[str]:
-        return ApplyLoopEngine.loop_memory_avoid_patterns(pattern=pattern, evidence=evidence)
+        return EvolutionLoopEngine.loop_memory_avoid_patterns(pattern=pattern, evidence=evidence)
 
     @staticmethod
     def _loop_memory_recommended_patterns(*, pattern: str, evidence: str, next_guidance: str) -> list[str]:
-        return ApplyLoopEngine.loop_memory_recommended_patterns(
+        return EvolutionLoopEngine.loop_memory_recommended_patterns(
             pattern=pattern,
             evidence=evidence,
             next_guidance=next_guidance,
@@ -1841,7 +1866,7 @@ class JobFlow:
         current_url = str(browser_session.get("last_known_url") or current.get("current_url") or "")
         updated = {
             **current,
-            "status": "blocked" if normalized_status == "blocked" else "running",
+            "status": "waiting_user" if normalized_status == "waiting_user" else ("blocked" if normalized_status == "blocked" else "running"),
             "reason_tag": "external_agent_phase_progress",
             "message": str(summary or current.get("message") or ""),
             "current_phase": str(next_phase or phase or current.get("current_phase") or ""),
@@ -2374,7 +2399,14 @@ class JobFlow:
         user_message: str,
         apply_requested: bool,
         operation: str = OPERATION_JOB_SEARCH,
+        execution_backend: str = "",
+        separate_batch: bool = False,
     ) -> dict[str, Any]:
+        selected_backend = normalize_execution_backend(execution_backend) or self.execution_backend
+        if selected_backend != self.execution_backend:
+            raise ValueError(
+                f"batch execution backend mismatch: requested={selected_backend} runtime={self.execution_backend}"
+            )
         normalized_operation = self._normalize_operation(operation)
         active_sites = self.site_tools.site_store.list_sites("active")
         if not active_sites:
@@ -2418,22 +2450,53 @@ class JobFlow:
                     entry_url=entry_url,
                     skill_path=skill_path,
                     allow_apply=allow_apply,
+                    execution_mode=str(preflight.get("execution_mode") or "stable"),
+                    site_mode=str(preflight.get("site_mode") or "ready"),
                     operation=normalized_operation,
                 )
             )
 
-        batch = self.job_store.create_batch(
-            session_id=session_id,
-            turn_id=turn_id,
-            user_message=user_message,
-            apply_requested=effective_apply_requested,
-            operation=normalized_operation,
-            sites=site_rows,
+        open_batch = self.job_store.latest_open_batch(session_id)
+        reusable_batch = (
+            open_batch
+            if not separate_batch
+            and isinstance(open_batch, dict)
+            and str(open_batch.get("status") or "") not in TERMINAL_BATCH_STATUSES
+            and self._normalize_operation(str(open_batch.get("operation") or "")) == normalized_operation
+            and str(open_batch.get("execution_backend") or selected_backend) == selected_backend
+            and bool(open_batch.get("apply_requested")) == effective_apply_requested
+            else None
         )
+        if reusable_batch is not None:
+            batch, appended_site_keys = self.job_store.append_sites(
+                batch_id=str(reusable_batch.get("batch_id") or ""),
+                sites=site_rows,
+            )
+            batch = dict(batch)
+            batch["_runtime_reused_batch"] = True
+            batch["_runtime_site_keys"] = appended_site_keys
+        else:
+            batch = self.job_store.create_batch(
+                session_id=session_id,
+                turn_id=turn_id,
+                user_message=user_message,
+                apply_requested=effective_apply_requested,
+                operation=normalized_operation,
+                sites=site_rows,
+                execution_backend=selected_backend,
+            )
+            batch = dict(batch)
+            batch["_runtime_reused_batch"] = False
+            batch["_runtime_site_keys"] = list(batch.get("sites") or {})
         batch_id = str(batch.get("batch_id") or "")
         refresh_posted_age = getattr(self.site_tools.site_store, "refresh_history_posted_age_metadata", None)
         if callable(refresh_posted_age):
-            for site_key in ready_site_keys:
+            refresh_site_keys = ready_site_keys
+            if reusable_batch is not None:
+                refresh_site_keys = [
+                    site_key for site_key in ready_site_keys if site_key in set(batch.get("_runtime_site_keys") or [])
+                ]
+            for site_key in refresh_site_keys:
                 try:
                     result = refresh_posted_age(site_key)
                 except Exception as exc:
@@ -2478,7 +2541,7 @@ class JobFlow:
         self._generate_workflow_evolution_summary_if_possible(batch)
         return batch
 
-    def run_batch(self, batch_id: str) -> str:
+    def run_batch(self, batch_id: str, *, site_keys: list[str] | None = None) -> str:
         batch = self.job_store.load_batch(batch_id)
         if not batch:
             return f"batch={batch_id} status=failed"
@@ -2492,10 +2555,13 @@ class JobFlow:
             and self.ENABLE_BROWSER_APPLY_PHASE
         )
         sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        requested_site_keys = None if site_keys is None else {str(site_key) for site_key in site_keys}
         runnable_keys = [
             str(site_key)
             for site_key, row in sites.items()
-            if isinstance(row, dict) and str(row.get("status") or "") in {"queued", "running", "ready"}
+            if isinstance(row, dict)
+            and str(row.get("status") or "") in {"queued", "running", "ready"}
+            and (requested_site_keys is None or str(site_key) in requested_site_keys)
         ]
         if not self.browser_runner:
             for site_key in runnable_keys:
@@ -2563,6 +2629,10 @@ class JobFlow:
                     "run_intent": {
                         "operation": normalized_operation,
                         "apply_requested": effective_apply_requested,
+                        "execution_backend": str(batch.get("execution_backend") or self.execution_backend),
+                        "site_mode": str(current.get("site_mode") or "ready"),
+                        "execution_mode": str(current.get("execution_mode") or "stable"),
+                        "evolution_scope": dict(current.get("evolution_scope") or {}),
                     },
                 },
             )
@@ -2770,7 +2840,7 @@ class JobFlow:
         if not isinstance(current, dict):
             return ""
         if (
-            str(current.get("status") or "") not in {"blocked_login", "blocked", "paused"}
+            str(current.get("status") or "") not in {"blocked_login", "blocked", "waiting_user", "paused"}
             and not is_agent_bridge_reason(str(current.get("reason_tag") or ""))
         ):
             return ""
@@ -2818,7 +2888,17 @@ class JobFlow:
                 apply_target_job_ids=plan.get("apply_target_job_ids"),
                 continuation_context=plan.get("continuation_context") if isinstance(plan.get("continuation_context"), dict) else None,
             )
-            if str(getattr(result, "current_phase", "") or "") == "apply":
+            if is_agent_bridge_reason(str(getattr(result, "reason_tag", "") or "")):
+                # A bridge result only means the retained work item was
+                # refreshed. The Codex turn happens after this method returns;
+                # do not aggregate old apply rows or release the site yet.
+                replacement = self._browser_result_to_site_row(
+                    result=result,
+                    existing=current,
+                    allow_apply=str((current.get("apply") or {}).get("status") or "") != "skipped",
+                    operation=str(batch.get("operation") or self.OPERATION_JOB_SEARCH),
+                )
+            elif str(getattr(result, "current_phase", "") or "") == "apply":
                 replacement = self._apply_result_to_site_row(
                     result=result,
                     existing=current,

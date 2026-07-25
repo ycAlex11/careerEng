@@ -14,7 +14,7 @@ from typing import Any
 
 from careereng.evolution.artifacts import WorkflowEvolutionSummaryStore
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore
-from careereng.evolution.memory_units import RUN_LOCAL_CLOSED_FOR_SYNTHESIS, EvolutionMemoryStore
+from careereng.evolution.memory_units import RUN_LOCAL_CLOSED_FOR_SYNTHESIS, run_local_units_for_batch_site
 from careereng.platform.persistence import JSONLStore
 from careereng.utils import now_iso, safe_file_stem
 
@@ -72,11 +72,10 @@ def _site_loop_summary(*, workspace: Path, batch_id: str, site_key: str, site_ro
     run_rows = _read_run_rows(workspace=workspace, site_key=site_key, batch_id=batch_id)
     merged_rows = _merge_run_job_rows(run_rows)
     context = _read_json(workspace / "sites" / safe_file_stem(site_key) / "jobs" / "runs" / f"{safe_file_stem(batch_id)}.context.json")
-    guidance = context.get("apply_loop_refinement_guidance") if isinstance(context.get("apply_loop_refinement_guidance"), list) else []
-    memory_units = EvolutionMemoryStore(workspace).query(
-        scopes=[f"batch:{batch_id}:site:{site_key}:apply"],
-        phase="apply",
-        lifecycles=["run_local"],
+    memory_units = run_local_units_for_batch_site(
+        workspace=workspace,
+        site_key=site_key,
+        batch_id=batch_id,
         statuses=["active", RUN_LOCAL_CLOSED_FOR_SYNTHESIS, "accepted", "rejected", "expired", "superseded"],
         limit=80,
     )
@@ -115,7 +114,7 @@ def _site_loop_summary(*, workspace: Path, batch_id: str, site_key: str, site_ro
         "current_phase": str(site_row.get("current_phase") or ""),
         "reason_tag": str(site_row.get("reason_tag") or ""),
         "loop_pattern_count": len(patterns),
-        "guidance_count": len(guidance),
+        "guidance_count": 0,
         "patterns": patterns,
         "job_outcomes": _job_outcomes(merged_rows),
         "failure_examples": _failure_examples(merged_rows),
@@ -123,7 +122,7 @@ def _site_loop_summary(*, workspace: Path, batch_id: str, site_key: str, site_ro
         "run_local_proposal_results": _run_local_proposal_results(memory_units),
         "run_context": {
             "path": str(workspace / "sites" / safe_file_stem(site_key) / "jobs" / "runs" / f"{safe_file_stem(batch_id)}.context.json"),
-            "apply_loop_refinement_summary": str(context.get("apply_loop_refinement_summary") or ""),
+            "evolution_followup_context": str(context.get("evolution_followup_context") or ""),
         },
     }
 
@@ -596,7 +595,7 @@ def _render_markdown(payload: dict[str, Any]) -> str:
                 f"terminal_or_failed={outcomes.get('terminal_or_failed_count')} "
                 f"statuses={status_text}"
             )
-        summary = str((site.get("run_context") or {}).get("apply_loop_refinement_summary") or "").strip()
+        summary = str((site.get("run_context") or {}).get("evolution_followup_context") or "").strip()
         if summary:
             lines.append(f"  Guidance: {summary[:500]}")
         for pattern in site.get("patterns") or []:

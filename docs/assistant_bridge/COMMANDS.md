@@ -50,6 +50,30 @@ python -m careereng batch-stop
 python -m careereng profile generate
 ```
 
+## Runtime Host
+
+```bash
+careereng runtime-host status
+careereng runtime-host serve
+careereng runtime-host stop
+careereng runtime-host release-site --site <site_key>
+careereng runtime-host cancel-batch --batch <batch_id>
+```
+
+Use one runtime host for the workspace. Do not start a separate host for every site. Releasing or cancelling one site/batch must not stop unrelated active sites.
+
+## MCP Site Execution
+
+MCP exposes a small fixed control surface:
+
+- `careereng_runtime_host_status` and `careereng_get_context` inspect runtime and batch state.
+- `careereng_get_work_item_context` establishes the active site task scope.
+- `careereng_work_item_list_browser_tools` and `careereng_work_item_list_state_tools` discover currently permitted tools.
+- `careereng_work_item_call_browser_tool`, `careereng_work_item_run_browser_sequence`, and `careereng_work_item_call_state_tool` execute within that scope.
+- `careereng_work_item_phase_result` closes one phase; `careereng_complete_evolution_solution` continues an applied exploration proposal.
+
+Do not use a static browser-tool list. The current work item determines which browser and state tools are available.
+
 ## Safety
 
 Prefer `assistant ingest` first when the user uses natural language. It records the event, classifies the request, and returns the suggested command.

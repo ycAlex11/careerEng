@@ -24,6 +24,7 @@ from careereng.career.applications.skill_policy import (
 from careereng.career.applications.skill_policy.schema import file_hash
 from careereng.career.applications.job_identity import infer_site_job_id_from_url, normalize_identity_url
 from careereng.career.applications.history_view import BatchHistoryView
+from careereng.career.applications.site_modes import SITE_MODE_DRAFT, normalize_site_mode
 from careereng.platform.observability import PerformanceRecorder
 from careereng.platform.persistence import JSONLStore
 from careereng.career.applications.posted_time import (
@@ -297,7 +298,7 @@ class SiteStore:
                 "updated_at": now_iso()[:10],
                 "scope": "site",
                 "site_key": site_id,
-                "status": "ready",
+                "status": SITE_MODE_DRAFT,
                 "apply_enabled": False,
                 "job_identity": {},
             },
@@ -402,6 +403,38 @@ class SiteStore:
             "front_matter": front_matter if isinstance(front_matter, dict) else {},
             "body": body,
         }
+
+    def set_skill_mode(
+        self,
+        site_id: str,
+        *,
+        mode: str,
+        apply_enabled: bool | None = None,
+    ) -> dict[str, Any]:
+        """Persist a declared execution mode without touching site evidence."""
+
+        skill = self.load_skill(site_id)
+        if not skill.get("exists"):
+            raise FileNotFoundError(f"site skill missing: {site_id}")
+        normalized_mode = normalize_site_mode(mode)
+        if str(mode or "").strip().lower() != normalized_mode:
+            raise ValueError(f"unsupported site mode: {mode}")
+        metadata = dict(skill.get("front_matter") or {})
+        metadata["status"] = normalized_mode
+        if apply_enabled is not None:
+            metadata["apply_enabled"] = bool(apply_enabled)
+        metadata["updated_at"] = now_iso()[:10]
+        path = Path(skill["path"])
+        path.write_text(dump_front_matter(metadata, str(skill.get("body") or "")), encoding="utf-8")
+        self.append_event(
+            site_id,
+            "site.skill_mode.changed",
+            {
+                "mode": normalized_mode,
+                "apply_enabled": bool(metadata.get("apply_enabled")),
+            },
+        )
+        return self.load_skill(site_id)
 
     def _job_identity_policy(self, site_id: str) -> dict[str, Any]:
         skill = self.load_skill(site_id)

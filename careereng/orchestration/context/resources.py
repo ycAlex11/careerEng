@@ -86,6 +86,8 @@ class ContextResourceResolver:
 
     def read(self, resource_id: str, *, reason: str = "") -> dict[str, Any]:
         requested = str(resource_id or "").strip().lower()
+        if requested != "history_view":
+            self.registry.refresh_if_changed()
         available = self.available_resource_ids()
         if requested not in CONTEXT_RESOURCE_IDS:
             raise ValueError(f"unknown context resource: {requested or '<missing>'}")
@@ -107,6 +109,7 @@ class ContextResourceResolver:
                 "available": True,
                 "status": "provided",
                 "reason": str(reason or "").strip(),
+                "version": self.registry.resource_version(requested),
             },
             "content": [{"type": "text", "text": value}],
         }
@@ -122,6 +125,7 @@ class ContextResourceResolver:
             return self._unavailable("history_view", self.available_resource_ids(), reason)
         view = begin(self.site_key, self.batch_id, event_action="context_resource")
         rows = view.rows() if view is not None else []
+        revision = int(getattr(getattr(view, "rows_view", None), "revision", 0) or 0) if view is not None else 0
         return {
             "isError": False,
             "structuredContent": {
@@ -132,6 +136,7 @@ class ContextResourceResolver:
                 "site_key": self.site_key,
                 "batch_id": self.batch_id,
                 "row_count": len(rows),
+                "version": str(revision),
             },
             "content": [
                 {

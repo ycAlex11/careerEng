@@ -17,6 +17,10 @@ class ProfileProcessCleanup:
     profile_dir: Path
     matched_pids: tuple[int, ...]
     terminated_pids: tuple[int, ...]
+    removed_lock_paths: tuple[Path, ...]
+
+
+_CHROME_PROFILE_LOCK_NAMES = ("SingletonLock", "SingletonSocket", "SingletonCookie")
 
 
 def _profile_process_ids(profile_dir: Path) -> tuple[int, ...]:
@@ -63,6 +67,24 @@ def _is_alive(pid: int) -> bool:
     return True
 
 
+def _remove_orphaned_chrome_locks(profile_dir: Path) -> tuple[Path, ...]:
+    """Remove Chromium singleton entries only after the exact profile is idle."""
+
+    if _profile_process_ids(profile_dir):
+        return ()
+    removed: list[Path] = []
+    for name in _CHROME_PROFILE_LOCK_NAMES:
+        path = profile_dir / name
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+        removed.append(path)
+    return tuple(removed)
+
+
 def reclaim_profile_processes(profile_dir: Path | str, *, grace_seconds: float = 1.0) -> ProfileProcessCleanup:
     """Terminate only Playwright/Chrome processes using one dedicated profile.
 
@@ -94,8 +116,13 @@ def reclaim_profile_processes(profile_dir: Path | str, *, grace_seconds: float =
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
+    # Chrome can leave these symlinks after the MCP owner exits. They block a
+    # later runtime even though no process still uses this dedicated profile.
+    removed_lock_paths = _remove_orphaned_chrome_locks(resolved_profile)
+
     return ProfileProcessCleanup(
         profile_dir=resolved_profile,
         matched_pids=matched,
         terminated_pids=tuple(terminated),
+        removed_lock_paths=removed_lock_paths,
     )

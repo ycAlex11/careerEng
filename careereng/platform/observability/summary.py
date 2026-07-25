@@ -12,6 +12,7 @@ from careereng.utils import ensure_dir, now_iso, safe_file_stem
 
 
 GROUP_KEYS = ("site_key", "phase", "api_type", "status", "model")
+PERFORMANCE_GROUP_KEYS = ("site_key", "phase", "operation", "backend", "status")
 
 
 def _int_value(value: Any) -> int:
@@ -182,6 +183,25 @@ def _group_summary(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]
     )
 
 
+def _performance_group_summary(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        value = str(row.get(key) or "unknown")
+        if not value.strip():
+            value = "unknown"
+        bucket = grouped.setdefault(value, {"name": value, **_empty_performance_totals()})
+        _accumulate_performance(bucket, row)
+    return sorted(
+        grouped.values(),
+        key=lambda item: (
+            _int_value(item.get("elapsed_ms")),
+            _int_value(item.get("events")),
+            str(item.get("name")),
+        ),
+        reverse=True,
+    )
+
+
 def build_metrics_summary(
     *,
     workspace: Path | str,
@@ -237,6 +257,7 @@ def build_metrics_summary(
         "groups": {key: _group_summary(filtered_rows, key) for key in GROUP_KEYS},
         "performance": {
             "totals": performance_totals,
+            "groups": {key: _performance_group_summary(filtered_performance_rows, key) for key in PERFORMANCE_GROUP_KEYS},
             "events": filtered_performance_rows,
         },
         "error_rows": [
@@ -252,6 +273,25 @@ def build_metrics_summary(
             for row in filtered_rows
             if str(row.get("status") or "") != "ok"
         ],
+    }
+
+
+def metrics_report_projection(summary: dict[str, Any]) -> dict[str, Any]:
+    """Return the compact report-facing view without raw observability rows."""
+
+    usage_groups = summary.get("groups") if isinstance(summary.get("groups"), dict) else {}
+    performance = summary.get("performance") if isinstance(summary.get("performance"), dict) else {}
+    performance_groups = performance.get("groups") if isinstance(performance.get("groups"), dict) else {}
+    return {
+        "filters": dict(summary.get("filters") or {}),
+        "usage": dict(summary.get("totals") or {}),
+        "usage_by_phase": list(usage_groups.get("phase") or []),
+        "performance": {
+            "totals": dict(performance.get("totals") or {}),
+            "by_phase": list(performance_groups.get("phase") or []),
+            "by_operation": list(performance_groups.get("operation") or []),
+        },
+        "error_count": len(summary.get("error_rows") or []),
     }
 
 

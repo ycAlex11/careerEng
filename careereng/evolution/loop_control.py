@@ -284,7 +284,17 @@ def create_loop_control_artifacts(
         "action": action,
         "target_ref": target_ref,
     }
-    evidence_id = _stable_id("evidence", {**fingerprint_payload, "batch_id": batch_id, "job_id": job_row.get("job_id")})
+    source_identity = str(
+        job_row.get("job_id")
+        or job_row.get("current_item_ref")
+        or job_row.get("url")
+        or job_row.get("title")
+        or ""
+    ).strip()
+    evidence_id = _stable_id(
+        "evidence",
+        {**fingerprint_payload, "batch_id": batch_id, "source_identity": source_identity},
+    )
     candidate_id = _stable_id("candidate", fingerprint_payload)
     previous_failed_batches = _previous_failed_batch_count(
         workspace=workspace_path,
@@ -319,6 +329,7 @@ def create_loop_control_artifacts(
         details={
             "batch_id": batch_id,
             "job_id": str(job_row.get("job_id") or ""),
+            "source_identity": source_identity,
             "title": str(job_row.get("title") or ""),
             "url": str(job_row.get("url") or ""),
             "application_status": str(job_row.get("application_status") or ""),

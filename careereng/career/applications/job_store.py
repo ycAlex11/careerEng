@@ -32,6 +32,7 @@ class JobStore:
         apply_requested: bool,
         sites: list[dict[str, Any]],
         operation: str = "job_search",
+        execution_backend: str = "provider",
     ) -> dict[str, Any]:
         batch_id = make_id("job_batch")
         now = now_iso()
@@ -41,6 +42,7 @@ class JobStore:
             "turn_id": turn_id,
             "user_message": user_message,
             "operation": str(operation or "job_search"),
+            "execution_backend": str(execution_backend or "provider"),
             "apply_requested": bool(apply_requested),
             "status": "running",
             "created_at": now,
@@ -55,6 +57,7 @@ class JobStore:
                 "session_id": session_id,
                 "turn_id": turn_id,
                 "operation": str(operation or "job_search"),
+                "execution_backend": str(execution_backend or "provider"),
                 "apply_requested": bool(apply_requested),
                 "site_count": len(payload["sites"]),
             },
@@ -74,6 +77,38 @@ class JobStore:
         payload["updated_at"] = now_iso()
         write_json(self._batch_path(batch_id), payload)
         return payload
+
+    def append_sites(self, *, batch_id: str, sites: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+        """Append new site rows to one unfinished batch in caller order.
+
+        The store only preserves durable batch membership. Scheduling and site
+        execution remain orchestration responsibilities.
+        """
+
+        batch = self.load_batch(str(batch_id or ""))
+        if not batch:
+            raise FileNotFoundError(f"job batch not found: {batch_id}")
+        if str(batch.get("status") or "") in TERMINAL_BATCH_STATUSES:
+            raise ValueError(f"cannot append sites to terminal batch: {batch_id}")
+        existing = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        updated_sites = dict(existing)
+        added: list[str] = []
+        for row in sites:
+            site_key = str((row or {}).get("site_key") or "").strip()
+            if not site_key or site_key in updated_sites:
+                continue
+            updated_sites[site_key] = dict(row)
+            added.append(site_key)
+        if not added:
+            return batch, []
+        batch = dict(batch)
+        batch["sites"] = updated_sites
+        saved = self.save_batch(batch)
+        self.append_event(
+            "batch.sites_appended",
+            {"batch_id": str(saved.get("batch_id") or ""), "site_keys": added},
+        )
+        return saved, added
 
     def append_event(self, name: str, payload: dict[str, Any]) -> None:
         self.events.append(

@@ -92,7 +92,7 @@ browser_name = "chrome"
 
 CareerEng uses two local configuration files:
 
-- `auth.json` stores provider API keys.
+- `auth.json` stores provider API keys when the provider backend is selected.
 - `config.toml` controls runtime behavior.
 
 Do not commit real API keys. Keep `auth.json` local.
@@ -102,6 +102,7 @@ The main `config.toml` sections are:
 - `[agent]`: controls non-browser LLM work, including persona generation, company discovery, routing, relatedness checks, and how many company candidates to return.
 - `[browser]`: controls browser automation, including visible/headless mode, retry behavior, and site parallelism.
 - `[browser.budgets]`: controls browser phase timeouts, step timeouts, max phase steps, and apply-job budgets.
+- `[execution]`: selects the browser execution backend (`provider` or `codex`) and enables or disables each backend.
 - `[workspace]` or `[paths]`: controls where local workspace data is stored.
 - `[providers.openai]` / `[providers.openrouter]`: controls OpenAI-compatible provider endpoints and structured-output behavior.
 
@@ -114,9 +115,9 @@ keep_open = true
 site_parallelism = 1
 ```
 
-For regular multi-site runs, `site_parallelism = 2` is a practical default. Increase it only after the active site skills are stable.
+For regular multi-site runs, `site_parallelism = 2` is a practical default. Increase it only after the active site skills are stable. Each site runs independently within this limit: a login, CAPTCHA, or pause on one site does not stop the other active sites. Sites added while a run is active use the next available execution slot.
 
-Browser automation uses `[providers.openai].api_base` and `[agent].default_model`; there is no separate browser `api_base` or browser model. If you use an OpenAI-compatible proxy or gateway, update `[providers.openai].api_base`, then put the matching key in `auth.json`.
+`[execution].selected_backend` is fixed for the lifetime of a runtime host. Select `provider` to use the configured API endpoint, or `codex` to use the local Codex execution path; CareerEng never switches between them during a run.
 
 Common browser budget knobs live under `[browser.budgets]`, for example:
 
@@ -197,6 +198,7 @@ The agent can then:
 - start, pause, continue, or stop job batches without losing durable application history;
 - operate the local browser with the site's saved profile to review applications, retrieve jobs, and complete apply flows;
 - preserve the live page for login, CAPTCHA, MFA, or other user-only steps, then continue after the user says the step is complete;
+- run multiple sites concurrently up to the configured limit, with each site retaining its own progress and browser session;
 - use local evidence and reports to propose Skill or workflow improvements while keeping business judgment in the AI layer.
 
 You can use natural language. For example:

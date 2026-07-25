@@ -11,13 +11,18 @@ from pathlib import Path
 from typing import Any
 
 from careereng.evolution.apply import EvolutionApplyError, apply_evolution_run
-from careereng.evolution.memory_units import EvolutionMemoryStore, evolution_memory_has_materialized_change
+from careereng.evolution.memory_units import (
+    EvolutionMemoryStore,
+    evolution_memory_has_materialized_change,
+    run_local_units_for_batch_site,
+)
 from careereng.evolution.loop_control import (
     LOOP_ACTION_TRIGGER_REFINEMENT,
     loop_control_from_row,
     loop_control_is_human_only_gap,
 )
 from careereng.evolution.solution_bridge import EvolutionSolutionBridgeError, ProviderSolutionBridge
+from careereng.evolution.work_items import create_site_exploration_synthesis_card
 from careereng.utils import read_json
 
 
@@ -27,7 +32,7 @@ class BatchEvolutionOrchestrator:
     """Run batch execution through the evolution outer loop.
 
     JobFlow remains the execution layer. This orchestrator consumes the generic
-    loop evidence already written by JobFlow/ApplyLoopEngine and decides whether
+    loop evidence already written by JobFlow/EvolutionLoopEngine and decides whether
     another batch attempt should be created.
     """
 
@@ -261,18 +266,27 @@ class BatchEvolutionOrchestrator:
         sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
         changed = False
         for site_key, row in list(sites.items()):
-            if not isinstance(row, dict) or not self._site_has_stopped_evolution_evidence(row):
+            if not isinstance(row, dict):
                 continue
-            apply_payload = row.get("apply") if isinstance(row.get("apply"), dict) else {}
-            loop_payload = apply_payload.get("loop_control") if isinstance(apply_payload.get("loop_control"), dict) else {}
-            artifacts = loop_payload.get("artifacts") if isinstance(loop_payload.get("artifacts"), dict) else {}
-            result = self.loop_engine.create_loop_control_solution_request(
-                artifacts=artifacts,
-                context_overrides={
-                    "solution_level": SOLUTION_LEVEL_OUTER_SYNTHESIS,
-                    "solution_request_kind": "synthesis_work_order",
-                },
-            )
+            if self._site_requires_exploration_synthesis(row):
+                result = self._create_exploration_synthesis_request(
+                    batch=batch,
+                    site_key=str(site_key),
+                    row=row,
+                )
+            elif self._site_has_stopped_evolution_evidence(row):
+                _container_key, container = self._evolution_container(row)
+                loop_payload = container.get("loop_control") if isinstance(container.get("loop_control"), dict) else {}
+                artifacts = loop_payload.get("artifacts") if isinstance(loop_payload.get("artifacts"), dict) else {}
+                result = self.loop_engine.create_loop_control_solution_request(
+                    artifacts=artifacts,
+                    context_overrides={
+                        "solution_level": SOLUTION_LEVEL_OUTER_SYNTHESIS,
+                        "solution_request_kind": "synthesis_work_order",
+                    },
+                )
+            else:
+                continue
             if str(result.get("error") or "").strip():
                 raise RuntimeError(str(result.get("error") or "Failed to create evolution synthesis request."))
             if not str(result.get("solution_request") or "").strip():
@@ -288,6 +302,35 @@ class BatchEvolutionOrchestrator:
             self.job_flow._generate_batch_report_if_possible(batch)
             self.job_flow._generate_workflow_evolution_summary_if_possible(batch)
         return batch, changed
+
+    def _create_exploration_synthesis_request(
+        self,
+        *,
+        batch: dict[str, Any],
+        site_key: str,
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Package a completed exploration run for Codex without inferring readiness."""
+
+        batch_id = str(batch.get("batch_id") or "")
+        card = create_site_exploration_synthesis_card(
+            workspace=Path(self.job_store.workspace),
+            project_root=Path(self.job_flow.project_root),
+            site_key=site_key,
+            site_name=str(row.get("site_name") or site_key),
+            batch_id=batch_id,
+            skill_path=str(row.get("skill_path") or ""),
+        )
+        return self.loop_engine.create_loop_control_solution_request(
+            artifacts={"action_card_id": str(card.get("card_id") or "")},
+            context_overrides={
+                "solution_level": SOLUTION_LEVEL_OUTER_SYNTHESIS,
+                "solution_request_kind": "synthesis_work_order",
+                "exploration_completion": True,
+                "site_key": site_key,
+                "batch_id": batch_id,
+            },
+        )
 
     def reconcile_item_loop_thresholds(self, batch: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         if not isinstance(batch, dict) or not batch:
@@ -458,6 +501,17 @@ class BatchEvolutionOrchestrator:
                     solution_run_id=solution_run_id,
                     reason="outer synthesis consumed run-local evidence",
                 )
+                decision = self._outer_synthesis_site_mode_decision(
+                    site_key=str(site_key),
+                    solution_run_id=solution_run_id,
+                )
+                if decision == "ready":
+                    updated = self._outer_synthesis_ready_site_row(current=row, solution_run_id=solution_run_id)
+                    batch = self.job_store.update_site(batch, str(site_key), updated)
+                    batch = self._drop_site_keys(batch=batch, site_key=str(site_key), keys=("continuation",))
+                    changed = True
+                    sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+                    continue
             active = (
                 self._active_materialized_run_local_proposals(site_key=str(site_key), batch_id=batch_id)
                 if solution_level == SOLUTION_LEVEL_ITEM_LOOP
@@ -480,12 +534,54 @@ class BatchEvolutionOrchestrator:
             batch = self.job_store.save_batch(batch)
         return batch
 
+    def _outer_synthesis_site_mode_decision(self, *, site_key: str, solution_run_id: str) -> str:
+        """Read an applied LLM decision; no business conclusion is made here."""
+
+        if not solution_run_id:
+            return ""
+        payload = read_json(Path(self.job_store.workspace) / "evolution" / "runs" / solution_run_id / "applied_files.json")
+        files = payload.get("files") if isinstance(payload.get("files"), list) else []
+        for record in files:
+            if not isinstance(record, dict) or str(record.get("change_type") or "") != "site_mode_update":
+                continue
+            if str(record.get("site_key") or "").strip() != str(site_key or "").strip():
+                continue
+            mode = str(record.get("mode") or "").strip().lower()
+            if mode in {"ready", "exploration"}:
+                return mode
+        return ""
+
+    @classmethod
+    def _outer_synthesis_ready_site_row(cls, *, current: dict[str, Any], solution_run_id: str) -> dict[str, Any]:
+        container_key, container = cls._evolution_container(current)
+        payload = dict(container or {})
+        loop_control = dict(payload.get("loop_control") or {})
+        loop_control.update(
+            {
+                "waiting_solution": False,
+                "synthesis_required": False,
+                "solution_consumed": True,
+                "materialized_solution_run_id": solution_run_id,
+                "solution_level": SOLUTION_LEVEL_OUTER_SYNTHESIS,
+                "outer_synthesis_decision": "ready",
+            }
+        )
+        payload["loop_control"] = loop_control
+        payload["status"] = "completed"
+        return {
+            **current,
+            "status": "completed",
+            "reason_tag": "outer_synthesis_ready",
+            "message": "Codex outer synthesis promoted this site to normal execution.",
+            container_key: payload,
+        }
+
     def _site_has_applied_solution_to_consume(self, row: dict[str, Any]) -> bool:
         solution_run_id = self._solution_run_id(row)
         if not self._solution_run_is_applied(solution_run_id):
             return False
-        apply_payload = row.get("apply") if isinstance(row.get("apply"), dict) else {}
-        loop_control = apply_payload.get("loop_control") if isinstance(apply_payload.get("loop_control"), dict) else {}
+        _container_key, container = self._evolution_container(row)
+        loop_control = container.get("loop_control") if isinstance(container.get("loop_control"), dict) else {}
         if bool(loop_control.get("solution_consumed")) and str(loop_control.get("materialized_solution_run_id") or "") == solution_run_id:
             return False
         return self._solution_level(row) in {SOLUTION_LEVEL_ITEM_LOOP, SOLUTION_LEVEL_OUTER_SYNTHESIS}
@@ -514,15 +610,28 @@ class BatchEvolutionOrchestrator:
         site_text = str(site_key or "").strip()
         if not batch_text or not site_text:
             return {"closed_count": 0, "closed_memory_ids": []}
-        apply_payload = current.get("apply") if isinstance(current.get("apply"), dict) else {}
-        loop_control = apply_payload.get("loop_control") if isinstance(apply_payload.get("loop_control"), dict) else {}
-        phase = str(loop_control.get("phase") or current.get("current_phase") or "apply").strip() or "apply"
-        scope = f"batch:{batch_text}:site:{site_text}:{phase}"
-        return EvolutionMemoryStore(Path(self.job_store.workspace)).close_run_local_scope_after_synthesis(
-            scope=scope,
-            reason=reason,
-            run_id=solution_run_id,
+        store = EvolutionMemoryStore(Path(self.job_store.workspace))
+        units = run_local_units_for_batch_site(
+            workspace=Path(self.job_store.workspace),
+            site_key=site_text,
+            batch_id=batch_text,
+            statuses=["active"],
         )
+        scopes = sorted({str(unit.get("scope") or "") for unit in units if str(unit.get("scope") or "")})
+        if not scopes:
+            _container_key, container = self._evolution_container(current)
+            loop_control = container.get("loop_control") if isinstance(container.get("loop_control"), dict) else {}
+            phase = str(loop_control.get("phase") or current.get("current_phase") or "apply").strip() or "apply"
+            scopes = [f"batch:{batch_text}:site:{site_text}:{phase}"]
+        closed: list[str] = []
+        for scope in scopes:
+            result = store.close_run_local_scope_after_synthesis(
+                scope=scope,
+                reason=reason,
+                run_id=solution_run_id,
+            )
+            closed.extend(result.get("closed_memory_ids") if isinstance(result.get("closed_memory_ids"), list) else [])
+        return {"closed_count": len(closed), "closed_memory_ids": closed, "scopes": scopes}
 
     def _active_materialized_run_local_proposals(self, *, site_key: str, batch_id: str) -> list[dict[str, Any]]:
         try:
@@ -547,8 +656,9 @@ class BatchEvolutionOrchestrator:
         solution_run_id: str,
         solution_level: str,
     ) -> dict[str, Any]:
-        apply_payload = dict(current.get("apply") or {})
-        loop_control = dict(apply_payload.get("loop_control") or {})
+        container_key, container = self._evolution_container(current)
+        payload = dict(container or {})
+        loop_control = dict(payload.get("loop_control") or {})
         proposal_payload = proposal.get("proposal") if isinstance(proposal.get("proposal"), dict) else {}
         loop_control.update(
             {
@@ -562,15 +672,15 @@ class BatchEvolutionOrchestrator:
                 "solution_level": solution_level,
             }
         )
-        apply_payload["loop_control"] = loop_control
+        payload["loop_control"] = loop_control
         if resume_current_batch:
             continuation_source = "run_local_overlay" if str(proposal_payload.get("proposal_id") or "") else "applied_solution"
-            apply_payload["status"] = "running"
+            payload["status"] = "running"
             return {
                 **current,
                 "status": "running",
                 "reason_tag": f"item_loop_resume_with_{continuation_source}",
-                "apply": apply_payload,
+                container_key: payload,
                 "continuation": {
                     "kind": "item_loop",
                     "phase": "apply",
@@ -583,18 +693,18 @@ class BatchEvolutionOrchestrator:
                 "message": "Resuming item loop with an applied evolution proposal.",
             }
         if solution_level == SOLUTION_LEVEL_OUTER_SYNTHESIS:
-            apply_payload["status"] = "blocked"
+            payload["status"] = "blocked"
             updated = {
                 **current,
                 "status": "blocked",
                 "reason_tag": "outer_synthesis_solution_applied",
-                "apply": apply_payload,
+                container_key: payload,
                 "message": "Outer synthesis proposal was applied; the current batch should close and a follow-up batch should validate it.",
             }
             updated.pop("continuation", None)
             return updated
-        apply_payload["status"] = str(apply_payload.get("status") or "blocked")
-        updated = {**current, "apply": apply_payload}
+        payload["status"] = str(payload.get("status") or "blocked")
+        updated = {**current, container_key: payload}
         updated.pop("continuation", None)
         return updated
 
@@ -614,8 +724,8 @@ class BatchEvolutionOrchestrator:
 
     @classmethod
     def _solution_level(cls, row: dict[str, Any]) -> str:
-        apply_payload = row.get("apply") if isinstance(row.get("apply"), dict) else {}
-        loop_control = apply_payload.get("loop_control") if isinstance(apply_payload.get("loop_control"), dict) else {}
+        _container_key, container = cls._evolution_container(row)
+        loop_control = container.get("loop_control") if isinstance(container.get("loop_control"), dict) else {}
         if str(loop_control.get("solution_request_kind") or "") == "synthesis_work_order" or bool(
             loop_control.get("synthesis_required")
         ):
@@ -628,13 +738,13 @@ class BatchEvolutionOrchestrator:
         if self._site_is_waiting_solution(row):
             return False
         site_status = str(row.get("status") or "").strip()
-        apply_payload = row.get("apply") if isinstance(row.get("apply"), dict) else {}
-        apply_status = str(apply_payload.get("status") or "").strip()
-        if site_status in {"queued", "running", "ready"} or apply_status in {"queued", "running", "ready"}:
+        container_key, container = self._evolution_container(row)
+        container_status = str(container.get("status") or "").strip()
+        if site_status in {"queued", "running", "ready"} or container_status in {"queued", "running", "ready"}:
             return False
-        if site_status not in {"blocked", "failed"} and apply_status not in {"blocked", "failed"}:
+        if site_status not in {"blocked", "failed"} and container_status not in {"blocked", "failed"}:
             return False
-        loop_payload = apply_payload.get("loop_control") if isinstance(apply_payload.get("loop_control"), dict) else {}
+        loop_payload = container.get("loop_control") if isinstance(container.get("loop_control"), dict) else {}
         if not loop_payload:
             return False
         if str(loop_payload.get("solution_request_kind") or "") == "synthesis_work_order":
@@ -642,15 +752,37 @@ class BatchEvolutionOrchestrator:
         artifacts = loop_payload.get("artifacts") if isinstance(loop_payload.get("artifacts"), dict) else {}
         if not str(artifacts.get("action_card_id") or "").strip():
             return False
-        control = loop_control_from_row(self.loop_engine.loop_control_payload_from_site_row(row))
+        control = loop_control_from_row(loop_payload)
         if not control or loop_control_is_human_only_gap(control):
             return False
+        if container_key == "evolution":
+            transition = loop_payload.get("item_loop_transition") if isinstance(loop_payload.get("item_loop_transition"), dict) else {}
+            return bool(loop_payload.get("artifacts", {}).get("escalated")) or str(transition.get("action") or "") == "pause_threshold"
         return True
 
-    @staticmethod
-    def _synthesis_waiting_solution_site_row(*, current: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
-        apply_payload = dict(current.get("apply") or {})
-        loop_control = dict(apply_payload.get("loop_control") or {})
+    @classmethod
+    def _site_requires_exploration_synthesis(cls, row: dict[str, Any]) -> bool:
+        """Recognize terminal exploration structurally, without judging its result."""
+
+        if cls._site_is_waiting_solution(row):
+            return False
+        if str(row.get("status") or "").strip() not in {"completed", "partial_completed", "failed", "blocked"}:
+            return False
+        scope = row.get("evolution_scope") if isinstance(row.get("evolution_scope"), dict) else {}
+        execution_mode = str(
+            scope.get("execution_mode") or row.get("execution_mode") or row.get("site_mode") or ""
+        ).strip()
+        if execution_mode != "exploration" or not bool(scope.get("active", execution_mode == "exploration")):
+            return False
+        _container_key, container = cls._evolution_container(row)
+        loop_control = container.get("loop_control") if isinstance(container.get("loop_control"), dict) else {}
+        return not bool(loop_control.get("synthesis_required"))
+
+    @classmethod
+    def _synthesis_waiting_solution_site_row(cls, *, current: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+        container_key, container = cls._evolution_container(current)
+        payload = dict(container or {})
+        loop_control = dict(payload.get("loop_control") or {})
         loop_control.update(
             {
                 "waiting_solution": True,
@@ -662,8 +794,8 @@ class BatchEvolutionOrchestrator:
                 "evidence_pack": str(request.get("evidence_pack") or ""),
             }
         )
-        apply_payload["loop_control"] = loop_control
-        apply_payload["status"] = "waiting_solution"
+        payload["loop_control"] = loop_control
+        payload["status"] = "waiting_solution"
         return {
             **current,
             "status": "waiting_solution",
@@ -671,7 +803,7 @@ class BatchEvolutionOrchestrator:
             "solution_run_id": str(request.get("run_id") or ""),
             "solution_request": str(request.get("solution_request") or ""),
             "proposal_output_path": str(request.get("proposal_output_path") or ""),
-            "apply": apply_payload,
+            container_key: payload,
             "message": "Evolution synthesis work order created from stopped execution-unit evidence.",
         }
 
@@ -746,8 +878,8 @@ class BatchEvolutionOrchestrator:
 
     @staticmethod
     def _site_is_waiting_solution(row: dict[str, Any]) -> bool:
-        apply_payload = row.get("apply") if isinstance(row.get("apply"), dict) else {}
-        return str(row.get("status") or "") == "waiting_solution" or str(apply_payload.get("status") or "") == "waiting_solution"
+        _container_key, container = BatchEvolutionOrchestrator._evolution_container(row)
+        return str(row.get("status") or "") == "waiting_solution" or str(container.get("status") or "") == "waiting_solution"
 
     @classmethod
     def _waiting_solution_run_ids(cls, batch: dict[str, Any]) -> list[str]:
@@ -766,9 +898,19 @@ class BatchEvolutionOrchestrator:
 
     @staticmethod
     def _solution_run_id(row: dict[str, Any]) -> str:
-        apply_payload = row.get("apply") if isinstance(row.get("apply"), dict) else {}
-        loop_control = apply_payload.get("loop_control") if isinstance(apply_payload.get("loop_control"), dict) else {}
+        _container_key, container = BatchEvolutionOrchestrator._evolution_container(row)
+        loop_control = container.get("loop_control") if isinstance(container.get("loop_control"), dict) else {}
         return str(loop_control.get("solution_run_id") or row.get("solution_run_id") or "").strip()
+
+    @staticmethod
+    def _evolution_container(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Prefer generic phase evolution state; retain apply compatibility."""
+
+        evolution = row.get("evolution") if isinstance(row.get("evolution"), dict) else {}
+        if isinstance(evolution.get("loop_control"), dict):
+            return "evolution", evolution
+        apply_payload = row.get("apply") if isinstance(row.get("apply"), dict) else {}
+        return "apply", apply_payload
 
     def _solution_run_is_applied(self, run_id: str) -> bool:
         normalized = str(run_id or "").strip()

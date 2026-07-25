@@ -11,6 +11,10 @@ from .site_skill_refinement import (
     SITE_WORKFLOW_COMPACTION_CANDIDATE_ID,
     create_site_skill_refinement_card,
 )
+from .site_exploration_synthesis import (
+    SITE_EXPLORATION_SYNTHESIS_TASK,
+    create_site_exploration_synthesis_card,
+)
 from .store import ActionCardError, ActionCardStore
 
 __all__ = [
@@ -19,8 +23,10 @@ __all__ = [
     "ActionCardStore",
     "NEW_SITE_WORKFLOW_TRANSFER_CANDIDATE_ID",
     "SITE_SKILL_BOOTSTRAP_TASK",
+    "SITE_EXPLORATION_SYNTHESIS_TASK",
     "SITE_SKILL_REFINEMENT_TASK",
     "SITE_WORKFLOW_COMPACTION_CANDIDATE_ID",
     "create_site_skill_bootstrap_card",
+    "create_site_exploration_synthesis_card",
     "create_site_skill_refinement_card",
 ]

@@ -44,6 +44,19 @@ class SiteWorkItemScheduler:
     def complete(self, site_key: str) -> SiteWorkItem | None:
         return self._active.pop(str(site_key), None)
 
+    def discard(self, site_key: str) -> SiteWorkItem | None:
+        """Remove an unowned site slot before durable-worker recovery.
+
+        The coordinator's active record is the execution owner. If it has
+        already been lost (for example after host restart), a scheduler-only
+        slot must not prevent the retained work item from being claimed again.
+        """
+
+        normalized = str(site_key)
+        active = self._active.pop(normalized, None)
+        self._queued = deque(row for row in self._queued if row.site_key != normalized)
+        return active
+
     def active(self, site_key: str) -> SiteWorkItem | None:
         return self._active.get(str(site_key))
 

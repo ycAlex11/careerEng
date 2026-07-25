@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -59,7 +60,7 @@ class BrowserContextRegistry:
 
     def _current_source_signature(self) -> tuple[tuple[str, int, int], ...]:
         paths = [
-            self.workspace / "profile" / "profile.md",
+            self.profile_store.doc_path,
             self.workspace / "profile" / "application_profile.md",
             self.cv_store.metadata_path,
         ]
@@ -75,6 +76,18 @@ class BrowserContextRegistry:
                 continue
             signature.append((str(path), int(stat.st_mtime_ns), int(stat.st_size)))
         return tuple(signature)
+
+    def resource_version(self, resource_id: str) -> str:
+        """Return a content version for a lazily served context resource."""
+
+        normalized = str(resource_id or "").strip().lower()
+        if normalized == "apply_facts":
+            payload = json.dumps(self.apply_facts, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        if normalized == "full_persona":
+            payload = json.dumps(self.persona_doc, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return ""
 
     def _load_cv_text(self) -> str:
         if self._cv_loaded:

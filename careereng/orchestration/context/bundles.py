@@ -152,15 +152,23 @@ class BrowserContextSession:
         continuation_context: dict[str, Any] | None = None,
     ) -> "BrowserContextSession":
         available_bundle_names = registry.available_bundles()
-        # Lightweight facts are useful for ordinary form fields. Full bundles
-        # remain descriptors until request_context explicitly materializes one.
+        # All profile data stays lazy. The agent requests it only when the live
+        # form needs it, so a resumed run cannot keep stale user facts.
         resume_pdf_path = str(staged_resume_pdf_path or "").strip() or str(default_apply_resume_pdf_path(workspace))
-        initial_apply_facts = build_apply_initial_facts(
-            registry=registry,
-            staged_resume_pdf_path=resume_pdf_path,
-            target_job_ids=target_job_ids,
-        )
-        bundle_texts = {"apply_facts": render_apply_facts(initial_apply_facts)} if initial_apply_facts else {}
+        bundle_texts: dict[str, str] = {}
+
+        def _load_apply_bundle(bundle: str) -> str:
+            registry.refresh_if_changed()
+            if str(bundle or "").strip().lower() == "apply_facts":
+                return render_apply_facts(
+                    build_apply_initial_facts(
+                        registry=registry,
+                        staged_resume_pdf_path=resume_pdf_path,
+                        target_job_ids=target_job_ids,
+                    ),
+                    requested=True,
+                )
+            return registry.bundle_item_text(bundle)
         load_run_context = getattr(site_store, "load_run_context", None)
         if callable(load_run_context):
             try:
@@ -170,11 +178,6 @@ class BrowserContextSession:
         else:
             run_context = {}
         apply_carry_forward = str(run_context.get("apply_carry_forward") or "").strip() if isinstance(run_context, dict) else ""
-        apply_loop_refinement_summary = (
-            str(run_context.get("apply_loop_refinement_summary") or "").strip()
-            if isinstance(run_context, dict)
-            else ""
-        )
         try:
             from careereng.evolution.memory_units import (
                 EvolutionMemoryStore,
@@ -258,17 +261,6 @@ class BrowserContextSession:
                     ),
                 }
             )
-        if apply_loop_refinement_summary:
-            items.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Current apply-loop refinement guidance from earlier apply targets in this same batch:\n"
-                        f"{apply_loop_refinement_summary}\n"
-                        "Treat this as temporary strategy guidance for the next target; it does not override confirmed site/project Skills."
-                    ),
-                }
-            )
         if evolution_memory_summary:
             items.append(
                 {
@@ -281,14 +273,12 @@ class BrowserContextSession:
                     ),
                 }
             )
-        if "apply_facts" in bundle_texts:
-            items.append({"role": "user", "content": bundle_texts["apply_facts"]})
         items.append({"role": "user", "content": registry.available_bundles_item_text()})
         return cls(
             bundle_texts=bundle_texts,
             base_items=items,
             phase_memory=phase_memory,
-            bundle_loader=registry.bundle_item_text,
+            bundle_loader=_load_apply_bundle,
             available_bundle_names=available_bundle_names,
         )
 
@@ -298,11 +288,38 @@ class BrowserContextSession:
         *,
         phase_memory: BrowserPhaseMemory | None = None,
         continuation_context: dict[str, Any] | None = None,
+        workspace: Path | None = None,
+        site_key: str = "",
+        batch_id: str = "",
+        phase: str = "",
     ) -> "BrowserContextSession":
         items: list[dict[str, str]] = []
         continuation_item = cls._continuation_context_item(continuation_context)
         if continuation_item:
             items.append(continuation_item)
+        if workspace and site_key and batch_id and phase:
+            try:
+                from careereng.evolution.memory_units import active_run_local_guidance
+
+                guidance = active_run_local_guidance(
+                    workspace=workspace,
+                    site_key=site_key,
+                    batch_id=batch_id,
+                    phase=phase,
+                )
+            except Exception:
+                guidance = ""
+            if guidance:
+                items.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Active run-local proposal for this phase:\n"
+                            f"{guidance}\n"
+                            "This is the strategy currently being validated. Verify it against live evidence before acting."
+                        ),
+                    }
+                )
         return cls(bundle_texts={}, base_items=items, phase_memory=phase_memory)
 
     @staticmethod

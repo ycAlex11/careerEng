@@ -8,6 +8,7 @@ from typing import Any
 from careereng.career.applications.channel_locator import ChannelLocator
 from careereng.orchestration.engine.agent_loop import AgentLoop
 from careereng.orchestration.engine.browser_automation import BrowserAutomationService
+from careereng.config.execution import CODEX_BACKEND, execution_backend_from_mode, resolve_execution_backend
 from careereng.config.loader import load_auth, load_config
 from careereng.adapters.providers import create_provider
 from careereng.orchestration.agent_protocol.llm import ProviderError, StructuredOutputResult
@@ -31,6 +32,13 @@ class FallbackProvider:
             mode="error",
             used_fallback=True,
         )
+
+
+class DisabledProvider(FallbackProvider):
+    """Prevent an API transport from being used when config disables it."""
+
+    def __init__(self):
+        super().__init__("provider execution is disabled by config")
 
 
 def _create_responses_browser_phase_runtime(settings: dict[str, Any]) -> BrowserPhaseRuntime:
@@ -77,10 +85,26 @@ def build_loop(*, project_root: Path, workspace: Path | None = None) -> tuple[Ag
     auth = load_auth(project_root)
     resolved_workspace = workspace or config.paths.workspace_path(project_root)
     resolved_workspace.mkdir(parents=True, exist_ok=True)
-    try:
-        _, provider = create_provider(config, auth, workspace=resolved_workspace)
-    except ProviderError as exc:
-        provider = FallbackProvider(str(exc))
+    execution_backend, execution_error = resolve_execution_backend(config)
+    if execution_error:
+        raise ValueError(execution_error)
+    if bool(getattr(config.execution, "provider_enabled", True)):
+        try:
+            _, provider = create_provider(config, auth, workspace=resolved_workspace)
+        except ProviderError as exc:
+            provider = FallbackProvider(str(exc))
+    else:
+        provider = DisabledProvider()
+
+    configured_mode = str(config.browser.execution_mode or "provider")
+    if execution_backend == CODEX_BACKEND:
+        browser_execution_mode = (
+            configured_mode
+            if execution_backend_from_mode(configured_mode) == CODEX_BACKEND
+            else "codex_app_server"
+        )
+    else:
+        browser_execution_mode = "provider"
 
     site_store = SiteStore(resolved_workspace, project_root=project_root)
     site_tools = SiteTools(site_store)
@@ -89,7 +113,7 @@ def build_loop(*, project_root: Path, workspace: Path | None = None) -> tuple[Ag
         project_root=project_root,
         workspace=resolved_workspace,
         site_store=site_store,
-        execution_mode=str(config.browser.execution_mode or "provider"),
+        execution_mode=browser_execution_mode,
         api_base=resolve_browser_api_base(config),
         api_key=str(auth.openai_api_key or ""),
         model=str(config.agent.default_model or "gpt-5"),
@@ -109,6 +133,7 @@ def build_loop(*, project_root: Path, workspace: Path | None = None) -> tuple[Ag
         executable_path=str(config.browser.executable_path or ""),
         phase_runtime_factory=_create_responses_browser_phase_runtime,
     )
+    browser_runner.execution_backend = execution_backend
     loop = AgentLoop(
         project_root=project_root,
         workspace=resolved_workspace,

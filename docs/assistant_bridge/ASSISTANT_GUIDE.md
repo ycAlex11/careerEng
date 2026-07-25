@@ -84,6 +84,30 @@ First version rule:
 - Do not automatically execute high-impact commands unless the user explicitly asks and the assistant is already allowed to run project commands.
 - If there is no `@career` and no active scope, use the bridge for suggestion first.
 
+## Running Site Workflows
+
+Codex Desktop or another main assistant coordinates CareerEng; it does not create a separate runtime host per site.
+
+1. Check `careereng_runtime_host_status` before starting or continuing browser work.
+2. If no host is reachable, start it with `careereng runtime-host serve`, then verify its status before dispatching site work.
+3. Use `careereng_get_context` to inspect the active batch and target site before changing its execution state.
+4. Multiple sites may run concurrently up to `browser.site_parallelism`. A paused, login-required, or CAPTCHA-required site does not block the other sites.
+5. When the user completes a browser-only step, continue the same target site from its retained page and durable state. Do not restart unrelated sites or create another host.
+6. The configured execution backend is fixed for a running host. Do not switch between provider and Codex execution during a run.
+
+For direct lifecycle commands, see `docs/assistant_bridge/COMMANDS.md`.
+
+## MCP Execution Tools
+
+Use MCP tools in this order:
+
+1. Inspect host and batch context with `careereng_runtime_host_status` and `careereng_get_context`.
+2. For an active site task, call `careereng_get_work_item_context`.
+3. Discover the current task's browser or state capabilities with its `careereng_work_item_list_*_tools` tool.
+4. Execute only through the matching `careereng_work_item_*` tool and finish the phase with `careereng_work_item_phase_result`.
+
+Do not maintain a static list of browser controls in this guide. Browser and state tools are discovered from the current work item because they are scoped to its site and phase.
+
 ## Action Cards
 
 When CareerEng needs Codex/user review instead of immediate execution, it may create an action card under:

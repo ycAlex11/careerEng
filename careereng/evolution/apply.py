@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 from typing import Any
 
+from careereng.career.applications.site_store import SiteStore
 from careereng.evolution.work_items import ActionCardError, ActionCardStore
 from careereng.evolution.proposals import ASSISTANT_CONTEXT_TARGET, EvolutionProposalError, load_proposal
 from careereng.evolution.memory_units import EvolutionMemoryStore, build_loop_evolution_memory
@@ -70,6 +71,10 @@ def apply_evolution_run(*, workspace: Path | str, run_id: str, project_root: Pat
             applied_files.append(result)
         elif change_type == "assistant_context_update":
             result = _apply_assistant_context_update(change=change, root=root, run_dir=run_dir)
+            applied_files.append(result["file_record"])
+            diff_chunks.append(result["diff"])
+        elif change_type == "site_mode_update":
+            result = _apply_site_mode_update(change=change, workspace=workspace_path, root=root, run_dir=run_dir)
             applied_files.append(result["file_record"])
             diff_chunks.append(result["diff"])
         else:
@@ -164,6 +169,62 @@ def _apply_skill_patch(*, change: dict[str, Any], root: Path, run_dir: Path) -> 
         "file_record": {
             "change_id": str(change.get("change_id") or ""),
             "change_type": "skill_patch",
+            "target_file": str(target),
+            "relative_path": str(relative_target),
+            "snapshot_path": str(snapshot),
+            "summary": str(change.get("summary") or ""),
+        },
+        "diff": diff,
+    }
+
+
+def _apply_site_mode_update(*, change: dict[str, Any], workspace: Path, root: Path, run_dir: Path) -> dict[str, Any]:
+    """Apply an LLM-selected site lifecycle mode with a normal file snapshot."""
+
+    site_key = str(change.get("site_key") or "").strip()
+    mode = str(change.get("mode") or "").strip().lower()
+    if not site_key or mode not in {"ready", "exploration"}:
+        raise EvolutionApplyError("site_mode_update requires site_key and mode=ready|exploration.")
+    site_store = SiteStore(workspace)
+    skill = site_store.load_skill(site_key)
+    if not skill.get("exists"):
+        raise EvolutionApplyError(f"site_mode_update target site Skill is missing: {site_key}")
+    target = Path(skill["path"])
+    original = target.read_text(encoding="utf-8")
+    before_mode = str((skill.get("front_matter") or {}).get("status") or "")
+    if before_mode == mode:
+        return {
+            "file_record": {
+                "change_id": str(change.get("change_id") or ""),
+                "change_type": "site_mode_update",
+                "site_key": site_key,
+                "mode": mode,
+                "target_file": str(target),
+                "relative_path": str(target.resolve().relative_to(root.resolve())),
+                "snapshot_path": "",
+                "summary": str(change.get("summary") or ""),
+                "status": "skipped_noop",
+            },
+            "diff": "",
+        }
+    snapshot = _snapshot_file(target=target, root=root, run_dir=run_dir)
+    updated_skill = site_store.set_skill_mode(site_key, mode=mode)
+    updated = Path(updated_skill["path"]).read_text(encoding="utf-8")
+    relative_target = target.resolve().relative_to(root.resolve())
+    diff = "".join(
+        difflib.unified_diff(
+            original.splitlines(keepends=True),
+            updated.splitlines(keepends=True),
+            fromfile=f"a/{relative_target}",
+            tofile=f"b/{relative_target}",
+        )
+    )
+    return {
+        "file_record": {
+            "change_id": str(change.get("change_id") or ""),
+            "change_type": "site_mode_update",
+            "site_key": site_key,
+            "mode": mode,
             "target_file": str(target),
             "relative_path": str(relative_target),
             "snapshot_path": str(snapshot),

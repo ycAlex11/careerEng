@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from careereng.orchestration.context import WorkflowMemoryStore
+from careereng.evolution.artifacts import EvolutionEvidenceStore
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore, render_lessons_markdown
 from careereng.evolution.item_loop import plan_item_loop_transition
 from careereng.evolution.loop_control import (
@@ -29,15 +30,41 @@ from careereng.evolution.memory_units import (
     evolution_memory_has_materialized_change,
 )
 from careereng.evolution.solution_provider import EvolutionSolutionError, create_solution_request_for_action_card
-from careereng.utils import make_id
+from careereng.utils import make_id, safe_file_stem
 
 
-class ApplyLoopEngine:
-    """Reusable engine for apply-item loop evolution.
+def build_site_loop_scope(
+    *,
+    site_key: str,
+    site_mode: str,
+    execution_mode: str,
+    inner_attempt_limit: int = 3,
+    outer_batch_limit: int = 3,
+) -> dict[str, Any]:
+    """Build structural boundaries for a generic site-workflow loop."""
 
-    JobFlow owns the browser/apply-list orchestration. This engine owns the
-    generic evolution contract around loop-control evidence, proposals, usage,
-    validation, and outer-loop follow-up packaging.
+    normalized_mode = str(site_mode or "ready").strip().lower() or "ready"
+    normalized_execution = str(execution_mode or "stable").strip().lower() or "stable"
+    trigger = "new_site_exploration" if normalized_execution == "exploration" else "site_refinement_cadence"
+    return {
+        "scope_kind": "site_workflow",
+        "scope_key": f"site:{safe_file_stem(site_key)}",
+        "trigger": trigger,
+        "site_mode": normalized_mode,
+        "execution_mode": normalized_execution,
+        "inner_attempt_limit": max(1, int(inner_attempt_limit or 1)),
+        "outer_batch_limit": max(1, int(outer_batch_limit or 1)),
+        "active": normalized_execution == "exploration",
+    }
+
+
+class EvolutionLoopEngine:
+    """Reusable engine for all evolution-loop scopes.
+
+    The current apply-item methods are one consumer of this engine. New-site
+    exploration and ready-site refinement use the same structural scope,
+    evidence, proposal, validation, and outer-followup contract. Python does
+    not choose the workflow strategy carried inside a scope.
     """
 
     def __init__(
@@ -94,6 +121,238 @@ class ApplyLoopEngine:
     @property
     def failed_batches_per_pattern(self) -> int:
         return int(self.browser_budgets.loop_control_failed_batches_per_pattern)
+
+    def site_loop_scope(
+        self,
+        *,
+        site_key: str,
+        site_mode: str,
+        execution_mode: str,
+    ) -> dict[str, Any]:
+        """Describe generic loop boundaries for one declared site mode."""
+
+        return build_site_loop_scope(
+            site_key=site_key,
+            site_mode=site_mode,
+            execution_mode=execution_mode,
+            inner_attempt_limit=self.refinement_attempts_per_batch,
+            outer_batch_limit=self.outer_batch_attempts,
+        )
+
+    def record_phase_signal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist a Codex-authored evolution signal for any site phase.
+
+        The signal is deliberately supplied by the agent. This method only
+        attaches scope, trace references, existing artifact contracts, and a
+        structural transition; it never derives a workflow fix itself.
+        """
+
+        raw = dict(payload or {})
+        site_key = safe_file_stem(str(raw.get("site_key") or ""))
+        batch_id = str(raw.get("batch_id") or "").strip()
+        phase = str(raw.get("phase") or "").strip()
+        signal = raw.get("signal") if isinstance(raw.get("signal"), dict) else {}
+        if not site_key or not batch_id or not phase:
+            raise ValueError("evolution signal requires site_key, batch_id, and phase")
+        control = loop_control_from_row(signal)
+        if not control:
+            raise ValueError("evolution signal requires a valid loop-control action")
+        current_item_ref = str(control.get("current_item_ref") or raw.get("current_url") or "").strip()
+        source = {
+            **signal,
+            "current_item_ref": current_item_ref,
+            "url": current_item_ref,
+            "title": str(signal.get("title") or phase),
+            "_loop_trace_ref": str(raw.get("trace_ref") or ""),
+        }
+        pattern = str(control.get("failure_pattern") or "unknown_loop_pattern")
+        attempts = self._phase_signal_attempts(
+            site_key=site_key,
+            batch_id=batch_id,
+            phase=phase,
+            pattern=pattern,
+        ) + 1
+        trace_context = self.loop_recent_trace_context(
+            trace_ref=raw.get("trace_ref") or "",
+            phase=phase,
+            limit=8,
+        )
+        next_guidance = str(control.get("refinement_hint") or "").strip()
+        enriched = {
+            **source,
+            "_loop_recent_tool_chain": trace_context.get("tool_chain") or [],
+            "_loop_last_tool_outputs": trace_context.get("outputs") or [],
+            "_loop_next_iteration_guidance": next_guidance,
+        }
+        artifacts = create_loop_control_artifacts(
+            workspace=self.workspace,
+            project_root=self.project_root,
+            site_key=site_key,
+            site_name=site_key,
+            phase=phase,
+            batch_id=batch_id,
+            job_row=enriched,
+            per_batch_attempts=attempts,
+            max_refinement_attempts_per_batch=self.refinement_attempts_per_batch,
+            max_failed_batches_per_pattern=self.failed_batches_per_pattern,
+        )
+        overlay = str(signal.get("run_local_overlay") or "").strip()
+        memory = self._persist_phase_signal_memory(
+            site_key=site_key,
+            batch_id=batch_id,
+            phase=phase,
+            turn_id=str(raw.get("turn_id") or ""),
+            control=control,
+            source=enriched,
+            artifacts=artifacts,
+            overlay=overlay,
+        )
+        transition = plan_item_loop_transition(
+            control,
+            attempts=attempts,
+            max_refinement_attempts=self.refinement_attempts_per_batch,
+            max_user_input_attempts=self.user_input_attempts_per_batch,
+            has_materialized_change=evolution_memory_has_materialized_change(memory),
+            artifacts=artifacts,
+        )
+        event = {
+            "batch_id": batch_id,
+            "site_key": site_key,
+            "phase": phase,
+            "turn_id": str(raw.get("turn_id") or ""),
+            "failure_pattern": pattern,
+            "loop_control_action": str(control.get("action") or ""),
+            "attempts": attempts,
+            "artifacts": artifacts,
+            "memory_id": str(memory.get("memory_id") or ""),
+            "materialized_change": evolution_memory_has_materialized_change(memory),
+            "item_loop_transition": transition.as_dict(),
+        }
+        self._persist_phase_signal_site_state(
+            site_key=site_key,
+            batch_id=batch_id,
+            phase=phase,
+            control=control,
+            artifacts=artifacts,
+            memory=memory,
+            transition=transition.as_dict(),
+        )
+        self.job_store.append_event("evolution.phase_signal.recorded", event)
+        return event
+
+    def _persist_phase_signal_site_state(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        phase: str,
+        control: dict[str, Any],
+        artifacts: dict[str, Any],
+        memory: dict[str, Any],
+        transition: dict[str, Any],
+    ) -> None:
+        """Attach generic loop state to the batch site row, not an apply row."""
+
+        try:
+            batch = self.job_store.load_batch(batch_id)
+            sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+            current = sites.get(site_key)
+            if not isinstance(current, dict):
+                return
+            evolution = dict(current.get("evolution") or {})
+            evolution["status"] = "active"
+            evolution["loop_control"] = {
+                **control,
+                "phase": phase,
+                "artifacts": artifacts,
+                "memory_id": str(memory.get("memory_id") or ""),
+                "proposal_status": str((memory.get("proposal") or {}).get("proposal_status") or ""),
+                "materialized_change": evolution_memory_has_materialized_change(memory),
+                "item_loop_transition": transition,
+            }
+            self.job_store.save_batch(self.job_store.update_site(batch, site_key, {**current, "evolution": evolution}))
+        except Exception:
+            # Signal evidence remains durable even if a batch row has already
+            # closed. The outer loop will still see it through the summary.
+            return
+
+    def _phase_signal_attempts(self, *, site_key: str, batch_id: str, phase: str, pattern: str) -> int:
+        count = 0
+        for row in EvolutionEvidenceStore(self.workspace).read_all():
+            details = row.get("details") if isinstance(row.get("details"), dict) else {}
+            if str(row.get("site_key") or "") != site_key or str(row.get("phase") or "") != phase:
+                continue
+            if str(details.get("batch_id") or "") != batch_id:
+                continue
+            if str(details.get("failure_pattern") or "") == pattern:
+                count += 1
+        return count
+
+    def _persist_phase_signal_memory(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        phase: str,
+        turn_id: str,
+        control: dict[str, Any],
+        source: dict[str, Any],
+        artifacts: dict[str, Any],
+        overlay: str,
+    ) -> dict[str, Any]:
+        pattern = str(control.get("failure_pattern") or "unknown_loop_pattern")
+        materialized = bool(overlay)
+        proposal_id = (
+            f"run_local_prop_{str(artifacts.get('evidence_id') or make_id('evidence')).replace('evidence_', '')}"
+            if materialized
+            else f"pending_run_local_prop_{str(artifacts.get('evidence_id') or make_id('evidence')).replace('evidence_', '')}"
+        )
+        unit = build_loop_evolution_memory(
+            candidate_id=str(artifacts.get("candidate_id") or "site_workflow_loop_control"),
+            scope=f"batch:{batch_id}:site:{site_key}:{phase}",
+            site_key=site_key,
+            phase=phase,
+            lifecycle="run_local",
+            status="active",
+            pattern=pattern,
+            evidence=str(control.get("evidence") or ""),
+            summary=(
+                f"{site_key} {phase} loop signal for `{pattern}` with a materialized run-local overlay."
+                if materialized
+                else f"{site_key} {phase} loop signal for `{pattern}` awaiting a concrete Codex proposal."
+            ),
+            avoid_patterns=self.loop_memory_avoid_patterns(pattern=pattern, evidence=str(control.get("evidence") or "")),
+            recommended_patterns=[overlay] if overlay else [],
+            source={
+                "batch_id": batch_id,
+                "turn_id": turn_id,
+                "phase": phase,
+                "current_item_ref": str(source.get("current_item_ref") or ""),
+                "trace_ref": str(source.get("_loop_trace_ref") or ""),
+                "evidence_id": str(artifacts.get("evidence_id") or ""),
+                "candidate_id": str(artifacts.get("candidate_id") or ""),
+                "action_card": str(artifacts.get("action_card") or ""),
+            },
+            target=str(control.get("target") or control.get("recommended_target") or ""),
+            confidence=0.6 if materialized else 0.45,
+            proposal={
+                "proposal_id": proposal_id,
+                "proposal_kind": "run_local_overlay",
+                "proposal_status": "materialized" if materialized else "incomplete",
+                "prompt_overlay": overlay or str(control.get("refinement_hint") or ""),
+                "expected_validation": (
+                    f"The next {phase} unit must use this overlay and record whether `{pattern}` changes."
+                ),
+                "source_evidence_id": str(artifacts.get("evidence_id") or ""),
+                "target_ref": str(artifacts.get("target_ref") or ""),
+                "materialized_change": (
+                    {"type": "run_local_overlay", "content": overlay, "source": "codex_worker"}
+                    if materialized
+                    else {}
+                ),
+            },
+        )
+        return EvolutionMemoryStore(self.workspace).upsert(unit)
 
     def aggregate_apply_status_for_run(self, *, site_key: str, batch_id: str) -> str:
         rows = self.merged_run_job_rows(site_key, batch_id)
@@ -427,8 +686,10 @@ class ApplyLoopEngine:
 
     @staticmethod
     def loop_control_payload_from_site_row(row: dict[str, Any]) -> dict[str, Any]:
+        evolution_payload = row.get("evolution") if isinstance(row.get("evolution"), dict) else {}
         apply_payload = row.get("apply") if isinstance(row.get("apply"), dict) else {}
-        loop_payload = apply_payload.get("loop_control") if isinstance(apply_payload.get("loop_control"), dict) else {}
+        container = evolution_payload if isinstance(evolution_payload.get("loop_control"), dict) else apply_payload
+        loop_payload = container.get("loop_control") if isinstance(container.get("loop_control"), dict) else {}
         if not loop_payload:
             return {}
         artifacts = loop_payload.get("artifacts") if isinstance(loop_payload.get("artifacts"), dict) else {}
@@ -474,13 +735,15 @@ class ApplyLoopEngine:
                 continue
             if loop_control_is_human_only_gap(control):
                 return []
+            evolution_payload = row.get("evolution") if isinstance(row.get("evolution"), dict) else {}
             apply_payload = row.get("apply") if isinstance(row.get("apply"), dict) else {}
-            loop_payload = apply_payload.get("loop_control") if isinstance(apply_payload.get("loop_control"), dict) else {}
+            container = evolution_payload if isinstance(evolution_payload.get("loop_control"), dict) else apply_payload
+            loop_payload = container.get("loop_control") if isinstance(container.get("loop_control"), dict) else {}
             if not bool(loop_payload.get("materialized_change")):
                 continue
-            apply_status = str(apply_payload.get("status") or "").strip()
+            container_status = str(container.get("status") or "").strip()
             site_status = str(row.get("status") or "").strip()
-            if not bool(loop_payload.get("should_pause")) and site_status not in {"blocked", "waiting_solution"} and apply_status not in {
+            if not bool(loop_payload.get("should_pause")) and site_status not in {"blocked", "waiting_solution"} and container_status not in {
                 "blocked",
                 "waiting_solution",
             }:
@@ -606,7 +869,7 @@ class ApplyLoopEngine:
                 site_key,
                 next_batch_id,
                 {
-                    "apply_loop_refinement_summary": context_text,
+                    "evolution_followup_context": context_text,
                     "evolution_decision": decision,
                     "outer_evolution_loop": {
                         "root_batch_id": root_batch_id,
@@ -663,14 +926,8 @@ class ApplyLoopEngine:
     ) -> str:
         previous_batch_id = str(previous_batch.get("batch_id") or "")
         artifacts = loop_payload.get("artifacts") if isinstance(loop_payload.get("artifacts"), dict) else {}
-        previous_context = self.site_store.load_run_context(site_key, previous_batch_id)
-        previous_summary = (
-            str(previous_context.get("apply_loop_refinement_summary") or "").strip()
-            if isinstance(previous_context, dict)
-            else ""
-        )
         lines = [
-            "Between-batch evolution guidance from the previous apply batch:",
+            "Between-batch evolution context from the previous site batch:",
             f"- previous_batch_id={previous_batch_id}",
             f"- outer_attempt={next_attempt}/{max_attempts}",
             f"- action={control.get('action')}",
@@ -698,12 +955,10 @@ class ApplyLoopEngine:
         evidence = str(control.get("evidence") or "").strip()
         if evidence:
             lines.append(f"- evidence={evidence}")
-        if previous_summary:
-            lines.extend(["", previous_summary])
         lines.extend(
             [
                 "",
-                "Use this evidence before repeating the apply workflow. The next batch must change strategy based on the prior evidence; do not repeat the exact same failed upload/click chain unchanged.",
+                "Use this evidence before repeating the relevant workflow. The next batch must validate a changed strategy rather than repeat the same failed action chain unchanged.",
             ]
         )
         return "\n".join(lines).strip()
@@ -843,9 +1098,6 @@ class ApplyLoopEngine:
         next_iteration_guidance: str = "",
         accepted_lessons_summary: str = "",
     ) -> dict[str, Any]:
-        save_run_context = getattr(self.site_store, "save_run_context", None)
-        if not callable(save_run_context):
-            return {}
         item = {
             "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "action": str(control.get("action") or ""),
@@ -878,44 +1130,6 @@ class ApplyLoopEngine:
         if memory:
             item["evolution_memory_id"] = str(memory.get("memory_id") or "")
             item["proposal_status"] = str((memory.get("proposal") or {}).get("proposal_status") or "")
-        try:
-            current = self.site_store.load_run_context(site_key, batch_id)
-        except Exception:
-            current = {}
-        previous = current.get("apply_loop_refinement_guidance") if isinstance(current, dict) else []
-        if not isinstance(previous, list):
-            previous = []
-        previous.append(item)
-        guidance = previous[-5:]
-        summary_lines = [
-            "Short-term apply-loop guidance from earlier items in this same batch:",
-            *[
-                (
-                    f"- pattern={row.get('failure_pattern')}; gap={row.get('gap_type')}; "
-                    f"target={row.get('target')}; action_card={row.get('action_card')}; "
-                    f"chain={' -> '.join(row.get('recent_tool_chain') or [])}; "
-                    f"next={row.get('next_iteration_guidance') or row.get('refinement_hint')}"
-                )
-                for row in guidance
-                if isinstance(row, dict)
-            ],
-            "Use these as run-local strategy updates before processing the next apply item. Do not repeat a known failed strategy.",
-        ]
-        lesson_lines = [str(row.get("accepted_lessons_summary") or "").strip() for row in guidance if isinstance(row, dict)]
-        lesson_lines = [line for line in lesson_lines if line]
-        if lesson_lines:
-            summary_lines.extend(["", "Relevant accepted lessons:", lesson_lines[-1]])
-        try:
-            save_run_context(
-                site_key,
-                batch_id,
-                {
-                    "apply_loop_refinement_guidance": guidance,
-                    "apply_loop_refinement_summary": "\n".join(summary_lines).strip(),
-                },
-            )
-        except Exception:
-            return memory if isinstance(memory, dict) else {}
         return memory if isinstance(memory, dict) else {}
 
     def persist_loop_control_evolution_memory(
@@ -1158,3 +1372,7 @@ class ApplyLoopEngine:
         if application_status in {"blocked", "apply_failed"}:
             return "terminal_failure_without_loop_control"
         return "unknown"
+
+
+# Compatibility name retained while callers migrate from the apply-only name.
+ApplyLoopEngine = EvolutionLoopEngine

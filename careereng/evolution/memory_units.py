@@ -345,6 +345,69 @@ def evolution_memory_has_materialized_change(unit: dict[str, Any] | None) -> boo
     )
 
 
+def active_run_local_guidance(
+    *,
+    workspace: Path | str,
+    site_key: str,
+    batch_id: str,
+    phase: str,
+    limit: int = 1,
+) -> str:
+    """Render only the current phase's materialized batch-local guidance.
+
+    This is a transport-neutral context lookup. It does not decide whether a
+    proposal is correct; the live worker still validates it against the page.
+    """
+
+    normalized_phase = str(phase or "").strip()
+    if not normalized_phase:
+        return ""
+    scope = f"batch:{batch_id}:site:{site_key}:{normalized_phase}"
+    units = EvolutionMemoryStore(workspace).query(
+        scopes=[scope],
+        phase=normalized_phase,
+        lifecycles=["run_local"],
+        statuses=["active"],
+        limit=max(1, int(limit or 1) * 4),
+    )
+    materialized = [unit for unit in units if evolution_memory_has_materialized_change(unit)]
+    return render_evolution_memory_guidance(
+        materialized[-max(1, int(limit or 1)) :],
+        title="Current Batch Active Run-Local Proposal",
+    )
+
+
+def run_local_units_for_batch_site(
+    *,
+    workspace: Path | str,
+    site_key: str,
+    batch_id: str,
+    statuses: list[str] | tuple[str, ...] | None = None,
+    limit: int = 80,
+) -> list[dict[str, Any]]:
+    """Return retained run-local evidence for every phase in one site batch."""
+
+    normalized_site = safe_file_stem(site_key)
+    normalized_batch = str(batch_id or "").strip()
+    allowed_statuses = {str(item or "").strip() for item in (statuses or []) if str(item or "").strip()}
+    prefix = f"batch:{normalized_batch}:site:{normalized_site}:"
+    rows: list[dict[str, Any]] = []
+    for raw in EvolutionMemoryStore(workspace).store.read_all():
+        row = normalize_evolution_memory_unit(raw)
+        if str(row.get("site_key") or "") != normalized_site:
+            continue
+        if str(row.get("lifecycle") or "") != "run_local":
+            continue
+        source = row.get("source") if isinstance(row.get("source"), dict) else {}
+        if not str(row.get("scope") or "").startswith(prefix) and str(source.get("batch_id") or "") != normalized_batch:
+            continue
+        if allowed_statuses and str(row.get("status") or "") not in allowed_statuses:
+            continue
+        rows.append(row)
+    rows.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""))
+    return rows[-max(1, int(limit or 1)) :]
+
+
 def render_evolution_memory_guidance(units: list[dict[str, Any]], *, title: str = "Relevant Evolution Memory") -> str:
     if not units:
         return ""

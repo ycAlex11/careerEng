@@ -4,6 +4,7 @@ from .browser_profile_owner import BrowserProfileOwnerError, BrowserProfileOwner
 from .manager import SessionManager
 from .phase import PhaseSession, phase_session_dir, write_phase_session
 from .runtime_registry import BrowserRuntimeLease, BrowserRuntimeRegistry
+from .site_workers import SiteWorkerSessionBinding, SiteWorkerSessionStore
 
 __all__ = [
     "BrowserProfileOwnerError",
@@ -12,6 +13,8 @@ __all__ = [
     "BrowserRuntimeRegistry",
     "PhaseSession",
     "SessionManager",
+    "SiteWorkerSessionBinding",
+    "SiteWorkerSessionStore",
     "phase_session_dir",
     "write_phase_session",
 ]

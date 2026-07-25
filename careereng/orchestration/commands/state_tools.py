@@ -19,6 +19,7 @@ from careereng.orchestration.agent_protocol.state_tools import (
     CACHE_READ_TOOL,
     CACHE_PROPOSE_TOOL,
     CACHE_VALIDATE_TOOL,
+    RECORD_EVOLUTION_SIGNAL_TOOL,
     normalize_tool_name,
     phase_result_tool_schema,
     record_application_reviews_tool_schema,
@@ -53,6 +54,7 @@ class PhaseStateToolContext:
     workspace: Path | str | None = None
     cache_scope: dict[str, Any] | None = None
     cache_dependency_versions: dict[str, Any] | None = None
+    record_evolution_signal: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
 
 
@@ -121,6 +123,28 @@ def execute_state_tool(tool_name: str, arguments: dict[str, Any] | None, context
                     "content": [{"type": "text", "text": "### Result\n- Phase memory update could not be persisted."}],
                 }
         return payload
+    if normalized == RECORD_EVOLUTION_SIGNAL_TOOL:
+        if not callable(context.record_evolution_signal):
+            return {
+                "isError": True,
+                "error": "evolution signal recording is unavailable for this runtime",
+                "structuredContent": {"status": "unavailable"},
+                "content": [{"type": "text", "text": "Evolution signal recording is unavailable for this runtime."}],
+            }
+        try:
+            result = context.record_evolution_signal(args)
+        except Exception as exc:
+            return {
+                "isError": True,
+                "error": str(exc),
+                "structuredContent": {"status": "persistence_failed"},
+                "content": [{"type": "text", "text": f"Evolution signal could not be recorded: {exc}"}],
+            }
+        return {
+            "isError": False,
+            "structuredContent": {"status": "recorded", **(result if isinstance(result, dict) else {})},
+            "content": [{"type": "text", "text": "Evolution signal recorded for the current loop scope."}],
+        }
     if normalized == CACHE_LOOKUP_TOOL:
         return _cache_lookup_payload(context=context, arguments=args)
     if normalized == CACHE_READ_TOOL:
@@ -216,13 +240,27 @@ def _cache_read_payload(*, context: PhaseStateToolContext, arguments: dict[str, 
 
 def _cache_propose_payload(*, context: PhaseStateToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
+        required = ("reuse_reason", "preconditions", "expected_benefit", "evidence")
+        missing = [key for key in required if not arguments.get(key)]
+        if missing:
+            raise CacheArtifactError(f"cache proposal requires: {', '.join(missing)}")
+        evidence = arguments.get("evidence") if isinstance(arguments.get("evidence"), list) else []
         artifact = _cache_store(context).propose(
             kind=str(arguments.get("kind") or ""),
             scope=_cache_scope(context, page_fingerprint=arguments.get("page_fingerprint")),
             dependency_versions=_cache_dependency_versions(context, arguments.get("dependency_keys")),
             content=arguments.get("content") if isinstance(arguments.get("content"), dict) else {},
             summary=str(arguments.get("summary") or ""),
-            source_refs=arguments.get("source_refs") if isinstance(arguments.get("source_refs"), list) else [],
+            source_refs=[
+                *(arguments.get("source_refs", []) if isinstance(arguments.get("source_refs"), list) else []),
+                *evidence,
+            ],
+            proposal={
+                "reuse_reason": str(arguments.get("reuse_reason") or ""),
+                "preconditions": dict(arguments.get("preconditions") or {}),
+                "expected_benefit": str(arguments.get("expected_benefit") or ""),
+                "evidence": evidence,
+            },
             batch_id=context.batch_id,
             turn_id=context.turn_id,
         )

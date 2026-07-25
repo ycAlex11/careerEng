@@ -378,6 +378,30 @@ def site_bootstrap(
         typer.echo("action_card: -")
 
 
+@site_app.command("mode")
+def site_mode(
+    name: str = typer.Argument(..., help="Registered site name or key"),
+    mode: str = typer.Argument(..., help="draft/exploration/ready"),
+    apply_enabled: bool | None = typer.Option(None, "--apply-enabled/--no-apply-enabled"),
+) -> None:
+    """Change a site's declared Skill mode without deleting its durable state."""
+
+    _, _, _, _, site_store, _, _ = _build_site_services()
+    site = site_store.find_site(name)
+    if not site:
+        raise typer.BadParameter(f"site not found: {name}")
+    site_key = str(site.get("site_key") or "")
+    try:
+        skill = site_store.set_skill_mode(site_key, mode=mode, apply_enabled=apply_enabled)
+    except (FileNotFoundError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    metadata = skill.get("front_matter") if isinstance(skill.get("front_matter"), dict) else {}
+    typer.echo(
+        f"site={site_key} mode={metadata.get('status') or '-'} "
+        f"apply_enabled={bool(metadata.get('apply_enabled'))}"
+    )
+
+
 @site_app.command("list")
 def site_list(status: str = typer.Option("all", "--status", help="all/active/inactive")) -> None:
     """List site registry rows."""

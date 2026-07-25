@@ -592,9 +592,16 @@ class AgentLoop:
         )
         if not batch:
             return "当前没有已注册的 active sites。请先完成公司注册。"
-        # Normal execution is independent of evolution. Terminal evidence may
-        # later open an explicit Codex/user evolution review.
-        return self.job_flow.run_batch(str(batch.get("batch_id") or ""))
+        reply = self.job_flow.run_batch(str(batch.get("batch_id") or ""))
+        # This is a transport-neutral handoff: it packages terminal exploration
+        # evidence for Codex but never selects a site strategy in Python.
+        if getattr(self.job_flow, "loop_engine", None) is not None:
+            from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
+
+            BatchEvolutionOrchestrator(self.job_flow, auto_solve=False).create_synthesis_request_if_needed(
+                self.job_flow.job_store.load_batch(str(batch.get("batch_id") or ""))
+            )
+        return reply
 
     def _interrupt_search_pending_if_needed(self, session_id: str, message: str) -> None:
         state = self.session_manager.get_state(session_id)
