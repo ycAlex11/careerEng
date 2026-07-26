@@ -488,7 +488,11 @@ site and backend to one external-agent thread. The session is a bounded
 continuity layer, not a replacement for batches: each batch keeps independent
 history, report, metrics, and evidence. Cancellation does not consume the
 configured effective-run boundary. At that boundary CareerEng creates an
-evolution synthesis task; it does not automatically make a business decision.
+evolution review task; it does not automatically make a business decision.
+An exploration run creates the same review task immediately after its terminal
+evidence is persisted. The applied Codex proposal decides either `ready` or a
+bounded follow-up exploration run; the batch itself is never rewritten to
+`waiting_solution` just to hold that review task.
 
 `orchestration/engine/site_work_items.py` owns generic queue and slot
 semantics, `orchestration/engine/agent_workers.py` owns retained external-agent
@@ -499,9 +503,9 @@ and Skills decide success, continuation, cache value, and proposed evolution.
 `adapters/codex/` only translates a claimed item to Codex App Server RPC/events.
 A future Claude Code adapter supplies the same thread transport contract rather
 than another lifecycle state machine.
-`agent.agent_parallelism` limits active Codex workers and falls back to
-`agent.site_parallelism` when unset. A batch is an aggregation, report, and
-evidence container, not a global browser lock.
+`agent.site_parallelism` limits active site workers for both Codex and provider
+execution. A batch is an aggregation, report, and evidence container, not a
+global browser lock.
 
 `platform/runtime_host/` serializes raw browser/state operations per site only.
 It must never serialize unrelated sites through a workspace-wide runtime lock.
@@ -514,8 +518,10 @@ instructions. A worker must not scan project files to reconstruct scope. After
 it records a phase result that advances the work item, it refreshes the same
 work-item context and continues on its existing Codex thread. A user-blocked
 phase preserves that thread, retained browser, and batch-scoped history view;
-terminal or cancelled site work releases them without clearing durable cache
-artifacts. Runtime records
+an execution idle timeout only requests a fresh scoped context and snapshot on
+that same thread. It does not create a new worker, decide a browser action, or
+write a job outcome. Final site completion or cancellation releases browser
+resources without clearing durable cache artifacts. Runtime records
 only lifecycle, resource-read, tool, cache, and token-usage facts; it does not
 choose context resources or workflow strategy for the worker.
 

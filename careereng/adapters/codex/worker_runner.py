@@ -15,6 +15,7 @@ from careereng.platform.sessions import SiteWorkerSessionStore
 
 from .app_server import CodexAppServerClient, CodexAppServerEvent
 from .thread_state import bind_work_order_thread, load_work_order_binding
+from .transport import normalize_codex_event, normalize_codex_operation, normalize_codex_trace
 
 
 # Compatibility names for existing callers. The record and lifecycle belong to
@@ -25,8 +26,11 @@ CodexWorkerRecord = AgentWorkerRecord
 class _CodexThreadTransport:
     """Adapt Codex App Server RPC to the generic agent-thread transport."""
 
-    def __init__(self, server: CodexAppServerClient):
+    def __init__(self, server: CodexAppServerClient, *, on_transport: Callable[[dict[str, Any]], None]):
         self._server = server
+        set_trace_callback = getattr(server, "set_trace_callback", None)
+        if callable(set_trace_callback):
+            set_trace_callback(on_transport)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._server, name)
@@ -35,13 +39,24 @@ class _CodexThreadTransport:
         return self._server.start()
 
     def start_thread(self, *, cwd: Path, timeout_seconds: float | None = None) -> dict[str, Any]:
-        return self._server.start_thread(cwd=cwd, timeout_seconds=timeout_seconds)
+        return normalize_codex_operation(
+            "thread_start",
+            self._server.start_thread(cwd=cwd, timeout_seconds=timeout_seconds),
+        )
 
     def resume_thread(self, thread_id: str) -> dict[str, Any]:
-        return self._server.resume_thread(thread_id)
+        return normalize_codex_operation(
+            "thread_resume",
+            self._server.resume_thread(thread_id),
+            thread_id=thread_id,
+        )
 
     def start_turn(self, *, thread_id: str, prompt: str) -> dict[str, Any]:
-        return self._server.start_turn(thread_id=thread_id, prompt=prompt)
+        return normalize_codex_operation(
+            "turn_start",
+            self._server.start_turn(thread_id=thread_id, prompt=prompt),
+            thread_id=thread_id,
+        )
 
     def interrupt_turn(self, *, thread_id: str, turn_id: str) -> dict[str, Any]:
         return self._server.interrupt_turn(thread_id=thread_id, turn_id=turn_id)
@@ -51,19 +66,29 @@ class _CodexThreadTransport:
 
 
 def _normalize_codex_event(event: CodexAppServerEvent) -> AgentWorkerEvent:
-    if event.method == "thread/tokenUsage/updated":
+    normalized = normalize_codex_event(event)
+    kind = str(normalized.get("kind") or "")
+    if kind == "usage":
         return AgentWorkerEvent(
             kind="usage",
-            thread_id=str(event.params.get("threadId") or ""),
-            usage=dict(event.params),
+            thread_id=str(normalized.get("thread_id") or ""),
+            usage=dict(normalized.get("payload") or {}),
         )
-    if event.method == "turn/completed":
-        turn = event.params.get("turn") if isinstance(event.params.get("turn"), dict) else {}
+    if kind == "turn_completed":
+        payload = normalized.get("payload") if isinstance(normalized.get("payload"), dict) else {}
+        turn = payload.get("turn") if isinstance(payload.get("turn"), dict) else {}
         return AgentWorkerEvent(
             kind="turn_completed",
-            thread_id=str(event.params.get("threadId") or ""),
-            turn_id=str(turn.get("id") or ""),
+            thread_id=str(normalized.get("thread_id") or ""),
+            turn_id=str(normalized.get("turn_id") or turn.get("id") or ""),
             turn_status=str(turn.get("status") or "completed"),
+        )
+    if kind in {"thread_started", "notification"}:
+        return AgentWorkerEvent(
+            kind="transport",
+            thread_id=str(normalized.get("thread_id") or ""),
+            turn_id=str(normalized.get("turn_id") or ""),
+            transport=normalized,
         )
     return AgentWorkerEvent(kind="ignored", thread_id="")
 
@@ -79,12 +104,31 @@ class CodexWorkerCoordinator(SiteAgentWorkerCoordinator):
         app_server_factory: Callable[[Callable[[CodexAppServerEvent], None]], CodexAppServerClient],
         workspace: Path | None = None,
         max_effective_batches_per_session: int = 5,
+        idle_timeout_seconds: int = 180,
+        max_resume_attempts: int = 2,
         on_record: Callable[[CodexWorkerRecord], None] | None = None,
         on_usage: Callable[[CodexWorkerRecord, dict[str, Any]], None] | None = None,
+        on_recovery: Callable[[CodexWorkerRecord, str], None] | None = None,
+        on_transport_event: Callable[[CodexWorkerRecord | None, dict[str, Any]], None] | None = None,
+        on_server_request: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None,
     ):
         def transport_factory(on_event: Callable[[AgentWorkerEvent], None]) -> _CodexThreadTransport:
+            def on_transport(payload: dict[str, Any]) -> None:
+                data = normalize_codex_trace(payload)
+                on_event(
+                    AgentWorkerEvent(
+                        kind="transport",
+                        thread_id=str(data.get("thread_id") or ""),
+                        turn_id=str(data.get("turn_id") or ""),
+                        transport=data,
+                    )
+                )
+
             server = app_server_factory(lambda event: on_event(_normalize_codex_event(event)))
-            return _CodexThreadTransport(server)
+            set_server_request_handler = getattr(server, "set_server_request_handler", None)
+            if callable(set_server_request_handler):
+                set_server_request_handler(on_server_request)
+            return _CodexThreadTransport(server, on_transport=on_transport)
 
         def bind_record(record: AgentWorkerRecord) -> None:
             bind_work_order_thread(
@@ -98,6 +142,7 @@ class CodexWorkerCoordinator(SiteAgentWorkerCoordinator):
                 session_reused=record.session_reused,
                 session_rotation_reason=record.session_rotation_reason,
                 last_error=record.last_error,
+                recovery_attempts=record.recovery_attempts,
             )
 
         super().__init__(
@@ -109,8 +154,12 @@ class CodexWorkerCoordinator(SiteAgentWorkerCoordinator):
             session_store=SiteWorkerSessionStore(workspace or (Path(project_root) / "workspace")),
             backend="codex_app_server",
             max_effective_batches_per_session=max_effective_batches_per_session,
+            idle_timeout_seconds=idle_timeout_seconds,
+            max_resume_attempts=max_resume_attempts,
             on_record=on_record,
             on_usage=on_usage,
+            on_recovery=on_recovery,
+            on_transport_event=on_transport_event,
         )
 
 

@@ -19,7 +19,6 @@ from careereng.platform.cache import CacheArtifactStore
 from careereng.platform.observability import build_metrics_summary, metrics_report_projection
 from careereng.platform.persistence import JSONLStore
 from careereng.platform.sessions import SiteWorkerSessionStore
-from careereng.career.applications.job_store import JobStore
 from careereng.career.applications.site_store import SiteStore
 from careereng.utils import ensure_dir, now_iso, read_json, safe_file_stem, write_json
 
@@ -174,11 +173,9 @@ def create_site_batch_evolution_reviews(
         return {"generated_at": now_iso(), "triggered_count": 0, "triggered": []}
 
     threshold = max(1, int(site_run_threshold or 1))
-    job_store = JobStore(workspace_path)
     site_store = SiteStore(workspace_path, project_root=root)
     state = _load_trigger_state(workspace_path)
     previous_by_site = state.setdefault("site_batch_review", {})
-    batches = job_store.list_batches()
     sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
     triggered: list[dict[str, Any]] = []
 
@@ -188,12 +185,9 @@ def create_site_batch_evolution_reviews(
         site_key = str(site_key or "").strip()
         if not site_key:
             continue
-        effective_runs = [
-            row
-            for row in batches
-            if _is_effective_site_batch_run(row, site_key)
-        ]
-        effective_count = len(effective_runs)
+        worker_session_evidence = SiteWorkerSessionStore(workspace_path).site_evidence(site_key)
+        effective_run_ids = _effective_site_run_ids(worker_session_evidence)
+        effective_count = len(effective_run_ids)
         previous = previous_by_site.get(site_key) if isinstance(previous_by_site.get(site_key), dict) else {}
         last_reviewed_count = int(previous.get("last_reviewed_effective_run_count") or 0)
         failure_triggered = _site_batch_failed(batch_status=batch_status, site=current_site)
@@ -212,7 +206,6 @@ def create_site_batch_evolution_reviews(
 
         skill_path = site_store.site_skill_path(site_key)
         cache_evidence = CacheArtifactStore(workspace_path).site_evidence(site_key)
-        worker_session_evidence = SiteWorkerSessionStore(workspace_path).site_evidence(site_key)
         site_metrics = metrics_report_projection(
             build_metrics_summary(workspace=workspace_path, batch_id=batch_id, site_key=site_key)
         )
@@ -230,6 +223,7 @@ def create_site_batch_evolution_reviews(
             "batch_status": batch_status,
             "phase_run_count": effective_count,
             "effective_site_run_count": effective_count,
+            "effective_site_run_ids": effective_run_ids,
             "last_reviewed_effective_run_count": last_reviewed_count,
             "reason": " ".join(reasons),
             "summary": f"{site_key} reached a site-batch evolution review trigger.",
@@ -1548,16 +1542,18 @@ def _load_trigger_state(workspace: Path) -> dict[str, Any]:
     return payload
 
 
-def _is_effective_site_batch_run(batch: dict[str, Any], site_key: str) -> bool:
-    """Count persisted terminal site runs, never user-cancelled work."""
+def _effective_site_run_ids(worker_session_evidence: dict[str, Any]) -> list[str]:
+    """Merge explicit completed-run IDs from all retained site sessions."""
 
-    if str(batch.get("status") or "") == "cancelled":
-        return False
-    sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
-    site = sites.get(site_key)
-    if not isinstance(site, dict):
-        return False
-    return str(site.get("status") or "") in {"completed", "partial_completed", "failed", "skipped"}
+    run_ids: list[str] = []
+    for session in worker_session_evidence.get("sessions", []) if isinstance(worker_session_evidence, dict) else []:
+        if not isinstance(session, dict):
+            continue
+        for run_id in session.get("effective_run_ids", []) if isinstance(session.get("effective_run_ids"), list) else []:
+            normalized = str(run_id or "").strip()
+            if normalized and normalized not in run_ids:
+                run_ids.append(normalized)
+    return run_ids
 
 
 def _site_batch_failed(*, batch_status: str, site: dict[str, Any]) -> bool:

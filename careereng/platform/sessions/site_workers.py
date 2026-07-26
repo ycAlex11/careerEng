@@ -1,9 +1,10 @@
 """Persist bounded external-agent continuity independently from batches.
 
-``SiteWorkItem`` remains a single ``site + batch`` unit.  A
+``SiteWorkItem`` remains a single ``site + batch`` unit. A
 ``SiteWorkerSession`` is the generic, backend-neutral continuity record that
-may bind several consecutive work items to one external-agent thread.  It
-does not inspect job, browser, or Skill content.
+may bind several consecutive work items to one external-agent thread. It
+counts completed site runs supplied by orchestration; it does not infer
+workflow success from job, browser, or Skill content.
 """
 
 from __future__ import annotations
@@ -14,9 +15,6 @@ import threading
 from typing import Any
 
 from careereng.utils import ensure_dir, make_id, now_iso, read_json, write_json
-
-
-_TERMINAL_EFFECTIVE_STATUSES = frozenset({"completed", "partial_completed", "failed"})
 
 
 @dataclass(frozen=True)
@@ -71,6 +69,7 @@ class SiteWorkerSessionStore:
         with self._lock:
             data = self._load_locked()
             sessions = data["sessions"]
+            self._archive_legacy_batch_counters(sessions)
             existing = self._find_batch_session(sessions, site_key=normalized_site, backend=normalized_backend, batch_id=normalized_batch)
             if existing is None:
                 existing = self._find_reusable_session(
@@ -152,7 +151,7 @@ class SiteWorkerSessionStore:
         batch_id: str,
         batch_status: str,
     ) -> dict[str, Any] | None:
-        """Record terminal batch facts; cancellation is deliberately non-effective."""
+        """Record batch outcome facts without treating a batch as a site run."""
 
         normalized_status = str(batch_status or "").strip()
         with self._lock:
@@ -168,12 +167,45 @@ class SiteWorkerSessionStore:
                 return None
             binding["outcome"] = normalized_status
             binding["updated_at"] = now_iso()
-            effective_ids = [str(value) for value in session.get("effective_batch_ids", []) if str(value)]
-            if normalized_status in _TERMINAL_EFFECTIVE_STATUSES and str(batch_id) not in effective_ids:
-                effective_ids.append(str(batch_id))
-            session["effective_batch_ids"] = effective_ids
+            session["updated_at"] = now_iso()
+            self._save_locked(data)
+            return dict(session)
+
+    def record_effective_site_run(
+        self,
+        *,
+        worker_session_id: str,
+        batch_id: str,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        """Count one orchestration-closed site run exactly once.
+
+        ``run_id`` is supplied by the shared orchestration layer. For a ready
+        site it is the completed batch ID; for exploration it is the root ID
+        spanning up to the configured number of attempts. This store does not
+        decide whether a browser or application outcome was successful.
+        """
+
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            raise ValueError("effective site run requires run_id")
+        with self._lock:
+            data = self._load_locked()
+            session = self._session_by_id(data["sessions"], worker_session_id)
+            if session is None:
+                return None
+            binding = next(
+                (row for row in session.get("batch_bindings", []) if str(row.get("batch_id") or "") == str(batch_id or "")),
+                None,
+            )
+            if binding is None:
+                return None
+            run_ids = [str(value) for value in session.get("effective_run_ids", []) if str(value)]
+            if normalized_run_id not in run_ids:
+                run_ids.append(normalized_run_id)
+            session["effective_run_ids"] = run_ids
             limit = max(1, int(session.get("max_effective_batches") or 1))
-            if len(effective_ids) >= limit:
+            if len(run_ids) >= limit:
                 session["status"] = "review_pending"
                 session["review_due_at"] = now_iso()
             session["updated_at"] = now_iso()
@@ -195,7 +227,12 @@ class SiteWorkerSessionStore:
                         "worker_session_id": str(session.get("worker_session_id") or ""),
                         "backend": str(session.get("backend") or ""),
                         "status": str(session.get("status") or ""),
-                        "effective_batch_count": len(session.get("effective_batch_ids") or []),
+                        "effective_site_run_count": len(session.get("effective_run_ids") or []),
+                        # Kept as a read-only compatibility projection for
+                        # existing reports while callers move to the precise
+                        # site-run name.
+                        "effective_batch_count": len(session.get("effective_run_ids") or []),
+                        "effective_run_ids": list(session.get("effective_run_ids") or []),
                         "max_effective_batches": int(session.get("max_effective_batches") or 0),
                         "active_thread_id": str(session.get("active_thread_id") or ""),
                         "batch_bindings": list(session.get("batch_bindings") or []),
@@ -252,7 +289,7 @@ class SiteWorkerSessionStore:
                 if str(row.get("site_key") or "") == site_key
                 and str(row.get("backend") or "") == backend
                 and str(row.get("status") or "active") == "active"
-                and len(row.get("effective_batch_ids") or []) < max_effective_batches
+                and len(row.get("effective_run_ids") or []) < max_effective_batches
             ),
             None,
         )
@@ -269,7 +306,21 @@ class SiteWorkerSessionStore:
             "active_thread_id": "",
             "thread_bindings": [],
             "batch_bindings": [],
-            "effective_batch_ids": [],
+            "effective_run_ids": [],
             "created_at": now,
             "updated_at": now,
         }
+
+    @staticmethod
+    def _archive_legacy_batch_counters(sessions: list[dict[str, Any]]) -> None:
+        """Do not reinterpret old batch-based counters as exploration cycles."""
+
+        for session in sessions:
+            if "effective_run_ids" in session:
+                continue
+            if not session.get("effective_batch_ids"):
+                session["effective_run_ids"] = []
+                continue
+            session["status"] = "archived_legacy_counter"
+            session["archived_at"] = now_iso()
+            session["archive_reason"] = "legacy batch counters cannot be safely reinterpreted as exploration cycles"

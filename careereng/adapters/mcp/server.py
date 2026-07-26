@@ -142,10 +142,11 @@ def _active_work_item_scope(runtime: CareerEngMCPRuntime, work_item_id: str) -> 
     site_key = str(scope.get("site_key") or "").strip()
     batch_id = str(scope.get("batch_id") or "").strip()
     phase = str((context.get("objective") or {}).get("phase") or "").strip()
+    evolution_run_id = str(scope.get("evolution_run_id") or "").strip()
     if not site_key or not batch_id or not phase:
         raise ValueError("active work item has incomplete execution scope")
     batch = runtime.job_store().load_batch(batch_id)
-    if str(batch.get("status") or "") in TERMINAL_BATCH_STATUSES:
+    if str(batch.get("status") or "") in TERMINAL_BATCH_STATUSES and not evolution_run_id:
         raise ValueError("work item batch is terminal")
     sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
     site = sites.get(site_key) if isinstance(sites.get(site_key), dict) else {}
@@ -157,6 +158,7 @@ def _active_work_item_scope(runtime: CareerEngMCPRuntime, work_item_id: str) -> 
         "batch_id": batch_id,
         "phase": phase,
         "turn_id": str(scope.get("turn_id") or ""),
+        "evolution_run_id": evolution_run_id,
     }
 
 
@@ -243,8 +245,13 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         return {"ok": True, **context}
 
     @server.tool()
-    def careereng_read_work_item_resource(work_item_id: str, resource_id: str) -> dict[str, Any]:
-        """Read one scoped context resource selected by a CareerEng worker."""
+    def careereng_read_work_item_resource(
+        work_item_id: str,
+        resource_id: str,
+        offset: int = 0,
+        limit: int = 8000,
+    ) -> dict[str, Any]:
+        """Read a selected scoped resource, optionally in a bounded text slice."""
         try:
             payload = _active_work_item_payload(runtime, work_item_id)
             context = build_work_item_context(payload)
@@ -277,7 +284,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                     "result": resource_result,
                 }
             else:
-                resource = read_work_item_resource(payload, requested)
+                resource = read_work_item_resource(payload, requested, offset=offset, limit=limit)
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
         from careereng.platform.observability import PerformanceRecorder
@@ -521,6 +528,45 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 "site_key": scope["site_key"],
                 "batch_id": scope["batch_id"],
                 "run_id": str(run_id or ""),
+            },
+        )
+
+    @server.tool()
+    def careereng_submit_evolution_proposal(work_item_id: str, proposal: dict[str, Any]) -> dict[str, Any]:
+        """Validate and persist one proposal for the active evolution summary."""
+        try:
+            scope = _active_work_item_scope(runtime, work_item_id)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        if not scope["evolution_run_id"]:
+            return {"ok": False, "error": "work item is not an evolution summary"}
+        return runtime.host_client().request(
+            "agent_bridge_submit_evolution_proposal",
+            {
+                "site_key": scope["site_key"],
+                "batch_id": scope["batch_id"],
+                "run_id": scope["evolution_run_id"],
+                "proposal": proposal if isinstance(proposal, dict) else {},
+            },
+        )
+
+    @server.tool()
+    def careereng_apply_evolution_solution(work_item_id: str, run_id: str) -> dict[str, Any]:
+        """Apply the persisted proposal for the active evolution summary."""
+        try:
+            scope = _active_work_item_scope(runtime, work_item_id)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        if not scope["evolution_run_id"]:
+            return {"ok": False, "error": "work item is not an evolution summary"}
+        if str(run_id or "").strip() != scope["evolution_run_id"]:
+            return {"ok": False, "error": "evolution run does not belong to this work item"}
+        return runtime.host_client().request(
+            "agent_bridge_apply_evolution_solution",
+            {
+                "site_key": scope["site_key"],
+                "batch_id": scope["batch_id"],
+                "run_id": scope["evolution_run_id"],
             },
         )
 

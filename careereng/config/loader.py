@@ -8,6 +8,7 @@ from pathlib import Path
 
 from careereng.config.schema import (
     AgentConfig,
+    AgentRecoveryConfig,
     AppConfig,
     AuthConfig,
     BrowserConfig,
@@ -50,6 +51,11 @@ site_parallelism = 2
 router_confidence_threshold = 0.75
 router_log_enabled = true
 search_company_top_k = 10
+
+[agent.recovery]
+# These are execution limits only. They do not decide browser actions.
+idle_timeout_seconds = 180
+max_resume_attempts = 2
 
 [browser]
 # provider: use the configured browser LLM API.
@@ -319,7 +325,7 @@ def ensure_files(project_root: Path) -> tuple[Path, Path]:
 def load_config(project_root: Path) -> AppConfig:
     cpath, _ = ensure_files(project_root)
     payload = {
-        "agent": AgentConfig().__dict__.copy(),
+        "agent": asdict(AgentConfig()),
         "browser": asdict(BrowserConfig()),
         "execution": asdict(ExecutionConfig()),
         "evolution": asdict(EvolutionConfig()),
@@ -355,6 +361,11 @@ def load_config(project_root: Path) -> AppConfig:
         agent = loaded.get("agent")
         if isinstance(agent, dict):
             for key, value in agent.items():
+                if key == "recovery" and isinstance(value, dict):
+                    for recovery_key, recovery_value in value.items():
+                        if recovery_key in payload["agent"]["recovery"]:
+                            payload["agent"]["recovery"][recovery_key] = recovery_value
+                    continue
                 if key in payload["agent"]:
                     payload["agent"][key] = value
 
@@ -537,7 +548,12 @@ def load_config(project_root: Path) -> AppConfig:
             browser_retrieval_policy_payload[key] = value
 
     return AppConfig(
-        agent=AgentConfig(**payload["agent"]),
+        agent=AgentConfig(
+            **{
+                **payload["agent"],
+                "recovery": AgentRecoveryConfig(**dict(payload["agent"].get("recovery") or {})),
+            }
+        ),
         browser=BrowserConfig(
             **browser_payload,
             budgets=BrowserBudgetsConfig(**browser_budgets_payload),

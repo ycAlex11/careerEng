@@ -80,12 +80,15 @@ DeepSeek currently uses a Moka/High-Flyer recruiting surface.
 
 ### Authentication
 
-- For the first DeepSeek run, require manual login/user takeover when the Moka page asks for account, password, verification, CAPTCHA, or other human-only input.
+- For every apply-enabled DeepSeek run, establish a signed-in Moka candidate session before application review, retrieval, or apply work.
+- Navigate to the candidate/account surface when needed. A public jobs list alone is not proof of an authenticated candidate session.
+- Require manual login/user takeover when the Moka page asks for account, password, verification, CAPTCHA, or other human-only input.
 - After the user completes login, continue from the same browser session.
 
 ### Ready Signal
 
-- The ready state is the Moka/DeepSeek jobs surface or candidate surface loaded without a blocking login challenge.
+- The ready state is a signed-in Moka candidate/account surface that can open private application records without a login prompt.
+- Do not treat a public Moka/DeepSeek jobs surface as ready for an apply-enabled run.
 
 ## Channel Discovery
 

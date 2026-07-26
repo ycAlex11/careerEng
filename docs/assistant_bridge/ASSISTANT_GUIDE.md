@@ -91,7 +91,7 @@ Codex Desktop or another main assistant coordinates CareerEng; it does not creat
 1. Check `careereng_runtime_host_status` before starting or continuing browser work.
 2. If no host is reachable, start it with `careereng runtime-host serve`, then verify its status before dispatching site work.
 3. Use `careereng_get_context` to inspect the active batch and target site before changing its execution state.
-4. Multiple sites may run concurrently up to `browser.site_parallelism`. A paused, login-required, or CAPTCHA-required site does not block the other sites.
+4. Multiple sites may run concurrently up to `agent.site_parallelism`. A paused, login-required, or CAPTCHA-required site does not block the other sites.
 5. When the user completes a browser-only step, continue the same target site from its retained page and durable state. Do not restart unrelated sites or create another host.
 6. The configured execution backend is fixed for a running host. Do not switch between provider and Codex execution during a run.
 

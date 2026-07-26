@@ -22,6 +22,7 @@ def create_site_exploration_synthesis_card(
     site_name: str,
     batch_id: str,
     skill_path: Path | str,
+    cycle_outcome: str = "",
     batch_report_path: Path | str = "",
     workflow_summary_path: Path | str = "",
 ) -> dict[str, Any]:
@@ -58,11 +59,16 @@ def create_site_exploration_synthesis_card(
         "batch_id": str(batch_id or ""),
         "target_skill": str(target_skill),
         "execution_mode": "exploration",
+        "cycle_outcome": str(cycle_outcome or ""),
         "proposal_contract": {
             "required_decision": "site_mode_update",
             "allowed_modes": ["ready", "exploration"],
-            "ready_meaning": "The observed workflow is sufficiently stable for normal site execution.",
+            "ready_meaning": (
+                "At least one application completed successfully in this exploration cycle, every required phase completed, "
+                "and no unresolved blocker or user-required information remains."
+            ),
             "exploration_meaning": "More evidence or a durable Skill/lesson change is required before normal execution.",
+            "cycle_outcome": str(cycle_outcome or ""),
         },
     }
     store = ActionCardStore(workspace_path)
@@ -86,8 +92,11 @@ def create_site_exploration_synthesis_card(
             "Read the target site Skill and the full batch report before deciding.",
             "Inspect relevant traces and snapshots, including both successful and failed units.",
             "Use the evidence pack to decide whether a durable Skill/lesson change is needed.",
-            "Write `site_mode_update` with `mode: ready` only when the evidence supports normal execution.",
-            "Keep `mode: exploration` when further validation is required; include the durable change or the next evidence plan.",
+            (
+                "Write `site_mode_update` with `mode: ready` only when the evidence shows at least one successful application, "
+                "all required phases completed, and no unresolved blocker or user-required information."
+            ),
+            "Use the recorded cycle outcome when selecting `ready` or `exploration`; do not invent a follow-up command.",
         ],
         safety_notes=[
             "Python records and applies the decision but must not decide site readiness.",

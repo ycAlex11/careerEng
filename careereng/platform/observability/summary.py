@@ -107,6 +107,9 @@ def _empty_performance_totals() -> dict[str, Any]:
         "cache_stale_or_retired": 0,
         "browser_sequences": 0,
         "browser_sequence_steps": 0,
+        "execution_no_progress": 0,
+        "execution_recovery_attempts": 0,
+        "execution_recovery_exhausted": 0,
     }
 
 
@@ -122,6 +125,14 @@ def _accumulate_performance(totals: dict[str, Any], row: dict[str, Any]) -> None
     if operation == "browser_sequence":
         totals["browser_sequences"] += 1
         totals["browser_sequence_steps"] += _int_value(row.get("sequence_step_count"))
+    if operation == "execution_recovery":
+        status = str(row.get("status") or "")
+        if status == "detected":
+            totals["execution_no_progress"] += 1
+        elif status == "resumed":
+            totals["execution_recovery_attempts"] += 1
+        elif status == "exhausted":
+            totals["execution_recovery_exhausted"] += 1
     if operation == "cache":
         action = str(row.get("cache_action") or "")
         if action == "lookup":

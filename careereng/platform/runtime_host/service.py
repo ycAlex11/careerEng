@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import errno
+import re
 import socket
 import socketserver
 import subprocess
@@ -24,6 +25,7 @@ from careereng.config.execution import (
     normalize_execution_backend,
     resolve_execution_backend,
 )
+from careereng.platform.observability.agent_transport_trace import AgentTransportTrace
 from careereng.platform.observability.recorder import PerformanceRecorder
 from careereng.platform.sessions import SiteWorkerSessionStore
 from careereng.orchestration.agent_protocol.runtime_lifecycle import RELEASE_SITE_OPERATION, release_site_payload
@@ -31,7 +33,7 @@ from careereng.adapters.external_agents.work_orders import (
     activate_browser_agent_evolution_solution,
     set_browser_agent_work_order_state,
 )
-from careereng.utils import make_id, read_json
+from careereng.utils import make_id, now_iso, read_json, write_json
 from .errors import RuntimeHostProtocolMismatchError, RuntimeHostUnavailableError
 from .protocol import RUNTIME_HOST_PROTOCOL_VERSION, protocol_version_from, runtime_host_identity, with_runtime_host_protocol
 
@@ -44,6 +46,13 @@ build_loop: Callable[..., tuple[Any, Any]] | None = None
 DEFAULT_RUNTIME_HOST_REQUEST_TIMEOUT_SECONDS = 1800.0
 # Compatibility for callers that have not yet migrated their import path.
 DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS = DEFAULT_RUNTIME_HOST_REQUEST_TIMEOUT_SECONDS
+_AUTONOMOUS_EXPLORATION_SUMMARY_TOOLS = frozenset(
+    {
+        "careereng_submit_evolution_proposal",
+        "careereng_apply_evolution_solution",
+        "careereng_complete_evolution_solution",
+    }
+)
 
 
 def runtime_host_socket_path(workspace: Path) -> Path:
@@ -94,6 +103,7 @@ class RuntimeHostService:
         self._managed_batch_seen = False
         self._idle_shutdown_callback: Callable[[], None] | None = None
         self._site_worker_sessions = SiteWorkerSessionStore(self.workspace)
+        self._agent_transport_trace = AgentTransportTrace(self.workspace)
         self._codex_workers = self._build_codex_worker_coordinator()
 
     def close(self) -> None:
@@ -119,6 +129,13 @@ class RuntimeHostService:
                 "actual_protocol_version": caller_version,
                 **runtime_host_identity(),
             }
+        # Every scoped agent-bridge request is objective worker progress. Keep
+        # this at the protocol boundary so new browser, state, context, or
+        # evolution tools cannot be omitted from the no-progress watchdog.
+        if op.startswith("agent_bridge_"):
+            site_key = str(payload.get("site_key") or "").strip()
+            if site_key:
+                self._record_codex_activity(site_key)
         if op == "ping":
             return {"ok": True, "reply": "pong", **runtime_host_identity()}
         if op == "shutdown":
@@ -147,6 +164,10 @@ class RuntimeHostService:
             return self._handle_agent_bridge_state_call_tool(payload)
         if op == "agent_bridge_evolution_solution_complete":
             return self._handle_agent_bridge_evolution_solution_complete(payload)
+        if op == "agent_bridge_submit_evolution_proposal":
+            return self._handle_agent_bridge_submit_evolution_proposal(payload)
+        if op == "agent_bridge_apply_evolution_solution":
+            return self._handle_agent_bridge_apply_evolution_solution(payload)
         if op != "process_message":
             return {"ok": False, "error": f"unsupported op: {op}"}
         session_id = str(payload.get("session_id") or "cli:default")
@@ -216,6 +237,8 @@ class RuntimeHostService:
             self._managed_batch_seen = True
             reused_batch = bool(batch.get("_runtime_reused_batch"))
             launch_site_keys = [str(site_key) for site_key in batch.get("_runtime_site_keys") or [] if str(site_key)]
+            if execution_backend == PROVIDER_BACKEND:
+                self._bind_provider_site_sessions(batch, site_keys=launch_site_keys or None)
             self._background_batch_running = bool(self._batch_workers)
         finally:
             self._lock.release()
@@ -228,14 +251,14 @@ class RuntimeHostService:
                     self.loop.job_flow.run_batch(batch_id)
                 elif launch_site_keys:
                     self.loop.job_flow.run_batch(batch_id, site_keys=launch_site_keys)
-                self._maybe_create_batch_evolution_reviews(batch_id)
+                self._maybe_create_site_run_summary(batch_id)
                 if not reused_batch:
                     self._enqueue_codex_workers_for_batch(batch_id, site_keys=launch_site_keys or None)
                 elif launch_site_keys:
                     self._enqueue_codex_workers_for_batch(batch_id, site_keys=launch_site_keys)
             except BaseException as exc:  # pragma: no cover - defensive manager boundary
                 self.loop.job_flow.fail_batch(batch_id=batch_id, error=str(exc))
-                self._maybe_create_batch_evolution_reviews(batch_id)
+                self._maybe_create_site_run_summary(batch_id)
             finally:
                 with self._lock:
                     self._batch_workers.pop(launch_id, None)
@@ -462,6 +485,10 @@ class RuntimeHostService:
 
         if not self._managed_batch_seen or self._batch_workers:
             return
+        if self._codex_workers is not None:
+            worker_state = self._codex_workers.snapshot()
+            if worker_state.get("active") or worker_state.get("queued"):
+                return
         job_flow = getattr(self.loop, "job_flow", None)
         job_store = getattr(job_flow, "job_store", None)
         list_batches = getattr(job_store, "list_batches", None)
@@ -511,7 +538,9 @@ class RuntimeHostService:
 
             result = self._run_site_operation(site_key, _call)
         except Exception as exc:
+            self._record_codex_activity(site_key)
             return {"ok": False, "error": str(exc)}
+        self._record_codex_activity(site_key)
         return {"ok": True, "site_key": site_key, "result": result}
 
     def _handle_agent_bridge_browser_run_sequence(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -529,7 +558,9 @@ class RuntimeHostService:
 
             result = self._run_site_operation(site_key, _run)
         except Exception as exc:
+            self._record_codex_activity(site_key)
             return {"ok": False, "error": str(exc)}
+        self._record_codex_activity(site_key)
         return {"ok": True, "site_key": site_key, "result": result}
 
     def _handle_agent_bridge_state_list_tools(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -610,10 +641,13 @@ class RuntimeHostService:
                     terminal_batch_id = str(completion.get("batch_id") or "")
             if terminal_batch_id:
                 # Any external phase can make a site terminal. Persist the
-                # phase continuation first, then perform one outer handoff.
+                # phase continuation first. Ready-site batches complete one
+                # effective run here; exploration attempts are counted only
+                # when their whole bounded cycle is closed after synthesis.
                 self._record_site_worker_batch_outcome(site_key=site_key, batch_id=terminal_batch_id)
-                synthesis_created = self._maybe_create_batch_evolution_reviews(terminal_batch_id)
-                if synthesis_created:
+                self._record_terminal_ready_site_run(site_key=site_key, batch_id=terminal_batch_id)
+                summary_created = self._maybe_create_site_run_summary(terminal_batch_id)
+                if summary_created:
                     self._activate_codex_evolution_solution(site_key=site_key, batch_id=terminal_batch_id)
             if isinstance(progression, dict) and str(progression.get("action") or "") in {
                 "advance_phase",
@@ -624,7 +658,9 @@ class RuntimeHostService:
                 # existing thread; the host must not queue a phase successor.
                 result = {**result, "continue_same_work_item": True}
         except Exception as exc:
+            self._record_codex_activity(site_key)
             return {"ok": False, "error": str(exc)}
+        self._record_codex_activity(site_key)
         return {"ok": True, "site_key": site_key, "result": result}
 
     def _handle_agent_bridge_read_context_resource(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -649,7 +685,9 @@ class RuntimeHostService:
 
             result = self._run_site_operation(site_key, _read)
         except Exception as exc:
+            self._record_codex_activity(site_key)
             return {"ok": False, "error": str(exc)}
+        self._record_codex_activity(site_key)
         return {"ok": True, "site_key": site_key, "result": result}
 
     def _run_site_operation(self, site_key: str, operation: Callable[[], Any]) -> Any:
@@ -667,13 +705,8 @@ class RuntimeHostService:
         finally:
             lock.release()
 
-    def _maybe_create_batch_evolution_reviews(self, batch_id: str) -> bool:
-        """Turn terminal batch evidence into a Codex-facing review decision.
-
-        The trigger is structural only. It never chooses an evolution direction
-        or writes a Skill/config/code patch; those decisions stay with Codex and
-        the user through the existing action-card flow.
-        """
+    def _maybe_create_site_run_summary(self, batch_id: str) -> bool:
+        """Request one LLM summary after a terminal exploration site run."""
 
         normalized_batch_id = str(batch_id or "").strip()
         if not normalized_batch_id:
@@ -683,25 +716,23 @@ class RuntimeHostService:
         if job_store is None:
             return False
         batch = job_store.load_batch(normalized_batch_id)
-        if str(batch.get("status") or "") not in {"completed", "partial_completed", "failed"}:
+        if str(batch.get("status") or "") not in {"completed", "partial_completed", "failed", "waiting_solution"}:
             return False
         try:
-            from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
+            from careereng.evolution.site_run_loop import SiteRunEvolutionCoordinator
 
-            _updated, synthesis_created = BatchEvolutionOrchestrator(job_flow, auto_solve=False).create_synthesis_request_if_needed(
-                batch
-            )
-            if synthesis_created:
+            updated, summary_created = self._site_run_coordinator(job_flow).request_summary_if_needed(batch)
+            if summary_created:
                 job_store.append_event(
-                    "evolution.outer_synthesis.requested",
+                    "evolution.site_run_summary.requested",
                     {"batch_id": normalized_batch_id, "source": "terminal_exploration"},
                 )
                 if str(batch.get("execution_backend") or "") == PROVIDER_BACKEND:
-                    self._consume_provider_evolution_solution(batch=_updated)
+                    self._consume_provider_evolution_solution(batch=updated)
                 return True
         except Exception as exc:  # pragma: no cover - terminal evidence must not fail a completed batch
             job_store.append_event(
-                "evolution.outer_synthesis.failed",
+                "evolution.site_run_summary.failed",
                 {"batch_id": normalized_batch_id, "error": str(exc)},
             )
             return False
@@ -738,16 +769,48 @@ class RuntimeHostService:
         return False
 
     def _consume_provider_evolution_solution(self, *, batch: dict[str, Any]) -> None:
-        """Use the existing provider proposal/apply path inside the current batch worker.
+        """Run the same site-run proposal/apply contract through a provider."""
 
-        Provider calls have no retained remote thread, but they share the same
-        persisted batch evidence, proposal contract, apply step, and follow-up
-        decision as the Codex worker path.
-        """
+        from careereng.evolution.apply import apply_evolution_run
+        from careereng.evolution.solution_bridge import ProviderSolutionBridge
 
-        from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
-
-        BatchEvolutionOrchestrator(self.loop.job_flow, auto_solve=True).solve_waiting_solution_and_continue(batch)
+        provider = getattr(self.loop.job_flow, "solution_provider", None)
+        model = str(getattr(self.loop.job_flow, "solution_model", "") or "")
+        if provider is None or not callable(getattr(provider, "chat", None)):
+            return
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        for site_key, row in sites.items():
+            if not isinstance(row, dict):
+                continue
+            run_id = str(row.get("solution_run_id") or "").strip()
+            if not run_id:
+                continue
+            bridge = ProviderSolutionBridge(
+                project_root=self.project_root,
+                workspace=self.workspace,
+                provider=provider,
+                model=model,
+            )
+            bridge.write_proposal_for_run(run_id)
+            apply_evolution_run(workspace=self.workspace, project_root=self.project_root, run_id=run_id)
+            coordinator = self._site_run_coordinator(self.loop.job_flow)
+            updated, decision = coordinator.consume_applied_summary(
+                batch=batch,
+                site_key=str(site_key),
+                run_id=run_id,
+            )
+            successor = coordinator.create_followup_if_needed(
+                batch=updated,
+                site_key=str(site_key),
+                decision=decision,
+            )
+            self._record_site_worker_batch_outcome(site_key=str(site_key), batch_id=str(updated.get("batch_id") or ""))
+            if not successor:
+                self._record_effective_site_run(site_key=str(site_key), batch_id=str(updated.get("batch_id") or ""))
+                self._maybe_create_site_run_summary(str(updated.get("batch_id") or ""))
+            if successor:
+                next_batch_id = str(successor.get("batch_id") or "")
+                self.loop.job_flow.run_batch(next_batch_id, site_keys=[str(site_key)])
 
     def _activate_codex_evolution_solution(self, *, site_key: str, batch_id: str) -> None:
         """Refresh the retained Codex work item with a completed site's summary task."""
@@ -774,13 +837,131 @@ class RuntimeHostService:
         phase_session_path = Path(str(session.get("phase_session_path") or ""))
         if not payload_path.is_file() or not phase_session_path.is_file():
             return
+        run_payload = read_json(Path(self.workspace) / "evolution" / "runs" / run_id / "run.json")
         activate_browser_agent_evolution_solution(
             payload_path=payload_path,
             phase_session_path=phase_session_path,
             run_id=run_id,
             solution_request=solution_request,
             proposal_output_path=proposal_output_path,
+            evidence_pack=str((run_payload.get("outputs") or {}).get("evidence_pack") or ""),
+            solution_status=str(run_payload.get("status") or "waiting_solution"),
         )
+
+    def resume_pending_codex_evolution_summaries(self) -> int:
+        """Rehydrate persisted summary tasks after a host restart, without a browser run."""
+
+        if self._codex_workers is None:
+            return 0
+        job_flow = getattr(self.loop, "job_flow", None)
+        job_store = getattr(job_flow, "job_store", None)
+        site_store = getattr(getattr(job_flow, "site_tools", None), "site_store", None)
+        if job_store is None or site_store is None:
+            return 0
+        from careereng.adapters.codex.worker_runner import worker_record_from_payload
+
+        resumed = 0
+        for batch in job_store.list_batches(include_terminal=True):
+            if str(batch.get("execution_backend") or "") != CODEX_BACKEND:
+                continue
+            batch_id = str(batch.get("batch_id") or "")
+            sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+            for site_key, row in sites.items():
+                if not isinstance(row, dict):
+                    continue
+                run_id = str(row.get("solution_run_id") or "")
+                if not run_id:
+                    continue
+                run_payload = read_json(Path(self.workspace) / "evolution" / "runs" / run_id / "run.json")
+                if str(run_payload.get("status") or "") not in {"waiting_solution", "proposal_written", "applied"}:
+                    continue
+                batch = self._site_run_coordinator(job_flow).retain_pending_summary(batch)
+                self._activate_codex_evolution_solution(site_key=str(site_key), batch_id=batch_id)
+                session = site_store.load_browser_session(str(site_key))
+                payload_path = Path(str(session.get("agent_bridge_payload_path") or ""))
+                if not payload_path.is_file():
+                    continue
+                try:
+                    self._codex_workers.enqueue(worker_record_from_payload(payload_path))
+                except Exception:
+                    continue
+                resumed += 1
+        return resumed
+
+    def _evolution_solution_batch_row(self, *, site_key: str, batch_id: str, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Verify that a summary run belongs to the retained terminal site batch."""
+
+        job_flow = getattr(self.loop, "job_flow", None)
+        job_store = getattr(job_flow, "job_store", None)
+        if job_store is None:
+            raise ValueError("workflow store is unavailable")
+        batch = job_store.load_batch(batch_id)
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        row = sites.get(site_key) if isinstance(sites.get(site_key), dict) else {}
+        if str(row.get("solution_run_id") or "") != run_id:
+            raise ValueError("evolution run does not belong to this site batch")
+        return batch, row
+
+    def _handle_agent_bridge_submit_evolution_proposal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist an LLM-authored proposal without making a workflow decision."""
+
+        site_key = str(payload.get("site_key") or "").strip()
+        batch_id = str(payload.get("batch_id") or "").strip()
+        run_id = str(payload.get("run_id") or "").strip()
+        proposal = payload.get("proposal") if isinstance(payload.get("proposal"), dict) else {}
+        if not site_key or not batch_id or not run_id:
+            return {"ok": False, "error": "site_key, batch_id, and run_id are required"}
+        try:
+            self._evolution_solution_batch_row(site_key=site_key, batch_id=batch_id, run_id=run_id)
+            from careereng.evolution.artifacts import EvolutionProposalArtifactStore
+            from careereng.evolution.proposals import EvolutionProposalError, validate_proposal
+
+            run_dir = Path(self.workspace) / "evolution" / "runs" / run_id
+            run_path = run_dir / "run.json"
+            run_payload = read_json(run_path)
+            if not run_payload:
+                raise ValueError("evolution run is unavailable")
+            if str(proposal.get("run_id") or "") != str(run_payload.get("run_id") or ""):
+                raise ValueError("proposal run_id does not match the evolution run")
+            if str(proposal.get("candidate_id") or "") != str(run_payload.get("candidate_id") or ""):
+                raise ValueError("proposal candidate_id does not match the evolution run")
+            validate_proposal(proposal)
+            proposal_path = EvolutionProposalArtifactStore().save_json(run_dir, proposal)
+            run_payload["status"] = "proposal_written"
+            run_payload["updated_at"] = now_iso()
+            lifecycle = run_payload.setdefault("lifecycle", [])
+            if isinstance(lifecycle, list):
+                lifecycle.append({"status": "proposal_written", "at": now_iso(), "summary": "Proposal submitted through the bounded agent work item."})
+            write_json(run_path, run_payload)
+        except (ValueError, EvolutionProposalError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "run_id": run_id, "proposal_output_path": str(proposal_path), "status": "proposal_written"}
+
+    def _handle_agent_bridge_apply_evolution_solution(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Apply a previously persisted proposal through the shared apply contract."""
+
+        site_key = str(payload.get("site_key") or "").strip()
+        batch_id = str(payload.get("batch_id") or "").strip()
+        run_id = str(payload.get("run_id") or "").strip()
+        if not site_key or not batch_id or not run_id:
+            return {"ok": False, "error": "site_key, batch_id, and run_id are required"}
+        try:
+            self._evolution_solution_batch_row(site_key=site_key, batch_id=batch_id, run_id=run_id)
+            run_path = Path(self.workspace) / "evolution" / "runs" / run_id / "run.json"
+            run_payload = read_json(run_path)
+            if str(run_payload.get("status") or "") == "applied":
+                return {
+                    "ok": True,
+                    "run_id": run_id,
+                    "result": {"run_id": run_id, "status": "already_applied"},
+                }
+            from careereng.evolution.apply import EvolutionApplyError, apply_evolution_run
+            from careereng.evolution.proposals import EvolutionProposalError
+
+            result = apply_evolution_run(workspace=self.workspace, project_root=self.project_root, run_id=run_id)
+        except (ValueError, EvolutionApplyError, EvolutionProposalError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "run_id": run_id, "result": result}
 
     def _handle_agent_bridge_evolution_solution_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Consume one applied site synthesis and schedule only the existing successor path."""
@@ -803,11 +984,13 @@ class RuntimeHostService:
         run_payload = read_json(Path(self.workspace) / "evolution" / "runs" / run_id / "run.json")
         if str(run_payload.get("status") or "") != "applied":
             return {"ok": False, "error": "evolution proposal has not been applied"}
-        from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
-
-        orchestrator = BatchEvolutionOrchestrator(job_flow, auto_solve=False)
-        updated = orchestrator.mark_applied_solution_for_outer_loop(batch)
-        successor = orchestrator.create_followup_batch_if_needed(updated)
+        coordinator = self._site_run_coordinator(job_flow)
+        updated, decision = coordinator.consume_applied_summary(batch=batch, site_key=site_key, run_id=run_id)
+        successor = coordinator.create_followup_if_needed(batch=updated, site_key=site_key, decision=decision) or {}
+        self._record_site_worker_batch_outcome(site_key=site_key, batch_id=str(updated.get("batch_id") or ""))
+        if not successor:
+            self._record_effective_site_run(site_key=site_key, batch_id=str(updated.get("batch_id") or ""))
+            self._maybe_create_site_run_summary(str(updated.get("batch_id") or ""))
         session = site_store.load_browser_session(site_key)
         payload_path = Path(str(session.get("agent_bridge_payload_path") or ""))
         phase_session_path = Path(str(session.get("phase_session_path") or ""))
@@ -819,8 +1002,9 @@ class RuntimeHostService:
             )
         next_batch_id = str(successor.get("batch_id") or "")
         if next_batch_id:
-            job_flow.run_batch(next_batch_id, site_keys=[site_key])
-            self._enqueue_codex_workers_for_batch(next_batch_id, site_keys=[site_key])
+            # Completion is a control-plane operation. The next site's browser
+            # work can be slow, so schedule it after this RPC returns.
+            self._schedule_successor_batch(site_key=site_key, batch_id=next_batch_id)
         return {
             "ok": True,
             "batch_id": batch_id,
@@ -829,6 +1013,40 @@ class RuntimeHostService:
             "next_batch_id": next_batch_id,
             "status": "continued" if next_batch_id else "completed",
         }
+
+    def _schedule_successor_batch(self, *, site_key: str, batch_id: str) -> None:
+        """Start one persisted successor without blocking summary completion."""
+
+        def _run() -> None:
+            job_flow = getattr(self.loop, "job_flow", None)
+            job_store = getattr(job_flow, "job_store", None)
+            try:
+                if job_flow is None:
+                    raise RuntimeError("workflow is unavailable")
+                job_flow.run_batch(batch_id, site_keys=[site_key])
+                self._enqueue_codex_workers_for_batch(batch_id, site_keys=[site_key])
+            except Exception as exc:
+                append_event = getattr(job_store, "append_event", None)
+                if callable(append_event):
+                    append_event(
+                        "evolution.successor_schedule.failed",
+                        {"batch_id": batch_id, "site_key": site_key, "error": str(exc)},
+                    )
+
+        threading.Thread(
+            target=_run,
+            name=f"careereng-successor-{site_key}",
+            daemon=True,
+        ).start()
+
+    def _site_run_coordinator(self, job_flow: Any):
+        from careereng.evolution.site_run_loop import SiteRunEvolutionCoordinator
+
+        loop_config = getattr(getattr(self.config, "evolution", None), "loops", None)
+        return SiteRunEvolutionCoordinator(
+            job_flow,
+            exploration_attempt_limit=int(getattr(loop_config, "inner_attempt_limit", 3) or 3),
+        )
 
     def _build_codex_worker_coordinator(self):
         browser_runner = getattr(self.loop, "browser_runner", None)
@@ -850,9 +1068,70 @@ class RuntimeHostService:
                 cwd=self.project_root,
                 event_callback=callback,
             ),
+            idle_timeout_seconds=int(getattr(getattr(agent_config, "recovery", None), "idle_timeout_seconds", 180) or 180),
+            max_resume_attempts=int(getattr(getattr(agent_config, "recovery", None), "max_resume_attempts", 2) or 0),
             on_record=self._record_codex_worker,
             on_usage=self._record_codex_usage,
+            on_recovery=self._record_codex_recovery,
+            on_transport_event=self._record_codex_transport,
+            on_server_request=self._handle_codex_server_request,
         )
+
+    def _handle_codex_server_request(self, method: str, params: dict[str, Any]) -> dict[str, Any] | None:
+        """Accept only the current exploration worker's synthesis tool calls.
+
+        This is a transport permission decision, not an evolution decision. The
+        worker still authors the proposal and the existing validation/apply
+        contract decides whether it can be persisted. All browser, file, and
+        ordinary state tools remain outside this automatic scope.
+        """
+
+        if str(method) != "mcpServer/elicitation/request":
+            return None
+        if str(params.get("serverName") or "") != "careereng":
+            return None
+        metadata = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+        if str(metadata.get("codex_approval_kind") or "") != "mcp_tool_call":
+            return None
+        tool_params = metadata.get("tool_params") if isinstance(metadata.get("tool_params"), dict) else {}
+        tool_name = self._elicited_tool_name(str(params.get("message") or ""))
+        if tool_name not in _AUTONOMOUS_EXPLORATION_SUMMARY_TOOLS:
+            return None
+        thread_id = str(params.get("threadId") or "")
+        workers = self._codex_workers
+        record_for_thread = getattr(workers, "record_for_thread", None)
+        record = record_for_thread(thread_id) if callable(record_for_thread) else None
+        if record is None:
+            return None
+        if str(tool_params.get("work_item_id") or "") != str(getattr(record, "work_item_id", "") or ""):
+            return None
+        payload = read_json(Path(getattr(record, "payload_path", "")))
+        evolution = payload.get("evolution_solution") if isinstance(payload.get("evolution_solution"), dict) else {}
+        if str(payload.get("current_phase") or "") != "evolution_summary" or not str(evolution.get("run_id") or ""):
+            return None
+        requested_run_id = str(tool_params.get("run_id") or "")
+        if tool_name == "careereng_submit_evolution_proposal":
+            proposal = tool_params.get("proposal") if isinstance(tool_params.get("proposal"), dict) else {}
+            requested_run_id = str(proposal.get("run_id") or "")
+        if requested_run_id and requested_run_id != str(evolution.get("run_id") or ""):
+            return None
+        self._record_codex_transport(
+            record,
+            {
+                "event": "mcp_elicitation_auto_approved",
+                "tool_name": tool_name,
+                "thread_id": thread_id,
+                "turn_id": str(params.get("turnId") or ""),
+                "work_item_id": str(record.work_item_id),
+                "run_id": str(evolution.get("run_id") or ""),
+            },
+        )
+        return {"action": "accept", "content": {}}
+
+    @staticmethod
+    def _elicited_tool_name(message: str) -> str:
+        match = re.search(r'tool\s+"([^"]+)"', str(message or ""))
+        return str(match.group(1) if match else "")
 
     def _enqueue_codex_workers_for_batch(self, batch_id: str, *, site_keys: list[str] | None = None) -> None:
         if self._codex_workers is None:
@@ -957,6 +1236,8 @@ class RuntimeHostService:
             worker_session_id=record.worker_session_id,
             worker_session_batch_ordinal=record.session_batch_ordinal,
         )
+        if record.status in {"completed", "unavailable", "interrupted", "cancelled"}:
+            self._shutdown_if_idle()
 
     def _record_codex_usage(self, record: Any, event: dict[str, Any]) -> None:
         """Persist App Server usage facts without interpreting worker behavior."""
@@ -975,6 +1256,75 @@ class RuntimeHostService:
             worker_session_id=record.worker_session_id,
             worker_session_batch_ordinal=record.session_batch_ordinal,
             token_usage=usage if isinstance(usage, dict) else {},
+        )
+
+    def _record_codex_transport(self, record: Any | None, payload: dict[str, Any]) -> None:
+        """Persist raw Codex transport facts with any known site-work correlation."""
+
+        event = str(payload.get("event") or "unknown")
+        correlation: dict[str, Any] = {}
+        if record is not None:
+            phase_session = read_json(Path(record.phase_session_path)) if getattr(record, "phase_session_path", None) else {}
+            current_phase = phase_session.get("current_phase") if isinstance(phase_session, dict) else {}
+            correlation = {
+                "site_key": record.site_key,
+                "batch_id": record.batch_id,
+                "work_item_id": record.work_item_id,
+                "thread_id": record.thread_id,
+                "turn_id": record.turn_id,
+                "worker_session_id": record.worker_session_id,
+                "phase": str(current_phase.get("slug") or "") if isinstance(current_phase, dict) else "",
+            }
+        # The worker may include thread/turn IDs in a raw transport event.  The
+        # correlated record is authoritative, and duplicate keyword expansion
+        # must never take down the watchdog while it records an interruption.
+        details = {
+            key: value
+            for key, value in payload.items()
+            if key != "event" and key not in correlation
+        }
+        self._agent_transport_trace.record(
+            backend="codex_app_server",
+            event=event,
+            **correlation,
+            **details,
+        )
+
+    def _record_codex_activity(self, site_key: str) -> None:
+        """Refresh only the objective activity clock for the active Codex site."""
+
+        if self._codex_workers is not None:
+            self._codex_workers.record_activity(site_key=site_key)
+
+    def _record_codex_recovery(self, record: Any, status: str) -> None:
+        """Persist a technical no-progress event without assigning a job outcome."""
+
+        job_flow = getattr(self.loop, "job_flow", None)
+        site_store = getattr(getattr(job_flow, "site_tools", None), "site_store", None)
+        payload = read_json(Path(record.payload_path)) if getattr(record, "payload_path", None) else {}
+        browser_session = site_store.load_browser_session(record.site_key) if site_store is not None else {}
+        details = {
+            "batch_id": record.batch_id,
+            "thread_id": record.thread_id,
+            "turn_id": record.turn_id,
+            "work_item_id": record.work_item_id,
+            "phase": str(payload.get("current_phase") or ""),
+            "current_url": str(browser_session.get("last_known_url") or ""),
+            "trace_ref": str(browser_session.get("current_trace_ref") or ""),
+            "last_browser_error": str(browser_session.get("last_step_error") or ""),
+            "recovery_attempts": record.recovery_attempts,
+            "last_error": record.last_error,
+        }
+        if site_store is not None:
+            site_store.append_event(record.site_key, "codex.execution.recovery", {"status": status, **details})
+        metric_details = {key: value for key, value in details.items() if key != "batch_id"}
+        PerformanceRecorder(self.workspace).record(
+            backend="codex_app_server",
+            operation="execution_recovery",
+            site_key=record.site_key,
+            batch_id=record.batch_id,
+            status=status,
+            **metric_details,
         )
 
     def _record_site_worker_batch_outcome(self, *, site_key: str, batch_id: str) -> None:
@@ -1005,6 +1355,92 @@ class RuntimeHostService:
                 )
                 return
 
+    @staticmethod
+    def _site_uses_exploration(batch: dict[str, Any], *, site_key: str) -> bool:
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        row = sites.get(site_key) if isinstance(sites.get(site_key), dict) else {}
+        scope = row.get("evolution_scope") if isinstance(row.get("evolution_scope"), dict) else {}
+        mode = str(scope.get("execution_mode") or row.get("execution_mode") or row.get("site_mode") or "")
+        return mode == "exploration"
+
+    def _record_effective_site_run(self, *, site_key: str, batch_id: str) -> None:
+        """Record one already-closed site run without evaluating its business result."""
+
+        normalized_site = str(site_key or "").strip()
+        normalized_batch = str(batch_id or "").strip()
+        if not normalized_site or not normalized_batch:
+            return
+        job_flow = getattr(self.loop, "job_flow", None)
+        job_store = getattr(job_flow, "job_store", None)
+        if job_store is None:
+            return
+        batch = job_store.load_batch(normalized_batch)
+        site_run = batch.get("site_run") if isinstance(batch.get("site_run"), dict) else {}
+        if self._site_uses_exploration(batch, site_key=normalized_site):
+            root_batch_id = str(site_run.get("root_batch_id") or normalized_batch)
+            run_id = f"exploration:{root_batch_id}"
+        else:
+            run_id = f"batch:{normalized_batch}"
+        evidence = self._site_worker_sessions.site_evidence(normalized_site)
+        for session in evidence.get("sessions", []):
+            if not isinstance(session, dict):
+                continue
+            bindings = session.get("batch_bindings") if isinstance(session.get("batch_bindings"), list) else []
+            if not any(str(binding.get("batch_id") or "") == normalized_batch for binding in bindings if isinstance(binding, dict)):
+                continue
+            updated = self._site_worker_sessions.record_effective_site_run(
+                worker_session_id=str(session.get("worker_session_id") or ""),
+                batch_id=normalized_batch,
+                run_id=run_id,
+            )
+            if updated is not None:
+                job_store.append_event(
+                    "site_worker.effective_run_recorded",
+                    {
+                        "site_key": normalized_site,
+                        "batch_id": normalized_batch,
+                        "run_id": run_id,
+                        "worker_session_id": str(session.get("worker_session_id") or ""),
+                        "effective_site_run_count": len(updated.get("effective_run_ids") or []),
+                    },
+                )
+            return
+
+    def _record_terminal_ready_site_run(self, *, site_key: str, batch_id: str) -> None:
+        """Count a terminal ready batch, while leaving exploration to synthesis."""
+
+        job_flow = getattr(self.loop, "job_flow", None)
+        job_store = getattr(job_flow, "job_store", None)
+        if job_store is None:
+            return
+        batch = job_store.load_batch(str(batch_id or ""))
+        if not self._site_uses_exploration(batch, site_key=str(site_key or "")):
+            self._record_effective_site_run(site_key=site_key, batch_id=batch_id)
+
+    def _bind_provider_site_sessions(self, batch: dict[str, Any], *, site_keys: list[str] | None) -> None:
+        """Give provider execution the same persisted run counter as Codex."""
+
+        batch_id = str(batch.get("batch_id") or "").strip()
+        if not batch_id:
+            return
+        evolution = getattr(self.config, "evolution", None)
+        review = getattr(evolution, "batch_review", None)
+        limit = int(getattr(review, "site_run_threshold", 5) or 5)
+        allowed = set(site_keys or [])
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        for site_key, row in sites.items():
+            if not isinstance(row, dict) or str(row.get("status") or "") == "cancelled":
+                continue
+            normalized_site = str(site_key or "").strip()
+            if not normalized_site or (allowed and normalized_site not in allowed):
+                continue
+            self._site_worker_sessions.bind_batch(
+                site_key=normalized_site,
+                backend="provider",
+                batch_id=batch_id,
+                max_effective_batches=limit,
+            )
+
 
 # Legacy public type name retained for code that imports it during migration.
 WorkspaceManager = RuntimeHostService
@@ -1020,7 +1456,15 @@ class _ManagerRequestHandler(socketserver.StreamRequestHandler):
         except Exception as exc:
             response = {"ok": False, "error": f"invalid request: {exc}"}
         else:
-            response = self.server.manager.handle_request(payload)
+            try:
+                response = self.server.manager.handle_request(payload)
+            except Exception as exc:
+                # A control-plane failure must still produce a response. Otherwise
+                # the client mistakes an executed operation for a dead host.
+                response = {
+                    "ok": False,
+                    "error": f"runtime host request failed: {type(exc).__name__}: {exc}",
+                }
         # The transport contract, not a workflow branch, owns the host identity.
         # Every response carries it so stale MCP/CLI clients fail clearly before
         # interpreting a browser or workflow result.
@@ -1071,6 +1515,7 @@ def serve_runtime_host(*, project_root: Path, workspace: Path, socket_path: Path
             daemon=True,
         ).start()
     )
+    runtime_host.resume_pending_codex_evolution_summaries()
     try:
         server.serve_forever(poll_interval=0.2)
     finally:

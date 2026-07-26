@@ -322,6 +322,8 @@ def activate_browser_agent_evolution_solution(
     run_id: str,
     solution_request: str,
     proposal_output_path: str,
+    evidence_pack: str = "",
+    solution_status: str = "waiting_solution",
 ) -> None:
     """Make an already-created evolution request the next turn of one worker.
 
@@ -338,6 +340,8 @@ def activate_browser_agent_evolution_solution(
         "run_id": str(run_id or "").strip(),
         "solution_request": str(solution_request or "").strip(),
         "proposal_output_path": str(proposal_output_path or "").strip(),
+        "evidence_pack": str(evidence_pack or Path(str(solution_request or "")).with_name("evidence_pack.md")).strip(),
+        "status": str(solution_status or "waiting_solution").strip(),
     }
     if not request["run_id"] or not request["solution_request"] or not request["proposal_output_path"]:
         raise ValueError("evolution solution handoff requires run_id and artifact paths")
@@ -348,6 +352,10 @@ def activate_browser_agent_evolution_solution(
                 "updated_at": now,
                 "context_revision": int(row.get("context_revision") or 0) + 1,
                 "worker_state": "active",
+                "current_phase": "evolution_summary",
+                "current_phase_context": {
+                    "phase": {"slug": "evolution_summary", "title": "Evolution summary"},
+                },
                 "evolution_solution": request,
             }
         )

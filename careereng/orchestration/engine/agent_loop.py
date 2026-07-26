@@ -596,9 +596,9 @@ class AgentLoop:
         # This is a transport-neutral handoff: it packages terminal exploration
         # evidence for Codex but never selects a site strategy in Python.
         if getattr(self.job_flow, "loop_engine", None) is not None:
-            from careereng.evolution.outer_loop import BatchEvolutionOrchestrator
+            from careereng.evolution.site_run_loop import SiteRunEvolutionCoordinator
 
-            BatchEvolutionOrchestrator(self.job_flow, auto_solve=False).create_synthesis_request_if_needed(
+            SiteRunEvolutionCoordinator(self.job_flow).request_summary_if_needed(
                 self.job_flow.job_store.load_batch(str(batch.get("batch_id") or ""))
             )
         return reply

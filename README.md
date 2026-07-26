@@ -115,7 +115,7 @@ keep_open = true
 site_parallelism = 1
 ```
 
-For regular multi-site runs, `site_parallelism = 2` is a practical default. Increase it only after the active site skills are stable. Each site runs independently within this limit: a login, CAPTCHA, or pause on one site does not stop the other active sites. Sites added while a run is active use the next available execution slot.
+For regular multi-site runs, `[agent].site_parallelism = 2` is a practical default. Increase it only after the active site skills are stable. Each site runs independently within this limit: a login, CAPTCHA, or pause on one site does not stop the other active sites. Sites added while a run is active use the next available execution slot.
 
 `[execution].selected_backend` is fixed for the lifetime of a runtime host. Select `provider` to use the configured API endpoint, or `codex` to use the local Codex execution path; CareerEng never switches between them during a run.
 

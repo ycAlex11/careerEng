@@ -7,6 +7,8 @@ enforces the persisted work item's scope.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 
@@ -22,6 +24,20 @@ _RESOURCE_DESCRIPTIONS = {
     "full_cv": "Current full CV text, available on demand when detailed evidence is needed.",
     "full_persona": "Current detailed persona/profile data, available on demand.",
     "history_view": "Current site-only batch history view, available on demand.",
+    "evolution_solution_request": "The persisted synthesis request and required proposal contract.",
+    "evolution_evidence_pack": "The persisted evidence pack for the current synthesis request.",
+    "evolution_summary_brief": "Small persisted run metadata and output contract for starting a synthesis without loading evidence.",
+    "evolution_run_protocol": "The project-wide contract for completing one evolution run.",
+    "evolution_proposal_schema": "The required shape and validation rules for an evolution proposal.",
+    "evolution_strategy_router": "Guidance for choosing an evolution strategy from available evidence.",
+}
+
+_MAX_RESOURCE_CHARS = 16_000
+_DEFAULT_RESOURCE_CHARS = 8_000
+_EVOLUTION_DOCUMENTS = {
+    "evolution_run_protocol": "docs/evolution/EVOLUTION_RUN_PROTOCOL.md",
+    "evolution_proposal_schema": "docs/evolution/PROPOSAL_SCHEMA.md",
+    "evolution_strategy_router": "docs/evolution/EVOLUTION_STRATEGY_ROUTER.md",
 }
 
 
@@ -33,6 +49,44 @@ def work_item_id_from_payload(payload: dict[str, Any]) -> str:
 
 def build_work_item_context(payload: dict[str, Any]) -> dict[str, Any]:
     """Build the minimal worker entry context and its resource catalog."""
+
+    evolution = payload.get("evolution_solution") if isinstance(payload.get("evolution_solution"), dict) else {}
+    if str(evolution.get("run_id") or "").strip():
+        return {
+            "work_item_id": work_item_id_from_payload(payload),
+            "kind": "evolution_solution",
+            "status": "active",
+            "objective": {
+                "phase": "evolution_summary",
+                "title": "Apply the persisted site-run synthesis contract.",
+            },
+            "scope": {
+                "site_key": str(payload.get("site_key") or ""),
+                "batch_id": str(payload.get("batch_id") or ""),
+                "session_id": str(payload.get("session_id") or ""),
+                "turn_id": str(payload.get("turn_id") or ""),
+                "evolution_run_id": str(evolution.get("run_id") or ""),
+                "evolution_status": str(evolution.get("status") or "waiting_solution"),
+            },
+            "constraints": [
+                "Use only the persisted synthesis request and evidence exposed by this work item.",
+                "Do not create a browser runtime, inspect project files, or change Python code.",
+                "Submit a structured proposal through CareerEng, apply it through CareerEng, then complete this synthesis.",
+            ],
+            "context_catalog": [
+                {"resource_id": "evolution_summary_brief", "description": _RESOURCE_DESCRIPTIONS["evolution_summary_brief"]},
+                {"resource_id": "evolution_solution_request", "description": _RESOURCE_DESCRIPTIONS["evolution_solution_request"]},
+                {"resource_id": "evolution_evidence_pack", "description": _RESOURCE_DESCRIPTIONS["evolution_evidence_pack"]},
+                {"resource_id": "evolution_run_protocol", "description": _RESOURCE_DESCRIPTIONS["evolution_run_protocol"]},
+                {"resource_id": "evolution_proposal_schema", "description": _RESOURCE_DESCRIPTIONS["evolution_proposal_schema"]},
+                {"resource_id": "evolution_strategy_router", "description": _RESOURCE_DESCRIPTIONS["evolution_strategy_router"]},
+            ],
+            "capabilities": {
+                "submit_proposal": "careereng_submit_evolution_proposal",
+                "apply_proposal": "careereng_apply_evolution_solution",
+                "complete_solution": "careereng_complete_evolution_solution",
+            },
+        }
 
     phase_context = payload.get("current_phase_context")
     phase_context = phase_context if isinstance(phase_context, dict) else {}
@@ -79,12 +133,43 @@ def build_work_item_context(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def read_work_item_resource(payload: dict[str, Any], resource_id: str) -> dict[str, Any]:
-    """Read one catalog resource from a work item without widening its scope."""
+def read_work_item_resource(
+    payload: dict[str, Any],
+    resource_id: str,
+    *,
+    offset: int = 0,
+    limit: int = _DEFAULT_RESOURCE_CHARS,
+) -> dict[str, Any]:
+    """Read one scoped resource, optionally as a bounded text slice."""
 
     requested = str(resource_id or "").strip()
     if requested not in _RESOURCE_DESCRIPTIONS:
         raise ValueError(f"unknown work-item resource: {requested or '<missing>'}")
+    evolution = payload.get("evolution_solution") if isinstance(payload.get("evolution_solution"), dict) else {}
+    if requested == "evolution_summary_brief":
+        if not str(evolution.get("run_id") or "").strip():
+            raise ValueError(f"work-item resource is not available: {requested}")
+        return {
+            "work_item_id": work_item_id_from_payload(payload),
+            "resource_id": requested,
+            "value": _evolution_summary_brief(evolution),
+        }
+    if requested in {"evolution_solution_request", "evolution_evidence_pack"}:
+        if not str(evolution.get("run_id") or "").strip():
+            raise ValueError(f"work-item resource is not available: {requested}")
+        path_key = "solution_request" if requested == "evolution_solution_request" else "evidence_pack"
+        path = Path(str(evolution.get(path_key) or ""))
+        if not path.is_file():
+            raise ValueError(f"evolution artifact is unavailable: {requested}")
+        return _read_text_resource(payload, requested, path, offset=offset, limit=limit)
+    if requested in _EVOLUTION_DOCUMENTS:
+        if not str(evolution.get("run_id") or "").strip():
+            raise ValueError(f"work-item resource is not available: {requested}")
+        project_root = Path(__file__).resolve().parents[3]
+        path = project_root / _EVOLUTION_DOCUMENTS[requested]
+        if not path.is_file():
+            raise ValueError(f"evolution document is unavailable: {requested}")
+        return _read_text_resource(payload, requested, path, offset=offset, limit=limit)
     phase_context = payload.get("current_phase_context")
     phase_context = phase_context if isinstance(phase_context, dict) else {}
     if requested == "state_tools":
@@ -99,4 +184,60 @@ def read_work_item_resource(payload: dict[str, Any], resource_id: str) -> dict[s
         "work_item_id": work_item_id_from_payload(payload),
         "resource_id": requested,
         "value": value,
+    }
+
+
+def _read_text_resource(
+    payload: dict[str, Any],
+    resource_id: str,
+    path: Path,
+    *,
+    offset: int,
+    limit: int,
+) -> dict[str, Any]:
+    """Return a bounded slice without deciding which source the agent needs."""
+
+    start = max(0, int(offset or 0))
+    size = min(_MAX_RESOURCE_CHARS, max(1, int(limit or _DEFAULT_RESOURCE_CHARS)))
+    text = path.read_text(encoding="utf-8")
+    end = min(len(text), start + size)
+    return {
+        "work_item_id": work_item_id_from_payload(payload),
+        "resource_id": resource_id,
+        "value": text[start:end],
+        "offset": start,
+        "next_offset": end if end < len(text) else None,
+        "total_chars": len(text),
+        "complete": end >= len(text),
+    }
+
+
+def _evolution_summary_brief(evolution: dict[str, Any]) -> dict[str, Any]:
+    """Expose stored run metadata without loading its long-form evidence files."""
+
+    solution_request = Path(str(evolution.get("solution_request") or ""))
+    run_path = solution_request.parent / "run.json"
+    run: dict[str, Any] = {}
+    if run_path.is_file():
+        try:
+            loaded = json.loads(run_path.read_text(encoding="utf-8"))
+            run = loaded if isinstance(loaded, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            run = {}
+    context = run.get("context") if isinstance(run.get("context"), dict) else {}
+    return {
+        "run_id": str(evolution.get("run_id") or ""),
+        "run_status": str(evolution.get("status") or run.get("status") or "waiting_solution"),
+        "candidate_id": str(run.get("candidate_id") or ""),
+        "site_key": str(context.get("site_key") or ""),
+        "batch_id": str(context.get("batch_id") or ""),
+        "proposal_contract": dict(context.get("proposal_contract") or {}),
+        "proposal_output_path": str(evolution.get("proposal_output_path") or ""),
+        "available_detail_resources": [
+            "evolution_run_protocol",
+            "evolution_proposal_schema",
+            "evolution_strategy_router",
+            "evolution_solution_request",
+            "evolution_evidence_pack",
+        ],
     }

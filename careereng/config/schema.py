@@ -7,6 +7,14 @@ from pathlib import Path
 
 
 @dataclass
+class AgentRecoveryConfig:
+    """Mechanical limits for external-agent no-progress recovery."""
+
+    idle_timeout_seconds: int = 180
+    max_resume_attempts: int = 2
+
+
+@dataclass
 class AgentConfig:
     default_provider: str = "openrouter"
     default_model: str = "openai/gpt-4o-mini"
@@ -17,6 +25,7 @@ class AgentConfig:
     router_confidence_threshold: float = 0.75
     router_log_enabled: bool = True
     search_company_top_k: int = 10
+    recovery: AgentRecoveryConfig = field(default_factory=AgentRecoveryConfig)
 
 
 @dataclass
