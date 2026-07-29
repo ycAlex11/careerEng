@@ -1,5 +1,6 @@
-"""Workspace project-state capabilities such as the development taskboard."""
+"""Workspace project-state capabilities such as taskboards and agent events."""
 
+from .agent_events import AgentEventDispatcher, AgentEventStore
 from .taskboard import TaskboardError, TaskboardStore
 
-__all__ = ["TaskboardError", "TaskboardStore"]
+__all__ = ["AgentEventDispatcher", "AgentEventStore", "TaskboardError", "TaskboardStore"]

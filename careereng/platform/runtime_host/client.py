@@ -93,6 +93,11 @@ class RuntimeHostClient:
 
         return self.request(RELEASE_SITE_OPERATION, release_site_payload(site_key=site_key))
 
+    def agent_status(self, *, site_key: str = "") -> dict[str, Any]:
+        """Read current host-owned site execution state without starting a host."""
+
+        return self.request("agent_status", {"site_key": str(site_key or "")}, timeout=3.0)
+
     @staticmethod
     def _validate_response(response: dict[str, Any]) -> None:
         remote_version = protocol_version_from(response)

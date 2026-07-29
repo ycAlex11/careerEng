@@ -148,6 +148,8 @@ class RuntimeHostService:
             return self._handle_pause_jobs_batch(payload)
         if op == "cancel_jobs_batch":
             return self._handle_cancel_jobs_batch(payload)
+        if op == "agent_status":
+            return self._handle_agent_status(payload)
         if op == RELEASE_SITE_OPERATION:
             return self._handle_release_site(payload)
         if op in {"agent_bridge_browser_list_tools", "browser_handoff_list_tools"}:
@@ -206,6 +208,55 @@ class RuntimeHostService:
             "cancelled": len(cancelled),
             "reply": "workspace manager shutting down",
         }
+
+    def _handle_agent_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Return live site execution facts without interpreting site behavior."""
+
+        requested_site = str(payload.get("site_key") or "").strip()
+        job_flow = getattr(self.loop, "job_flow", None)
+        site_store = getattr(getattr(job_flow, "site_tools", None), "site_store", None)
+        if site_store is None:
+            return {"ok": True, "sites": []}
+        worker_rows: dict[str, dict[str, Any]] = {}
+        if self._codex_workers is not None:
+            snapshot = self._codex_workers.snapshot()
+            for bucket in ("active", "paused", "queued"):
+                for row in snapshot.get(bucket, []):
+                    if isinstance(row, dict) and str(row.get("site_key") or ""):
+                        worker_rows[str(row["site_key"])] = {**row, "scheduler_state": bucket}
+        sites: list[dict[str, Any]] = []
+        for site in site_store.list_sites():
+            site_key = str(site.get("site_key") or site.get("site_id") or "").strip()
+            if not site_key or (requested_site and site_key != requested_site):
+                continue
+            browser = site_store.load_browser_session(site_key)
+            worker = worker_rows.get(site_key, {})
+            browser_status = str(browser.get("browser_status") or "")
+            worker_status = str(worker.get("status") or browser.get("codex_worker_status") or "")
+            pending_action = str(browser.get("pending_action") or "")
+            if not worker and worker_status in {"completed", "released", "cancelled", "unavailable"}:
+                worker_status = ""
+            if not worker_status and not pending_action and browser_status not in {"running", "waiting_user", "paused"}:
+                continue
+            sites.append(
+                {
+                    "site_key": site_key,
+                    "site_name": str(site.get("canonical_company") or site.get("raw_name") or ""),
+                    "phase": str(browser.get("agent_bridge_current_phase") or browser.get("resume_phase") or ""),
+                    "worker_status": worker_status,
+                    "scheduler_state": str(worker.get("scheduler_state") or ""),
+                    "thread_id": str(worker.get("thread_id") or browser.get("codex_thread_id") or ""),
+                    "turn_id": str(worker.get("turn_id") or browser.get("codex_turn_id") or ""),
+                    "batch_id": str(worker.get("batch_id") or ""),
+                    "work_item_id": str(worker.get("work_item_id") or ""),
+                    "browser_status": browser_status,
+                    "pending_action": pending_action,
+                    "current_url": str(browser.get("last_known_url") or ""),
+                    "last_activity_at": str(worker.get("updated_at") or browser.get("updated_at") or ""),
+                    "last_error": str(worker.get("last_error") or browser.get("codex_worker_last_error") or ""),
+                }
+            )
+        return {"ok": True, "sites": sites, **runtime_host_identity()}
 
     def _handle_start_jobs_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
         session_id = str(payload.get("session_id") or "cli:default")
@@ -444,11 +495,16 @@ class RuntimeHostService:
             batch = cancel_batch(batch_id=batch_id, reason=reason)
             self._managed_batch_seen = True
             sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+            # Cancel the whole batch before dispatching another queued site.
+            # A per-site release would otherwise free one slot and immediately
+            # launch the next queued item from the batch being cancelled.
+            if self._codex_workers is not None:
+                for site_key in sites:
+                    self._codex_workers.cancel(site_key=str(site_key))
             for site_key in sites:
                 self._record_site_worker_batch_outcome(site_key=str(site_key), batch_id=batch_id)
                 if self._codex_workers is not None:
-                    self._codex_workers.cancel(site_key=str(site_key))
-                    self._codex_workers.release(site_key=str(site_key))
+                    self._codex_workers.release(site_key=str(site_key), dispatch=False)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         self._shutdown_if_idle()
@@ -1190,7 +1246,11 @@ class RuntimeHostService:
         batch = job_flow.job_store.load_batch(record.batch_id)
         if str(batch.get("execution_backend") or "provider") != CODEX_BACKEND:
             return None
-        return self._codex_workers.resume_work_order(record, message=message)
+        resumed = self._codex_workers.resume_work_order(record, message=message)
+        wait_for_turn_start = getattr(self._codex_workers, "wait_for_turn_start", None)
+        if callable(wait_for_turn_start):
+            return wait_for_turn_start(resumed)
+        return resumed
 
     def _record_codex_worker(self, record: Any) -> None:
         """Mirror adapter lifecycle metadata into existing site/session evidence."""
@@ -1326,6 +1386,26 @@ class RuntimeHostService:
             status=status,
             **metric_details,
         )
+        if status == "exhausted":
+            self._publish_agent_event(
+                kind="site.execution_recovery_exhausted",
+                attention="review_required",
+                summary=str(record.last_error or "Execution recovery was exhausted."),
+                site_key=record.site_key,
+                batch_id=record.batch_id,
+                thread_id=record.thread_id,
+                turn_id=record.turn_id,
+                phase=str(details.get("phase") or ""),
+                current_url=str(details.get("current_url") or ""),
+                details={"recovery_attempts": record.recovery_attempts},
+            )
+
+    def _publish_agent_event(self, **payload: Any) -> dict[str, Any] | None:
+        job_flow = getattr(self.loop, "job_flow", None)
+        publisher = getattr(job_flow, "publish_agent_event", None)
+        if not callable(publisher):
+            return None
+        return publisher(**payload)
 
     def _record_site_worker_batch_outcome(self, *, site_key: str, batch_id: str) -> None:
         """Persist terminal batch facts for an owning worker session."""

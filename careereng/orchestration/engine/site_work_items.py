@@ -54,8 +54,9 @@ class SiteWorkItemScheduler:
 
         normalized = str(site_key)
         active = self._active.pop(normalized, None)
+        queued = next((row for row in self._queued if row.site_key == normalized), None)
         self._queued = deque(row for row in self._queued if row.site_key != normalized)
-        return active
+        return active or queued
 
     def active(self, site_key: str) -> SiteWorkItem | None:
         return self._active.get(str(site_key))

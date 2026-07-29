@@ -2,7 +2,7 @@
 id: site-deepseek
 name: deepseek Site Skill
 version: v1
-updated_at: '2026-07-04'
+updated_at: '2026-07-29'
 scope: site
 site_key: deepseek
 status: ready
@@ -81,14 +81,16 @@ DeepSeek currently uses a Moka/High-Flyer recruiting surface.
 ### Authentication
 
 - For every apply-enabled DeepSeek run, establish a signed-in Moka candidate session before application review, retrieval, or apply work.
-- Navigate to the candidate/account surface when needed. A public jobs list alone is not proof of an authenticated candidate session.
+- Do not treat the candidate applications route, `投递记录`, `我的简历`, or `个人资料` by themselves as authentication proof: the logged-out Moka surface can expose those pages and their empty states.
+- First inspect or open the visible top-right avatar/account control and read its menu. Treat the session as authenticated only when that menu exposes a concrete signed-in identity together with an explicit `退出` / logout action, or another equally clear account-only logout signal.
+- If that signal is absent, use the visible DeepSeek/Moka login entry revealed by the account control or current anonymous surface. Do not continue to application review, retrieval, or apply from the anonymous jobs/candidate surface.
 - Require manual login/user takeover when the Moka page asks for account, password, verification, CAPTCHA, or other human-only input.
 - After the user completes login, continue from the same browser session.
 
 ### Ready Signal
 
-- The ready state is a signed-in Moka candidate/account surface that can open private application records without a login prompt.
-- Do not treat a public Moka/DeepSeek jobs surface as ready for an apply-enabled run.
+- The ready state is a visible signed-in candidate/account menu with a concrete identity and explicit `退出` / logout action.
+- Do not treat a public Moka/DeepSeek jobs surface, candidate applications route, or empty `投递记录` page as ready for an apply-enabled run.
 
 ## Channel Discovery
 

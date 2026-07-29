@@ -258,6 +258,16 @@ def refresh_browser_agent_work_order(
         }
         for phase in phase_rows
     ]
+    if continuation_context:
+        continuation_path_value = str(payload.get("continuation_context_path") or "").strip()
+        if continuation_path_value:
+            continuation_path = Path(continuation_path_value)
+            if not continuation_path.is_absolute():
+                continuation_path = workspace / continuation_path
+        else:
+            continuation_path = payload_path.parent / "continuation_context.json"
+        write_json(continuation_path, dict(continuation_context))
+        payload["continuation_context_path"] = _workspace_relative(workspace, continuation_path)
     now = now_iso()
     for row in (payload, session_payload):
         row.update(

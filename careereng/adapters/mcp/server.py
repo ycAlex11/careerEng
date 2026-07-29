@@ -20,6 +20,7 @@ from careereng.career.applications.job_store import JobStore, TERMINAL_BATCH_STA
 from careereng.career.applications.site_modes import SITE_MODES
 from careereng.career.applications.site_store import SiteStore
 from careereng.platform.runtime_host import RUNTIME_HOST_PROTOCOL_VERSION, runtime_host_client, runtime_host_status
+from careereng.platform.project_state import AgentEventStore
 from careereng.utils import make_id
 
 
@@ -43,6 +44,9 @@ class CareerEngMCPRuntime:
 
     def site_store(self) -> SiteStore:
         return SiteStore(self.workspace, project_root=self.project_root)
+
+    def agent_events(self) -> AgentEventStore:
+        return AgentEventStore(self.workspace)
 
     def host_client(self):
         # The desktop adapter must never create a browser-owning process inside
@@ -190,6 +194,38 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
     def careereng_runtime_host_status() -> dict[str, Any]:
         """Check whether the user-owned local runtime host is reachable."""
         return runtime_host_status(project_root=runtime.project_root, workspace=runtime.workspace)
+
+    @server.tool()
+    def careereng_list_agent_events(
+        cursor: str = "",
+        site_key: str = "",
+        include_notifications: bool = True,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Read new durable events for the Codex Desktop main-agent inbox."""
+        return {
+            "ok": True,
+            **runtime.agent_events().list_events(
+                consumer_id="codex_desktop",
+                cursor=cursor,
+                site_key=site_key,
+                include_notifications=include_notifications,
+                limit=limit,
+            ),
+        }
+
+    @server.tool()
+    def careereng_ack_agent_events(cursor: str) -> dict[str, Any]:
+        """Acknowledge agent events through a durable Desktop cursor."""
+        try:
+            return {"ok": True, **runtime.agent_events().acknowledge(consumer_id="codex_desktop", cursor=cursor)}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @server.tool()
+    def careereng_get_agent_status(site_key: str = "") -> dict[str, Any]:
+        """Return current host-owned execution state grouped by site, not batch."""
+        return runtime.host_client().agent_status(site_key=site_key)
 
     @server.tool()
     def careereng_get_context(

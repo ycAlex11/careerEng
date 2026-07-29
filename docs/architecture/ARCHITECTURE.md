@@ -281,6 +281,33 @@ missing or stale host is a recoverable infrastructure condition, reported as
 `runtime_host_unavailable` or `runtime_host_protocol_mismatch`, never as a job
 or site failure.
 
+## Main-Agent Events And Live Status
+
+Concurrent site workers never write directly into the Codex Desktop
+conversation. They report lifecycle facts through CareerEng. The shared event
+store persists a compact, append-only main-agent inbox at
+`workspace/agent_events/events.jsonl`; Desktop maintains its own acknowledgement
+cursor there. This persistence is authoritative, so a Desktop restart or a
+temporarily unavailable callback receiver cannot lose a user-required event.
+
+Events carry site, batch, thread, turn, phase, URL, summary, and one attention
+classification:
+
+- `action_required`: user browser/profile action such as sign-in, CAPTCHA, or
+  missing information.
+- `review_required`: bounded recovery is exhausted or the worker needs a user
+  decision.
+- `notification`: site or batch completion and report availability.
+- `audit`: detailed execution facts that stay outside the default Desktop inbox.
+
+`careereng_list_agent_events` and `careereng_ack_agent_events` are polling
+tools for this inbox. `careereng_get_agent_status` is separate: it reads the
+host's current per-site worker/browser state and answers what is running now.
+It is not a batch projection and it does not replace durable events. A future
+Desktop callback adapter may register with the event dispatcher for
+`action_required` and `review_required`; it must only wake Desktop after the
+same event is already durable.
+
 CLI may explicitly run the lifecycle commands:
 
 ```text
@@ -479,7 +506,8 @@ CareerEng batch/site work item
   -> Codex thread receives a work_item_id and pulls scoped MCP context
   -> Codex thread uses CareerEng MCP/browser/state tools
   -> Codex App Server emits turn lifecycle events
-  -> CareerEng records thread/turn linkage and updates batch evidence
+  -> CareerEng records thread/turn linkage, updates batch evidence, and emits
+     a durable main-agent event when user attention or a completion milestone is needed
 ```
 
 One `site + batch` has one active work item at a time. A persisted

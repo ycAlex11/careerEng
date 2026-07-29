@@ -34,6 +34,7 @@ from careereng.career.resume.store import CVStore
 from careereng.career.applications.job_store import JobStore
 from careereng.orchestration.engine.router_store import RouterStore
 from careereng.platform.observability.run_store import RunStore
+from careereng.platform.project_state import AgentEventStore
 from careereng.career.applications.search_store import SearchStore
 from careereng.career.applications.site_tools import SiteTools
 from careereng.utils import make_id, safe_file_stem
@@ -80,6 +81,7 @@ class AgentLoop:
         self.search_store = SearchStore(workspace)
         self.application_store = ApplicationStore(workspace)
         self.job_store = JobStore(workspace)
+        self.agent_events = AgentEventStore(workspace)
         self.site_tools = site_tools
         setattr(self.site_tools, "project_root", self.project_root)
         self.channel_locator = ChannelLocator(site_tools=self.site_tools, search_store=self.search_store)
@@ -123,6 +125,7 @@ class AgentLoop:
             profile_store=self.profile_store,
             cv_store=self.cv_store,
             intent_store=self.intent_store,
+            agent_events=self.agent_events,
             site_parallelism=self.site_parallelism,
             browser_budgets=browser_budgets,
         )

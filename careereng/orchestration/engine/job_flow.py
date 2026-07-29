@@ -38,6 +38,7 @@ from careereng.career.applications.reports import generate_job_batch_report
 from careereng.career.applications.application_store import ApplicationStore
 from careereng.career.applications.job_store import JobStore, TERMINAL_BATCH_STATUSES
 from careereng.career.applications.site_tools import SiteTools
+from careereng.platform.project_state import AgentEventStore
 
 
 class JobFlow:
@@ -92,6 +93,7 @@ class JobFlow:
         profile_store: Any,
         cv_store: Any,
         intent_store: Any,
+        agent_events: AgentEventStore | None = None,
         site_parallelism: int = 2,
         browser_budgets: BrowserBudgetsConfig | None = None,
     ):
@@ -108,6 +110,7 @@ class JobFlow:
         self.profile_store = profile_store
         self.cv_store = cv_store
         self.intent_store = intent_store
+        self.agent_events = agent_events
         self.site_parallelism = max(1, int(site_parallelism or 1))
         self.browser_budgets = browser_budgets or BrowserBudgetsConfig()
         self.applications = ApplicationPlanningService(
@@ -140,6 +143,37 @@ class JobFlow:
         set_signal_recorder = getattr(self.browser_runner, "set_evolution_signal_recorder", None)
         if callable(set_signal_recorder):
             set_signal_recorder(self.loop_engine.record_phase_signal)
+
+    def publish_agent_event(
+        self,
+        *,
+        kind: str,
+        attention: str,
+        summary: str,
+        site_key: str = "",
+        batch_id: str = "",
+        thread_id: str = "",
+        turn_id: str = "",
+        phase: str = "",
+        current_url: str = "",
+        details: dict[str, Any] | None = None,
+        dedupe_key: str = "",
+    ) -> dict[str, Any] | None:
+        if self.agent_events is None:
+            return None
+        return self.agent_events.publish(
+            kind=kind,
+            attention=attention,
+            summary=summary,
+            site_key=site_key,
+            batch_id=batch_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            phase=phase,
+            current_url=current_url,
+            details=details,
+            dedupe_key=dedupe_key,
+        )
 
     @property
     def APPLY_JOB_PHASE_TIMEOUT_SECONDS(self) -> int:
@@ -417,7 +451,19 @@ class JobFlow:
                 "final_markdown_path": str(report.get("final_markdown_path") or ""),
             },
         )
-        if str(batch.get("status") or "") in {"completed", "partial_completed", "failed", "cancelled"}:
+        terminal_status = str(batch.get("status") or "")
+        if terminal_status in {"completed", "partial_completed", "failed", "cancelled"}:
+            self.publish_agent_event(
+                kind="batch.completed",
+                attention="notification",
+                summary=f"Batch {batch_id} finished with status {terminal_status}.",
+                batch_id=batch_id,
+                details={
+                    "batch_status": terminal_status,
+                    "report_markdown_path": str(report.get("final_markdown_path") or report.get("markdown_path") or ""),
+                },
+                dedupe_key=f"batch_terminal:{batch_id}:{terminal_status}",
+            )
             end_history_view = getattr(self.site_tools.site_store, "end_batch_history_view", None)
             if callable(end_history_view):
                 for site_key in (batch.get("sites") or {}):
@@ -468,6 +514,17 @@ class JobFlow:
                 "browser.runtime_released",
                 {"batch_id": batch_id, "site_key": site_key, "scope": "site_terminal"},
             )
+        self.publish_agent_event(
+            kind="site.completed",
+            attention="notification",
+            summary=str(site.get("message") or "Site execution completed."),
+            site_key=site_key,
+            batch_id=batch_id,
+            phase=str(site.get("current_phase") or ""),
+            current_url=str(site.get("current_url") or ""),
+            details={"site_status": str(site.get("status") or "")},
+            dedupe_key=f"site_terminal:{batch_id}:{site_key}:{site.get('status') or ''}",
+        )
 
     def _generate_workflow_evolution_summary_if_possible(self, batch: dict[str, Any]) -> None:
         batch_id = str(batch.get("batch_id") or "")
@@ -1875,6 +1932,17 @@ class JobFlow:
         batch = self.job_store.update_site(batch, site_key, updated)
         batch["status"] = self._compute_batch_status(batch)
         batch = self.job_store.save_batch(batch)
+        if normalized_status == "waiting_user":
+            self.publish_agent_event(
+                kind="site.waiting_user",
+                attention="action_required",
+                summary=str(summary or "User action is required to continue this site."),
+                site_key=site_key,
+                batch_id=str(batch.get("batch_id") or ""),
+                phase=str(phase or ""),
+                current_url=current_url,
+                details={"resume_available": True},
+            )
         return {
             "handled": True,
             "batch_id": str(batch.get("batch_id") or ""),
@@ -2606,6 +2674,17 @@ class JobFlow:
                         site_key=site_key,
                         site=latest_row,
                     )
+                    if str(latest_row.get("status") or "") == "waiting_user":
+                        self.publish_agent_event(
+                            kind="site.waiting_user",
+                            attention="action_required",
+                            summary=str(latest_row.get("message") or "User action is required to continue this site."),
+                            site_key=site_key,
+                            batch_id=batch_id,
+                            phase=str(latest_row.get("current_phase") or ""),
+                            current_url=str(latest_row.get("current_url") or ""),
+                            details={"resume_available": True},
+                        )
                 if generate_report:
                     self._generate_batch_report_if_possible(batch)
                 return dict(latest_row) if isinstance(latest_row, dict) else dict(updated)
@@ -2814,14 +2893,16 @@ class JobFlow:
     def _parse_resume_signal(self, message: str) -> tuple[str, str] | None:
         raw = message.strip()
         match = re.match(
-            r"^([A-Za-z0-9][A-Za-z0-9\-]*)\s+(done|ok|ready|完成|y|yes|n|no|是|否|好|取消)$",
+            r"^([A-Za-z0-9][A-Za-z0-9\-]*)(?:\s+(.+))?$",
             raw,
             flags=re.I,
         )
         if not match:
             return None
         site_key = match.group(1).strip().lower()
-        decision = match.group(2).strip().lower()
+        # The site key is resolved against the current resumable batch before
+        # this is acted on. Keep the remainder intact for the resumed agent.
+        decision = str(match.group(2) or "done").strip().lower()
         return site_key, decision
 
     def resolve_resume_site_key(self, *, session_id: str, message: str, site_key: str = "") -> str:

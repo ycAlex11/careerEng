@@ -278,6 +278,21 @@ class SiteAgentWorkerCoordinator:
             self._dispatch_locked()
             return self._active.get(record.site_key, record)
 
+    def wait_for_turn_start(self, record: AgentWorkerRecord, *, timeout_seconds: float = 10.0) -> AgentWorkerRecord:
+        """Confirm that a requested resume owns a live external-agent turn."""
+
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds or 0.1))
+        while time.monotonic() < deadline:
+            with self._lock:
+                current = self._active.get(record.site_key)
+                if current is not None and current.work_item_id == record.work_item_id:
+                    if current.turn_id and current.status in {"running", "recovering"}:
+                        return current
+                    if current.status in {"unavailable", "execution_unavailable", "interrupted", "cancelled"}:
+                        raise RuntimeError(current.last_error or f"worker resume failed with status={current.status}")
+            time.sleep(0.01)
+        raise RuntimeError(f"timed out waiting for resumed worker turn: site={record.site_key}")
+
     def _queue_successor_locked(self, record: AgentWorkerRecord, *, message: str) -> None:
         """Keep a distinct work item pending without disturbing the active one."""
 
@@ -302,20 +317,25 @@ class SiteAgentWorkerCoordinator:
             self._persist_locked(record)
             return record
 
-    def release(self, *, site_key: str) -> AgentWorkerRecord | None:
+    def release(self, *, site_key: str, dispatch: bool = True) -> AgentWorkerRecord | None:
         with self._lock:
-            record = self._active.pop(str(site_key), None)
-            self._successors.pop(str(site_key), None)
-            paused = self._paused.pop(str(site_key), None)
-            self._pause_requested.discard(str(site_key))
+            normalized_site_key = str(site_key)
+            record = self._active.pop(normalized_site_key, None)
+            self._successors.pop(normalized_site_key, None)
+            paused = self._paused.pop(normalized_site_key, None)
+            queued = self._scheduler.discard(normalized_site_key)
+            self._pause_requested.discard(normalized_site_key)
             if record is None:
                 record = paused
+            if record is None and isinstance(queued.payload if queued is not None else None, AgentWorkerRecord):
+                record = queued.payload
             if record is None:
                 return None
             self._by_thread.pop(record.thread_id, None)
             record.status = "released"
             self._persist_locked(record)
-            self._dispatch_locked()
+            if dispatch:
+                self._dispatch_locked()
             return record
 
     def snapshot(self) -> dict[str, Any]:
@@ -660,11 +680,15 @@ class SiteAgentWorkerCoordinator:
                 return
             self._persist_locked(record, bind_thread=current_payload.work_item_id == record.work_item_id)
             self._active.pop(record.site_key, None)
-            self._scheduler.complete(record.site_key)
             self._by_thread.pop(str(event.thread_id), None)
             if worker_state == "waiting_user":
+                # A user takeover retains the browser and its resume context.
+                # It therefore keeps its scheduler slot until the site is
+                # completed, cancelled, or explicitly released.
                 record.status = "waiting_user"
                 self._paused[record.site_key] = record
+                return
+            self._scheduler.complete(record.site_key)
             successor = self._successors.pop(record.site_key, None)
             if successor is not None:
                 self._scheduler.enqueue(SiteWorkItem(successor.site_key, successor.batch_id, successor))
