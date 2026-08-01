@@ -382,6 +382,12 @@ remain compatibility exports only. Domain stores still own their workspace
 schemas, paths, and semantic state transitions; platform persistence must not
 centralize those decisions.
 
+JSONL primitives provide forward and reverse bounded iteration, but do not
+interpret rows. Application history remains owned by `career/applications/`:
+its canonical job records stay in the site history document, while a derived
+site-local activity index supports recent-observation reads. Observation time
+is never treated as a job publication date.
+
 ## Evolution Work Items
 
 `evolution/work_items/` owns durable, assistant-facing evolution work items.

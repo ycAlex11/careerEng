@@ -88,7 +88,7 @@ class CodexMainAgentBridge:
         """Retry persisted attention events after a bridge or App Server restart."""
 
         delivered = 0
-        for event in self.event_store.events.read_all():
+        for event in self.event_store.events.iter_rows():
             if not isinstance(event, dict) or str(event.get("attention") or "") not in _ATTENTION_EVENTS:
                 continue
             if self._delivery_status(str(event.get("event_id") or "")) == "delivered":

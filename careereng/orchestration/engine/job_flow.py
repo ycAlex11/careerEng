@@ -1232,16 +1232,10 @@ class JobFlow:
         if path is None or not path.exists():
             return False
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            lines = JSONLStore(path).read_last(300)
         except OSError:
             return False
-        for line in reversed(lines[-300:]):
-            if not line.strip():
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for event in reversed(lines):
             if isinstance(event, dict) and self._trace_event_started_apply_flow(event, job_url=job_url):
                 return True
         return False

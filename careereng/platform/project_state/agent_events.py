@@ -130,7 +130,7 @@ class AgentEventStore:
         }
         with self._lock:
             if normalized_dedupe_key:
-                for existing in self.events.read_all():
+                for existing in self.events.iter_rows_reverse():
                     if str(existing.get("dedupe_key") or "") == normalized_dedupe_key:
                         return existing
             self.events.append(event)
@@ -151,13 +151,11 @@ class AgentEventStore:
         with self._lock:
             cursors = self._load_cursors()
             effective_cursor = requested_cursor or str(cursors.get(consumer) or "")
-            rows = self.events.read_all()
-        start_index = self._index_after_cursor(rows, effective_cursor)
         filtered: list[dict[str, Any]] = []
         normalized_site = str(site_key or "").strip()
         cursor_can_advance = not normalized_site and include_notifications
         scanned_cursor = effective_cursor
-        for row in rows[start_index:]:
+        for row in self._iter_rows_after_cursor(effective_cursor):
             scanned_cursor = str(row.get("event_id") or scanned_cursor)
             if normalized_site and str(row.get("site_key") or "") != normalized_site:
                 continue
@@ -184,8 +182,10 @@ class AgentEventStore:
         consumer = str(consumer_id or "codex_desktop").strip() or "codex_desktop"
         acknowledged_cursor = str(cursor or "").strip()
         if acknowledged_cursor:
-            event_ids = {str(row.get("event_id") or "") for row in self.events.read_all()}
-            if acknowledged_cursor not in event_ids:
+            if not any(
+                str(row.get("event_id") or "") == acknowledged_cursor
+                for row in self.events.iter_rows_reverse()
+            ):
                 raise ValueError(f"unknown agent event cursor: {acknowledged_cursor}")
         with self._lock:
             cursors = self._load_cursors()
@@ -198,11 +198,19 @@ class AgentEventStore:
         rows = payload.get("consumers") if isinstance(payload.get("consumers"), dict) else {}
         return {str(key): str(value) for key, value in rows.items() if str(key)}
 
-    @staticmethod
-    def _index_after_cursor(rows: list[dict[str, Any]], cursor: str) -> int:
+    def _iter_rows_after_cursor(self, cursor: str):
+        """Stream rows after a durable cursor without materializing the inbox."""
+
         if not cursor:
-            return 0
-        for index, row in enumerate(rows):
+            yield from self.events.iter_rows()
+            return
+        found_cursor = False
+        for row in self.events.iter_rows():
             if str(row.get("event_id") or "") == cursor:
-                return index + 1
-        return 0
+                found_cursor = True
+                continue
+            if found_cursor:
+                yield row
+        if not found_cursor:
+            # Preserve the former compatibility behavior for an unknown cursor.
+            yield from self.events.iter_rows()

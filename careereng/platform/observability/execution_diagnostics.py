@@ -32,11 +32,14 @@ class ExecutionDiagnosticStore:
         path = self.path
         if path is None or not path.is_file():
             return []
-        rows = JSONLStore(path).read_all()
-        matched = [
-            row for row in rows
-            if isinstance(row, dict)
-            and str(row.get("site_key") or "") == str(site_key or "")
-            and (not batch_id or str(row.get("batch_id") or "") == str(batch_id))
-        ]
-        return matched[-max(1, int(limit or 1)):]
+        matched: list[dict[str, Any]] = []
+        for row in JSONLStore(path).iter_rows_reverse():
+            if str(row.get("site_key") or "") != str(site_key or ""):
+                continue
+            if batch_id and str(row.get("batch_id") or "") != str(batch_id):
+                continue
+            matched.append(row)
+            if len(matched) >= max(1, int(limit or 1)):
+                break
+        matched.reverse()
+        return matched

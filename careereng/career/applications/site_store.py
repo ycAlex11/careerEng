@@ -557,6 +557,11 @@ class SiteStore:
         self._ensure_site_tree(root)
         return root / "jobs" / "history_jobs.json"
 
+    def _history_activity_index_path(self, site_id: str) -> Path:
+        root = self.site_dir(site_id)
+        self._ensure_site_tree(root)
+        return root / "jobs" / "history_activity_index.jsonl"
+
     def _job_runs_dir(self, site_id: str) -> Path:
         root = self.site_dir(site_id)
         self._ensure_site_tree(root)
@@ -1495,7 +1500,88 @@ class SiteStore:
             + "\n",
             encoding="utf-8",
         )
+        self._write_history_activity_index(site_id, compacted_rows)
         self._sync_batch_history_views(site_id, compacted_rows)
+
+    def _write_history_activity_index(self, site_id: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        indexed_rows = self._history_activity_index_rows(rows)
+        JSONLStore(self._history_activity_index_path(site_id)).write_all(indexed_rows)
+        return indexed_rows
+
+    @staticmethod
+    def _history_activity_at(row: dict[str, Any]) -> str:
+        """Return local observation time only; this is never a job publish date."""
+
+        for field in (
+            "last_seen_at",
+            "application_review_checked_at",
+            "posted_observed_at",
+            "observed_at",
+            "ts",
+            "first_seen_at",
+        ):
+            value = str(row.get(field) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _history_activity_index_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        indexed_rows: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            indexed_rows.append(
+                {
+                    "job_id": str(row.get("job_id") or ""),
+                    "canonical_job_id": str(row.get("canonical_job_id") or ""),
+                    "title": str(row.get("title") or ""),
+                    "url": str(row.get("url") or ""),
+                    "activity_at": self._history_activity_at(row),
+                    "first_seen_at": str(row.get("first_seen_at") or ""),
+                    "last_seen_at": str(row.get("last_seen_at") or ""),
+                    "application_status": str(row.get("application_status") or ""),
+                    "application_review_status": str(row.get("application_review_status") or ""),
+                    "decision_status": str(row.get("decision_status") or ""),
+                    "apply_state": str(row.get("apply_state") or ""),
+                }
+            )
+        return sorted(
+            indexed_rows,
+            key=lambda item: (str(item.get("activity_at") or ""), str(item.get("job_id") or "")),
+            reverse=True,
+        )
+
+    def iter_history_activity(
+        self,
+        site_id: str,
+        *,
+        since_at: str = "",
+        limit: int = 0,
+    ):
+        """Yield local history activity newest-first, stopping at a local time boundary.
+
+        ``activity_at`` represents when CareerEng observed or updated a row. It
+        is deliberately separate from a job's published date, which can remain
+        unknown for sites such as AMD.
+        """
+
+        normalized_since = str(since_at or "").strip()
+        yielded = 0
+        index_path = self._history_activity_index_path(site_id)
+        if index_path.exists() and index_path.stat().st_size:
+            rows = JSONLStore(index_path).iter_rows()
+        else:
+            # Compatibility for older workspaces: create only derived local
+            # metadata, without changing canonical history or job decisions.
+            rows = iter(self._write_history_activity_index(site_id, self._load_history_jobs(site_id)))
+        for row in rows:
+            activity_at = str(row.get("activity_at") or "")
+            if normalized_since and activity_at and activity_at < normalized_since:
+                break
+            yield row
+            yielded += 1
+            if limit > 0 and yielded >= limit:
+                break
 
     def _inspect_legacy_job_data(self, root: Path) -> tuple[bool, bool]:
         catalog = root / "jobs" / "catalog.jsonl"
@@ -2502,7 +2588,7 @@ class SiteStore:
     ) -> list[dict[str, Any]]:
         # Application review itself establishes the latest canonical state;
         # the shared batch view is created/refreshed immediately afterwards.
-        history_rows = self._load_history_jobs(site_id)
+        history_rows = self._history_rows_for_batch(site_id, batch_id)
         by_job_id, by_canonical_job_id, by_match_key = self._history_indexes_for_batch(
             site_id,
             history_rows,

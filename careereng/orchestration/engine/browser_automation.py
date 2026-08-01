@@ -1270,17 +1270,16 @@ class BrowserAutomationService:
         path = self.site_store.site_dir(site_key) / "events" / "all.jsonl"
         if not path.exists():
             return ""
-        latest = ""
-        for row in JSONLStore(path).read_all():
+        for row in JSONLStore(path).iter_rows_reverse():
             if str(row.get("name") or "") != "browser.phase.done":
                 continue
             payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
             if str(payload.get("phase") or "") != "session_preparation":
                 continue
             ts = str(row.get("ts") or "")
-            if ts and ts > latest:
-                latest = ts
-        return latest
+            if ts:
+                return ts
+        return ""
 
     @classmethod
     def _resume_upload_needed(cls, *, resume_updated_at: str, last_preparation_at: str) -> bool:
