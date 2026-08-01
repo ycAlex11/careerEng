@@ -147,6 +147,23 @@ artifact. Cache validation events are indexed into evolution evidence packs so
 later user-approved evolution can decide whether to promote a repeated result
 into a lesson, Skill patch, or infrastructure proposal.
 
+## Durable Work-Item Boundary
+
+Every external-agent task has one persisted `work_item_id`, indexed in
+`workspace/agent_bridge/work_items/index.json`. MCP resolves authorization and
+scope from that index plus the payload, never from mutable browser-session
+metadata. Browser sessions may display the current work order, but losing or
+refreshing that display field must not invalidate an active task. Work-item
+lifecycle events are append-only in the same workspace directory; a worker
+turn, phase transition, and user wait refresh the existing item rather than
+creating a new task identity.
+
+`platform/observability/execution_diagnostics.py` records objective execution
+facts such as inactivity recovery, browser/transport errors, and checkpoints.
+They are exposed as an on-demand work-item resource. Python records and scopes
+the evidence; the agent decides whether it indicates user input, retry-later,
+recovery, exploration, or a proposal.
+
 ## Site Mode And Evolution Boundary
 
 Site Skill front matter carries one structural execution mode and one separate
@@ -249,6 +266,14 @@ from persisted unfinished batch/site records and their current work item.
 Only the user can request an explicitly isolated batch, or a new batch begins
 after the prior one has ended.
 
+A batch is a run group, not a site lifecycle gate. Each site independently
+owns retrieval, application, `waiting_user` resume, exploration synthesis,
+and its effective-run counter. When one site finishes browser work, its Codex
+thread performs that site's summary immediately while other sites in the same
+batch continue. A site summary is therefore represented on its site row and
+never changes the whole batch to `waiting_solution`. Only after every site has
+settled does the batch produce its aggregate report and become releasable.
+
 ## Runtime Host Boundary
 
 `platform/runtime_host/` owns the workspace-scoped local process boundary for
@@ -303,10 +328,16 @@ classification:
 `careereng_list_agent_events` and `careereng_ack_agent_events` are polling
 tools for this inbox. `careereng_get_agent_status` is separate: it reads the
 host's current per-site worker/browser state and answers what is running now.
-It is not a batch projection and it does not replace durable events. A future
-Desktop callback adapter may register with the event dispatcher for
-`action_required` and `review_required`; it must only wake Desktop after the
-same event is already durable.
+It is not a batch projection and it does not replace durable events.
+
+For immediate Codex delivery, `careereng_register_main_agent` stores the
+current App Server thread id at `workspace/agent_events/main_agent.json`. The
+Codex-specific `adapters/codex/main_agent_bridge.py` subscribes to the shared
+dispatcher, then delivers only durable `action_required` and `review_required`
+events to that registered thread. Delivery attempts are recorded separately;
+an App Server failure leaves the event in the inbox for retry after a new
+registration or host restart. Replacing the registered thread id transfers
+future main-agent notifications to the new Desktop control conversation.
 
 CLI may explicitly run the lifecycle commands:
 
@@ -519,8 +550,9 @@ configured effective-run boundary. At that boundary CareerEng creates an
 evolution review task; it does not automatically make a business decision.
 An exploration run creates the same review task immediately after its terminal
 evidence is persisted. The applied Codex proposal decides either `ready` or a
-bounded follow-up exploration run; the batch itself is never rewritten to
-`waiting_solution` just to hold that review task.
+bounded follow-up exploration run. A follow-up requeues only that site in the
+same batch and retains its Codex thread; the batch itself is never rewritten
+to `waiting_solution` just to hold that review task.
 
 `orchestration/engine/site_work_items.py` owns generic queue and slot
 semantics, `orchestration/engine/agent_workers.py` owns retained external-agent

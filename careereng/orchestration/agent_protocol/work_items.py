@@ -24,6 +24,7 @@ _RESOURCE_DESCRIPTIONS = {
     "full_cv": "Current full CV text, available on demand when detailed evidence is needed.",
     "full_persona": "Current detailed persona/profile data, available on demand.",
     "history_view": "Current site-only batch history view, available on demand.",
+    "execution_diagnostics": "Recent objective runtime, browser, and transport diagnostics for this site work item.",
     "evolution_solution_request": "The persisted synthesis request and required proposal contract.",
     "evolution_evidence_pack": "The persisted evidence pack for the current synthesis request.",
     "evolution_summary_brief": "Small persisted run metadata and output contract for starting a synthesis without loading evidence.",
@@ -91,7 +92,7 @@ def build_work_item_context(payload: dict[str, Any]) -> dict[str, Any]:
     phase_context = payload.get("current_phase_context")
     phase_context = phase_context if isinstance(phase_context, dict) else {}
     phase = phase_context.get("phase") if isinstance(phase_context.get("phase"), dict) else {}
-    resource_ids = [name for name in _RESOURCE_DESCRIPTIONS if name in phase_context or name == "state_tools"]
+    resource_ids = [name for name in _RESOURCE_DESCRIPTIONS if name in phase_context or name in {"state_tools", "execution_diagnostics"}]
     if str(payload.get("current_phase") or phase.get("slug") or "") == "apply":
         resource_ids.extend(["apply_facts", "full_cv", "full_persona", "history_view"])
     return {

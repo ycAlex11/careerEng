@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import errno
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .errors import RuntimeHostError, RuntimeHostProtocolMismatchError, RuntimeHostUnavailableError
+from .errors import (
+    RuntimeHostAccessDeniedError,
+    RuntimeHostError,
+    RuntimeHostProtocolMismatchError,
+    RuntimeHostUnavailableError,
+)
 from .protocol import RUNTIME_HOST_PROTOCOL_VERSION, protocol_version_from, with_runtime_host_protocol
 from careereng.orchestration.agent_protocol.runtime_lifecycle import RELEASE_SITE_OPERATION, release_site_payload
 from .service import (
@@ -56,8 +63,19 @@ class RuntimeHostClient:
                 with_runtime_host_protocol({"op": operation, **(payload or {})}),
                 timeout=timeout,
             )
-        except RuntimeHostProtocolMismatchError:
+        except (RuntimeHostAccessDeniedError, RuntimeHostProtocolMismatchError):
             raise
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EPERM}:
+                raise RuntimeHostAccessDeniedError(
+                    "The current process cannot inspect the CareerEng runtime host socket. "
+                    "This does not mean the host is stopped."
+                ) from exc
+            raise RuntimeHostUnavailableError(
+                "CareerEng runtime host is unavailable. Start it in the local user environment with "
+                "`python -m careereng runtime-host serve`; do not retry browser operations in this agent process. "
+                f"details={exc}"
+            ) from exc
         except Exception as exc:
             raise RuntimeHostUnavailableError(
                 "CareerEng runtime host is unavailable. Start it in the local user environment with "
@@ -98,6 +116,11 @@ class RuntimeHostClient:
 
         return self.request("agent_status", {"site_key": str(site_key or "")}, timeout=3.0)
 
+    def main_agent_registration_updated(self) -> dict[str, Any]:
+        """Ask a running host bridge to retry any durable pending attention events."""
+
+        return self.request("main_agent_registration_updated", timeout=3.0)
+
     @staticmethod
     def _validate_response(response: dict[str, Any]) -> None:
         remote_version = protocol_version_from(response)
@@ -118,13 +141,32 @@ def runtime_host_status(*, project_root: Path, workspace: Path) -> dict[str, Any
     """Read host health without auto-starting a process."""
 
     client = runtime_host_client(project_root=project_root, workspace=workspace, autostart=False)
-    try:
-        return {"ok": True, "running": True, "socket_path": str(runtime_host_socket_path(workspace)), "host": client.ping()}
-    except RuntimeHostError as exc:
-        return {
-            "ok": False,
-            "running": False,
-            "socket_path": str(runtime_host_socket_path(workspace)),
-            "error_code": exc.error_code,
-            "error": str(exc),
-        }
+    last_error: RuntimeHostError | None = None
+    for attempt in range(3):
+        try:
+            return {
+                "ok": True,
+                "running": True,
+                "socket_path": str(runtime_host_socket_path(workspace)),
+                "host": client.ping(),
+            }
+        except RuntimeHostAccessDeniedError as exc:
+            return {
+                "ok": False,
+                "running": None,
+                "socket_path": str(runtime_host_socket_path(workspace)),
+                "error_code": exc.error_code,
+                "error": str(exc),
+            }
+        except RuntimeHostError as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.15)
+    assert last_error is not None
+    return {
+        "ok": False,
+        "running": False,
+        "socket_path": str(runtime_host_socket_path(workspace)),
+        "error_code": last_error.error_code,
+        "error": str(last_error),
+    }

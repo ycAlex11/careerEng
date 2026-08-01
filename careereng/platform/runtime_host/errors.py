@@ -11,5 +11,11 @@ class RuntimeHostUnavailableError(RuntimeHostError):
     error_code = "runtime_host_unavailable"
 
 
+class RuntimeHostAccessDeniedError(RuntimeHostError):
+    """The caller cannot inspect an otherwise unknown local host socket."""
+
+    error_code = "runtime_host_access_denied"
+
+
 class RuntimeHostProtocolMismatchError(RuntimeHostError):
     error_code = "runtime_host_protocol_mismatch"

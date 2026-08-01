@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 
 from careereng.adapters.bootstrap import project_root_from_cwd, workspace_path as resolve_workspace_path
 from careereng.orchestration.agent_protocol.work_items import build_work_item_context, read_work_item_resource, work_item_id_from_payload
+from careereng.orchestration.agent_protocol.work_item_store import WorkItemStore
 from careereng.adapters.external_agents.contracts import AGENT_BRIDGE_PROTOCOL_VERSION
 from careereng.orchestration.agent_protocol.runtime_lifecycle import release_site_payload
 from careereng.career.applications.job_store import JobStore, TERMINAL_BATCH_STATUSES
@@ -118,23 +119,7 @@ def _latest_batch(store: JobStore, *, session_id: str, batch_id: str) -> dict[st
 def _active_work_item_payload(runtime: CareerEngMCPRuntime, work_item_id: str) -> dict[str, Any]:
     """Resolve an active persisted work item without exposing its file path."""
 
-    requested = str(work_item_id or "").strip()
-    if not requested:
-        raise ValueError("work_item_id is required")
-    for site in runtime.site_store().list_sites(status="active"):
-        site_key = str(site.get("site_key") or site.get("site_id") or "").strip()
-        if not site_key:
-            continue
-        session = runtime.site_store().load_browser_session(site_key)
-        payload_path = Path(str(session.get("agent_bridge_payload_path") or ""))
-        if not payload_path.is_file():
-            continue
-        from careereng.utils import read_json
-
-        payload = read_json(payload_path)
-        if isinstance(payload, dict) and work_item_id_from_payload(payload) == requested:
-            return payload
-    raise ValueError("active work item was not found")
+    return WorkItemStore(runtime.workspace).resolve_active(work_item_id)
 
 
 def _active_work_item_scope(runtime: CareerEngMCPRuntime, work_item_id: str) -> dict[str, Any]:
@@ -223,6 +208,27 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             return {"ok": False, "error": str(exc)}
 
     @server.tool()
+    def careereng_register_main_agent(thread_id: str) -> dict[str, Any]:
+        """Register this Codex App Server thread as the workspace main agent."""
+        try:
+            registration = runtime.agent_events().register_main_agent(thread_id=thread_id)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        retry: dict[str, Any] = {}
+        try:
+            retry = runtime.host_client().main_agent_registration_updated()
+        except Exception:
+            # The registration is durable. A future host start retries pending
+            # events even when the current host is intentionally offline.
+            retry = {"deferred": True}
+        return {"ok": True, **registration, "delivery_retry": retry}
+
+    @server.tool()
+    def careereng_get_main_agent_registration() -> dict[str, Any]:
+        """Return the current workspace main-agent callback target."""
+        return {"ok": True, "registration": runtime.agent_events().main_agent_registration()}
+
+    @server.tool()
     def careereng_get_agent_status(site_key: str = "") -> dict[str, Any]:
         """Return current host-owned execution state grouped by site, not batch."""
         return runtime.host_client().agent_status(site_key=site_key)
@@ -299,7 +305,19 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             }
             if requested not in catalog_ids:
                 raise ValueError(f"work-item resource is not available: {requested or '<missing>'}")
-            if requested in {"apply_facts", "full_cv", "full_persona", "history_view"}:
+            if requested == "execution_diagnostics":
+                scope = _active_work_item_scope(runtime, work_item_id)
+                from careereng.platform.observability import ExecutionDiagnosticStore
+
+                resource = {
+                    "work_item_id": scope["work_item_id"],
+                    "resource_id": requested,
+                    "value": ExecutionDiagnosticStore(runtime.workspace).latest(
+                        site_key=scope["site_key"],
+                        batch_id=scope["batch_id"],
+                    ),
+                }
+            elif requested in {"apply_facts", "full_cv", "full_persona", "history_view"}:
                 scope = _active_work_item_scope(runtime, work_item_id)
                 response = runtime.host_client().request(
                     "agent_bridge_read_context_resource",

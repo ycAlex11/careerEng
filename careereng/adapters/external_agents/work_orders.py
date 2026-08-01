@@ -16,6 +16,7 @@ from careereng.platform.observability import PerformanceRecorder
 from careereng.platform.cache import CacheArtifactStore
 from careereng.evolution.memory_units import active_run_local_guidance
 from careereng.orchestration.agent_protocol.state_tools import state_tool_schemas_for_phase
+from careereng.orchestration.agent_protocol.work_item_store import WorkItemStore
 from careereng.utils import ensure_dir, make_id, now_iso, read_json, safe_file_stem, write_json
 
 
@@ -177,6 +178,7 @@ def advance_browser_agent_work_order(
     )
     write_json(payload_path, payload)
     write_json(phase_session_path, session_payload)
+    WorkItemStore(workspace).register(payload_path, event="phase_advanced")
 
     markdown_path = Path(payload.get("markdown_path") or "")
     if not markdown_path.is_absolute():
@@ -293,6 +295,7 @@ def refresh_browser_agent_work_order(
     payload["cache_dependency_versions"] = versions
     write_json(payload_path, payload)
     write_json(phase_session_path, session_payload)
+    WorkItemStore(workspace).register(payload_path, event="work_item_refreshed")
     markdown_path = Path(str(payload.get("markdown_path") or ""))
     if not markdown_path.is_absolute():
         markdown_path = payload_path.parent / "work_order.md"
@@ -307,6 +310,7 @@ def refresh_browser_agent_work_order(
 
 def set_browser_agent_work_order_state(
     *,
+    workspace: Path | None = None,
     payload_path: Path,
     phase_session_path: Path,
     worker_state: str,
@@ -323,10 +327,13 @@ def set_browser_agent_work_order_state(
         row["updated_at"] = updated_at
     write_json(Path(payload_path), payload)
     write_json(Path(phase_session_path), session_payload)
+    if workspace is not None:
+        WorkItemStore(workspace).register(payload_path, event=f"state:{worker_state}")
 
 
 def activate_browser_agent_evolution_solution(
     *,
+    workspace: Path | None = None,
     payload_path: Path,
     phase_session_path: Path,
     run_id: str,
@@ -371,6 +378,8 @@ def activate_browser_agent_evolution_solution(
         )
     write_json(Path(payload_path), payload)
     write_json(Path(phase_session_path), session_payload)
+    if workspace is not None:
+        WorkItemStore(workspace).register(payload_path, event="evolution_solution_activated")
 
 
 def persist_browser_agent_phase_memory(
@@ -580,6 +589,7 @@ def create_browser_agent_work_order(
     payload["markdown_path"] = _workspace_relative(workspace, markdown_path)
     write_json(payload_path, payload)
     markdown_path.write_text(_render_browser_work_order(payload), encoding="utf-8")
+    WorkItemStore(workspace).register(payload_path, event="created")
     PerformanceRecorder(workspace).record(
         backend="external_agent",
         operation="agent_context",

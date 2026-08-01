@@ -33,6 +33,13 @@ apply_enabled: true
 - Re-check the live JD and application state before opening the apply flow.
 - Hard-exclude intern, campus, student, new-grad, co-op, 校招, and 实习 roles before opening any apply flow.
 
+### AMD Matching Override
+
+- For AMD, treat a live AI or software-engineering role with clear technical-stack overlap as a positive apply candidate. Relevant overlap includes Python, C++, AI/ML systems, LLM/agent applications, RAG, computer vision, simulation platforms, GPU software, AI frameworks, performance tooling, testing, CI, and developer infrastructure.
+- Do not require an exact prior AMD/ROCm/GPU-specialist title when the live JD's core work remains compatible with the candidate's demonstrated software and applied-AI background. Record the concrete overlap in the matching rationale.
+- Hard-exclude a role only when the live JD explicitly requires `10+ years` of relevant experience, or when its core work is low-level graphics/platform driver development, firmware/ASIC bring-up, electrical/hardware architecture, or another specialist domain for which the candidate has no supporting evidence.
+- Do not exclude a role merely because it is senior. If the JD does not explicitly require `10+ years`, evaluate the actual technical stack and responsibilities first.
+
 ## Session Preparation
 
 ### Goal

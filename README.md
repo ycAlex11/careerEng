@@ -184,6 +184,14 @@ careereng site add "Microsoft" --url https://careers.microsoft.com
 
 CareerEng is designed to be operated with Codex Desktop, Claude Code, or another coding agent. Once the agent is connected to CareerEng, it can use the local workspace, current context, and browser capability instead of treating each chat as a fresh job-search session.
 
+For browser work, start the one local runtime host from the CareerEng project directory and keep that terminal open while sites are running:
+
+```zsh
+.venv/bin/python -m careereng runtime-host serve
+```
+
+Do not start a separate host per site. The host is reused by all running sites and is released after their workflows reach terminal states.
+
 For a new AI conversation, give the agent this instruction:
 
 ```text

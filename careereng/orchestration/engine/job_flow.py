@@ -242,6 +242,10 @@ class JobFlow:
         rows = [row for row in sites.values() if isinstance(row, dict)]
         operation = self._normalize_operation(str(batch.get("operation") or ""))
         apply_requested = bool(batch.get("apply_requested"))
+        # A site summary is still work for that site, but never a batch-wide
+        # pause. Other sites keep their own scheduling slots and progression.
+        if any(self._site_summary_pending(row) for row in rows):
+            return "running"
         if any(str(row.get("status") or "") in {"queued", "running"} for row in rows):
             return "running"
         if any(str(row.get("status") or "") == "paused" for row in rows):
@@ -275,6 +279,14 @@ class JobFlow:
         if rows:
             return "completed"
         return "failed"
+
+    @staticmethod
+    def _site_summary_pending(row: dict[str, Any]) -> bool:
+        evolution = row.get("evolution") if isinstance(row.get("evolution"), dict) else {}
+        return (
+            str(evolution.get("status") or "") == "summary_pending"
+            and bool(str(row.get("solution_run_id") or "").strip())
+        )
 
     def _is_batch_cancelled(self, batch_id: str) -> bool:
         if not str(batch_id or "").strip():
@@ -493,6 +505,14 @@ class JobFlow:
 
         if not is_non_resumable_site_terminal(site):
             return
+        if self._site_exploration_summary_eligible(site):
+            # A terminal exploration site has one retained Codex summary turn
+            # before it becomes fully releasable. The batch group is unrelated.
+            return
+        if self._site_summary_pending(site):
+            # The browser may be terminal, but the retained site thread still
+            # owns a summary turn. Releasing here would kill that turn.
+            return
         try:
             released = self.runtime_lifecycle.release_site(site_key)
         except Exception as exc:
@@ -524,6 +544,17 @@ class JobFlow:
             current_url=str(site.get("current_url") or ""),
             details={"site_status": str(site.get("status") or "")},
             dedupe_key=f"site_terminal:{batch_id}:{site_key}:{site.get('status') or ''}",
+        )
+
+    @staticmethod
+    def _site_exploration_summary_eligible(site: dict[str, Any]) -> bool:
+        scope = site.get("evolution_scope") if isinstance(site.get("evolution_scope"), dict) else {}
+        evolution = site.get("evolution") if isinstance(site.get("evolution"), dict) else {}
+        mode = str(scope.get("execution_mode") or site.get("execution_mode") or site.get("site_mode") or "")
+        return (
+            bool(scope.get("active", False))
+            and mode == "exploration"
+            and str(evolution.get("status") or "") != "completed"
         )
 
     def _generate_workflow_evolution_summary_if_possible(self, batch: dict[str, Any]) -> None:
@@ -1793,7 +1824,6 @@ class JobFlow:
             "path": str(apply_plan.get("path") or ""),
             "counts": self._apply_plan_counts(apply_plan),
             "normalization": apply_plan.get("normalization") if isinstance(apply_plan.get("normalization"), dict) else {},
-            "requeued_from_history": int(apply_plan.get("requeued_from_history") or 0),
         }
         return {**current, "apply": apply_payload}
 
@@ -1919,6 +1949,16 @@ class JobFlow:
         if not isinstance(current, dict):
             return {"handled": False, "reason": "missing_site", "batch_id": batch_id}
         normalized_status = str(result_status or "").strip().lower()
+        # A stale worker can report the final phase after the workflow already
+        # closed the site. Preserve that terminal decision instead of reopening it.
+        if normalized_status == "done" and is_non_resumable_site_terminal(current):
+            return {
+                "handled": True,
+                "ignored": "site_already_terminal",
+                "batch_id": str(batch.get("batch_id") or ""),
+                "batch_status": str(batch.get("status") or ""),
+                "site": dict(current),
+            }
         browser_session = self.site_tools.site_store.load_browser_session(site_key)
         current_url = str(browser_session.get("last_known_url") or current.get("current_url") or "")
         updated = {

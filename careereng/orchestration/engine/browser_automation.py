@@ -809,6 +809,7 @@ class BrowserAutomationService:
             )
         if transition.action == "continue_current":
             set_browser_agent_work_order_state(
+                workspace=self.workspace,
                 payload_path=payload_path,
                 phase_session_path=phase_session_path,
                 worker_state="waiting_user",
@@ -826,6 +827,7 @@ class BrowserAutomationService:
             )
         if transition.action == "complete_sequence":
             set_browser_agent_work_order_state(
+                workspace=self.workspace,
                 payload_path=payload_path,
                 phase_session_path=phase_session_path,
                 worker_state="transitioning",

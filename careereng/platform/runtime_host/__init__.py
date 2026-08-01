@@ -1,7 +1,7 @@
 """Workspace-scoped local runtime host for browser and phase execution."""
 
 from .client import RuntimeHostClient, runtime_host_client, runtime_host_status
-from .errors import RuntimeHostError, RuntimeHostProtocolMismatchError, RuntimeHostUnavailableError
+from .errors import RuntimeHostAccessDeniedError, RuntimeHostError, RuntimeHostProtocolMismatchError, RuntimeHostUnavailableError
 from .protocol import RUNTIME_HOST_PROTOCOL_VERSION
 from .service import (
     RuntimeHostService,
@@ -12,6 +12,7 @@ from .service import (
 
 __all__ = [
     "RuntimeHostClient",
+    "RuntimeHostAccessDeniedError",
     "RuntimeHostError",
     "RuntimeHostProtocolMismatchError",
     "RuntimeHostService",

@@ -282,40 +282,6 @@ class ApplicationPlanningService:
             decision_context_hash = self.decision_context_hash(site_key)
             skill_policies = load_job_skill_policies(self.project_root, site_key)
             apply_candidate_policy = skill_policies.get("apply_candidate_policy", {})
-            requeued_rows: list[dict[str, Any]] = []
-            history_candidates_for_apply = getattr(self.site_store, "apply_list_history_candidates", None)
-            if callable(history_candidates_for_apply):
-                try:
-                    history_candidates = history_candidates_for_apply(
-                        site_key,
-                        current_context_versions=context_versions,
-                        current_decision_context_hash=decision_context_hash,
-                        apply_candidate_policy=apply_candidate_policy,
-                        batch_id=batch_id,
-                    )
-                except TypeError:
-                    history_candidates = history_candidates_for_apply(
-                        site_key,
-                        current_context_versions=context_versions,
-                        current_decision_context_hash=decision_context_hash,
-                        apply_candidate_policy=apply_candidate_policy,
-                    )
-                except Exception:
-                    history_candidates = []
-                existing_identity_keys = {
-                    key
-                    for row in rows
-                    if isinstance(row, dict)
-                    for key in self._row_identity_key_set(site_key, row)
-                }
-                requeued_rows = [
-                    row
-                    for row in history_candidates
-                    if isinstance(row, dict) and not (self._row_identity_key_set(site_key, row) & existing_identity_keys)
-                ]
-                if requeued_rows:
-                    self.site_store.update_run_jobs(site_key, requeued_rows, session_id, turn_id, batch_id)
-                    rows = self.merged_run_job_rows_for_batch(site_key, batch_id)
             match_history_rows = getattr(self.site_store, "match_history_rows", None)
             if callable(match_history_rows):
                 try:
@@ -337,8 +303,6 @@ class ApplicationPlanningService:
             )
             if normalization:
                 plan["normalization"] = normalization
-            if requeued_rows:
-                plan["requeued_from_history"] = len(requeued_rows)
             self.job_store.append_event(
                 "job_apply_plan.written",
                 {
@@ -348,7 +312,6 @@ class ApplicationPlanningService:
                     "snapshot_id": str(plan.get("snapshot_id") or ""),
                     "counts": plan.get("counts") if isinstance(plan.get("counts"), dict) else {},
                     "normalization": normalization if isinstance(normalization, dict) else {},
-                    "requeued_from_history": int(plan.get("requeued_from_history") or 0),
                 },
             )
         terminal_updates = [

@@ -13,7 +13,7 @@ from typing import Any
 
 from careereng.evolution.memory_units import EvolutionMemoryStore, run_local_units_for_batch_site
 from careereng.evolution.work_items import create_site_exploration_synthesis_card
-from careereng.utils import make_id, now_iso, read_json, write_json
+from careereng.utils import now_iso, read_json, write_json
 
 
 class SiteRunEvolutionCoordinator:
@@ -26,15 +26,25 @@ class SiteRunEvolutionCoordinator:
         default_limit = int(getattr(getattr(job_flow, "browser_budgets", None), "inner_max_failures", 3) or 3)
         self.exploration_attempt_limit = max(1, int(exploration_attempt_limit or default_limit))
 
-    def request_summary_if_needed(self, batch: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    def request_summary_if_needed(
+        self,
+        batch: dict[str, Any],
+        *,
+        site_key: str = "",
+    ) -> tuple[dict[str, Any], bool]:
+        """Create a summary for one finished exploration site without pausing its batch."""
+
         if not isinstance(batch, dict) or not batch:
             return batch, False
-        if str(batch.get("status") or "") in {"running", "cancelled"}:
+        if str(batch.get("status") or "") == "cancelled":
             return batch, False
         batch_id = str(batch.get("batch_id") or "")
         changed = False
+        requested_site_key = str(site_key or "").strip()
         sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
-        for site_key, row in list(sites.items()):
+        for candidate_site_key, row in list(sites.items()):
+            if requested_site_key and str(candidate_site_key) != requested_site_key:
+                continue
             if not self._requires_summary(row):
                 continue
             cycle_outcome = self._cycle_outcome(row)
@@ -42,8 +52,8 @@ class SiteRunEvolutionCoordinator:
             card = create_site_exploration_synthesis_card(
                 workspace=Path(self.job_store.workspace),
                 project_root=Path(self.job_flow.project_root),
-                site_key=str(site_key),
-                site_name=str(summary_row.get("site_name") or site_key),
+                site_key=str(candidate_site_key),
+                site_name=str(summary_row.get("site_name") or candidate_site_key),
                 batch_id=batch_id,
                 skill_path=str(summary_row.get("skill_path") or ""),
                 cycle_outcome=cycle_outcome,
@@ -54,7 +64,7 @@ class SiteRunEvolutionCoordinator:
                     "solution_level": "site_run_summary",
                     "solution_request_kind": "site_run_summary",
                     "exploration_completion": True,
-                    "site_key": str(site_key),
+                    "site_key": str(candidate_site_key),
                     "batch_id": batch_id,
                 },
             )
@@ -67,12 +77,12 @@ class SiteRunEvolutionCoordinator:
                 request,
                 cycle_outcome=cycle_outcome,
             )
-            batch = self._replace_site_row(batch, str(site_key), updated)
+            batch = self._replace_site_row(batch, str(candidate_site_key), updated)
             changed = True
         if changed:
-            # Browser execution is terminal, but the batch is not: its Codex
-            # synthesis is the remaining work for this same batch.
-            batch["status"] = "waiting_solution"
+            # This summary belongs to one site. Batch status remains a pure
+            # run-group projection so other sites keep running.
+            batch["status"] = self._batch_status_after_summary(batch)
             batch = self.job_store.save_batch(batch)
         return batch, changed
 
@@ -114,24 +124,32 @@ class SiteRunEvolutionCoordinator:
         return batch, decision
 
     def retain_pending_summary(self, batch: dict[str, Any]) -> dict[str, Any]:
-        """Restore the non-terminal batch boundary for persisted synthesis work."""
+        """Restore a pending site summary without converting the whole batch to a wait."""
 
         if not isinstance(batch, dict) or str(batch.get("status") or "") == "cancelled":
             return batch
         if not self._has_pending_summary(batch):
             return batch
-        if str(batch.get("status") or "") == "waiting_solution":
-            return batch
         updated = dict(batch)
-        updated["status"] = "waiting_solution"
+        sites = updated.get("sites") if isinstance(updated.get("sites"), dict) else {}
+        for site_key, row in list(sites.items()):
+            if not isinstance(row, dict) or not self._summary_from_row(row).get("run_id"):
+                continue
+            evolution = dict(row.get("evolution") or {})
+            if str(evolution.get("status") or "") == "summary_pending":
+                continue
+            evolution["status"] = "summary_pending"
+            updated = self._replace_site_row(updated, str(site_key), {**row, "evolution": evolution})
+        updated["status"] = self._batch_status_after_summary(updated)
         return self.job_store.save_batch(updated)
 
     def create_followup_if_needed(self, *, batch: dict[str, Any], site_key: str, decision: str) -> dict[str, Any]:
-        """Create one successor only for an unresolved exploration cycle.
+        """Requeue one site only for an unresolved exploration cycle.
 
         The applied proposal supplies the Skill/lesson update and site mode.
         Whether the current cycle needs another validation pass comes only
         from persisted execution facts, never from a proposal follow-up flag.
+        The continuation stays in the same batch run group.
         """
 
         outcome = self._summary_cycle_outcome(batch=batch, site_key=site_key)
@@ -149,7 +167,8 @@ class SiteRunEvolutionCoordinator:
                 reason="summary_mode_not_exploration",
             )
             return {}
-        site_run = batch.get("site_run") if isinstance(batch.get("site_run"), dict) else {}
+        row = self._site_row(batch=batch, site_key=site_key)
+        site_run = self._site_run(row, batch=batch)
         attempt = max(1, int(site_run.get("attempt") or 1))
         max_attempts = self.exploration_attempt_limit
         if attempt >= max_attempts:
@@ -163,47 +182,33 @@ class SiteRunEvolutionCoordinator:
                 reason="exploration_attempt_limit",
             )
             return {}
-        next_batch = self.job_flow.create_batch(
-            session_id=str(batch.get("session_id") or "cli:default"),
-            turn_id=make_id("turn"),
-            user_message=str(batch.get("user_message") or ""),
-            apply_requested=bool(batch.get("apply_requested")),
-            operation=str(batch.get("operation") or "job_search"),
-        )
-        next_batch_id = str(next_batch.get("batch_id") or "")
-        if not next_batch_id:
-            return {}
-        next_sites = next_batch.get("sites") if isinstance(next_batch.get("sites"), dict) else {}
-        for key, value in list(next_sites.items()):
-            if key == site_key or not isinstance(value, dict):
-                continue
-            next_sites[key] = {
-                **value,
-                "status": "skipped",
-                "reason_tag": "site_run_not_targeted",
-                "message": "This exploration follow-up only runs the originating site.",
-            }
-        next_batch["sites"] = next_sites
+        # The next exploration attempt is another work item for this site in
+        # the same run group. Its retained Codex thread is reused by the
+        # session store; no synthetic follow-up batch is created.
         root_batch_id = str(site_run.get("root_batch_id") or batch.get("batch_id") or "")
-        next_batch["site_run"] = {
-            "root_batch_id": root_batch_id,
-            "previous_batch_id": str(batch.get("batch_id") or ""),
-            "attempt": attempt + 1,
-            "max_attempts": max_attempts,
-            "site_key": site_key,
-            "reason": "applied_site_run_summary_requested_exploration",
-        }
-        next_batch = self.job_store.save_batch(next_batch)
-        batch["site_run"] = {
+        evolution = dict(row.get("evolution") or {})
+        evolution["site_run"] = {
             **site_run,
             "root_batch_id": root_batch_id,
-            "attempt": attempt,
+            "attempt": attempt + 1,
             "max_attempts": max_attempts,
-            "next_batch_id": next_batch_id,
-            "site_key": site_key,
+            "reason": "applied_site_run_summary_requested_exploration",
         }
-        self.job_store.save_batch(batch)
-        return next_batch
+        next_row = {
+            **row,
+            "status": "queued",
+            "reason_tag": "site_exploration_followup",
+            "message": "Continuing this site's exploration after its summary.",
+            "current_phase": "",
+            "evolution": evolution,
+            "solution_run_id": "",
+            "solution_request": "",
+            "proposal_output_path": "",
+        }
+        batch = self.job_store.update_site(batch, site_key, next_row)
+        batch["status"] = "running"
+        batch = self.job_store.save_batch(batch)
+        return {"batch_id": str(batch.get("batch_id") or ""), "site_key": site_key, "same_batch": True}
 
     def normalize_legacy_waiting_summary(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Archive one old blocking synthesis request without deleting evidence.
@@ -349,12 +354,26 @@ class SiteRunEvolutionCoordinator:
         )
 
     def _batch_status_after_summary(self, batch: dict[str, Any]) -> str:
-        if self._has_pending_summary(batch):
-            return "waiting_solution"
         compute = getattr(self.job_flow, "_compute_batch_status", None)
         if callable(compute):
             return str(compute(batch) or "completed")
         return "completed"
+
+    @staticmethod
+    def _site_row(*, batch: dict[str, Any], site_key: str) -> dict[str, Any]:
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        row = sites.get(site_key) if isinstance(sites.get(site_key), dict) else {}
+        return dict(row)
+
+    @staticmethod
+    def _site_run(row: dict[str, Any], *, batch: dict[str, Any] | None = None) -> dict[str, Any]:
+        evolution = row.get("evolution") if isinstance(row.get("evolution"), dict) else {}
+        site_run = evolution.get("site_run") if isinstance(evolution.get("site_run"), dict) else {}
+        if site_run:
+            return dict(site_run)
+        # Compatibility with records created before site-scoped loop state.
+        legacy = (batch or {}).get("site_run") if isinstance((batch or {}).get("site_run"), dict) else {}
+        return dict(legacy)
 
     @staticmethod
     def _summary_requested_row(
@@ -422,18 +441,19 @@ class SiteRunEvolutionCoordinator:
         return "no_eligible_apply_target"
 
     def _record_auto_followup_stopped(self, *, batch: dict[str, Any], site_key: str, reason: str) -> None:
-        site_run = batch.get("site_run") if isinstance(batch.get("site_run"), dict) else {}
+        row = self._site_row(batch=batch, site_key=site_key)
+        site_run = self._site_run(row, batch=batch)
         attempt = max(1, int(site_run.get("attempt") or 1))
         max_attempts = self.exploration_attempt_limit
-        batch["site_run"] = {
+        evolution = dict(row.get("evolution") or {})
+        evolution["site_run"] = {
             **site_run,
             "attempt": attempt,
             "max_attempts": max_attempts,
-            "site_key": site_key,
             "auto_followup_stopped": True,
             "stop_reason": reason,
         }
-        self.job_store.save_batch(batch)
+        self.job_store.save_batch(self.job_store.update_site(batch, site_key, {**row, "evolution": evolution}))
         append_event = getattr(self.job_store, "append_event", None)
         if callable(append_event):
             append_event(

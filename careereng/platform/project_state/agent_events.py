@@ -59,8 +59,40 @@ class AgentEventStore:
         self.root = ensure_dir(self.workspace / "agent_events")
         self.events = JSONLStore(self.root / "events.jsonl")
         self.cursors_path = self.root / "cursors.json"
+        self.main_agent_path = self.root / "main_agent.json"
         self.dispatcher = dispatcher or AgentEventDispatcher()
         self._lock = RLock()
+
+    def register_main_agent(self, *, thread_id: str, consumer_id: str = "codex_desktop") -> dict[str, str]:
+        """Persist the one App Server thread allowed to receive main-agent events."""
+
+        normalized_thread_id = str(thread_id or "").strip()
+        if not normalized_thread_id:
+            raise ValueError("main-agent thread_id is required")
+        registration = {
+            "thread_id": normalized_thread_id,
+            "consumer_id": str(consumer_id or "codex_desktop").strip() or "codex_desktop",
+            "registered_at": now_iso(),
+        }
+        with self._lock:
+            write_json(self.main_agent_path, registration)
+        return registration
+
+    def main_agent_registration(self) -> dict[str, str]:
+        """Return the current workspace-scoped main-agent target, if registered."""
+
+        with self._lock:
+            payload = read_json(self.main_agent_path)
+        if not isinstance(payload, dict):
+            return {}
+        thread_id = str(payload.get("thread_id") or "").strip()
+        if not thread_id:
+            return {}
+        return {
+            "thread_id": thread_id,
+            "consumer_id": str(payload.get("consumer_id") or "codex_desktop").strip() or "codex_desktop",
+            "registered_at": str(payload.get("registered_at") or ""),
+        }
 
     def publish(
         self,

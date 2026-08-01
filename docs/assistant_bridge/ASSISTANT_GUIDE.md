@@ -88,12 +88,19 @@ First version rule:
 
 Codex Desktop or another main assistant coordinates CareerEng; it does not create a separate runtime host per site.
 
-1. Check `careereng_runtime_host_status` before starting or continuing browser work.
-2. If no host is reachable, start it with `careereng runtime-host serve`, then verify its status before dispatching site work.
-3. Use `careereng_get_context` to inspect the active batch and target site before changing its execution state.
-4. Multiple sites may run concurrently up to `agent.site_parallelism`. A paused, login-required, or CAPTCHA-required site does not block the other sites.
-5. When the user completes a browser-only step, continue the same target site from its retained page and durable state. Do not restart unrelated sites or create another host.
-6. The configured execution backend is fixed for a running host. Do not switch between provider and Codex execution during a run.
+Before starting browser work, start the one workspace host in the local user terminal when it is not already running:
+
+```zsh
+cd /Users/alexlee/Desktop/gh/careerEng
+.venv/bin/python -m careereng runtime-host serve
+```
+
+Do not search for its socket, invent another launch command, start a second host, directly launch another browser runtime, or switch to a provider backend when host access fails. If `careereng_runtime_host_status` reports a permission error, report that error; it does not prove the host is stopped.
+
+1. Use `careereng_get_context` to inspect the active batch and target site before changing its execution state.
+2. Multiple sites may run concurrently up to `agent.site_parallelism`. A paused, login-required, or CAPTCHA-required site does not block the other sites.
+3. When the user completes a browser-only step, continue the same target site from its retained page and durable state. Do not restart unrelated sites or create another host.
+4. The configured execution backend is fixed for a running host. Do not switch between provider and Codex execution during a run.
 
 For direct lifecycle commands, see `docs/assistant_bridge/COMMANDS.md`.
 
