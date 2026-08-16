@@ -140,9 +140,17 @@ class SiteAgentWorkerCoordinator:
                 if existing.work_item_id != record.work_item_id:
                     self._successors[record.site_key] = record
                 return existing
+            # A new work item may reuse the site's Codex thread, but never a
+            # previous batch's turn, error, or scheduler state.
+            record.turn_id = ""
+            record.status = "queued"
+            record.last_error = ""
+            record.recovery_attempts = 0
+            record.recovery_pending = False
             accepted = self._scheduler.enqueue(SiteWorkItem(record.site_key, record.batch_id, record))
             if not accepted:
                 return record
+            self._persist_locked(record)
             self._dispatch_locked()
         return record
 
@@ -731,10 +739,7 @@ def worker_record_from_payload(payload_path: Path) -> AgentWorkerRecord:
         phase_session_path=phase_session,
         work_item_id=work_item_id_from_payload(payload) or Path(payload_path).parent.name,
         thread_id=str(binding.get("thread_id") or ""),
-        turn_id=str(binding.get("turn_id") or ""),
         status="waiting_user" if str(payload.get("worker_state") or "") == "waiting_user" else "",
-        last_error=str(binding.get("last_error") or ""),
-        recovery_attempts=int(binding.get("recovery_attempts") or 0),
         context_revision=int(payload.get("context_revision") or 0),
         watchdog_enabled=phase_slug != "evolution_summary",
     )

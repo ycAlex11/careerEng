@@ -256,7 +256,10 @@ class RuntimeHostService:
             browser = site_store.load_browser_session(site_key)
             worker = worker_rows.get(site_key, {})
             browser_status = str(browser.get("browser_status") or "")
-            worker_status = str(worker.get("status") or browser.get("codex_worker_status") or "")
+            # A current scheduler record owns this site's live status. The
+            # browser session is historical fallback only when no current
+            # worker exists for the site.
+            worker_status = str(worker.get("status") or "") if worker else str(browser.get("codex_worker_status") or "")
             pending_action = str(browser.get("pending_action") or "")
             if not worker and worker_status in {"completed", "released", "cancelled", "unavailable"}:
                 worker_status = ""
@@ -680,6 +683,9 @@ class RuntimeHostService:
         turn_id = str(payload.get("turn_id") or "").strip()
         phase = str(payload.get("phase") or "").strip()
         terminal_batch_id = ""
+        phase_result_status = ""
+        phase_result_batch_id = ""
+        phase_sequence_consumed = False
         try:
             def _call() -> dict[str, Any]:
                 browser_runner = getattr(self.loop, "browser_runner", None)
@@ -699,6 +705,8 @@ class RuntimeHostService:
                 progression_completion = progression.get("completion") if isinstance(progression.get("completion"), dict) else {}
                 batch_id = str(active_context.get("batch_id") or progression_completion.get("batch_id") or "").strip()
                 terminal_batch_id = batch_id
+                phase_result_status = phase_status
+                phase_result_batch_id = batch_id
                 record_progress = getattr(getattr(self.loop, "job_flow", None), "record_external_phase_progress", None)
                 if batch_id and phase_status and callable(record_progress):
                     result = {
@@ -731,6 +739,31 @@ class RuntimeHostService:
                         ),
                     }
                     terminal_batch_id = str(completion.get("batch_id") or "")
+                    phase_sequence_consumed = True
+            # An apply work order has exactly one declared phase. Its terminal
+            # result must consume the active target even if an older bridge
+            # response omitted the completion payload.
+            if (
+                tool_name == "phase_result"
+                and phase_result_status.lower() == "done"
+                and str(phase or "").strip() == "apply"
+                and str(progression.get("action") or "") == "complete_sequence"
+                and phase_result_batch_id
+                and not phase_sequence_consumed
+            ):
+                continue_sequence = getattr(getattr(self.loop, "job_flow", None), "continue_external_phase_sequence", None)
+                if callable(continue_sequence):
+                    result = {
+                        **result,
+                        "workflow_continuation": continue_sequence(
+                            site_key=site_key,
+                            batch_id=phase_result_batch_id,
+                            terminal_phase="apply",
+                            session_id="",
+                            turn_id=turn_id,
+                        ),
+                    }
+                    terminal_batch_id = phase_result_batch_id
             if terminal_batch_id:
                 # Any external phase can make a site terminal. Persist the
                 # phase continuation first. Ready-site batches complete one

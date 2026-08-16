@@ -50,9 +50,10 @@ apply_enabled: true
 
 - Use the AMD careers candidate flow, not a generic AMD marketing page.
 - If the current AMD jobs page shows `Returning User Login`, `Return to Login`, `Sign In`, or similar, click it during `Session Preparation` to reach the AMD login surface.
-- On the AMD login surface, use the visible `LinkedIn` account login option.
-- Continue through visible LinkedIn or remembered-account continuation steps when they are one-click browser actions.
-- If a LinkedIn or AMD login page shows a saved/filled credential state with a visible `Sign in`, `Continue`, `Log in`, `登录`, or equivalent forward button, click that forward button once before declaring the flow blocked.
+- On the AMD login surface, use the visible `Google` account login option for the Gmail-linked iCIMS candidate account.
+- Continue through visible Google or remembered-Google-account continuation steps when they are one-click browser actions.
+- If a Google or AMD login page shows a saved/filled credential state with a visible `Sign in`, `Continue`, `Log in`, `登录`, or equivalent forward button, click that forward button once before declaring the flow blocked.
+- Do not use LinkedIn continuation for AMD. If a Google continuation is unavailable or requires a human-only action, stop with `waiting_user` rather than falling back to LinkedIn or another account.
 - Do not read, expose, copy, or modify saved passwords. Only use visible one-click continuation actions when credentials are already filled or remembered by the browser.
 - If the flow reaches password entry, MFA, verification code, CAPTCHA, email confirmation, or another explicit human-only challenge with no visible one-click continuation left, stop with `blocked`.
 
@@ -145,7 +146,9 @@ apply_enabled: true
 
 - Treat `Candidate Profile - <job>` pages inside `global-external-amd.icims.com/jobs/<job_id>/<slug>/candidate?mode=apply...` as a normal AMD apply step, not as an error.
 - If an AMD apply step reaches `Candidate Profile`, update only the resume unless a required field is explicitly blocking progress.
-- Use `Replace Resume`, `Upload Resume`, `My Computer`, or the closest visible AMD resume upload control to upload the staged resume PDF.
+- For AMD Candidate Profile resume replacement, use this order only: click the current resume's `Replace Resume` entry, choose `My Computer`, then re-read the live page before calling `browser_file_upload`.
+- Do not choose Google Drive or any other external resume source for AMD.
+- Do not call `browser_file_upload` merely because Candidate Profile exposes multiple file chooser controls. Call it only after the `My Computer` route has been explicitly selected for the current resume.
 - AMD/iCIMS resume upload controls may expose a hidden `input[type=file]` that cannot be clicked normally. Do not click a hidden file input or keep retrying a pointer click when an outer iCIMS wrapper intercepts pointer events.
 - When a file input is required, use the browser file upload / file chooser tool to set the staged resume PDF on that input, then re-read the live page before continuing.
 - Do not proactively change name, phone, address, education, professional experience, or other profile fields.

@@ -2,7 +2,7 @@
 id: site-microsoft
 name: microsoft Site Skill
 version: v1
-updated_at: '2026-04-28'
+updated_at: '2026-08-16'
 scope: site
 site_key: microsoft
 status: ready
@@ -40,7 +40,9 @@ apply_enabled: true
 
 ### Goal
 
-- Complete Microsoft careers login preparation, update the Microsoft careers profile resume only when the runtime resume freshness context says it is needed, and leave the browser inside the signed-in Microsoft careers or apply flow for the next phase.
+- Complete Microsoft careers login preparation and apply the readiness rule for the current operation.
+- For job search or apply runs, verify that Microsoft has the current staged resume before any site-native match evaluation.
+- For application-status-review-only runs, stop after signed-in `Action Center` readiness without opening profile or resume management.
 
 ### Site Facts
 
@@ -54,9 +56,14 @@ apply_enabled: true
 ### Workflow
 
 - If the current page still shows a visible `Sign in` entry for the Microsoft careers or application flow, continue that sign-in path instead of declaring readiness.
-- Read the runtime resume freshness context first.
-- If `resume_upload_needed = false`, do not open `My profile` or `Resume Manager` only to upload or re-check the resume. Continue toward the login-ready completion condition unless the live site clearly shows that the remote resume is missing, mismatched, or unusable.
-- If `resume_upload_needed = true`, after login use the Microsoft careers avatar / account menu, then choose `My profile`.
+- Read `run_intent.operation` and `apply_requested` before deciding whether resume setup is required.
+- If `run_intent.operation = application_status_review` and `apply_requested = false`, treat `Session Preparation` as complete once Microsoft is signed in and `Action Center` is visible.
+- For that status-review-only branch, record `My profile` and `Resume Manager` as do-not-repeat for the current run; do not open, inspect, upload, delete, or modify resume/profile content.
+- After recording that status-review-only readiness, finish the phase immediately and do not execute the remaining resume workflow.
+- Do not use the status-review-only branch for job search or apply runs.
+- For job search or apply runs, read the runtime resume freshness context before entering profile or resume management.
+- For job search or apply runs, `resume_upload_needed` is only a local upload hint; it never replaces a visible remote resume verification for Microsoft.
+- For job search or apply runs, after login, use the Microsoft careers avatar / account menu, then choose `My profile` before any job search, result-card match reading, or `Strong Match` / `Good Match` decision.
 - In `My profile`, open `Resume Manager` before inspecting other profile areas.
 - If `Resume Manager` is visible and the Microsoft resume step is not yet satisfied in this run, click `Resume Manager` immediately.
 - If `Resume Manager` is not yet visible, stay on the same Microsoft careers profile surface and keep rechecking only for `Resume Manager`.
@@ -73,7 +80,8 @@ apply_enabled: true
 ### Completion Or Blocked
 
 - Do not treat the Microsoft careers or apply domain by itself as proof that login completed.
-- End `Session Preparation` after Microsoft is signed in and either `resume_upload_needed = false` or the current staged resume filename is visibly present in `Resume Manager`; close any resume dialog before finishing.
+- For application-status-review-only runs, end `Session Preparation` after Microsoft is signed in and `Action Center` is visible; do not require `Resume Manager`.
+- For job search or apply runs, end `Session Preparation` only after Microsoft is signed in and the current staged resume filename is visibly present in `Resume Manager`; close any resume dialog before finishing.
 - If the current live page still shows `Sign in`, treat authentication as unresolved and continue the Microsoft careers auth flow instead of declaring success.
 - If the flow requires password entry, verification, MFA, CAPTCHA, email confirmation, or another explicit human-only challenge, stop with `blocked`.
 
@@ -84,10 +92,12 @@ apply_enabled: true
 ### Don't
 
 - Do not switch into a generic Microsoft homepage, store page, product page, profile page, account page, or broad Microsoft brand navigation during this phase.
+- Do not open `My profile` or `Resume Manager` during an application-status-review-only run after signed-in `Action Center` readiness is visible.
+- Do not let the status-review-only exception bypass staged-resume verification in any job search or apply run.
 - Do not use `Find jobs`, jobs `Search`, or a Microsoft jobs list as the normal proof of login during this phase when `My profile` is reachable.
 - Do not inspect or edit general Microsoft profile fields before `Resume Manager` is satisfied.
 - Do not substitute another resume area, profile section, or settings page for `Resume Manager`.
-- Do not open or re-open `Resume Manager` when `resume_upload_needed = false` unless the live page clearly shows the remote resume is missing, mismatched, or unusable.
+- Do not skip `Resume Manager` solely because `resume_upload_needed = false`; first verify the visible remote filename against the current staged resume filename.
 - Do not upload a different file when the current staged resume filename is already visibly present in Microsoft `Resume Manager`.
 - Do not delete old resume files during `Session Preparation`; old remote resume cleanup is non-blocking and should not delay login/session readiness.
 - Do not reopen `Resume Manager` after the current staged resume filename has already been confirmed there in the current `session_preparation` run.
