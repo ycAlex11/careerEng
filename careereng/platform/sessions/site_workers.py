@@ -212,6 +212,53 @@ class SiteWorkerSessionStore:
             self._save_locked(data)
             return dict(session)
 
+    def retract_effective_site_run(
+        self,
+        *,
+        worker_session_id: str,
+        batch_id: str,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        """Remove a previously counted run when its bound batch is cancelled."""
+
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            raise ValueError("effective site run retraction requires run_id")
+        with self._lock:
+            data = self._load_locked()
+            sessions = data["sessions"]
+            session = self._session_by_id(sessions, worker_session_id)
+            if session is None:
+                return None
+            binding = next(
+                (row for row in session.get("batch_bindings", []) if str(row.get("batch_id") or "") == str(batch_id or "")),
+                None,
+            )
+            if binding is None:
+                return None
+            run_ids = [str(value) for value in session.get("effective_run_ids", []) if str(value)]
+            if normalized_run_id not in run_ids:
+                return dict(session)
+            session["effective_run_ids"] = [value for value in run_ids if value != normalized_run_id]
+            limit = max(1, int(session.get("max_effective_batches") or 1))
+            has_other_active_session = any(
+                other is not session
+                and str(other.get("site_key") or "") == str(session.get("site_key") or "")
+                and str(other.get("backend") or "") == str(session.get("backend") or "")
+                and str(other.get("status") or "active") == "active"
+                for other in sessions
+            )
+            if (
+                str(session.get("status") or "") == "review_pending"
+                and len(session["effective_run_ids"]) < limit
+                and not has_other_active_session
+            ):
+                session["status"] = "active"
+                session.pop("review_due_at", None)
+            session["updated_at"] = now_iso()
+            self._save_locked(data)
+            return dict(session)
+
     def site_evidence(self, site_key: str, *, backend: str = "") -> dict[str, Any]:
         """Return compact persisted session facts for reports/review cards."""
 

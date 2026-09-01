@@ -2,7 +2,7 @@
 id: site-apple
 name: Apple Site Skill
 version: v1
-updated_at: '2026-06-03'
+updated_at: '2026-09-02'
 scope: site
 site_key: apple
 status: ready

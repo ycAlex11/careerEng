@@ -2,7 +2,7 @@
 id: site-microsoft
 name: microsoft Site Skill
 version: v1
-updated_at: '2026-08-16'
+updated_at: '2026-09-02'
 scope: site
 site_key: microsoft
 status: ready

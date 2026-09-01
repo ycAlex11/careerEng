@@ -1525,6 +1525,8 @@ class RuntimeHostService:
                     batch_id=normalized_batch,
                     batch_status=batch_status,
                 )
+                if batch_status == "cancelled":
+                    self._retract_effective_site_run(site_key=normalized_site, batch_id=normalized_batch)
                 return
 
     @staticmethod
@@ -1547,12 +1549,7 @@ class RuntimeHostService:
         if job_store is None:
             return
         batch = job_store.load_batch(normalized_batch)
-        site_run = batch.get("site_run") if isinstance(batch.get("site_run"), dict) else {}
-        if self._site_uses_exploration(batch, site_key=normalized_site):
-            root_batch_id = str(site_run.get("root_batch_id") or normalized_batch)
-            run_id = f"exploration:{root_batch_id}"
-        else:
-            run_id = f"batch:{normalized_batch}"
+        run_id = self._effective_site_run_id(batch, site_key=normalized_site, batch_id=normalized_batch)
         evidence = self._site_worker_sessions.site_evidence(normalized_site)
         for session in evidence.get("sessions", []):
             if not isinstance(session, dict):
@@ -1577,6 +1574,53 @@ class RuntimeHostService:
                     },
                 )
             return
+
+    def _retract_effective_site_run(self, *, site_key: str, batch_id: str) -> None:
+        """Retract a counted site run after orchestration cancels its batch."""
+
+        normalized_site = str(site_key or "").strip()
+        normalized_batch = str(batch_id or "").strip()
+        if not normalized_site or not normalized_batch:
+            return
+        job_flow = getattr(self.loop, "job_flow", None)
+        job_store = getattr(job_flow, "job_store", None)
+        if job_store is None:
+            return
+        batch = job_store.load_batch(normalized_batch)
+        run_id = self._effective_site_run_id(batch, site_key=normalized_site, batch_id=normalized_batch)
+        evidence = self._site_worker_sessions.site_evidence(normalized_site)
+        for session in evidence.get("sessions", []):
+            if not isinstance(session, dict):
+                continue
+            bindings = session.get("batch_bindings") if isinstance(session.get("batch_bindings"), list) else []
+            if not any(str(binding.get("batch_id") or "") == normalized_batch for binding in bindings if isinstance(binding, dict)):
+                continue
+            if run_id not in session.get("effective_run_ids", []):
+                return
+            updated = self._site_worker_sessions.retract_effective_site_run(
+                worker_session_id=str(session.get("worker_session_id") or ""),
+                batch_id=normalized_batch,
+                run_id=run_id,
+            )
+            if updated is not None:
+                job_store.append_event(
+                    "site_worker.effective_run_retracted",
+                    {
+                        "site_key": normalized_site,
+                        "batch_id": normalized_batch,
+                        "run_id": run_id,
+                        "worker_session_id": str(session.get("worker_session_id") or ""),
+                        "effective_site_run_count": len(updated.get("effective_run_ids") or []),
+                    },
+                )
+            return
+
+    @classmethod
+    def _effective_site_run_id(cls, batch: dict[str, Any], *, site_key: str, batch_id: str) -> str:
+        site_run = batch.get("site_run") if isinstance(batch.get("site_run"), dict) else {}
+        if cls._site_uses_exploration(batch, site_key=site_key):
+            return f"exploration:{str(site_run.get('root_batch_id') or batch_id)}"
+        return f"batch:{batch_id}"
 
     def _record_terminal_ready_site_run(self, *, site_key: str, batch_id: str) -> None:
         """Count only a normal completed ready-site run.
