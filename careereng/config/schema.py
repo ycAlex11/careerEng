@@ -12,6 +12,8 @@ class AgentRecoveryConfig:
 
     idle_timeout_seconds: int = 180
     max_resume_attempts: int = 2
+    interrupt_ack_timeout_seconds: int = 15
+    max_interrupt_attempts: int = 2
 
 
 @dataclass

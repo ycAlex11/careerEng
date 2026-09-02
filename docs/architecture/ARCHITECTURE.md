@@ -325,6 +325,12 @@ classification:
 - `notification`: site or batch completion and report availability.
 - `audit`: detailed execution facts that stay outside the default Desktop inbox.
 
+Heartbeat and raw transport activity remain internal runtime evidence and are
+not forwarded as Desktop conversation noise. Durable phase changes,
+waiting-user states, exhausted recovery, and terminal milestones are the
+user-facing event boundary. The registered main agent receives those events;
+site worker threads receive only scoped execution and continuation prompts.
+
 `careereng_list_agent_events` and `careereng_ack_agent_events` are polling
 tools for this inbox. `careereng_get_agent_status` is separate: it reads the
 host's current per-site worker/browser state and answers what is running now.
@@ -333,11 +339,13 @@ It is not a batch projection and it does not replace durable events.
 For immediate Codex delivery, `careereng_register_main_agent` stores the
 current App Server thread id at `workspace/agent_events/main_agent.json`. The
 Codex-specific `adapters/codex/main_agent_bridge.py` subscribes to the shared
-dispatcher, then delivers only durable `action_required` and `review_required`
-events to that registered thread. Delivery attempts are recorded separately;
-an App Server failure leaves the event in the inbox for retry after a new
-registration or host restart. Replacing the registered thread id transfers
-future main-agent notifications to the new Desktop control conversation.
+dispatcher, then delivers durable `action_required`, `review_required`, phase
+advance, site completion, and batch completion events to that registered
+thread. Raw heartbeat and audit events are never delivered there. Delivery
+attempts are recorded separately; an App Server failure leaves the event in
+the inbox for retry after a new registration or host restart. Replacing the
+registered thread id transfers future main-agent notifications to the new
+Desktop control conversation.
 
 CLI may explicitly run the lifecycle commands:
 
@@ -519,6 +527,12 @@ history view. Those bodies are resolved only after the worker requests them;
 the resolver is shared by provider and Codex paths and caches only within the
 active runtime scope.
 
+The first work order for a site batch snapshots the project and site Skill
+text used to assemble phase context. Later phase and apply-target refreshes in
+that same batch derive their slices from the snapshot rather than rereading a
+possibly edited Skill. Profile, CV, history, and other user data remain lazy
+live resources. An explicit new batch receives a new Skill snapshot.
+
 The initial `apply` envelope is also backend-neutral. It contains only staged
 resume path/basename, lightweight form facts, and target identifiers. Full CV,
 persona, and site history remain explicit lazy resources. Browser executors
@@ -569,11 +583,52 @@ and Skills decide success, continuation, cache value, and proposed evolution.
 `adapters/codex/` only translates a claimed item to Codex App Server RPC/events.
 A future Claude Code adapter supplies the same thread transport contract rather
 than another lifecycle state machine.
+
+`orchestration/worker_control/` owns backend-neutral asynchronous control
+contracts. Every executable work item carries a `control_epoch` lease and a
+monotonic `site_revision`. Every mutating browser/state call also carries the
+worker-observed `context_revision`; an apply terminal result additionally
+carries the exact active target job id. MCP validates these values before
+forwarding, and the runtime host validates them again immediately before side
+effects. Pause, stop, cancel, release, phase refresh, and target refresh
+therefore reject stale calls instead of rebinding them to newer site state.
+Control states are monotonic, so a delayed interrupt acknowledgement cannot
+reopen a cancelled or released item.
+
+Pause is an acknowledged transition: `active -> pausing -> paused`. Transport
+activity is treated as heartbeat evidence, and the coordinator repeats the
+idempotent interrupt probe only within the configured retry bound. If no
+terminal turn event arrives, the item becomes `pause_unconfirmed`; its old
+thread is quarantined and a later resume starts from durable CareerEng state on
+a replacement thread. This recovery mechanism detects transport uncertainty;
+the epoch fence, not heartbeat timing, prevents stale side effects.
+
+Ordinary Skill phases are logical state boundaries, not worker-lifecycle
+boundaries. `phase_result(done)` advances durable context synchronously; the
+same Codex turn may immediately fetch that context and continue through the
+retained browser. The temporary `transitioning` state is used only while the
+career-domain continuation prepares another sequence, such as retrieval to
+apply. That continuation atomically reopens the same work item as `active`
+with higher context and site revisions before the state-tool call returns. A
+phase boundary never closes the worker thread or browser runtime. If domain
+continuation rejects a completion after the state tool entered `transitioning`,
+the host restores the same work item to `active`; it never leaves a live target
+stranded between states.
+
+If a Codex turn nevertheless ends while its work item is still `active`, the
+coordinator starts a bounded continuation on the retained thread. Repeated
+turn endings without a context revision become an execution-recovery failure,
+not a completed site and not a permanently false `running` worker. A stale
+turn cannot regain access after phase refresh, pause, cancellation, or release
+because each accepted state or context change advances the site revision.
+
 `agent.site_parallelism` limits active site workers for both Codex and provider
 execution. A batch is an aggregation, report, and evidence container, not a
 global browser lock.
 
-`platform/runtime_host/` serializes raw browser/state operations per site only.
+`platform/runtime_host/` serializes raw browser/state and lifecycle operations
+per site only. Site-scoped pause, stop, and cancel never release another site's
+worker or runtime and never convert the shared batch into a global stop.
 It must never serialize unrelated sites through a workspace-wide runtime lock.
 Waiting-user, approval, cancellation, and release events are scoped to the
 owning site work item and Codex thread. Provider execution uses the same
@@ -586,8 +641,9 @@ work-item context and continues on its existing Codex thread. A user-blocked
 phase preserves that thread, retained browser, and batch-scoped history view;
 an execution idle timeout only requests a fresh scoped context and snapshot on
 that same thread. It does not create a new worker, decide a browser action, or
-write a job outcome. Final site completion or cancellation releases browser
-resources without clearing durable cache artifacts. Runtime records
+write a job outcome. Final site completion first marks the work item
+`completed`, then releases only that site's worker and browser resources
+without clearing durable cache artifacts. Runtime records
 only lifecycle, resource-read, tool, cache, and token-usage facts; it does not
 choose context resources or workflow strategy for the worker.
 

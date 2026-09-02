@@ -101,6 +101,10 @@ Do not search for its socket, invent another launch command, start a second host
 2. Multiple sites may run concurrently up to `agent.site_parallelism`. A paused, login-required, or CAPTCHA-required site does not block the other sites.
 3. When the user completes a browser-only step, continue the same target site from its retained page and durable state. Do not restart unrelated sites or create another host.
 4. The configured execution backend is fixed for a running host. Do not switch between provider and Codex execution during a run.
+5. Use site-scoped pause, stop, or cancel when changing one worker. These commands revoke that work item's execution lease and do not stop sibling sites in the batch.
+6. Treat `pause_unconfirmed` as transport uncertainty, not job failure. Resume reconstructs the worker from durable state instead of trusting the unconfirmed thread.
+7. Ordinary phase completion keeps the same site work item, Codex thread, and browser. CareerEng advances phase context synchronously and automatically continues a non-terminal item if its current turn ends.
+8. Internal heartbeat traffic is not a Desktop progress stream. The registered main agent receives only durable phase, attention, recovery, and terminal events.
 
 For direct lifecycle commands, see `docs/assistant_bridge/COMMANDS.md`.
 
@@ -111,7 +115,8 @@ Use MCP tools in this order:
 1. Inspect host and batch context with `careereng_runtime_host_status` and `careereng_get_context`.
 2. For an active site task, call `careereng_get_work_item_context`.
 3. Discover the current task's browser or state capabilities with its `careereng_work_item_list_*_tools` tool.
-4. Execute only through the matching `careereng_work_item_*` tool and finish the phase with `careereng_work_item_phase_result`.
+4. Execute only through the matching `careereng_work_item_*` tool. Pass the task context's `lease.context_revision` unchanged to every mutating browser/state call.
+5. Finish a phase with `careereng_work_item_phase_result`. During apply, also pass the single current `scope.apply_target_job_ids` value unchanged; a stale revision or target is rejected and must not be retried against refreshed context.
 
 Do not maintain a static list of browser controls in this guide. Browser and state tools are discovered from the current work item because they are scoped to its site and phase.
 

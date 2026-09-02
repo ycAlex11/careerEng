@@ -513,6 +513,15 @@ class JobFlow:
             # The browser may be terminal, but the retained site thread still
             # owns a summary turn. Releasing here would kill that turn.
             return
+        complete_work_item = getattr(self.runtime_lifecycle, "complete_site_work_item", None)
+        if callable(complete_work_item):
+            try:
+                complete_work_item(site_key)
+            except Exception as exc:
+                self.job_store.append_event(
+                    "work_item.completion.failed",
+                    {"batch_id": batch_id, "site_key": site_key, "error": str(exc)},
+                )
         try:
             released = self.runtime_lifecycle.release_site(site_key)
         except Exception as exc:
@@ -1977,6 +1986,18 @@ class JobFlow:
                 current_url=current_url,
                 details={"resume_available": True},
             )
+        elif normalized_status == "done" and str(next_phase or "").strip() and str(next_phase) != str(phase):
+            self.publish_agent_event(
+                kind="site.phase_advanced",
+                attention="notification",
+                summary=f"{site_key} advanced from {phase} to {next_phase}.",
+                site_key=site_key,
+                batch_id=str(batch.get("batch_id") or ""),
+                phase=str(next_phase),
+                current_url=current_url,
+                details={"previous_phase": str(phase or ""), "next_phase": str(next_phase or "")},
+                dedupe_key=f"site_phase:{batch_id}:{site_key}:{phase}:{next_phase}",
+            )
         return {
             "handled": True,
             "batch_id": str(batch.get("batch_id") or ""),
@@ -2902,7 +2923,9 @@ class JobFlow:
             raise ValueError("batch has no resumable sites")
         sites.update(updated_sites)
         batch["sites"] = sites
-        batch["status"] = "paused"
+        batch["status"] = "paused" if not requested_site else "running"
+        if requested_site:
+            batch["status"] = self._compute_batch_status(batch)
         saved = self.job_store.save_batch(batch)
         self.job_store.append_event(
             "batch.paused",
@@ -2922,6 +2945,35 @@ class JobFlow:
         for site_key in sites:
             self.site_tools.site_store.end_batch_history_view(str(saved.get("batch_id") or ""), str(site_key))
         self._release_terminal_browser_resources(saved)
+        return saved
+
+    def cancel_site(self, *, batch_id: str, site_key: str, reason: str = "user_requested_cancel") -> dict[str, Any]:
+        """Cancel one site without converting its shared batch into cancelled."""
+
+        batch = self.job_store.load_batch(str(batch_id or ""))
+        if not batch:
+            raise FileNotFoundError(f"job batch not found: {batch_id}")
+        normalized_site = str(site_key or "").strip()
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        current = sites.get(normalized_site)
+        if not isinstance(current, dict):
+            raise ValueError(f"site is not in batch: {normalized_site}")
+        updated = self._cancelled_site_row(current, current_phase=str(current.get("current_phase") or ""))
+        updated["message"] = f"Site cancelled: {str(reason or 'user_requested_cancel')}"
+        sites[normalized_site] = updated
+        batch["sites"] = sites
+        batch["status"] = "running"
+        batch["status"] = self._compute_batch_status(batch)
+        saved = self.job_store.save_batch(batch)
+        self.site_tools.site_store.end_batch_history_view(str(saved.get("batch_id") or ""), normalized_site)
+        self.job_store.append_event(
+            "site.cancelled",
+            {
+                "batch_id": str(saved.get("batch_id") or ""),
+                "site_key": normalized_site,
+                "reason": str(reason or "user_requested_cancel"),
+            },
+        )
         return saved
 
     def _parse_resume_signal(self, message: str) -> tuple[str, str] | None:

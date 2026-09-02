@@ -56,6 +56,8 @@ search_company_top_k = 10
 # These are execution limits only. They do not decide browser actions.
 idle_timeout_seconds = 180
 max_resume_attempts = 2
+interrupt_ack_timeout_seconds = 15
+max_interrupt_attempts = 2
 
 [browser]
 # provider: use the configured browser LLM API.

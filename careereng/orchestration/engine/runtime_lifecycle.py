@@ -13,6 +13,15 @@ class SiteRuntimeLifecycle:
     """Release resources only after orchestration has made its terminal decision."""
 
     browser_runner: Any | None
+
+    def complete_site_work_item(self, site_key: str) -> bool:
+        normalized_site_key = release_site_payload(site_key=site_key)["site_key"]
+        complete_work_item = getattr(self.browser_runner, "complete_site_work_item", None)
+        if not callable(complete_work_item):
+            return False
+        result = complete_work_item(normalized_site_key)
+        return result is not False
+
     def release_site(self, site_key: str) -> bool:
         normalized_site_key = release_site_payload(site_key=site_key)["site_key"]
         finish_site = getattr(self.browser_runner, "finish_site", None)

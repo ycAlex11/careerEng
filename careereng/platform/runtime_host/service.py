@@ -35,6 +35,7 @@ from careereng.adapters.external_agents.work_orders import (
     set_browser_agent_work_order_state,
 )
 from careereng.orchestration.agent_protocol.work_item_store import WorkItemStore
+from careereng.orchestration.worker_control import WorkItemFence
 from careereng.utils import make_id, now_iso, read_json, write_json
 from .errors import RuntimeHostAccessDeniedError, RuntimeHostProtocolMismatchError, RuntimeHostUnavailableError
 from .protocol import RUNTIME_HOST_PROTOCOL_VERSION, protocol_version_from, runtime_host_identity, with_runtime_host_protocol
@@ -168,6 +169,12 @@ class RuntimeHostService:
             return self._handle_fresh_snapshot_resume(payload)
         if op == "pause_jobs_batch":
             return self._handle_pause_jobs_batch(payload)
+        if op == "pause_site":
+            return self._handle_pause_site(payload)
+        if op == "stop_site":
+            return self._handle_stop_site(payload)
+        if op == "cancel_site":
+            return self._handle_cancel_site(payload)
         if op == "cancel_jobs_batch":
             return self._handle_cancel_jobs_batch(payload)
         if op == "agent_status":
@@ -507,7 +514,35 @@ class RuntimeHostService:
         if not batch_id:
             return {"ok": False, "error": "batch_id is required"}
         try:
-            batch = self._run_site_operation(site_key, lambda: self.loop.job_flow.pause_batch(batch_id=batch_id, site_key=site_key))
+            job_flow = getattr(self.loop, "job_flow", None)
+            job_store = getattr(job_flow, "job_store", None)
+            current = job_store.load_batch(batch_id) if job_store is not None else {}
+            current_sites = current.get("sites") if isinstance(current.get("sites"), dict) else {}
+            revoked: list[dict[str, Any]] = []
+            if site_key:
+                def _pause_site() -> dict[str, Any]:
+                    revoked.extend(
+                        WorkItemStore(self.workspace).revoke_scope(
+                            site_key=site_key,
+                            batch_id=batch_id,
+                            state="pausing",
+                            event="pause_requested",
+                        )
+                    )
+                    return self.loop.job_flow.pause_batch(batch_id=batch_id, site_key=site_key)
+
+                batch = self._run_site_operation(site_key, _pause_site)
+            else:
+                for target in current_sites:
+                    revoked.extend(
+                        WorkItemStore(self.workspace).revoke_scope(
+                            site_key=str(target),
+                            batch_id=batch_id,
+                            state="pausing",
+                            event="pause_requested",
+                        )
+                    )
+                batch = self.loop.job_flow.pause_batch(batch_id=batch_id, site_key="")
             if self._codex_workers is not None:
                 sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
                 targets = [site_key] if site_key else list(sites.keys())
@@ -515,7 +550,60 @@ class RuntimeHostService:
                     self._codex_workers.pause(site_key=str(target))
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "accepted": True, "batch": batch}
+        return {"ok": True, "accepted": True, "batch": batch, "revoked_work_items": len(revoked)}
+
+    def _handle_pause_site(self, payload: dict[str, Any]) -> dict[str, Any]:
+        site_key = str(payload.get("site_key") or "").strip()
+        batch_id = str(payload.get("batch_id") or "").strip()
+        if not site_key or not batch_id:
+            return {"ok": False, "error": "batch_id and site_key are required"}
+        return self._handle_pause_jobs_batch({"batch_id": batch_id, "site_key": site_key})
+
+    def _handle_stop_site(self, payload: dict[str, Any]) -> dict[str, Any]:
+        site_key = str(payload.get("site_key") or "").strip()
+        batch_id = str(payload.get("batch_id") or "").strip()
+        if not site_key or not batch_id:
+            return {"ok": False, "error": "batch_id and site_key are required"}
+        paused = self._handle_pause_site({"batch_id": batch_id, "site_key": site_key})
+        if not paused.get("ok"):
+            return paused
+        try:
+            released = self._release_site_runtime(site_key=site_key, dispatch=True)
+            WorkItemStore(self.workspace).release_scope(site_key=site_key, batch_id=batch_id, event="site_stopped")
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "batch": paused.get("batch")}
+        return {"ok": True, "accepted": True, "released": released, "batch": paused.get("batch")}
+
+    def _handle_cancel_site(self, payload: dict[str, Any]) -> dict[str, Any]:
+        site_key = str(payload.get("site_key") or "").strip()
+        batch_id = str(payload.get("batch_id") or "").strip()
+        reason = str(payload.get("reason") or "user_requested_cancel")
+        if not site_key or not batch_id:
+            return {"ok": False, "error": "batch_id and site_key are required"}
+        try:
+            cancel_site = getattr(getattr(self.loop, "job_flow", None), "cancel_site", None)
+            if not callable(cancel_site):
+                raise RuntimeError("site cancellation is unavailable")
+
+            def _cancel_site() -> dict[str, Any]:
+                WorkItemStore(self.workspace).revoke_scope(
+                    site_key=site_key,
+                    batch_id=batch_id,
+                    state="cancelling",
+                    event="site_cancel_requested",
+                )
+                return cancel_site(batch_id=batch_id, site_key=site_key, reason=reason)
+
+            batch = self._run_site_operation(site_key, _cancel_site)
+            if self._codex_workers is not None:
+                self._codex_workers.cancel(site_key=site_key)
+            released = self._release_site_runtime(site_key=site_key, dispatch=True)
+            WorkItemStore(self.workspace).release_scope(site_key=site_key, batch_id=batch_id, event="site_cancelled")
+            self._record_site_worker_batch_outcome(site_key=site_key, batch_id=batch_id)
+            self._retract_effective_site_run(site_key=site_key, batch_id=batch_id)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "accepted": True, "released": released, "batch": batch}
 
     def _handle_cancel_jobs_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
         batch_id = str(payload.get("batch_id") or "").strip()
@@ -527,6 +615,16 @@ class RuntimeHostService:
             cancel_batch = getattr(job_flow, "cancel_batch", None)
             if not callable(cancel_batch):
                 raise RuntimeError("batch cancellation is unavailable")
+            job_store = getattr(job_flow, "job_store", None)
+            current = job_store.load_batch(batch_id) if job_store is not None else {}
+            current_sites = current.get("sites") if isinstance(current.get("sites"), dict) else {}
+            for target in current_sites:
+                WorkItemStore(self.workspace).revoke_scope(
+                    site_key=str(target),
+                    batch_id=batch_id,
+                    state="cancelling",
+                    event="batch_cancel_requested",
+                )
             batch = cancel_batch(batch_id=batch_id, reason=reason)
             self._managed_batch_seen = True
             sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
@@ -556,24 +654,33 @@ class RuntimeHostService:
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
         try:
-            def _release() -> bool:
-                browser_runner = getattr(self.loop, "browser_runner", None)
-                finish_site = getattr(browser_runner, "finish_site", None)
-                if not callable(finish_site):
-                    raise RuntimeError("site runtime release is unavailable")
-                outcome = finish_site(request["site_key"])
-                # Legacy browser runners returned None after a successful
-                # release. Preserve that contract while newer runners expose
-                # a precise boolean reclamation result.
-                return True if outcome is None else bool(outcome)
-
-            released = self._run_site_operation(request["site_key"], _release)
-            if self._codex_workers is not None:
-                self._codex_workers.release(site_key=request["site_key"])
+            self._run_site_operation(
+                request["site_key"],
+                lambda: WorkItemStore(self.workspace).revoke_scope(
+                    site_key=request["site_key"],
+                    state="stopping",
+                    event="runtime_release_requested",
+                ),
+            )
+            released = self._release_site_runtime(site_key=request["site_key"], dispatch=True)
             WorkItemStore(self.workspace).release_scope(site_key=request["site_key"])
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "released": bool(released), **request}
+
+    def _release_site_runtime(self, *, site_key: str, dispatch: bool) -> bool:
+        def _release() -> bool:
+            browser_runner = getattr(self.loop, "browser_runner", None)
+            finish_site = getattr(browser_runner, "finish_site", None)
+            if not callable(finish_site):
+                raise RuntimeError("site runtime release is unavailable")
+            outcome = finish_site(site_key)
+            return True if outcome is None else bool(outcome)
+
+        released = self._run_site_operation(site_key, _release)
+        if self._codex_workers is not None:
+            self._codex_workers.release(site_key=site_key, dispatch=dispatch)
+        return bool(released)
 
     def _shutdown_if_idle(self) -> None:
         """Close only after every workspace batch has reached a terminal state."""
@@ -603,6 +710,7 @@ class RuntimeHostService:
     def _handle_agent_bridge_browser_list_tools(self, payload: dict[str, Any]) -> dict[str, Any]:
         site_key = str(payload.get("site_key") or "").strip()
         try:
+            self._validate_work_item_fence(payload)
             def _list() -> list[dict[str, Any]]:
                 browser_runner = getattr(self.loop, "browser_runner", None)
                 list_tools = getattr(browser_runner, "list_active_browser_tools", None)
@@ -624,6 +732,7 @@ class RuntimeHostService:
         turn_id = str(payload.get("turn_id") or "").strip()
         phase = str(payload.get("phase") or AGENT_BRIDGE_STATUS).strip() or AGENT_BRIDGE_STATUS
         try:
+            self._validate_work_item_fence(payload)
             def _call() -> dict[str, Any]:
                 browser_runner = getattr(self.loop, "browser_runner", None)
                 call_tool = getattr(browser_runner, "call_active_browser_tool", None)
@@ -644,6 +753,7 @@ class RuntimeHostService:
         turn_id = str(payload.get("turn_id") or "").strip()
         phase = str(payload.get("phase") or AGENT_BRIDGE_STATUS).strip() or AGENT_BRIDGE_STATUS
         try:
+            self._validate_work_item_fence(payload)
             def _run() -> dict[str, Any]:
                 browser_runner = getattr(self.loop, "browser_runner", None)
                 run_sequence = getattr(browser_runner, "run_active_browser_sequence", None)
@@ -662,6 +772,7 @@ class RuntimeHostService:
         site_key = str(payload.get("site_key") or "").strip()
         phase = str(payload.get("phase") or "").strip()
         try:
+            self._validate_work_item_fence(payload)
             def _list() -> list[dict[str, Any]]:
                 browser_runner = getattr(self.loop, "browser_runner", None)
                 list_tools = getattr(browser_runner, "list_active_state_tools", None)
@@ -687,6 +798,14 @@ class RuntimeHostService:
         phase_result_batch_id = ""
         phase_sequence_consumed = False
         try:
+            work_item_record = self._validate_work_item_fence(payload)
+            if (
+                tool_name == "phase_result"
+                and phase == "apply"
+                and not work_item_record.get("legacy_unversioned")
+                and not str(payload.get("apply_target_job_id") or "").strip()
+            ):
+                raise ValueError("apply phase result requires the active apply target fence")
             def _call() -> dict[str, Any]:
                 browser_runner = getattr(self.loop, "browser_runner", None)
                 call_tool = getattr(browser_runner, "call_active_state_tool", None)
@@ -728,18 +847,45 @@ class RuntimeHostService:
             ):
                 continue_sequence = getattr(getattr(self.loop, "job_flow", None), "continue_external_phase_sequence", None)
                 if callable(continue_sequence):
+                    continuation_result = continue_sequence(
+                        site_key=str(completion.get("site_key") or site_key),
+                        batch_id=str(completion.get("batch_id") or ""),
+                        terminal_phase=str(completion.get("terminal_phase") or ""),
+                        session_id=str(completion.get("session_id") or ""),
+                        turn_id=str(completion.get("turn_id") or turn_id),
+                    )
+                    self._reject_unhandled_phase_continuation(
+                        site_key=site_key,
+                        work_item_record=work_item_record,
+                        continuation_result=continuation_result,
+                    )
                     result = {
                         **result,
-                        "workflow_continuation": continue_sequence(
-                            site_key=str(completion.get("site_key") or site_key),
-                            batch_id=str(completion.get("batch_id") or ""),
-                            terminal_phase=str(completion.get("terminal_phase") or ""),
-                            session_id=str(completion.get("session_id") or ""),
-                            turn_id=str(completion.get("turn_id") or turn_id),
-                        ),
+                        "workflow_continuation": continuation_result,
                     }
                     terminal_batch_id = str(completion.get("batch_id") or "")
                     phase_sequence_consumed = True
+                    continued_site = (
+                        continuation_result.get("site")
+                        if isinstance(continuation_result, dict) and isinstance(continuation_result.get("site"), dict)
+                        else {}
+                    )
+                    continued_phase = str(continued_site.get("current_phase") or "")
+                    terminal_phase = str(completion.get("terminal_phase") or "")
+                    if continued_phase and continued_phase != terminal_phase:
+                        self._publish_agent_event(
+                            kind="site.phase_advanced",
+                            attention="notification",
+                            summary=f"{site_key} advanced from {terminal_phase} to {continued_phase}.",
+                            site_key=site_key,
+                            batch_id=terminal_batch_id,
+                            thread_id="",
+                            turn_id=str(completion.get("turn_id") or turn_id),
+                            phase=continued_phase,
+                            current_url=str(continued_site.get("current_url") or ""),
+                            details={"previous_phase": terminal_phase, "next_phase": continued_phase},
+                            dedupe_key=f"site_phase:{terminal_batch_id}:{site_key}:{terminal_phase}:{continued_phase}",
+                        )
             # An apply work order has exactly one declared phase. Its terminal
             # result must consume the active target even if an older bridge
             # response omitted the completion payload.
@@ -753,15 +899,21 @@ class RuntimeHostService:
             ):
                 continue_sequence = getattr(getattr(self.loop, "job_flow", None), "continue_external_phase_sequence", None)
                 if callable(continue_sequence):
+                    continuation_result = continue_sequence(
+                        site_key=site_key,
+                        batch_id=phase_result_batch_id,
+                        terminal_phase="apply",
+                        session_id="",
+                        turn_id=turn_id,
+                    )
+                    self._reject_unhandled_phase_continuation(
+                        site_key=site_key,
+                        work_item_record=work_item_record,
+                        continuation_result=continuation_result,
+                    )
                     result = {
                         **result,
-                        "workflow_continuation": continue_sequence(
-                            site_key=site_key,
-                            batch_id=phase_result_batch_id,
-                            terminal_phase="apply",
-                            session_id="",
-                            turn_id=turn_id,
-                        ),
+                        "workflow_continuation": continuation_result,
                     }
                     terminal_batch_id = phase_result_batch_id
             if terminal_batch_id:
@@ -787,6 +939,78 @@ class RuntimeHostService:
             return {"ok": False, "error": str(exc)}
         self._record_codex_activity(site_key)
         return {"ok": True, "site_key": site_key, "result": result}
+
+    def _reject_unhandled_phase_continuation(
+        self,
+        *,
+        site_key: str,
+        work_item_record: dict[str, Any],
+        continuation_result: Any,
+    ) -> None:
+        if not isinstance(continuation_result, dict) or continuation_result.get("handled") is not False:
+            return
+        self._restore_active_work_item(site_key=site_key, work_item_record=work_item_record)
+        reason = str(continuation_result.get("reason") or "phase_continuation_rejected").strip()
+        raise ValueError(f"phase completion was rejected: {reason}")
+
+    def _restore_active_work_item(self, *, site_key: str, work_item_record: dict[str, Any]) -> None:
+        payload_path = Path(str(work_item_record.get("payload_path") or ""))
+        if not payload_path.is_file():
+            return
+        payload = read_json(payload_path)
+        if str(payload.get("work_order_id") or "") != str(work_item_record.get("work_item_id") or ""):
+            return
+        job_flow = getattr(self.loop, "job_flow", None)
+        site_store = getattr(getattr(job_flow, "site_tools", None), "site_store", None)
+        browser_session = site_store.load_browser_session(site_key) if site_store is not None else {}
+        phase_session_path = Path(str(browser_session.get("phase_session_path") or ""))
+        if not phase_session_path.is_file():
+            phase_session_path = payload_path.parent / "phase_session.json"
+        if not phase_session_path.is_file():
+            return
+        set_browser_agent_work_order_state(
+            workspace=self.workspace,
+            payload_path=payload_path,
+            phase_session_path=phase_session_path,
+            worker_state="active",
+        )
+
+    def _validate_work_item_fence(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Reject stale or revoked external-agent tool calls before side effects."""
+
+        has_fence = any(
+            payload.get(field)
+            for field in ("work_item_id", "batch_id", "control_epoch", "site_revision")
+        )
+        if not has_fence and not protocol_version_from(payload):
+            return {"legacy_unversioned": True}
+        fence = WorkItemFence(
+            work_item_id=str(payload.get("work_item_id") or "").strip(),
+            site_key=str(payload.get("site_key") or "").strip(),
+            batch_id=str(payload.get("batch_id") or "").strip(),
+            control_epoch=int(payload.get("control_epoch") or 0),
+            site_revision=int(payload.get("site_revision") or 0),
+        )
+        if not all((fence.work_item_id, fence.site_key, fence.batch_id, fence.control_epoch, fence.site_revision)):
+            raise ValueError("agent bridge request has incomplete work-item fencing")
+        record = WorkItemStore(self.workspace).validate_fence(fence)
+        if "context_revision" in payload:
+            expected_context_revision = int(payload.get("context_revision") or 0)
+            if expected_context_revision <= 0:
+                raise ValueError("agent bridge request has invalid context revision")
+            if expected_context_revision != int(record.get("context_revision") or 0):
+                raise ValueError("work item context revision is stale")
+        expected_target = str(payload.get("apply_target_job_id") or "").strip()
+        if expected_target:
+            work_item_payload = read_json(Path(str(record.get("payload_path") or "")))
+            active_targets = {
+                str(value or "").strip()
+                for value in work_item_payload.get("apply_target_job_ids") or []
+                if str(value or "").strip()
+            }
+            if expected_target not in active_targets:
+                raise ValueError("apply target fence does not match the active work item target")
+        return record
 
     def _handle_agent_bridge_read_context_resource(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Read one worker-selected resource through the retained runtime."""
@@ -823,8 +1047,7 @@ class RuntimeHostService:
             return operation()
         with self._site_locks_guard:
             lock = self._site_locks.setdefault(normalized_site, threading.Lock())
-        if not lock.acquire(blocking=False):
-            raise RuntimeError(f"site runtime is busy: {normalized_site}")
+        lock.acquire()
         try:
             return operation()
         finally:
@@ -1205,6 +1428,12 @@ class RuntimeHostService:
             ),
             idle_timeout_seconds=int(getattr(getattr(agent_config, "recovery", None), "idle_timeout_seconds", 180) or 180),
             max_resume_attempts=int(getattr(getattr(agent_config, "recovery", None), "max_resume_attempts", 2) or 0),
+            interrupt_ack_timeout_seconds=int(
+                getattr(getattr(agent_config, "recovery", None), "interrupt_ack_timeout_seconds", 15) or 15
+            ),
+            max_interrupt_attempts=int(
+                getattr(getattr(agent_config, "recovery", None), "max_interrupt_attempts", 2) or 2
+            ),
             on_record=self._record_codex_worker,
             on_usage=self._record_codex_usage,
             on_recovery=self._record_codex_recovery,
@@ -1325,6 +1554,7 @@ class RuntimeHostService:
         batch = job_flow.job_store.load_batch(record.batch_id)
         if str(batch.get("execution_backend") or "provider") != CODEX_BACKEND:
             return None
+        WorkItemStore(self.workspace).reissue(record.work_item_id, event="worker_resume_requested")
         resumed = self._codex_workers.resume_work_order(record, message=message)
         wait_for_turn_start = getattr(self._codex_workers, "wait_for_turn_start", None)
         if callable(wait_for_turn_start):
@@ -1338,10 +1568,16 @@ class RuntimeHostService:
         site_store = getattr(getattr(job_flow, "site_tools", None), "site_store", None)
         if site_store is None:
             return
-        if str(record.status or "") in {"released", "cancelled"}:
+        persisted_state = {
+            "paused": "paused",
+            "pause_unconfirmed": "pause_unconfirmed",
+            "released": "released",
+            "cancelled": "cancelled",
+        }.get(str(record.status or ""))
+        if persisted_state:
             try:
                 WorkItemStore(self.workspace).transition(
-                    str(record.work_item_id or ""), state="released", event=f"worker:{record.status}"
+                    str(record.work_item_id or ""), state=persisted_state, event=f"worker:{record.status}"
                 )
             except ValueError:
                 pass

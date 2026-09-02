@@ -99,6 +99,11 @@ def build_work_item_context(payload: dict[str, Any]) -> dict[str, Any]:
         "work_item_id": work_item_id_from_payload(payload),
         "kind": "site_batch",
         "status": "active",
+        "lease": {
+            "context_revision": int(payload.get("context_revision") or 0),
+            "site_revision": int(payload.get("site_revision") or 0),
+            "control_epoch": int(payload.get("control_epoch") or 0),
+        },
         "objective": {
             "phase": str(payload.get("current_phase") or phase.get("slug") or ""),
             "title": str(phase.get("title") or ""),
@@ -119,6 +124,8 @@ def build_work_item_context(payload: dict[str, Any]) -> dict[str, Any]:
             "Operate only the retained runtime for this work item.",
             "Do not inspect project files or create a browser runtime for context.",
             "Use CareerEng MCP tools for browser and state changes.",
+            "Pass lease.context_revision unchanged to every browser or state mutation.",
+            "During apply, pass the current scope apply target unchanged when reporting the phase result.",
             "Treat run_intent as authoritative. Do not infer retrieval-only scope from an empty current apply target list.",
         ],
         "context_catalog": [

@@ -209,6 +209,7 @@ def refresh_browser_agent_work_order(
     cache_candidates: list[dict[str, Any]] | None = None,
     cache_dependency_versions: dict[str, Any] | None = None,
     apply_initial_facts: dict[str, Any] | None = None,
+    skill_snapshot: dict[str, Any] | None = None,
 ) -> AgentBridgeWorkOrder:
     """Reuse a site-batch work item for the next declared browser sequence."""
 
@@ -249,6 +250,11 @@ def refresh_browser_agent_work_order(
         cache_candidates=cache_candidates,
     ).as_dict()
     resolved_apply_facts = dict(apply_initial_facts or payload.get("apply_initial_facts") or {})
+    resolved_skill_snapshot = dict(
+        payload.get("skill_snapshot")
+        if isinstance(payload.get("skill_snapshot"), dict)
+        else (skill_snapshot or {})
+    )
     state_commands = state_tool_commands(str(payload.get("site_key") or ""), phase=current_phase)
     state_tools = state_tool_schemas_for_phase(current_phase, include_phase_result=True)
     phase_payload = [
@@ -293,6 +299,7 @@ def refresh_browser_agent_work_order(
         )
     payload["phases"] = phase_payload
     payload["cache_dependency_versions"] = versions
+    payload["skill_snapshot"] = resolved_skill_snapshot
     write_json(payload_path, payload)
     write_json(phase_session_path, session_payload)
     WorkItemStore(workspace).register(payload_path, event="work_item_refreshed")
@@ -477,6 +484,7 @@ def create_browser_agent_work_order(
     cache_candidates: list[dict[str, Any]] | None = None,
     cache_dependency_versions: dict[str, Any] | None = None,
     apply_initial_facts: dict[str, Any] | None = None,
+    skill_snapshot: dict[str, Any] | None = None,
 ) -> AgentBridgeWorkOrder:
     workspace = Path(workspace).resolve()
     phase_rows = list(phases)
@@ -567,6 +575,7 @@ def create_browser_agent_work_order(
         "current_phase_context": phase_context,
         "phase_memory": phase_memory.as_payload(),
         "cache_dependency_versions": dict(cache_dependency_versions or {}),
+        "skill_snapshot": dict(skill_snapshot or {}),
         "apply_initial_facts": resolved_apply_facts,
         "tool_commands": tool_commands or {},
         "browser_tool_commands": tool_commands or {},

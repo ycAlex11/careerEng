@@ -55,7 +55,7 @@ class CareerEngMCPRuntime:
         return runtime_host_client(project_root=self.project_root, workspace=self.workspace, autostart=False)
 
 
-def _compact_batch(batch: dict[str, Any] | None) -> dict[str, Any]:
+def _compact_batch(batch: dict[str, Any] | None, *, site_store: SiteStore | None = None) -> dict[str, Any]:
     if not isinstance(batch, dict) or not batch:
         return {}
     sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
@@ -71,16 +71,20 @@ def _compact_batch(batch: dict[str, Any] | None) -> dict[str, Any]:
         "updated_at": str(batch.get("updated_at") or ""),
         "site_count": len(sites),
         "sites": {
-            str(site_key): _compact_batch_site(site)
+            str(site_key): _compact_batch_site(
+                site,
+                browser_session=(site_store.load_browser_session(str(site_key)) if site_store is not None else None),
+            )
             for site_key, site in sites.items()
             if isinstance(site, dict) and str(site_key)
         },
     }
 
 
-def _compact_batch_site(site: dict[str, Any]) -> dict[str, Any]:
+def _compact_batch_site(site: dict[str, Any], *, browser_session: dict[str, Any] | None = None) -> dict[str, Any]:
     retrieve = site.get("retrieve") if isinstance(site.get("retrieve"), dict) else {}
     apply = site.get("apply") if isinstance(site.get("apply"), dict) else {}
+    browser = browser_session if isinstance(browser_session, dict) else {}
     return {
         "site_key": str(site.get("site_key") or ""),
         "site_name": str(site.get("site_name") or ""),
@@ -91,6 +95,8 @@ def _compact_batch_site(site: dict[str, Any]) -> dict[str, Any]:
         "retrieve_status": str(retrieve.get("status") or ""),
         "apply_status": str(apply.get("status") or ""),
         "message": str(site.get("message") or "")[:500],
+        "worker_status": str(browser.get("codex_worker_status") or ""),
+        "worker_last_error": str(browser.get("codex_worker_last_error") or "")[:500],
     }
 
 
@@ -122,7 +128,13 @@ def _active_work_item_payload(runtime: CareerEngMCPRuntime, work_item_id: str) -
     return WorkItemStore(runtime.workspace).resolve_active(work_item_id)
 
 
-def _active_work_item_scope(runtime: CareerEngMCPRuntime, work_item_id: str) -> dict[str, Any]:
+def _active_work_item_scope(
+    runtime: CareerEngMCPRuntime,
+    work_item_id: str,
+    *,
+    expected_context_revision: int | None = None,
+    expected_apply_target_job_id: str = "",
+) -> dict[str, Any]:
     """Resolve the immutable execution scope for one active worker item."""
 
     payload = _active_work_item_payload(runtime, work_item_id)
@@ -141,6 +153,16 @@ def _active_work_item_scope(runtime: CareerEngMCPRuntime, work_item_id: str) -> 
     site = sites.get(site_key) if isinstance(sites.get(site_key), dict) else {}
     if not site:
         raise ValueError("work item site is not active in its batch")
+    context_revision = int(payload.get("context_revision") or 0)
+    if expected_context_revision is not None and context_revision != int(expected_context_revision):
+        raise ValueError(
+            "work item context revision is stale "
+            f"(expected={expected_context_revision}, current={context_revision})"
+        )
+    apply_target_job_ids = [str(value or "").strip() for value in scope.get("apply_target_job_ids") or [] if str(value or "").strip()]
+    expected_target = str(expected_apply_target_job_id or "").strip()
+    if expected_target and expected_target not in apply_target_job_ids:
+        raise ValueError("apply target fence does not match the active work item target")
     return {
         "work_item_id": str(context.get("work_item_id") or ""),
         "site_key": site_key,
@@ -148,6 +170,20 @@ def _active_work_item_scope(runtime: CareerEngMCPRuntime, work_item_id: str) -> 
         "phase": phase,
         "turn_id": str(scope.get("turn_id") or ""),
         "evolution_run_id": evolution_run_id,
+        "context_revision": context_revision,
+        "apply_target_job_ids": apply_target_job_ids,
+        "control_epoch": int(payload.get("control_epoch") or 0),
+        "site_revision": int(payload.get("site_revision") or 0),
+    }
+
+
+def _work_item_fence_payload(scope: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "work_item_id": scope["work_item_id"],
+        "batch_id": scope["batch_id"],
+        "context_revision": scope["context_revision"],
+        "control_epoch": scope["control_epoch"],
+        "site_revision": scope["site_revision"],
     }
 
 
@@ -261,7 +297,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             "project_root": str(runtime.project_root),
             "workspace": str(runtime.workspace),
             "session_id": session_id,
-            "batch": _compact_batch(batch),
+            "batch": _compact_batch(batch, site_store=site_store),
             "active_sites": compact_sites,
         }
 
@@ -363,7 +399,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
     ) -> dict[str, Any]:
         """Return compact status for one batch, or the latest open batch by default."""
         batch = _latest_batch(runtime.job_store(), session_id=session_id, batch_id=batch_id)
-        return {"ok": True, "batch": _compact_batch(batch)}
+        return {"ok": True, "batch": _compact_batch(batch, site_store=runtime.site_store())}
 
     @server.tool()
     def careereng_start_jobs_batch(
@@ -415,6 +451,24 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         return runtime.host_client().request(
             "pause_jobs_batch",
             {"batch_id": batch_id, "site_key": site_key},
+        )
+
+    @server.tool()
+    def careereng_pause_site(batch_id: str, site_key: str) -> dict[str, Any]:
+        """Pause one site worker while retaining its browser runtime."""
+        return runtime.host_client().request("pause_site", {"batch_id": batch_id, "site_key": site_key})
+
+    @server.tool()
+    def careereng_stop_site(batch_id: str, site_key: str) -> dict[str, Any]:
+        """Pause one site worker and release only its browser runtime."""
+        return runtime.host_client().request("stop_site", {"batch_id": batch_id, "site_key": site_key})
+
+    @server.tool()
+    def careereng_cancel_site(batch_id: str, site_key: str, reason: str = "user_requested_cancel") -> dict[str, Any]:
+        """Cancel one site without cancelling other sites in the batch."""
+        return runtime.host_client().request(
+            "cancel_site",
+            {"batch_id": batch_id, "site_key": site_key, "reason": reason},
         )
 
     @server.tool()
@@ -472,19 +526,24 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             return {"ok": False, "error": str(exc)}
         result = runtime.host_client().request(
             "agent_bridge_browser_list_tools",
-            {"site_key": scope["site_key"]},
+            {"site_key": scope["site_key"], **_work_item_fence_payload(scope)},
         )
         return {**result, "work_item_id": scope["work_item_id"]}
 
     @server.tool()
     def careereng_work_item_call_browser_tool(
         work_item_id: str,
+        context_revision: int,
         tool_name: str,
         arguments: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Call one browser tool inside the immutable scope of a worker item."""
         try:
-            scope = _active_work_item_scope(runtime, work_item_id)
+            scope = _active_work_item_scope(
+                runtime,
+                work_item_id,
+                expected_context_revision=context_revision,
+            )
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
         result = runtime.host_client().request(
@@ -495,6 +554,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 "arguments": arguments or {},
                 "turn_id": scope["turn_id"],
                 "phase": scope["phase"],
+                **_work_item_fence_payload(scope),
             },
         )
         return {**result, "work_item_id": scope["work_item_id"]}
@@ -502,11 +562,16 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
     @server.tool()
     def careereng_work_item_run_browser_sequence(
         work_item_id: str,
+        context_revision: int,
         steps: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Run explicit browser steps only inside the immutable worker scope."""
         try:
-            scope = _active_work_item_scope(runtime, work_item_id)
+            scope = _active_work_item_scope(
+                runtime,
+                work_item_id,
+                expected_context_revision=context_revision,
+            )
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
         result = runtime.host_client().request(
@@ -516,6 +581,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 "steps": steps,
                 "turn_id": scope["turn_id"],
                 "phase": scope["phase"],
+                **_work_item_fence_payload(scope),
             },
         )
         return {**result, "work_item_id": scope["work_item_id"]}
@@ -529,21 +595,32 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             return {"ok": False, "error": str(exc)}
         result = runtime.host_client().request(
             "agent_bridge_state_list_tools",
-            {"site_key": scope["site_key"], "phase": scope["phase"]},
+            {"site_key": scope["site_key"], "phase": scope["phase"], **_work_item_fence_payload(scope)},
         )
         return {**result, "work_item_id": scope["work_item_id"]}
 
     @server.tool()
     def careereng_work_item_call_state_tool(
         work_item_id: str,
+        context_revision: int,
         tool_name: str,
         arguments: dict[str, Any] | None = None,
+        apply_target_job_id: str = "",
     ) -> dict[str, Any]:
         """Call a state tool only inside the immutable worker scope."""
         try:
-            scope = _active_work_item_scope(runtime, work_item_id)
+            scope = _active_work_item_scope(
+                runtime,
+                work_item_id,
+                expected_context_revision=context_revision,
+                expected_apply_target_job_id=apply_target_job_id,
+            )
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
+        if tool_name == "phase_result" and scope["phase"] == "apply":
+            targets = scope["apply_target_job_ids"]
+            if len(targets) != 1 or str(apply_target_job_id or "").strip() != targets[0]:
+                return {"ok": False, "error": "apply phase result requires the active apply target fence"}
         result = runtime.host_client().request(
             "agent_bridge_state_call_tool",
             {
@@ -552,6 +629,8 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 "arguments": arguments or {},
                 "turn_id": scope["turn_id"],
                 "phase": scope["phase"],
+                "apply_target_job_id": str(apply_target_job_id or "").strip(),
+                **_work_item_fence_payload(scope),
             },
         )
         return {**result, "work_item_id": scope["work_item_id"]}
@@ -559,14 +638,18 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
     @server.tool()
     def careereng_work_item_phase_result(
         work_item_id: str,
+        context_revision: int,
         status: Literal["done", "waiting_user", "blocked"],
         summary: str,
+        apply_target_job_id: str = "",
     ) -> dict[str, Any]:
         """Write the terminal result of exactly one active worker phase."""
         return careereng_work_item_call_state_tool(
             work_item_id=work_item_id,
+            context_revision=context_revision,
             tool_name="phase_result",
             arguments={"status": status, "summary": summary},
+            apply_target_job_id=apply_target_job_id,
         )
 
     @server.tool()

@@ -144,6 +144,28 @@ class SiteWorkerSessionStore:
             self._save_locked(data)
             return dict(session)
 
+    def quarantine_thread(self, *, worker_session_id: str, thread_id: str, reason: str) -> dict[str, Any] | None:
+        """Detach an unconfirmed transport thread without ending its site session."""
+
+        with self._lock:
+            data = self._load_locked()
+            session = self._session_by_id(data["sessions"], worker_session_id)
+            if session is None:
+                return None
+            normalized_thread = str(thread_id or "").strip()
+            session.setdefault("thread_bindings", []).append(
+                {
+                    "thread_id": normalized_thread,
+                    "quarantined_at": now_iso(),
+                    "reason": str(reason or "transport_unconfirmed"),
+                }
+            )
+            if str(session.get("active_thread_id") or "") == normalized_thread:
+                session["active_thread_id"] = ""
+            session["updated_at"] = now_iso()
+            self._save_locked(data)
+            return dict(session)
+
     def record_batch_outcome(
         self,
         *,

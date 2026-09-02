@@ -70,7 +70,7 @@ from careereng.config.schema import (
 from careereng.career.resume.export import default_apply_resume_pdf_path
 from careereng.platform.persistence import JSONLStore
 from careereng.platform.observability import PerformanceRecorder
-from careereng.utils import now_iso
+from careereng.utils import now_iso, read_json
 
 
 SUPPORTED_PHASES = {
@@ -332,8 +332,30 @@ class BrowserAutomationService:
                 "reused_runtime": bool(reused_runtime),
             },
         )
+        existing_payload_path = Path(str(prior_session.get("agent_bridge_payload_path") or ""))
+        existing_phase_session_path = Path(str(prior_session.get("phase_session_path") or ""))
+        same_batch = str(prior_session.get("agent_bridge_batch_id") or "") == str(batch_id or "")
+        existing_payload = read_json(existing_payload_path) if same_batch and existing_payload_path.is_file() else {}
+        pinned_snapshot = existing_payload.get("skill_snapshot") if isinstance(existing_payload.get("skill_snapshot"), dict) else {}
+        if pinned_snapshot:
+            skill_snapshot = dict(pinned_snapshot)
+        else:
+            dependency_versions = self._cache_dependency_versions(site_key)
+            skill_snapshot = {
+                "project_markdown": load_text(self._project_skill_path()),
+                "site_markdown": load_text(self._site_skill_path(site_key)),
+                "versions": {
+                    key: value
+                    for key, value in dependency_versions.items()
+                    if "skill" in str(key) or "policy" in str(key)
+                },
+            }
         allowed_slugs = set(phase_slugs or DEFAULT_RUN_PHASES)
-        phases = self._phase_prompts(site_key, allowed_slugs=allowed_slugs)
+        phases = build_phase_prompts(
+            str(skill_snapshot.get("project_markdown") or ""),
+            str(skill_snapshot.get("site_markdown") or ""),
+            allowed_slugs=allowed_slugs,
+        )
         apply_initial_facts: dict[str, Any] = {}
         if any(phase.slug == "apply" for phase in phases):
             try:
@@ -364,9 +386,6 @@ class BrowserAutomationService:
                 site_key,
                 {"staged_resume_pdf_path": str(staged_resume_pdf)},
             )
-        existing_payload_path = Path(str(prior_session.get("agent_bridge_payload_path") or ""))
-        existing_phase_session_path = Path(str(prior_session.get("phase_session_path") or ""))
-        same_batch = str(prior_session.get("agent_bridge_batch_id") or "") == str(batch_id or "")
         common_kwargs = {
             "workspace": self.workspace,
             "entry_url": entry_url,
@@ -378,6 +397,7 @@ class BrowserAutomationService:
             "cache_candidates": self._cache_candidates(site_key=site_key, phase_slug=phases[0].slug if phases else "", batch_id=batch_id),
             "cache_dependency_versions": self._cache_dependency_versions(site_key),
             "apply_initial_facts": apply_initial_facts,
+            "skill_snapshot": skill_snapshot,
         }
         if same_batch and existing_payload_path.is_file() and existing_phase_session_path.is_file():
             work_order = refresh_browser_agent_work_order(
@@ -1898,6 +1918,20 @@ class BrowserAutomationService:
         if not self._context_resource_scopes:
             self._browser_context_registry.release_loaded_bundles()
         return released
+
+    def complete_site_work_item(self, site_key: str) -> bool:
+        session = self.site_store.load_browser_session(site_key)
+        payload_path = Path(str(session.get("agent_bridge_payload_path") or ""))
+        phase_session_path = Path(str(session.get("phase_session_path") or ""))
+        if not payload_path.is_file() or not phase_session_path.is_file():
+            return False
+        set_browser_agent_work_order_state(
+            workspace=self.workspace,
+            payload_path=payload_path,
+            phase_session_path=phase_session_path,
+            worker_state="completed",
+        )
+        return True
 
     def _retain_context_resource_scope(self, *, site_key: str, batch_id: str) -> None:
         normalized_site = str(site_key or "").strip()

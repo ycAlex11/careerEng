@@ -71,8 +71,13 @@ MCP exposes a small fixed control surface:
 - `careereng_work_item_list_browser_tools` and `careereng_work_item_list_state_tools` discover currently permitted tools.
 - `careereng_work_item_call_browser_tool`, `careereng_work_item_run_browser_sequence`, and `careereng_work_item_call_state_tool` execute within that scope.
 - `careereng_work_item_phase_result` closes one phase; `careereng_complete_evolution_solution` continues an applied exploration proposal.
+- `careereng_pause_site`, `careereng_stop_site`, and `careereng_cancel_site` change only the named site's lifecycle within its batch.
+- `careereng_pause_jobs_batch` and `careereng_cancel_jobs_batch` remain explicit whole-batch controls.
 
 Do not use a static browser-tool list. The current work item determines which browser and state tools are available.
+Do not emulate a site-only action by cancelling the batch. A revoked work-item
+epoch rejects delayed browser/state calls, while a stale site revision rejects
+late lifecycle results.
 
 ## Safety
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+from time import monotonic
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -16,7 +17,7 @@ from typing import Any, Callable, Protocol
 from careereng.orchestration.agent_protocol.work_items import work_item_id_from_payload
 from careereng.orchestration.engine.site_work_items import SiteWorkItem, SiteWorkItemScheduler
 from careereng.platform.sessions import SiteWorkerSessionStore
-from careereng.utils import now_iso, read_json
+from careereng.utils import make_id, now_iso, read_json
 
 
 @dataclass(frozen=True)
@@ -66,10 +67,15 @@ class AgentWorkerRecord:
     last_error: str = ""
     recovery_attempts: int = 0
     recovery_pending: bool = False
+    continuation_attempts: int = 0
+    control_operation_id: str = ""
+    interrupt_attempts: int = 0
+    interrupt_requested_monotonic: float = field(default=0.0, repr=False)
+    last_transport_seen_monotonic: float = field(default_factory=monotonic, repr=False)
     # Summary turns have no browser activity to observe and may wait for a
     # proposal/apply authorization, so they are outside the browser watchdog.
     watchdog_enabled: bool = True
-    last_activity_monotonic: float = field(default_factory=time.monotonic, repr=False)
+    last_activity_monotonic: float = field(default_factory=monotonic, repr=False)
     # This is intentionally process-local. A persisted empty turn id after a
     # host restart is resumable; an in-memory launch is not a second turn.
     turn_start_inflight: bool = False
@@ -96,6 +102,8 @@ class SiteAgentWorkerCoordinator:
         max_effective_batches_per_session: int = 5,
         idle_timeout_seconds: int = 180,
         max_resume_attempts: int = 2,
+        interrupt_ack_timeout_seconds: int = 15,
+        max_interrupt_attempts: int = 2,
         on_record: Callable[[AgentWorkerRecord], None] | None = None,
         on_usage: Callable[[AgentWorkerRecord, dict[str, Any]], None] | None = None,
         on_recovery: Callable[[AgentWorkerRecord, str], None] | None = None,
@@ -111,6 +119,8 @@ class SiteAgentWorkerCoordinator:
         self.max_effective_batches_per_session = max(1, int(max_effective_batches_per_session or 1))
         self.idle_timeout_seconds = max(1, int(idle_timeout_seconds or 1))
         self.max_resume_attempts = max(0, int(max_resume_attempts or 0))
+        self.interrupt_ack_timeout_seconds = max(1, int(interrupt_ack_timeout_seconds or 1))
+        self.max_interrupt_attempts = max(1, int(max_interrupt_attempts or 1))
         self.on_record = on_record
         self.on_usage = on_usage
         self.on_recovery = on_recovery
@@ -139,6 +149,8 @@ class SiteAgentWorkerCoordinator:
             if existing is not None:
                 if existing.work_item_id != record.work_item_id:
                     self._successors[record.site_key] = record
+                else:
+                    existing.resume_message = _append_resume_message(existing.resume_message, record.resume_message)
                 return existing
             # A new work item may reuse the site's Codex thread, but never a
             # previous batch's turn, error, or scheduler state.
@@ -147,6 +159,7 @@ class SiteAgentWorkerCoordinator:
             record.last_error = ""
             record.recovery_attempts = 0
             record.recovery_pending = False
+            record.continuation_attempts = 0
             accepted = self._scheduler.enqueue(SiteWorkItem(record.site_key, record.batch_id, record))
             if not accepted:
                 return record
@@ -195,13 +208,16 @@ class SiteAgentWorkerCoordinator:
             if record.status == "pausing":
                 return record
             self._pause_requested.add(record.site_key)
+            record.control_operation_id = make_id("pause")
+            record.interrupt_attempts = 0
             if record.thread_id and record.turn_id:
                 try:
                     self._interrupt_locked(record, source="user_pause")
                 except RuntimeError:
                     # The persisted record remains resumable; a later resume
                     # can use the same thread if transport confirms it idle.
-                    pass
+                    record.interrupt_attempts = 1
+                    record.interrupt_requested_monotonic = monotonic()
             record.status = "pausing"
             record.updated_at = now_iso()
             self._persist_locked(record)
@@ -256,6 +272,24 @@ class SiteAgentWorkerCoordinator:
 
             paused = self._paused.get(record.site_key)
             if paused is not None and _same_work_item(paused, record) and paused.thread_id:
+                if paused.status == "pause_unconfirmed":
+                    self._paused.pop(record.site_key, None)
+                    self._pause_requested.discard(record.site_key)
+                    self._forget_thread_association_locked(paused)
+                    self.session_store.quarantine_thread(
+                        worker_session_id=paused.worker_session_id,
+                        thread_id=paused.thread_id,
+                        reason="pause_ack_timeout",
+                    )
+                    paused.thread_id = ""
+                    paused.turn_id = ""
+                    paused.status = "queued"
+                    paused.control_operation_id = ""
+                    paused.interrupt_attempts = 0
+                    paused.resume_message = _append_resume_message(paused.resume_message, message)
+                    self._scheduler.enqueue(SiteWorkItem(paused.site_key, paused.batch_id, paused))
+                    self._dispatch_locked()
+                    return paused
                 self._paused.pop(record.site_key, None)
                 server = self._ensure_server_locked()
                 self._associate_thread_locked(paused, paused.thread_id)
@@ -289,8 +323,8 @@ class SiteAgentWorkerCoordinator:
     def wait_for_turn_start(self, record: AgentWorkerRecord, *, timeout_seconds: float = 10.0) -> AgentWorkerRecord:
         """Confirm that a requested resume owns a live external-agent turn."""
 
-        deadline = time.monotonic() + max(0.1, float(timeout_seconds or 0.1))
-        while time.monotonic() < deadline:
+        deadline = monotonic() + max(0.1, float(timeout_seconds or 0.1))
+        while monotonic() < deadline:
             with self._lock:
                 current = self._active.get(record.site_key)
                 if current is not None and current.work_item_id == record.work_item_id:
@@ -362,7 +396,7 @@ class SiteAgentWorkerCoordinator:
             record = self._active.get(str(site_key or ""))
             if record is None:
                 return
-            record.last_activity_monotonic = time.monotonic()
+            record.last_activity_monotonic = monotonic()
 
     def record_for_thread(self, thread_id: str) -> AgentWorkerRecord | None:
         """Return the live owner of one external-agent thread, if any."""
@@ -397,7 +431,7 @@ class SiteAgentWorkerCoordinator:
         record.turn_id = ""
         record.turn_start_inflight = True
         record.status = "starting"
-        record.last_activity_monotonic = time.monotonic()
+        record.last_activity_monotonic = monotonic()
         record.updated_at = now_iso()
         self._active[record.site_key] = record
         self._persist_locked(record)
@@ -474,7 +508,7 @@ class SiteAgentWorkerCoordinator:
                     should_interrupt = record.site_key in self._pause_requested
                     record.status = "pausing" if should_interrupt else "running"
                     record.last_error = ""
-                    record.last_activity_monotonic = time.monotonic()
+                    record.last_activity_monotonic = monotonic()
                     record.updated_at = now_iso()
                     self._persist_locked(record)
                 if should_interrupt:
@@ -511,8 +545,30 @@ class SiteAgentWorkerCoordinator:
 
         while not self._closed.wait(timeout=1.0):
             with self._lock:
-                now = time.monotonic()
+                now = monotonic()
                 for record in list(self._active.values()):
+                    if record.status == "pausing" and record.turn_id:
+                        if now - record.interrupt_requested_monotonic < self.interrupt_ack_timeout_seconds:
+                            continue
+                        if record.interrupt_attempts < self.max_interrupt_attempts:
+                            try:
+                                self._interrupt_locked(record, source="pause_ack_retry")
+                            except RuntimeError as exc:
+                                record.interrupt_attempts += 1
+                                record.interrupt_requested_monotonic = now
+                                record.last_error = f"{type(exc).__name__}: {exc}"
+                                record.updated_at = now_iso()
+                                self._persist_locked(record)
+                            continue
+                        record.status = "pause_unconfirmed"
+                        record.last_error = "turn interrupt acknowledgement timed out"
+                        record.updated_at = now_iso()
+                        self._persist_locked(record)
+                        self._active.pop(record.site_key, None)
+                        self._scheduler.complete(record.site_key)
+                        self._paused[record.site_key] = record
+                        self._dispatch_locked()
+                        continue
                     if (
                         not record.watchdog_enabled
                         or record.status != "running"
@@ -565,6 +621,11 @@ class SiteAgentWorkerCoordinator:
             },
         )
         self._ensure_server_locked().interrupt_turn(thread_id=record.thread_id, turn_id=record.turn_id)
+        record.interrupt_attempts += 1
+        record.interrupt_requested_monotonic = monotonic()
+        record.last_transport_seen_monotonic = record.interrupt_requested_monotonic
+        record.updated_at = now_iso()
+        self._persist_locked(record)
 
     def _emit_transport_event_locked(self, record: AgentWorkerRecord | None, payload: dict[str, Any]) -> None:
         if self.on_transport_event is not None:
@@ -600,10 +661,10 @@ class SiteAgentWorkerCoordinator:
     def _on_event(self, event: AgentWorkerEvent) -> None:
         if event.kind == "transport":
             with self._lock:
-                self._emit_transport_event_locked(
-                    self._by_thread.get(str(event.thread_id)),
-                    dict(event.transport),
-                )
+                record = self._by_thread.get(str(event.thread_id))
+                if record is not None:
+                    record.last_transport_seen_monotonic = monotonic()
+                self._emit_transport_event_locked(record, dict(event.transport))
             return
         if event.kind == "usage":
             with self._lock:
@@ -617,7 +678,19 @@ class SiteAgentWorkerCoordinator:
             record = self._by_thread.get(str(event.thread_id))
             if record is None:
                 return
+            if event.turn_id and record.turn_id and str(event.turn_id) != str(record.turn_id):
+                self._emit_transport_event_locked(
+                    record,
+                    {
+                        "event": "stale_turn_completion_ignored",
+                        "thread_id": str(event.thread_id),
+                        "turn_id": str(event.turn_id),
+                        "active_turn_id": str(record.turn_id),
+                    },
+                )
+                return
             prior_status = record.status
+            record.last_transport_seen_monotonic = monotonic()
             record.turn_id = str(event.turn_id or record.turn_id)
             record.status = str(event.turn_status or "completed")
             record.updated_at = now_iso()
@@ -632,6 +705,7 @@ class SiteAgentWorkerCoordinator:
                 self._pause_requested.discard(record.site_key)
                 record.turn_id = ""
                 record.status = "paused"
+                record.control_operation_id = ""
                 self._persist_locked(record)
                 self._active.pop(record.site_key, None)
                 self._scheduler.complete(record.site_key)
@@ -659,24 +733,49 @@ class SiteAgentWorkerCoordinator:
                     return
                 record.turn_id = _required_turn_id(result)
                 record.status = "running"
-                record.last_activity_monotonic = time.monotonic()
+                record.last_activity_monotonic = monotonic()
                 self._persist_locked(record)
                 self._emit_recovery_locked(record, "resumed")
                 return
             current_payload = worker_record_from_payload(record.payload_path)
             worker_state = _worker_state_from_payload(record.payload_path)
-            if (
+            same_active_item = (
                 current_payload.work_item_id == record.work_item_id
-                and current_payload.context_revision > record.context_revision
                 and worker_state == "active"
-            ):
-                record.context_revision = current_payload.context_revision
+            )
+            if same_active_item:
+                revision_advanced = current_payload.context_revision > record.context_revision
+                if revision_advanced:
+                    record.context_revision = current_payload.context_revision
+                    record.continuation_attempts = 0
+                else:
+                    record.continuation_attempts += 1
+                    if record.continuation_attempts > self.max_resume_attempts:
+                        record.turn_id = ""
+                        record.status = "execution_unavailable"
+                        record.last_error = "worker turn ended repeatedly while the work item remained active"
+                        self._persist_locked(record)
+                        self._emit_recovery_locked(record, "exhausted")
+                        self._active.pop(record.site_key, None)
+                        self._scheduler.complete(record.site_key)
+                        self._by_thread.pop(str(event.thread_id), None)
+                        self._dispatch_locked()
+                        return
                 record.watchdog_enabled = current_payload.watchdog_enabled
+                pending_message = record.resume_message
+                record.resume_message = ""
+                prompt = (
+                    _resume_prompt(record, pending_message)
+                    if pending_message
+                    else (_continue_prompt(record) if revision_advanced else _unfinished_turn_prompt(record))
+                )
                 try:
-                    result = self._ensure_server_locked().start_turn(thread_id=record.thread_id, prompt=_continue_prompt(record))
-                except RuntimeError:
-                    record.status = "interrupted"
+                    result = self._ensure_server_locked().start_turn(thread_id=record.thread_id, prompt=prompt)
+                except RuntimeError as exc:
+                    record.status = "execution_unavailable"
+                    record.last_error = f"{type(exc).__name__}: {exc}"
                     self._persist_locked(record)
+                    self._emit_recovery_locked(record, "exhausted")
                     self._active.pop(record.site_key, None)
                     self._scheduler.complete(record.site_key)
                     self._by_thread.pop(str(event.thread_id), None)
@@ -839,6 +938,16 @@ def _recovery_prompt(record: AgentWorkerRecord) -> str:
     )
 
 
+def _unfinished_turn_prompt(record: AgentWorkerRecord) -> str:
+    return (
+        "Continue the same bounded CareerEng work item after its previous Codex turn ended without a terminal work-item state.\n"
+        f"Work item ID: {record.work_item_id}\n"
+        "First call careereng_get_work_item_context with this same ID. Continue only the active phase from persisted CareerEng state. "
+        "Do not create a browser runtime or inspect project files. If progress requires the user, report waiting_user through phase_result; "
+        "otherwise continue until the phase advances or the site reaches a terminal state."
+    )
+
+
 def _worker_state_from_payload(payload_path: Path) -> str:
     payload = read_json(Path(payload_path))
     return str(payload.get("worker_state") or "").strip()
@@ -876,6 +985,9 @@ def _record_payload(record: AgentWorkerRecord) -> dict[str, Any]:
         "session_rotation_reason": record.session_rotation_reason,
         "last_error": record.last_error,
         "recovery_attempts": record.recovery_attempts,
+        "continuation_attempts": record.continuation_attempts,
+        "control_operation_id": record.control_operation_id,
+        "interrupt_attempts": record.interrupt_attempts,
         "watchdog_enabled": record.watchdog_enabled,
         "updated_at": record.updated_at,
     }

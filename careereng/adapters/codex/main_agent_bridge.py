@@ -17,10 +17,18 @@ from careereng.utils import now_iso, read_json, write_json
 
 
 _ATTENTION_EVENTS = frozenset({"action_required", "review_required"})
+_PROGRESS_EVENTS = frozenset({"site.phase_advanced", "site.completed", "batch.completed"})
+
+
+def _is_deliverable(event: dict[str, Any]) -> bool:
+    return (
+        str(event.get("attention") or "") in _ATTENTION_EVENTS
+        or str(event.get("kind") or "") in _PROGRESS_EVENTS
+    )
 
 
 class CodexMainAgentBridge:
-    """Asynchronously wake the registered main thread for durable attention events."""
+    """Asynchronously wake the registered main thread for durable key events."""
 
     def __init__(
         self,
@@ -53,7 +61,7 @@ class CodexMainAgentBridge:
     def enqueue(self, event: dict[str, Any]) -> None:
         """Schedule delivery without blocking the workflow that wrote the event."""
 
-        if str(event.get("attention") or "") not in _ATTENTION_EVENTS:
+        if not _is_deliverable(event):
             return
         event_id = str(event.get("event_id") or "").strip()
         if not event_id or self._delivery_status(event_id) == "delivered":
@@ -85,11 +93,11 @@ class CodexMainAgentBridge:
             return {"delivered": True, "thread_id": thread_id}
 
     def retry_pending(self) -> int:
-        """Retry persisted attention events after a bridge or App Server restart."""
+        """Retry deliverable events after a bridge or App Server restart."""
 
         delivered = 0
         for event in self.event_store.events.iter_rows():
-            if not isinstance(event, dict) or str(event.get("attention") or "") not in _ATTENTION_EVENTS:
+            if not isinstance(event, dict) or not _is_deliverable(event):
                 continue
             if self._delivery_status(str(event.get("event_id") or "")) == "delivered":
                 continue
@@ -135,6 +143,13 @@ def _main_agent_prompt(event: dict[str, Any]) -> str:
 
     site_key = str(event.get("site_key") or "").strip()
     kind = str(event.get("kind") or "attention_required").strip()
+    if str(event.get("attention") or "") == "notification":
+        return (
+            "CareerEng has a durable execution progress event. "
+            "Call careereng_list_agent_events, report the new phase or completion milestone concisely, "
+            "and acknowledge only the events you handled. "
+            f"Event kind: {kind}. Site: {site_key or 'workspace'}."
+        )
     return (
         "CareerEng has a durable event requiring your attention. "
         "Call careereng_list_agent_events before taking action. "
