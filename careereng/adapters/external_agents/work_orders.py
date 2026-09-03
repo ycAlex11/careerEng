@@ -154,10 +154,14 @@ def advance_browser_agent_work_order(
     # A work item owns one site task for the lifetime of its batch. Advancing a
     # phase refreshes its scoped context in place; it must not replace the
     # Codex thread that is carrying the task's live reasoning state.
+    next_context_revision = max(
+        int(payload.get("context_revision") or 0),
+        int(session_payload.get("context_revision") or 0),
+    ) + 1
     payload.update(
         {
             "updated_at": now_iso(),
-            "context_revision": int(payload.get("context_revision") or 0) + 1,
+            "context_revision": next_context_revision,
             "worker_state": "active",
             "current_phase": normalized_phase,
             "current_phase_context": phase_context,
@@ -168,7 +172,7 @@ def advance_browser_agent_work_order(
     session_payload.update(
         {
             "updated_at": now_iso(),
-            "context_revision": int(session_payload.get("context_revision") or 0) + 1,
+            "context_revision": next_context_revision,
             "worker_state": "active",
             "current_phase": normalized_phase,
             "phase_context": phase_context,
@@ -277,11 +281,15 @@ def refresh_browser_agent_work_order(
         write_json(continuation_path, dict(continuation_context))
         payload["continuation_context_path"] = _workspace_relative(workspace, continuation_path)
     now = now_iso()
+    next_context_revision = max(
+        int(payload.get("context_revision") or 0),
+        int(session_payload.get("context_revision") or 0),
+    ) + 1
     for row in (payload, session_payload):
         row.update(
             {
                 "updated_at": now,
-                "context_revision": int(row.get("context_revision") or 0) + 1,
+                "context_revision": next_context_revision,
                 "worker_state": "active",
                 "entry_url": str(entry_url or ""),
                 "phase_slugs": list(phase_slugs),

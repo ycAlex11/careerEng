@@ -432,9 +432,11 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         site_key: str,
         message: str = "",
         session_id: str = DEFAULT_SESSION_ID,
+        command_id: str = "",
     ) -> dict[str, Any]:
         """Resume a waiting_user phase after the user completes a human-only browser action."""
         resume_message = str(message or "").strip() or f"{site_key} done"
+        effective_command_id = str(command_id or make_id("worker_command"))
         return runtime.host_client().request(
             "fresh_snapshot_resume",
             {
@@ -442,6 +444,27 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 "message": resume_message,
                 "turn_id": make_id("turn"),
                 "site_key": site_key,
+                "command_id": effective_command_id,
+            },
+        )
+
+    @server.tool()
+    def careereng_send_worker_command(
+        site_key: str,
+        message: str,
+        interrupt_current_turn: bool = False,
+        command_id: str = "",
+    ) -> dict[str, Any]:
+        """Send guidance to a running worker, optionally redirecting it after interrupt acknowledgement."""
+
+        effective_command_id = str(command_id or make_id("worker_command"))
+        return runtime.host_client().request(
+            "worker_command",
+            {
+                "site_key": site_key,
+                "message": message,
+                "kind": "redirect" if interrupt_current_turn else "guidance",
+                "command_id": effective_command_id,
             },
         )
 

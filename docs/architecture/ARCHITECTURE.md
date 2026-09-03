@@ -164,6 +164,21 @@ They are exposed as an on-demand work-item resource. Python records and scopes
 the evidence; the agent decides whether it indicates user input, retry-later,
 recovery, exploration, or a proposal.
 
+## Batch Resume Snapshot Boundary
+
+An apply-enabled batch locks the current exported resume before any site worker
+starts. The resume capability creates one immutable batch artifact plus one
+site-isolated upload copy under `workspace/tmp/browser_controls/`, records the
+filename, content hash, version, and scoped paths in the batch, and carries the
+site copy into every work item from its first phase. A reused unfinished batch
+keeps its original resume version when another site is appended.
+
+Workers may upload only the staged path declared by their current work item.
+The runtime host validates `browser_file_upload` calls before browser side
+effects, while Skills and the LLM continue to decide when a site's live page
+requires a resume upload. Mid-batch resume replacement is intentionally not
+supported; a newly exported resume is selected by the next new batch.
+
 ## Site Mode And Evolution Boundary
 
 Site Skill front matter carries one structural execution mode and one separate

@@ -95,6 +95,29 @@ def build_work_item_context(payload: dict[str, Any]) -> dict[str, Any]:
     resource_ids = [name for name in _RESOURCE_DESCRIPTIONS if name in phase_context or name in {"state_tools", "execution_diagnostics"}]
     if str(payload.get("current_phase") or phase.get("slug") or "") == "apply":
         resource_ids.extend(["apply_facts", "full_cv", "full_persona", "history_view"])
+    apply_initial_facts = (
+        payload.get("apply_initial_facts")
+        if isinstance(payload.get("apply_initial_facts"), dict)
+        else {}
+    )
+    staged_resume = (
+        apply_initial_facts.get("staged_resume")
+        if isinstance(apply_initial_facts.get("staged_resume"), dict)
+        else {}
+    )
+    scope = {
+        "site_key": str(payload.get("site_key") or ""),
+        "batch_id": str(payload.get("batch_id") or ""),
+        "session_id": str(payload.get("session_id") or ""),
+        "turn_id": str(payload.get("turn_id") or ""),
+        "apply_target_job_ids": list(payload.get("apply_target_job_ids") or []),
+    }
+    if staged_resume:
+        scope["resume_snapshot"] = {
+            key: staged_resume.get(key)
+            for key in ("filename", "path", "sha256", "version")
+            if staged_resume.get(key)
+        }
     return {
         "work_item_id": work_item_id_from_payload(payload),
         "kind": "site_batch",
@@ -108,13 +131,7 @@ def build_work_item_context(payload: dict[str, Any]) -> dict[str, Any]:
             "phase": str(payload.get("current_phase") or phase.get("slug") or ""),
             "title": str(phase.get("title") or ""),
         },
-        "scope": {
-            "site_key": str(payload.get("site_key") or ""),
-            "batch_id": str(payload.get("batch_id") or ""),
-            "session_id": str(payload.get("session_id") or ""),
-            "turn_id": str(payload.get("turn_id") or ""),
-            "apply_target_job_ids": list(payload.get("apply_target_job_ids") or []),
-        },
+        "scope": scope,
         "run_intent": (
             dict(payload.get("run_intent") or {})
             if isinstance(payload.get("run_intent"), dict)
@@ -126,6 +143,7 @@ def build_work_item_context(payload: dict[str, Any]) -> dict[str, Any]:
             "Use CareerEng MCP tools for browser and state changes.",
             "Pass lease.context_revision unchanged to every browser or state mutation.",
             "During apply, pass the current scope apply target unchanged when reporting the phase result.",
+            "When scope.resume_snapshot is present, use only its path for resume file uploads in this batch.",
             "Treat run_intent as authoritative. Do not infer retrieval-only scope from an empty current apply target list.",
         ],
         "context_catalog": [

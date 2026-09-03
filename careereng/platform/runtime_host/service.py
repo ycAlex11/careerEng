@@ -36,6 +36,7 @@ from careereng.adapters.external_agents.work_orders import (
 )
 from careereng.orchestration.agent_protocol.work_item_store import WorkItemStore
 from careereng.orchestration.worker_control import WorkItemFence
+from careereng.career.resume.batch_snapshot import validate_site_resume_snapshot
 from careereng.utils import make_id, now_iso, read_json, write_json
 from .errors import RuntimeHostAccessDeniedError, RuntimeHostProtocolMismatchError, RuntimeHostUnavailableError
 from .protocol import RUNTIME_HOST_PROTOCOL_VERSION, protocol_version_from, runtime_host_identity, with_runtime_host_protocol
@@ -167,6 +168,8 @@ class RuntimeHostService:
             return self._handle_start_jobs_batch(payload)
         if op == "fresh_snapshot_resume":
             return self._handle_fresh_snapshot_resume(payload)
+        if op == "worker_command":
+            return self._handle_worker_command(payload)
         if op == "pause_jobs_batch":
             return self._handle_pause_jobs_batch(payload)
         if op == "pause_site":
@@ -380,6 +383,7 @@ class RuntimeHostService:
         session_id = str(payload.get("session_id") or "cli:default")
         message = str(payload.get("message") or "")
         turn_id = str(payload.get("turn_id") or make_id("turn"))
+        command_id = str(payload.get("command_id") or turn_id).strip()
         site_key = str(payload.get("site_key") or "").strip()
         acquired = self._lock.acquire(blocking=False)
         if not acquired:
@@ -407,7 +411,7 @@ class RuntimeHostService:
             self._lock.release()
         if reply is not None and self._codex_workers is not None and site_key:
             try:
-                record = self._resume_codex_site(site_key=site_key, message=message)
+                record = self._resume_codex_site(site_key=site_key, message=message, command_id=command_id)
             except Exception as exc:
                 return {"ok": False, "error": f"codex_worker_resume_failed: {exc}"}
             if record is not None:
@@ -421,6 +425,41 @@ class RuntimeHostService:
         if reply is None:
             return {"ok": True, "accepted": False, "reply": ""}
         return {"ok": True, "accepted": True, "reply": reply, "turn_id": turn_id}
+
+    def _handle_worker_command(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Queue or redirect one running worker without refreshing browser context."""
+
+        site_key = str(payload.get("site_key") or "").strip()
+        message = str(payload.get("message") or "").strip()
+        kind = str(payload.get("kind") or "guidance").strip().lower()
+        command_id = str(payload.get("command_id") or "").strip()
+        if not site_key or not message:
+            return {"ok": False, "error": "site_key and message are required"}
+        if kind not in {"guidance", "redirect"}:
+            return {"ok": False, "error": f"unsupported running worker command: {kind}"}
+        if self._codex_workers is None:
+            return {"ok": False, "error": "worker command transport is unavailable"}
+        try:
+            record = self._codex_workers.command(
+                site_key=site_key,
+                kind=kind,
+                message=message,
+                command_id=command_id,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": f"worker_command_failed: {exc}"}
+        if record is None:
+            return {"ok": False, "accepted": False, "error": f"no active worker for site={site_key}"}
+        return {
+            "ok": True,
+            "accepted": True,
+            "site_key": site_key,
+            "batch_id": record.batch_id,
+            "work_item_id": record.work_item_id,
+            "thread_id": record.thread_id,
+            "turn_id": record.turn_id,
+            "worker_status": record.status,
+        }
 
     def _resolve_execution_backend(self, *, requested_backend: object = "") -> tuple[str, str]:
         """Validate one configured transport without fallback or switching."""
@@ -732,7 +771,12 @@ class RuntimeHostService:
         turn_id = str(payload.get("turn_id") or "").strip()
         phase = str(payload.get("phase") or AGENT_BRIDGE_STATUS).strip() or AGENT_BRIDGE_STATUS
         try:
-            self._validate_work_item_fence(payload)
+            work_item_record = self._validate_work_item_fence(payload)
+            self._validate_work_item_resume_upload(
+                work_item_record,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
             def _call() -> dict[str, Any]:
                 browser_runner = getattr(self.loop, "browser_runner", None)
                 call_tool = getattr(browser_runner, "call_active_browser_tool", None)
@@ -753,7 +797,15 @@ class RuntimeHostService:
         turn_id = str(payload.get("turn_id") or "").strip()
         phase = str(payload.get("phase") or AGENT_BRIDGE_STATUS).strip() or AGENT_BRIDGE_STATUS
         try:
-            self._validate_work_item_fence(payload)
+            work_item_record = self._validate_work_item_fence(payload)
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                self._validate_work_item_resume_upload(
+                    work_item_record,
+                    tool_name=str(step.get("tool_name") or ""),
+                    arguments=step.get("arguments") if isinstance(step.get("arguments"), dict) else {},
+                )
             def _run() -> dict[str, Any]:
                 browser_runner = getattr(self.loop, "browser_runner", None)
                 run_sequence = getattr(browser_runner, "run_active_browser_sequence", None)
@@ -1011,6 +1063,53 @@ class RuntimeHostService:
             if expected_target not in active_targets:
                 raise ValueError("apply target fence does not match the active work item target")
         return record
+
+    def _validate_work_item_resume_upload(
+        self,
+        work_item_record: dict[str, Any],
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        """Fence file uploads to the immutable resume snapshot declared by the batch."""
+
+        if str(tool_name or "").strip() != "browser_file_upload":
+            return
+        payload_path = Path(str(work_item_record.get("payload_path") or ""))
+        work_item_payload = read_json(payload_path) if payload_path.is_file() else {}
+        apply_facts = (
+            work_item_payload.get("apply_initial_facts")
+            if isinstance(work_item_payload.get("apply_initial_facts"), dict)
+            else {}
+        )
+        staged_resume = (
+            apply_facts.get("staged_resume")
+            if isinstance(apply_facts.get("staged_resume"), dict)
+            else {}
+        )
+        site_key = str(work_item_payload.get("site_key") or "").strip()
+        batch_id = str(work_item_payload.get("batch_id") or "").strip()
+        if not staged_resume or not site_key or not batch_id:
+            raise ValueError("browser_file_upload requires an available batch resume snapshot")
+        validated_snapshot = validate_site_resume_snapshot(
+            staged_resume,
+            workspace=self.workspace,
+            site_key=site_key,
+            batch_id=batch_id,
+        )
+        raw_paths = arguments.get("paths")
+        if isinstance(raw_paths, str):
+            upload_paths = [raw_paths]
+        elif isinstance(raw_paths, list):
+            upload_paths = [str(path or "") for path in raw_paths if str(path or "").strip()]
+        else:
+            single_path = str(arguments.get("path") or "").strip()
+            upload_paths = [single_path] if single_path else []
+        if not upload_paths:
+            raise ValueError("browser_file_upload requires the batch resume snapshot path")
+        expected = Path(str(validated_snapshot.get("path") or "")).resolve()
+        if any(Path(path).expanduser().resolve() != expected for path in upload_paths):
+            raise ValueError("browser_file_upload path does not match the batch resume snapshot")
 
     def _handle_agent_bridge_read_context_resource(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Read one worker-selected resource through the retained runtime."""
@@ -1537,7 +1636,7 @@ class RuntimeHostService:
                     {"batch_id": batch_id, "site_key": str(site_key), "error": str(exc)},
                 )
 
-    def _resume_codex_site(self, *, site_key: str, message: str):
+    def _resume_codex_site(self, *, site_key: str, message: str, command_id: str = ""):
         if self._codex_workers is None:
             return None
         from careereng.adapters.codex.worker_runner import worker_record_from_payload
@@ -1554,8 +1653,12 @@ class RuntimeHostService:
         batch = job_flow.job_store.load_batch(record.batch_id)
         if str(batch.get("execution_backend") or "provider") != CODEX_BACKEND:
             return None
-        WorkItemStore(self.workspace).reissue(record.work_item_id, event="worker_resume_requested")
-        resumed = self._codex_workers.resume_work_order(record, message=message)
+        WorkItemStore(self.workspace).reissue(
+            record.work_item_id,
+            event="worker_resume_requested",
+            command_id=command_id,
+        )
+        resumed = self._codex_workers.resume_work_order(record, message=message, command_id=command_id)
         wait_for_turn_start = getattr(self._codex_workers, "wait_for_turn_start", None)
         if callable(wait_for_turn_start):
             return wait_for_turn_start(resumed)
@@ -1715,6 +1818,14 @@ class RuntimeHostService:
             **metric_details,
         )
         if status == "exhausted":
+            record_unavailable = getattr(job_flow, "record_external_execution_unavailable", None)
+            if callable(record_unavailable):
+                record_unavailable(
+                    site_key=record.site_key,
+                    batch_id=record.batch_id,
+                    phase=str(details.get("phase") or ""),
+                    summary=str(record.last_error or "External worker execution recovery was exhausted."),
+                )
             self._publish_agent_event(
                 kind="site.execution_recovery_exhausted",
                 attention="review_required",
@@ -2208,6 +2319,7 @@ def fresh_snapshot_resume(
     session_id: str,
     message: str,
     turn_id: str = "",
+    command_id: str = "",
 ) -> dict[str, Any]:
     socket_path = ensure_workspace_manager(project_root=project_root, workspace=workspace)
     response = _send_request(
@@ -2217,6 +2329,7 @@ def fresh_snapshot_resume(
             "session_id": session_id,
             "message": message,
             "turn_id": turn_id,
+            "command_id": command_id,
         },
         timeout=DEFAULT_MANAGER_REQUEST_TIMEOUT_SECONDS,
     )

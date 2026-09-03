@@ -16,6 +16,15 @@ from typing import Any, Callable, Protocol
 
 from careereng.orchestration.agent_protocol.work_items import work_item_id_from_payload
 from careereng.orchestration.engine.site_work_items import SiteWorkItem, SiteWorkItemScheduler
+from careereng.orchestration.worker_control import (
+    WorkerCommand,
+    WorkerCommandAction,
+    WorkerCommandArbiter,
+    WorkerCommandInbox,
+    WorkerCommandKind,
+    WorkerCommandStatus,
+    create_worker_command,
+)
 from careereng.platform.sessions import SiteWorkerSessionStore
 from careereng.utils import make_id, now_iso, read_json
 
@@ -67,6 +76,7 @@ class AgentWorkerRecord:
     last_error: str = ""
     recovery_attempts: int = 0
     recovery_pending: bool = False
+    control_command_ids: list[str] = field(default_factory=list)
     continuation_attempts: int = 0
     control_operation_id: str = ""
     interrupt_attempts: int = 0
@@ -115,6 +125,8 @@ class SiteAgentWorkerCoordinator:
         self.load_binding = load_binding
         self.bind_record = bind_record
         self.session_store = session_store or SiteWorkerSessionStore(self.project_root / "workspace")
+        self.command_inbox = WorkerCommandInbox(self.session_store.workspace)
+        self.command_arbiter = WorkerCommandArbiter()
         self.backend = str(backend or "external_agent")
         self.max_effective_batches_per_session = max(1, int(max_effective_batches_per_session or 1))
         self.idle_timeout_seconds = max(1, int(idle_timeout_seconds or 1))
@@ -142,6 +154,55 @@ class SiteAgentWorkerCoordinator:
         )
         self._watchdog.start()
 
+    def _enqueue_control_command_locked(
+        self,
+        record: AgentWorkerRecord,
+        *,
+        kind: WorkerCommandKind,
+        message: str = "",
+        command_id: str = "",
+    ) -> WorkerCommand:
+        return self.command_inbox.enqueue(
+            create_worker_command(
+                site_key=record.site_key,
+                batch_id=record.batch_id,
+                work_item_id=record.work_item_id,
+                kind=kind,
+                message=message,
+                command_id=command_id,
+                expected_context_revision=record.context_revision,
+            )
+        )
+
+    def _claim_command_locked(self, record: AgentWorkerRecord, command: WorkerCommand) -> None:
+        if command.command_id in record.control_command_ids:
+            return
+        self.command_inbox.transition(command.command_id, status=WorkerCommandStatus.CLAIMED)
+        record.control_command_ids.append(command.command_id)
+
+    def _claim_pending_commands_locked(self, record: AgentWorkerRecord) -> None:
+        for command in self.command_inbox.pending(site_key=record.site_key, work_item_id=record.work_item_id):
+            self._claim_command_locked(record, command)
+
+    def _complete_claimed_commands_locked(
+        self,
+        record: AgentWorkerRecord,
+        *,
+        status: WorkerCommandStatus = WorkerCommandStatus.APPLIED,
+        error: str = "",
+    ) -> None:
+        command_ids = list(record.control_command_ids)
+        record.control_command_ids.clear()
+        for command_id in command_ids:
+            self.command_inbox.transition(command_id, status=status, error=error)
+
+    @staticmethod
+    def _reset_recovery_for_user_command(record: AgentWorkerRecord) -> None:
+        record.recovery_pending = False
+        record.recovery_attempts = 0
+        record.continuation_attempts = 0
+        record.last_activity_monotonic = monotonic()
+
     def enqueue(self, record: AgentWorkerRecord) -> AgentWorkerRecord:
         with self._lock:
             self._bind_session_locked(record)
@@ -167,23 +228,33 @@ class SiteAgentWorkerCoordinator:
             self._dispatch_locked()
         return record
 
-    def resume(self, *, site_key: str, message: str) -> AgentWorkerRecord | None:
+    def resume(self, *, site_key: str, message: str, command_id: str = "") -> AgentWorkerRecord | None:
         with self._lock:
             record = self._active.get(str(site_key))
             if record is None:
                 return None
-            if record.status in {"pausing", "starting", "waiting_user"} or record.turn_start_inflight:
-                # A turn/start call is invalid until App Server confirms that
-                # the interrupted turn has reached its terminal event.
+            command = self._enqueue_control_command_locked(
+                record,
+                kind=WorkerCommandKind.RESUME,
+                message=message,
+                command_id=command_id,
+            )
+            if command.status != WorkerCommandStatus.PENDING:
                 return record
-            if record.turn_id:
-                # One Codex thread has one in-flight turn.  Preserve a user
-                # continuation for its next context read instead of starting
-                # a competing turn on the same thread.
+            decision = self.command_arbiter.decide(
+                command,
+                worker_status=record.status,
+                has_turn=bool(record.turn_id),
+                turn_start_inflight=record.turn_start_inflight,
+                recovery_pending=record.recovery_pending,
+            )
+            self._reset_recovery_for_user_command(record)
+            if decision.action == WorkerCommandAction.QUEUE:
                 record.resume_message = _append_resume_message(record.resume_message, message)
                 record.updated_at = now_iso()
                 self._persist_locked(record)
                 return record
+            self._claim_command_locked(record, command)
             server = self._ensure_server_locked()
             if record.thread_id:
                 self._associate_thread_locked(record, record.thread_id)
@@ -192,13 +263,91 @@ class SiteAgentWorkerCoordinator:
                 except Exception:
                     self._forget_thread_association_locked(record)
                     raise
-            result = server.start_turn(thread_id=record.thread_id, prompt=_resume_prompt(record, message))
-            record.turn_id = _required_turn_id(result)
-            record.status = "running"
+            try:
+                result = server.start_turn(thread_id=record.thread_id, prompt=_resume_prompt(record, message))
+                record.turn_id = _required_turn_id(result)
+                record.status = "running"
+                record.last_activity_monotonic = monotonic()
+                self._complete_claimed_commands_locked(record)
+                self._persist_locked(record)
+            except Exception as exc:
+                self._complete_claimed_commands_locked(
+                    record,
+                    status=WorkerCommandStatus.FAILED,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                raise
+            return record
+
+    def command(
+        self,
+        *,
+        site_key: str,
+        kind: WorkerCommandKind | str,
+        message: str = "",
+        command_id: str = "",
+    ) -> AgentWorkerRecord | None:
+        """Submit one durable user command to the site's serialized worker."""
+
+        normalized_kind = kind if isinstance(kind, WorkerCommandKind) else WorkerCommandKind(str(kind))
+        if normalized_kind == WorkerCommandKind.RESUME:
+            return self.resume(site_key=site_key, message=message, command_id=command_id)
+        if normalized_kind == WorkerCommandKind.PAUSE:
+            return self.pause(site_key=site_key, command_id=command_id)
+        if normalized_kind == WorkerCommandKind.CANCEL:
+            return self.cancel(site_key=site_key, command_id=command_id)
+        with self._lock:
+            record = self._active.get(str(site_key))
+            if record is None:
+                return None
+            command = self._enqueue_control_command_locked(
+                record,
+                kind=normalized_kind,
+                message=message,
+                command_id=command_id,
+            )
+            if command.status != WorkerCommandStatus.PENDING:
+                return record
+            decision = self.command_arbiter.decide(
+                command,
+                worker_status=record.status,
+                has_turn=bool(record.turn_id),
+                turn_start_inflight=record.turn_start_inflight,
+                recovery_pending=record.recovery_pending,
+            )
+            self._reset_recovery_for_user_command(record)
+            record.resume_message = _append_resume_message(record.resume_message, message)
+            if decision.action == WorkerCommandAction.INTERRUPT:
+                self._claim_command_locked(record, command)
+                record.status = "redirecting"
+                record.control_operation_id = command.command_id
+                self._interrupt_locked(record, source="user_redirect")
+            elif decision.action == WorkerCommandAction.START:
+                self._claim_command_locked(record, command)
+                if not record.thread_id:
+                    self._start_locked(record)
+                    return record
+                try:
+                    result = self._ensure_server_locked().start_turn(
+                        thread_id=record.thread_id,
+                        prompt=_resume_prompt(record, record.resume_message),
+                    )
+                    record.turn_id = _required_turn_id(result)
+                    record.resume_message = ""
+                    record.status = "running"
+                    self._complete_claimed_commands_locked(record)
+                except Exception as exc:
+                    self._complete_claimed_commands_locked(
+                        record,
+                        status=WorkerCommandStatus.FAILED,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    raise
+            record.updated_at = now_iso()
             self._persist_locked(record)
             return record
 
-    def pause(self, *, site_key: str) -> AgentWorkerRecord | None:
+    def pause(self, *, site_key: str, command_id: str = "") -> AgentWorkerRecord | None:
         """Interrupt one turn while retaining its thread/session binding."""
 
         with self._lock:
@@ -207,6 +356,14 @@ class SiteAgentWorkerCoordinator:
                 return self._paused.get(str(site_key))
             if record.status == "pausing":
                 return record
+            command = self._enqueue_control_command_locked(
+                record,
+                kind=WorkerCommandKind.PAUSE,
+                command_id=command_id,
+            )
+            if command.status != WorkerCommandStatus.PENDING:
+                return record
+            self._claim_command_locked(record, command)
             self._pause_requested.add(record.site_key)
             record.control_operation_id = make_id("pause")
             record.interrupt_attempts = 0
@@ -220,16 +377,37 @@ class SiteAgentWorkerCoordinator:
                     record.interrupt_requested_monotonic = monotonic()
             record.status = "pausing"
             record.updated_at = now_iso()
+            if not record.turn_id:
+                record.status = "paused"
+                self._active.pop(record.site_key, None)
+                self._scheduler.complete(record.site_key)
+                self._paused[record.site_key] = record
+                self._complete_claimed_commands_locked(record)
+                self._dispatch_locked()
             self._persist_locked(record)
             return record
 
-    def resume_work_order(self, record: AgentWorkerRecord, *, message: str) -> AgentWorkerRecord:
+    def resume_work_order(
+        self,
+        record: AgentWorkerRecord,
+        *,
+        message: str,
+        command_id: str = "",
+    ) -> AgentWorkerRecord:
         """Resume a retained work item after a host or transport restart."""
 
         with self._lock:
             current = self._active.get(record.site_key)
             if current is not None:
                 if _same_work_item(current, record):
+                    command = self._enqueue_control_command_locked(
+                        current,
+                        kind=WorkerCommandKind.RESUME,
+                        message=message,
+                        command_id=command_id,
+                    )
+                    if command.status != WorkerCommandStatus.PENDING:
+                        return current
                     if (
                         current.turn_id
                         or current.turn_start_inflight
@@ -247,6 +425,8 @@ class SiteAgentWorkerCoordinator:
                     # its external turn was never started. Resume that same
                     # work item and thread instead of treating queued as live.
                     current.resume_message = _append_resume_message(current.resume_message, message)
+                    self._reset_recovery_for_user_command(current)
+                    self._claim_command_locked(current, command)
                     if current.thread_id:
                         server = self._ensure_server_locked()
                         self._associate_thread_locked(current, current.thread_id)
@@ -255,15 +435,25 @@ class SiteAgentWorkerCoordinator:
                         except Exception:
                             self._forget_thread_association_locked(current)
                             raise
-                        result = server.start_turn(
-                            thread_id=current.thread_id,
-                            prompt=_resume_prompt(current, current.resume_message),
-                        )
-                        current.turn_id = _required_turn_id(result)
-                        current.resume_message = ""
-                        current.status = "running"
-                        current.updated_at = now_iso()
-                        self._persist_locked(current)
+                        try:
+                            result = server.start_turn(
+                                thread_id=current.thread_id,
+                                prompt=_resume_prompt(current, current.resume_message),
+                            )
+                            current.turn_id = _required_turn_id(result)
+                            current.resume_message = ""
+                            current.status = "running"
+                            current.last_activity_monotonic = monotonic()
+                            current.updated_at = now_iso()
+                            self._complete_claimed_commands_locked(current)
+                            self._persist_locked(current)
+                        except Exception as exc:
+                            self._complete_claimed_commands_locked(
+                                current,
+                                status=WorkerCommandStatus.FAILED,
+                                error=f"{type(exc).__name__}: {exc}",
+                            )
+                            raise
                         return current
                     self._start_locked(current)
                     return current
@@ -272,6 +462,14 @@ class SiteAgentWorkerCoordinator:
 
             paused = self._paused.get(record.site_key)
             if paused is not None and _same_work_item(paused, record) and paused.thread_id:
+                command = self._enqueue_control_command_locked(
+                    paused,
+                    kind=WorkerCommandKind.RESUME,
+                    message=message,
+                    command_id=command_id,
+                )
+                if command.status != WorkerCommandStatus.PENDING:
+                    return paused
                 if paused.status == "pause_unconfirmed":
                     self._paused.pop(record.site_key, None)
                     self._pause_requested.discard(record.site_key)
@@ -287,6 +485,7 @@ class SiteAgentWorkerCoordinator:
                     paused.control_operation_id = ""
                     paused.interrupt_attempts = 0
                     paused.resume_message = _append_resume_message(paused.resume_message, message)
+                    self._reset_recovery_for_user_command(paused)
                     self._scheduler.enqueue(SiteWorkItem(paused.site_key, paused.batch_id, paused))
                     self._dispatch_locked()
                     return paused
@@ -299,13 +498,24 @@ class SiteAgentWorkerCoordinator:
                     self._forget_thread_association_locked(paused)
                     self._paused[record.site_key] = paused
                     raise
-                result = server.start_turn(thread_id=paused.thread_id, prompt=_resume_prompt(paused, message))
-                paused.turn_id = _required_turn_id(result)
-                paused.status = "running"
-                paused.updated_at = now_iso()
-                self._active[paused.site_key] = paused
-                self._by_thread[paused.thread_id] = paused
-                self._persist_locked(paused)
+                self._reset_recovery_for_user_command(paused)
+                self._claim_command_locked(paused, command)
+                try:
+                    result = server.start_turn(thread_id=paused.thread_id, prompt=_resume_prompt(paused, message))
+                    paused.turn_id = _required_turn_id(result)
+                    paused.status = "running"
+                    paused.updated_at = now_iso()
+                    self._active[paused.site_key] = paused
+                    self._by_thread[paused.thread_id] = paused
+                    self._complete_claimed_commands_locked(paused)
+                    self._persist_locked(paused)
+                except Exception as exc:
+                    self._complete_claimed_commands_locked(
+                        paused,
+                        status=WorkerCommandStatus.FAILED,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    raise
                 return paused
 
             # The host no longer has an in-memory owner for this work item.
@@ -313,6 +523,13 @@ class SiteAgentWorkerCoordinator:
             # and retained thread binding without persisting a queue state.
             self._scheduler.discard(record.site_key)
             record.resume_message = _append_resume_message(record.resume_message, message)
+            self._enqueue_control_command_locked(
+                record,
+                kind=WorkerCommandKind.RESUME,
+                message=message,
+                command_id=command_id,
+            )
+            self._reset_recovery_for_user_command(record)
             self._bind_session_locked(record)
             accepted = self._scheduler.enqueue(SiteWorkItem(record.site_key, record.batch_id, record))
             if not accepted:
@@ -343,19 +560,29 @@ class SiteAgentWorkerCoordinator:
             existing.resume_message = _append_resume_message(existing.resume_message, message)
             return
         record.resume_message = _append_resume_message(record.resume_message, message)
+        self._enqueue_control_command_locked(record, kind=WorkerCommandKind.RESUME, message=message)
         self._successors[record.site_key] = record
 
-    def cancel(self, *, site_key: str) -> AgentWorkerRecord | None:
+    def cancel(self, *, site_key: str, command_id: str = "") -> AgentWorkerRecord | None:
         with self._lock:
             record = self._active.get(str(site_key))
             if record is None:
                 return None
+            command = self._enqueue_control_command_locked(
+                record,
+                kind=WorkerCommandKind.CANCEL,
+                command_id=command_id,
+            )
+            if command.status != WorkerCommandStatus.PENDING:
+                return record
+            self._claim_command_locked(record, command)
             if record.thread_id and record.turn_id:
                 try:
                     self._interrupt_locked(record, source="batch_cancel")
                 except RuntimeError:
                     pass
             record.status = "cancelling"
+            self._complete_claimed_commands_locked(record)
             self._persist_locked(record)
             return record
 
@@ -477,6 +704,7 @@ class SiteAgentWorkerCoordinator:
                 )
                 prompt = _resume_prompt(record, record.resume_message) if record.resume_message else _work_prompt(record)
                 record.resume_message = ""
+                self._claim_pending_commands_locked(record)
                 record.updated_at = now_iso()
                 self._persist_locked(record)
             self._start_turn_async(record, prompt)
@@ -484,6 +712,11 @@ class SiteAgentWorkerCoordinator:
             with self._lock:
                 if self._active.get(record.site_key) is not record:
                     return
+                self._complete_claimed_commands_locked(
+                    record,
+                    status=WorkerCommandStatus.FAILED,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 record.turn_start_inflight = False
                 record.status = "unavailable"
                 record.last_error = f"{type(exc).__name__}: {exc}"
@@ -510,6 +743,7 @@ class SiteAgentWorkerCoordinator:
                     record.last_error = ""
                     record.last_activity_monotonic = monotonic()
                     record.updated_at = now_iso()
+                    self._complete_claimed_commands_locked(record)
                     self._persist_locked(record)
                 if should_interrupt:
                     try:
@@ -529,6 +763,11 @@ class SiteAgentWorkerCoordinator:
             record.status = "unavailable"
             record.last_error = f"{type(last_error).__name__}: {last_error}"
             record.updated_at = now_iso()
+            self._complete_claimed_commands_locked(
+                record,
+                status=WorkerCommandStatus.FAILED,
+                error=record.last_error,
+            )
             self._persist_locked(record)
             self._active.pop(record.site_key, None)
             self._scheduler.complete(record.site_key)
@@ -563,6 +802,11 @@ class SiteAgentWorkerCoordinator:
                         record.status = "pause_unconfirmed"
                         record.last_error = "turn interrupt acknowledgement timed out"
                         record.updated_at = now_iso()
+                        self._complete_claimed_commands_locked(
+                            record,
+                            status=WorkerCommandStatus.FAILED,
+                            error=record.last_error,
+                        )
                         self._persist_locked(record)
                         self._active.pop(record.site_key, None)
                         self._scheduler.complete(record.site_key)
@@ -590,6 +834,12 @@ class SiteAgentWorkerCoordinator:
                             pass
                         continue
                     record.recovery_attempts += 1
+                    recovery_command = self._enqueue_control_command_locked(
+                        record,
+                        kind=WorkerCommandKind.RECOVERY,
+                        message="execution idle timeout",
+                    )
+                    self._claim_command_locked(record, recovery_command)
                     record.recovery_pending = True
                     record.status = "recovering"
                     record.updated_at = now_iso()
@@ -602,6 +852,11 @@ class SiteAgentWorkerCoordinator:
                         record.status = "running"
                         record.last_error = f"{type(exc).__name__}: {exc}"
                         record.last_activity_monotonic = now
+                        self._complete_claimed_commands_locked(
+                            record,
+                            status=WorkerCommandStatus.FAILED,
+                            error=record.last_error,
+                        )
                         self._persist_locked(record)
 
     def _emit_recovery_locked(self, record: AgentWorkerRecord, status: str) -> None:
@@ -706,6 +961,7 @@ class SiteAgentWorkerCoordinator:
                 record.turn_id = ""
                 record.status = "paused"
                 record.control_operation_id = ""
+                self._complete_claimed_commands_locked(record)
                 self._persist_locked(record)
                 self._active.pop(record.site_key, None)
                 self._scheduler.complete(record.site_key)
@@ -716,14 +972,22 @@ class SiteAgentWorkerCoordinator:
             if record.recovery_pending:
                 record.recovery_pending = False
                 record.turn_id = ""
+                self._claim_pending_commands_locked(record)
+                pending_message = record.resume_message
+                record.resume_message = ""
                 try:
                     result = self._ensure_server_locked().start_turn(
                         thread_id=record.thread_id,
-                        prompt=_recovery_prompt(record),
+                        prompt=_resume_prompt(record, pending_message) if pending_message else _recovery_prompt(record),
                     )
                 except RuntimeError as exc:
                     record.status = "execution_unavailable"
                     record.last_error = f"{type(exc).__name__}: {exc}"
+                    self._complete_claimed_commands_locked(
+                        record,
+                        status=WorkerCommandStatus.FAILED,
+                        error=record.last_error,
+                    )
                     self._persist_locked(record)
                     self._emit_recovery_locked(record, "exhausted")
                     self._active.pop(record.site_key, None)
@@ -734,6 +998,7 @@ class SiteAgentWorkerCoordinator:
                 record.turn_id = _required_turn_id(result)
                 record.status = "running"
                 record.last_activity_monotonic = monotonic()
+                self._complete_claimed_commands_locked(record)
                 self._persist_locked(record)
                 self._emit_recovery_locked(record, "resumed")
                 return
@@ -762,6 +1027,7 @@ class SiteAgentWorkerCoordinator:
                         self._dispatch_locked()
                         return
                 record.watchdog_enabled = current_payload.watchdog_enabled
+                self._claim_pending_commands_locked(record)
                 pending_message = record.resume_message
                 record.resume_message = ""
                 prompt = (
@@ -774,6 +1040,11 @@ class SiteAgentWorkerCoordinator:
                 except RuntimeError as exc:
                     record.status = "execution_unavailable"
                     record.last_error = f"{type(exc).__name__}: {exc}"
+                    self._complete_claimed_commands_locked(
+                        record,
+                        status=WorkerCommandStatus.FAILED,
+                        error=record.last_error,
+                    )
                     self._persist_locked(record)
                     self._emit_recovery_locked(record, "exhausted")
                     self._active.pop(record.site_key, None)
@@ -783,6 +1054,8 @@ class SiteAgentWorkerCoordinator:
                     return
                 record.turn_id = _required_turn_id(result)
                 record.status = "running"
+                record.last_activity_monotonic = monotonic()
+                self._complete_claimed_commands_locked(record)
                 self._persist_locked(record)
                 return
             self._persist_locked(record, bind_thread=current_payload.work_item_id == record.work_item_id)
@@ -985,6 +1258,7 @@ def _record_payload(record: AgentWorkerRecord) -> dict[str, Any]:
         "session_rotation_reason": record.session_rotation_reason,
         "last_error": record.last_error,
         "recovery_attempts": record.recovery_attempts,
+        "control_command_ids": list(record.control_command_ids),
         "continuation_attempts": record.continuation_attempts,
         "control_operation_id": record.control_operation_id,
         "interrupt_attempts": record.interrupt_attempts,

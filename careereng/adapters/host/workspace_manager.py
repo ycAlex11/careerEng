@@ -61,10 +61,16 @@ def start_manager_jobs_batch(*, project_root, workspace, session_id: str, messag
     )
 
 
-def fresh_snapshot_resume(*, project_root, workspace, session_id: str, message: str, turn_id: str = "", site_key: str = ""):
+def fresh_snapshot_resume(*, project_root, workspace, session_id: str, message: str, turn_id: str = "", site_key: str = "", command_id: str = ""):
     return _legacy_client(project_root=project_root, workspace=workspace).request(
         "fresh_snapshot_resume",
-        {"session_id": session_id, "message": message, "turn_id": turn_id, "site_key": site_key},
+        {
+            "session_id": session_id,
+            "message": message,
+            "turn_id": turn_id,
+            "site_key": site_key,
+            "command_id": command_id,
+        },
     )
 
 

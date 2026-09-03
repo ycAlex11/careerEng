@@ -38,6 +38,7 @@ from careereng.career.applications.reports import generate_job_batch_report
 from careereng.career.applications.application_store import ApplicationStore
 from careereng.career.applications.job_store import JobStore, TERMINAL_BATCH_STATUSES
 from careereng.career.applications.site_tools import SiteTools
+from careereng.career.resume.batch_snapshot import site_resume_snapshot, stage_batch_resume_snapshot
 from careereng.platform.project_state import AgentEventStore
 
 
@@ -905,6 +906,11 @@ class JobFlow:
         phase_timeout_seconds_override: int | None = None,
         timeout_ms_override: int | None = None,
     ) -> Any:
+        batch = self.job_store.load_batch(batch_id) if batch_id else {}
+        apply_resume_snapshot = site_resume_snapshot(
+            batch.get("resume_snapshot") if isinstance(batch, dict) else {},
+            site_key,
+        )
         run_kwargs = {
             "site_key": site_key,
             "site_name": site_name,
@@ -918,6 +924,8 @@ class JobFlow:
             "phase_timeout_seconds_override": phase_timeout_seconds_override,
             "timeout_ms_override": timeout_ms_override,
         }
+        if apply_resume_snapshot:
+            run_kwargs["apply_resume_snapshot"] = apply_resume_snapshot
         if continuation_context:
             intent_only = set(continuation_context) == {"run_intent"}
             execution_mode = normalize_execution_mode(str(getattr(self.browser_runner, "execution_mode", "") or ""))
@@ -937,6 +945,7 @@ class JobFlow:
             resume=True,
             phase_slugs=(self.AUTH_RECOVERY_PHASE,),
             timeout_ms_override=timeout_ms_override,
+            **({"apply_resume_snapshot": apply_resume_snapshot} if apply_resume_snapshot else {}),
         )
         if str(getattr(login_result, "status", "") or "") != "ready":
             return login_result
@@ -964,6 +973,8 @@ class JobFlow:
             "phase_timeout_seconds_override": phase_timeout_seconds_override,
             "timeout_ms_override": timeout_ms_override,
         }
+        if apply_resume_snapshot:
+            recovery_kwargs["apply_resume_snapshot"] = apply_resume_snapshot
         if continuation_context:
             intent_only = set(continuation_context) == {"run_intent"}
             execution_mode = normalize_execution_mode(str(getattr(self.browser_runner, "execution_mode", "") or ""))
@@ -2005,6 +2016,50 @@ class JobFlow:
             "site": dict((batch.get("sites") or {}).get(site_key) or {}),
         }
 
+    def record_external_execution_unavailable(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        phase: str = "",
+        summary: str = "",
+    ) -> dict[str, Any]:
+        """Close one worker's technical execution scope without a job outcome."""
+
+        batch = self.job_store.load_batch(batch_id)
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        current = sites.get(site_key)
+        if not isinstance(current, dict):
+            return {"handled": False, "reason": "missing_site", "batch_id": batch_id}
+        browser_session = self.site_tools.site_store.load_browser_session(site_key)
+        current_url = str(browser_session.get("last_known_url") or current.get("current_url") or "")
+        updated = {
+            **current,
+            "status": "blocked",
+            "reason_tag": "external_agent_execution_unavailable",
+            "message": str(summary or "External worker execution is unavailable."),
+            "current_phase": str(phase or current.get("current_phase") or ""),
+            "current_url": current_url,
+        }
+        batch = self.job_store.update_site(batch, site_key, updated)
+        batch["status"] = self._compute_batch_status(batch)
+        batch = self.job_store.save_batch(batch)
+        self.site_tools.site_store.save_browser_session(
+            site_key,
+            {
+                "browser_status": "execution_unavailable",
+                "pending_action": "review_execution_failure",
+                "resume_phase": str(updated.get("current_phase") or ""),
+                "last_known_url": current_url,
+            },
+        )
+        return {
+            "handled": True,
+            "batch_id": str(batch.get("batch_id") or ""),
+            "batch_status": str(batch.get("status") or ""),
+            "site": dict((batch.get("sites") or {}).get(site_key) or {}),
+        }
+
     def _continue_external_apply_target(
         self,
         *,
@@ -2595,6 +2650,7 @@ class JobFlow:
                 batch_id=str(reusable_batch.get("batch_id") or ""),
                 sites=site_rows,
             )
+            batch = self._stage_batch_resume_snapshot(batch, site_keys=appended_site_keys)
             batch = dict(batch)
             batch["_runtime_reused_batch"] = True
             batch["_runtime_site_keys"] = appended_site_keys
@@ -2608,6 +2664,7 @@ class JobFlow:
                 sites=site_rows,
                 execution_backend=selected_backend,
             )
+            batch = self._stage_batch_resume_snapshot(batch)
             batch = dict(batch)
             batch["_runtime_reused_batch"] = False
             batch["_runtime_site_keys"] = list(batch.get("sites") or {})
@@ -2633,6 +2690,51 @@ class JobFlow:
                     },
                 )
         return batch
+
+    def _stage_batch_resume_snapshot(
+        self,
+        batch: dict[str, Any],
+        *,
+        site_keys: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Lock one resume version and stage isolated site copies before workers start."""
+
+        if not bool(batch.get("apply_requested")):
+            return batch
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        requested = set(site_keys) if site_keys is not None else None
+        apply_sites = [
+            str(site_key)
+            for site_key, row in sites.items()
+            if isinstance(row, dict)
+            and str((row.get("apply") or {}).get("status") or "") == "pending"
+            and (requested is None or str(site_key) in requested)
+        ]
+        existing = batch.get("resume_snapshot") if isinstance(batch.get("resume_snapshot"), dict) else {}
+        if not apply_sites and not existing:
+            return batch
+        if not existing:
+            self.site_tools.ensure_default_resume_pdf()
+        snapshot = stage_batch_resume_snapshot(
+            workspace=self.job_store.workspace,
+            batch_id=str(batch.get("batch_id") or ""),
+            site_keys=apply_sites,
+            existing=existing,
+        )
+        updated = dict(batch)
+        updated["resume_snapshot"] = snapshot
+        saved = self.job_store.save_batch(updated)
+        self.job_store.append_event(
+            "batch.resume_snapshot.staged",
+            {
+                "batch_id": str(saved.get("batch_id") or ""),
+                "site_keys": apply_sites,
+                "filename": str(snapshot.get("filename") or ""),
+                "sha256": str(snapshot.get("sha256") or ""),
+                "version": str(snapshot.get("version") or ""),
+            },
+        )
+        return saved
 
     def fail_batch(self, *, batch_id: str, error: str) -> dict[str, Any]:
         batch = self.job_store.load_batch(batch_id)

@@ -68,6 +68,7 @@ from careereng.config.schema import (
     BrowserRetrievalPolicyConfig,
 )
 from careereng.career.resume.export import default_apply_resume_pdf_path
+from careereng.career.resume.batch_snapshot import validate_site_resume_snapshot
 from careereng.platform.persistence import JSONLStore
 from careereng.platform.observability import PerformanceRecorder
 from careereng.utils import now_iso, read_json
@@ -293,6 +294,7 @@ class BrowserAutomationService:
         phase_slugs: tuple[str, ...] | None = None,
         apply_target_job_ids: tuple[str, ...] | None = None,
         continuation_context: dict[str, Any] | None = None,
+        apply_resume_snapshot: dict[str, Any] | None = None,
     ) -> BrowserAutomationResult:
         active, reused_runtime = self._reserve_runtime(site_key, entry_url)
         prior_session = self.site_store.load_browser_session(site_key)
@@ -357,7 +359,24 @@ class BrowserAutomationService:
             allowed_slugs=allowed_slugs,
         )
         apply_initial_facts: dict[str, Any] = {}
-        if any(phase.slug == "apply" for phase in phases):
+        resolved_resume_snapshot: dict[str, Any] = {}
+        if apply_resume_snapshot:
+            try:
+                resolved_resume_snapshot = validate_site_resume_snapshot(
+                    apply_resume_snapshot,
+                    workspace=self.workspace,
+                    site_key=site_key,
+                    batch_id=batch_id,
+                )
+            except Exception as exc:
+                return BrowserAutomationResult(
+                    site_key=site_key,
+                    site_name=site_name,
+                    status="failed",
+                    reason_tag="resume_snapshot_invalid",
+                    message=str(exc),
+                )
+        elif any(phase.slug == "apply" for phase in phases):
             try:
                 staged_resume_pdf = self._stage_apply_resume_pdf(runtime_output_dir=active.runtime.output_dir)
             except Exception as exc:
@@ -368,14 +387,15 @@ class BrowserAutomationService:
                     reason_tag="resume_pdf_unavailable",
                     message=str(exc),
                 )
-            # Keep only execution hints in the persisted work item. Profile
-            # facts remain an on-demand resource so a resumed agent gets the
-            # user's latest values instead of a stale copied payload.
+            resolved_resume_snapshot = {
+                "site_key": site_key,
+                "batch_id": batch_id,
+                "path": str(staged_resume_pdf),
+                "filename": Path(staged_resume_pdf).name,
+            }
+        if resolved_resume_snapshot:
             apply_initial_facts = {
-                "staged_resume": {
-                    "path": str(staged_resume_pdf),
-                    "filename": Path(staged_resume_pdf).name,
-                },
+                "staged_resume": resolved_resume_snapshot,
                 "apply_target_job_ids": [
                     str(job_id or "").strip()
                     for job_id in (apply_target_job_ids or ())
@@ -384,7 +404,7 @@ class BrowserAutomationService:
             }
             self.site_store.save_browser_session(
                 site_key,
-                {"staged_resume_pdf_path": str(staged_resume_pdf)},
+                {"staged_resume_pdf_path": str(resolved_resume_snapshot.get("path") or "")},
             )
         common_kwargs = {
             "workspace": self.workspace,
@@ -1416,6 +1436,7 @@ class BrowserAutomationService:
         continuation_context: dict[str, Any] | None = None,
         phase_timeout_seconds_override: int | None = None,
         timeout_ms_override: int | None = None,
+        apply_resume_snapshot: dict[str, Any] | None = None,
     ) -> BrowserAutomationResult:
         active, reused_runtime = self._reserve_runtime(site_key, entry_url, timeout_ms=timeout_ms_override)
         self.site_store.save_browser_session(
@@ -1479,19 +1500,39 @@ class BrowserAutomationService:
                 session_state = self.site_store.ensure_browser_session(site_key)
                 apply_staged_resume_pdf_path = ""
                 if result is None:
-                    try:
-                        staged_resume_pdf = self._stage_apply_resume_pdf(runtime_output_dir=active.runtime.output_dir)
-                    except Exception as exc:
-                        if any(phase.slug == "apply" for phase in phases):
+                    if apply_resume_snapshot:
+                        try:
+                            resolved_resume_snapshot = validate_site_resume_snapshot(
+                                apply_resume_snapshot,
+                                workspace=self.workspace,
+                                site_key=site_key,
+                                batch_id=batch_id,
+                            )
+                        except Exception as exc:
                             result = BrowserAutomationResult(
                                 site_key=site_key,
                                 site_name=site_name,
                                 status="failed",
-                                reason_tag="resume_pdf_unavailable",
+                                reason_tag="resume_snapshot_invalid",
                                 message=str(exc),
                             )
+                        else:
+                            apply_staged_resume_pdf_path = str(resolved_resume_snapshot.get("path") or "")
                     else:
-                        apply_staged_resume_pdf_path = str(staged_resume_pdf)
+                        try:
+                            staged_resume_pdf = self._stage_apply_resume_pdf(runtime_output_dir=active.runtime.output_dir)
+                        except Exception as exc:
+                            if any(phase.slug == "apply" for phase in phases):
+                                result = BrowserAutomationResult(
+                                    site_key=site_key,
+                                    site_name=site_name,
+                                    status="failed",
+                                    reason_tag="resume_pdf_unavailable",
+                                    message=str(exc),
+                                )
+                        else:
+                            apply_staged_resume_pdf_path = str(staged_resume_pdf)
+                    if apply_staged_resume_pdf_path:
                         self.site_store.save_browser_session(
                             site_key,
                             {"staged_resume_pdf_path": apply_staged_resume_pdf_path},
@@ -1850,6 +1891,7 @@ class BrowserAutomationService:
         continuation_context: dict[str, Any] | None = None,
         phase_timeout_seconds_override: int | None = None,
         timeout_ms_override: int | None = None,
+        apply_resume_snapshot: dict[str, Any] | None = None,
     ) -> BrowserAutomationResult:
         if self.execution_mode in {AGENT_BRIDGE_MODE, CODEX_APP_SERVER_MODE}:
             return self._run_site_agent_bridge(
@@ -1863,6 +1905,7 @@ class BrowserAutomationService:
                 phase_slugs=phase_slugs,
                 apply_target_job_ids=apply_target_job_ids,
                 continuation_context=continuation_context,
+                apply_resume_snapshot=apply_resume_snapshot,
             )
         try:
             async def _runner() -> BrowserAutomationResult:
@@ -1879,6 +1922,7 @@ class BrowserAutomationService:
                     continuation_context=continuation_context,
                     phase_timeout_seconds_override=phase_timeout_seconds_override,
                     timeout_ms_override=timeout_ms_override,
+                    apply_resume_snapshot=apply_resume_snapshot,
                 )
 
             return anyio.run(_runner)

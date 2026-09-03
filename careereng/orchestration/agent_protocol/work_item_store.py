@@ -158,7 +158,13 @@ class WorkItemStore:
                 write_json(self.index_path, {"updated_at": now_iso(), "records": records})
             return changed
 
-    def reissue(self, work_item_id: str, *, event: str = "reissued") -> dict[str, Any]:
+    def reissue(
+        self,
+        work_item_id: str,
+        *,
+        event: str = "reissued",
+        command_id: str = "",
+    ) -> dict[str, Any]:
         """Issue a fresh executable lease for one retained work item."""
 
         with self._lock:
@@ -167,13 +173,28 @@ class WorkItemStore:
             record = records.get(str(work_item_id or ""))
             if not isinstance(record, dict):
                 raise ValueError("work item was not found in durable index")
+            normalized_command_id = str(command_id or "").strip()
+            if normalized_command_id and str(record.get("last_reissue_command_id") or "") == normalized_command_id:
+                return dict(record)
             if str(record.get("state") or "") in {"completed", "cancelled", "released"}:
                 raise ValueError("terminal work item cannot be reissued")
+            payload, _ = self._load_payload(record.get("payload_path"))
+            if work_item_id_from_payload(payload) != str(work_item_id or ""):
+                raise ValueError("work item payload does not match durable index")
+            for field in ("site_key", "batch_id"):
+                if str(payload.get(field) or "") != str(record.get(field) or ""):
+                    raise ValueError("work item payload scope does not match durable index")
+            payload_context_revision = max(0, int(payload.get("context_revision") or 0))
+            current_context_revision = max(0, int(record.get("context_revision") or 0))
+            if payload_context_revision < current_context_revision:
+                raise ValueError("work item payload context revision regressed")
             updated = {
                 **record,
                 "state": "active",
+                "context_revision": payload_context_revision,
                 "control_epoch": next_control_epoch(record.get("control_epoch")),
                 "site_revision": int(record.get("site_revision") or 0) + 1,
+                "last_reissue_command_id": normalized_command_id,
                 "updated_at": now_iso(),
             }
             records[str(work_item_id)] = updated
