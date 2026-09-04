@@ -471,11 +471,15 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - Before starting any apply flow, re-check the live title and JD for excluded early-career signals: `intern`, `internship`, `campus`, `student`, `graduate program`, `new grad`, `new graduate`, `co-op`, `校招`, or `实习`.
 - If an excluded early-career signal is visible, record the job as `filtered_out` and do not click `Apply`, `Submit Resume`, or any equivalent apply entry. This exclusion is a hard gate and overrides otherwise good JD/persona matching.
 - `recommended_apply` means the current job is approved to continue its apply flow. It is not a terminal outcome by itself.
-- For every job, move on only after the current job reaches a true terminal run-state such as `filtered_out`, `already_applied`, `submitted`, or `blocked`, or after a structured loop-control gap has been recorded for the current job.
+- Unless the active site Skill requires complete-set ranking, move on only after the current job reaches a true terminal run-state such as `filtered_out`, `already_applied`, `submitted`, or `blocked`, or after a structured loop-control gap has been recorded for the current job.
+- When the active site Skill requires ranking all eligible jobs before applying, evaluate each job without entering its application flow. For each eligible job write `decision_status = recommended_apply`, leave `application_status` empty, set `apply_state = ranking_pending`, include the positive site-declared `ranking_limit`, include `ranking_group` when the Skill defines more than one queue, and persist `match_score_final` or `match_score_initial`.
+- `ranking_pending` completes the current job's review step but is not an application outcome. After every apply-plan job has completed review, CareerEng deterministically changes the highest-ranked jobs to `ready_to_apply` and the remaining ranked jobs to `deferred_by_rank`.
+- `ready_to_apply` means ranking is complete. Do not re-score that target or return it to `ranking_pending`; continue its live application flow until it reaches a real application outcome.
+- `deferred_by_rank` is a completed batch selection result, not a rejection, not a not-fit decision, and not an application outcome. Keep `application_status` empty.
 - Submit only the jobs that are judged `recommended_apply`.
 - Record JD sync, decision, and application progress when it helps preserve information without interrupting the visible live-page flow.
 - Use `update_jobs` whenever the current job gains new JD data, decision state, apply state, submission result, or blocking reason.
-- Treat `update_jobs` as a progress checkpoint, not as completion, unless that update writes a true terminal outcome for the current job.
+- Treat `update_jobs` as a progress checkpoint, not as completion, unless it writes a true terminal outcome or a valid `ranking_pending` review checkpoint for a ranking-enabled site.
 - On a confirmed successful submission, write `application_status = submitted`, `apply_state = terminal_submitted`, `decision_status = recommended_apply`, and preserve the exact website confirmation in `application_status_raw`.
 - On a confirmed already-applied state, write `application_status = already_applied`, `apply_state = terminal_already_applied`, and preserve the exact website wording in `application_status_raw` when visible.
 - On a confirmed hard exclusion or final not-fit decision, write `application_status = filtered_out`, `decision_status = filtered_out`, and `apply_state = terminal_filtered_out`.
@@ -636,5 +640,5 @@ Loop-control continuation semantics:
 
 ### Completion
 
-- Finish `Apply` only after every saved job for the current site and batch has reached a terminal state.
+- Finish `Apply` only after every saved job for the current site and batch has reached a true terminal state or `deferred_by_rank`, and no job remains `ranking_pending` or `ready_to_apply`.
 - Do not leave jobs in an in-between state just because one role was submitted successfully.

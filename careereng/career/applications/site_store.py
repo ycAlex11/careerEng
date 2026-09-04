@@ -125,6 +125,7 @@ class SiteStore:
         "employment_type",
         "match_label",
         "apply_state",
+        "ranking_group",
         "site_job_id",
         "description_ref",
         "jd_sync_status",
@@ -162,6 +163,8 @@ class SiteStore:
         "match_score_initial",
         "match_score_final",
         "fit_confidence",
+        "ranking_limit",
+        "ranking_rank",
         "observed_posted_age_days",
         "first_observed_posted_age_days",
         "current_posted_age_days",
@@ -1335,6 +1338,7 @@ class SiteStore:
             "employment_type",
             "match_label",
             "apply_state",
+            "ranking_group",
             "site_job_id",
             "description_ref",
             "jd_sync_status",
@@ -2409,6 +2413,13 @@ class SiteStore:
                 if field.startswith("posted_first_observed") and str(merged.get(field) or "").strip():
                     continue
                 merged[field] = value
+        for field in ("ranking_limit", "ranking_rank"):
+            if incoming.get(field) in (None, ""):
+                continue
+            try:
+                merged[field] = int(float(incoming.get(field)))
+            except Exception:
+                pass
         if isinstance(incoming.get("context_versions"), dict) and not preserve_existing_filtered_decision:
             merged["context_versions"] = dict(incoming["context_versions"])
         if incoming.get("observed_posted_age_days") not in (None, ""):
@@ -2992,6 +3003,46 @@ class SiteStore:
     def list_run_jobs(self, site_id: str, batch_id: str) -> list[dict[str, Any]]:
         rows = JSONLStore(self._job_run_path(site_id, batch_id)).read_all()
         return [row for row in rows if isinstance(row, dict)]
+
+    def clone_run_checkpoint(
+        self,
+        site_id: str,
+        *,
+        source_batch_id: str,
+        target_batch_id: str,
+        session_id: str,
+        turn_id: str,
+    ) -> list[dict[str, Any]]:
+        """Clone one batch's frozen job rows without promoting new history."""
+
+        rows = self.list_run_jobs(site_id, source_batch_id)
+        cloned: list[dict[str, Any]] = []
+        for row in rows:
+            cloned.append(
+                {
+                    **row,
+                    "observation_id": make_id("obs"),
+                    "ts": now_iso(),
+                    "batch_id": target_batch_id,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "recovered_from_observation_id": str(row.get("observation_id") or ""),
+                    "recovered_from_batch_id": source_batch_id,
+                }
+            )
+        JSONLStore(self._job_run_path(site_id, target_batch_id)).write_all(cloned)
+        source_context = self.load_run_context(site_id, source_batch_id)
+        if source_context:
+            self.save_run_context(
+                site_id,
+                target_batch_id,
+                {
+                    **source_context,
+                    "recovered_from_batch_id": source_batch_id,
+                    "recovered_at": now_iso(),
+                },
+            )
+        return cloned
 
     def append_jobs(
         self,

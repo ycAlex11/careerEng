@@ -32,6 +32,7 @@ def _fresh_resume_apply_target(
 ) -> dict[str, str]:
     apply_payload = current.get("apply") if isinstance(current.get("apply"), dict) else {}
     loop_payload = apply_payload.get("loop_control") if isinstance(apply_payload.get("loop_control"), dict) else {}
+    active_job_id = str(apply_payload.get("active_target_job_id") or "").strip()
     current_item_ref = str(loop_payload.get("current_item_ref") or "").strip()
     current_url = str(
         browser_session.get("last_known_url")
@@ -40,6 +41,22 @@ def _fresh_resume_apply_target(
         or current.get("entry_url")
         or ""
     ).strip()
+
+    if active_job_id:
+        row = next(
+            (
+                candidate
+                for candidate in run_rows
+                if isinstance(candidate, dict) and str(candidate.get("job_id") or "").strip() == active_job_id
+            ),
+            {},
+        )
+        return {
+            "job_id": active_job_id,
+            "job_url": str(row.get("url") or ""),
+            "entry_url": current_url or str(row.get("url") or ""),
+            "title": str(row.get("title") or ""),
+        }
 
     def matches(row: dict[str, Any]) -> bool:
         job_id = str(row.get("job_id") or "").strip()
@@ -130,8 +147,11 @@ def build_fresh_snapshot_resume_plan(
         "last_known_url": str(browser_session.get("last_known_url") or ""),
         "current_url": str(current.get("current_url") or ""),
         "instruction": (
-            "The user says the manual browser step is done. Start from the current live page with a fresh "
-            "snapshot and continue this phase. Do not infer a terminal business outcome from this resume signal alone."
+            "The user requested continuation. Resume only the current unfinished phase from durable state with a fresh "
+            "browser snapshot; never rerun an earlier completed phase or rebuild its frozen output. During apply, reopen "
+            "the same current Job URL and reconcile its live state: record already-applied outcomes, continue drafts, "
+            "apply when no success evidence exists, record closed jobs, and request user input if the state remains "
+            "ambiguous. Do not infer a terminal business outcome from the resume signal alone."
         ),
     }
     if apply_target:

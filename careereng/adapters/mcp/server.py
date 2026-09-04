@@ -433,8 +433,9 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         message: str = "",
         session_id: str = DEFAULT_SESSION_ID,
         command_id: str = "",
+        source_batch_id: str = "",
     ) -> dict[str, Any]:
-        """Resume a waiting_user phase after the user completes a human-only browser action."""
+        """Continue in place, or recover from a terminal batch checkpoint."""
         resume_message = str(message or "").strip() or f"{site_key} done"
         effective_command_id = str(command_id or make_id("worker_command"))
         return runtime.host_client().request(
@@ -445,6 +446,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 "turn_id": make_id("turn"),
                 "site_key": site_key,
                 "command_id": effective_command_id,
+                "source_batch_id": str(source_batch_id or ""),
             },
         )
 

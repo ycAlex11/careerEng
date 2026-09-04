@@ -1,8 +1,8 @@
 ---
 id: site-google
 name: google Site Skill
-version: v1
-updated_at: '2026-08-01'
+version: v2
+updated_at: '2026-09-03'
 scope: site
 site_key: google
 status: exploration
@@ -27,9 +27,9 @@ Use this file to describe how this site should be handled.
 ### Application Gate
 
 - Apply the shared matching policy to every retrieved candidate and rank eligible roles by final match score after required JD/CV review.
-- Google permits at most three applications in a rolling 30-day window. When the live dashboard cap is absent, place only the top three ranked eligible roles in the apply list.
+- Google permits at most three applications in a rolling 30-day window. When the live dashboard cap is absent, place only the top two ranked eligible roles in the apply list.
 - If final scores tie, prioritize stronger direct technical evidence, then newer posting evidence when available.
-- Roles outside the top three are deferred candidates, not rejected roles. Preserve them for a later eligible Google application window.
+- Roles outside the top two are deferred candidates, not rejected roles. Preserve them for a later eligible Google application window.
 
 ## Session Preparation
 

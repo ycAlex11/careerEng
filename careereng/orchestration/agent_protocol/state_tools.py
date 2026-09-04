@@ -156,6 +156,9 @@ def update_jobs_tool_schema() -> dict[str, Any]:
         "employment_type": {"type": "string"},
         "match_label": {"type": "string"},
         "apply_state": {"type": "string"},
+        "ranking_group": {"type": "string"},
+        "ranking_limit": {"type": "number"},
+        "ranking_rank": {"type": "number"},
         "site_job_id": {"type": "string"},
         "posted_at": {"type": "string"},
         "description": {"type": "string"},
@@ -193,7 +196,11 @@ def update_jobs_tool_schema() -> dict[str, Any]:
     return {
         "type": "function",
         "name": UPDATE_JOBS_TOOL,
-        "description": "Persist current per-job JD, decision, and application state for the active batch run.",
+        "description": (
+            "Persist current per-job JD, decision, ranking, and application state for the active batch run. "
+            "A ranking_pending row must be recommended_apply, have no application_status, include a positive "
+            "ranking_limit, and include a match score."
+        ),
         "strict": False,
         "parameters": {
             "type": "object",

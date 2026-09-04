@@ -105,6 +105,10 @@ Do not search for its socket, invent another launch command, start a second host
 6. Treat `pause_unconfirmed` as transport uncertainty, not job failure. Resume reconstructs the worker from durable state instead of trusting the unconfirmed thread.
 7. Ordinary phase completion keeps the same site work item, Codex thread, and browser. CareerEng advances phase context synchronously and automatically continues a non-terminal item if its current turn ends.
 8. Internal heartbeat traffic is not a Desktop progress stream. The registered main agent receives only durable phase, attention, recovery, and terminal events.
+9. For ranking-enabled sites, `ranking_pending` completes evaluation only; CareerEng materializes `ready_to_apply` and `deferred_by_rank`, then continues selected jobs to real application outcomes.
+10. If bounded technical recovery is exhausted, report `waiting_user` rather than a job failure. A user continuation reissues the same durable work item, recreates only a dead scoped browser runtime when necessary, and resumes the current phase/item.
+11. Recovery never reruns completed phases. Retrieval continues its saved checkpoint with dedupe; apply uses the frozen Apply List and reconciles an uncertain active item from that item's Job URL before continuing.
+12. Prefer in-place continuation. When the original batch is terminal or non-reissuable and the user asks to continue rather than cancel, pass its `source_batch_id`; CareerEng creates one idempotent recovery batch whose starting phase/item is derived from that source checkpoint.
 
 For direct lifecycle commands, see `docs/assistant_bridge/COMMANDS.md`.
 

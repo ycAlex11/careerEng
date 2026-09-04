@@ -106,10 +106,13 @@ def _job_status(row: dict[str, Any]) -> str:
     status = _application_status(row)
     if status:
         return status
+    apply_state = _normalize_status(row.get("apply_state"))
+    if apply_state in {"ranking_pending", "ready_to_apply", "deferred_by_rank"}:
+        return apply_state
     status = _decision_status(row)
     if status:
         return status
-    return _normalize_status(row.get("apply_state"))
+    return apply_state
 
 
 def _truncate_summary(text: str, *, max_chars: int = 320) -> str:
@@ -760,6 +763,15 @@ def build_site_report(
         "apply_submitted": int(apply.get("submitted") or 0),
         "apply_failed": int(apply.get("failed") or 0),
         "apply_blocked": int(apply.get("blocked") or 0),
+        "ranking_pending_count": len(
+            [row for row in rows if _normalize_status(row.get("apply_state")) == "ranking_pending"]
+        ),
+        "ready_to_apply_count": len(
+            [row for row in rows if _normalize_status(row.get("apply_state")) == "ready_to_apply"]
+        ),
+        "deferred_by_rank_count": len(
+            [row for row in rows if _normalize_status(row.get("apply_state")) == "deferred_by_rank"]
+        ),
         "retrieved_count": len(rows),
         "new_jobs_count": new_jobs_count,
         "new_submitted_count": new_submitted_count,

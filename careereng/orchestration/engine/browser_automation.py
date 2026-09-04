@@ -1963,6 +1963,47 @@ class BrowserAutomationService:
             self._browser_context_registry.release_loaded_bundles()
         return released
 
+    def prepare_site_runtime_for_recovery(self, site_key: str) -> bool:
+        """Retain a healthy runtime or rebuild a dead one without losing work context."""
+
+        normalized_site = str(site_key or "").strip()
+        session = self.site_store.load_browser_session(normalized_site)
+        last_error = str(session.get("last_step_error") or "").strip().lower()
+        must_reset = any(
+            marker in last_error
+            for marker in (
+                "target page, context or browser has been closed",
+                "browser context has been closed",
+                "browser has been closed",
+            )
+        )
+        if not must_reset:
+            try:
+                self._runtime_registry.active(normalized_site)
+            except RuntimeError:
+                must_reset = True
+        released = False
+        if must_reset:
+            released = self._runtime_registry.release_or_reclaim(
+                site_key=normalized_site,
+                profile_dir=self.site_store.browser_profile_dir(normalized_site),
+            )
+        self.site_store.save_browser_session(
+            normalized_site,
+            {
+                "browser_status": "recovering",
+                "active_run_id": "",
+                "pending_action": "execution_recovery_resume_prepared",
+                **({"last_browser_pid": 0} if must_reset else {}),
+            },
+        )
+        self.site_store.append_event(
+            normalized_site,
+            "browser.runtime.recovery_prepared",
+            {"runtime_reset": must_reset, "released": bool(released)},
+        )
+        return must_reset
+
     def complete_site_work_item(self, site_key: str) -> bool:
         session = self.site_store.load_browser_session(site_key)
         payload_path = Path(str(session.get("agent_bridge_payload_path") or ""))

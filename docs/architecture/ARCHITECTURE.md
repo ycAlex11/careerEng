@@ -179,6 +179,25 @@ effects, while Skills and the LLM continue to decide when a site's live page
 requires a resume upload. Mid-batch resume replacement is intentionally not
 supported; a newly exported resume is selected by the next new batch.
 
+## Ranked Application Queue Boundary
+
+Sites that must compare all eligible jobs before submission declare that policy,
+the ranking limit, and any queue grouping in their Skill. The worker owns live
+JD interpretation and records eligible rows as `ranking_pending` with scores;
+Python does not infer site policy or job fit.
+
+`career/applications/ranked_queue.py` owns only generic validation and
+deterministic queue materialization. Once every apply-plan row has completed
+review, it marks the selected rows `ready_to_apply` and the remainder
+`deferred_by_rank`. The orchestration engine then runs only selected rows through
+submission. `application_status` remains reserved for observed application
+outcomes, so ranking, deferral, rejection, and submission cannot be conflated.
+
+Queue materialization is persisted and idempotent. A resumed worker treats
+`ready_to_apply` as a submission target without repeating matching, while
+`deferred_by_rank` is complete for the current batch but is not a historical
+application outcome.
+
 ## Site Mode And Evolution Boundary
 
 Site Skill front matter carries one structural execution mode and one separate
@@ -633,9 +652,21 @@ stranded between states.
 If a Codex turn nevertheless ends while its work item is still `active`, the
 coordinator starts a bounded continuation on the retained thread. Repeated
 turn endings without a context revision become an execution-recovery failure,
-not a completed site and not a permanently false `running` worker. A stale
-turn cannot regain access after phase refresh, pause, cancellation, or release
+not a completed site and not a permanently false `running` worker. Exhausted
+recovery parks the same durable work item in `waiting_user`, releases its
+scheduler slot, and leaves the current phase and item unchanged. A user
+continuation reissues that item with a new control epoch; a stale turn cannot
+regain access after recovery, phase refresh, pause, cancellation, or release
 because each accepted state or context change advances the site revision.
+
+Phase recovery is monotonic. Once a phase completes, its durable output is the
+frozen input for later phases in that batch and recovery never reruns it. A
+retrieval interruption resumes its saved page/checkpoint with normal dedupe. An
+apply interruption resumes the persisted Apply List and its active target. If
+the result of that target is uncertain, the Skill-guided worker reopens that
+target's Job URL and reconciles the live page instead of returning to search or
+application-history review. Newly posted or removed jobs are deferred to the
+next batch.
 
 `agent.site_parallelism` limits active site workers for both Codex and provider
 execution. A batch is an aggregation, report, and evidence container, not a
@@ -661,6 +692,23 @@ write a job outcome. Final site completion first marks the work item
 without clearing durable cache artifacts. Runtime records
 only lifecycle, resource-read, tool, cache, and token-usage facts; it does not
 choose context resources or workflow strategy for the worker.
+
+A browser process is replaceable infrastructure, not durable workflow state.
+When recovery is exhausted because the scoped browser is dead, the runtime host
+may discard and recreate only that site's browser process/profile lease while
+retaining its payload, phase session, Skill snapshot, Apply List, active target,
+work-item identity, and batch. Normal `release_site` remains terminal for that
+execution scope and is never used as a recovery shortcut.
+
+User continuation follows a resume-or-recover rule. If the original batch and
+work item remain resumable, the host reissues them in place. If the source batch
+is terminal or otherwise cannot be reissued, `checkpoint_recovery` creates one
+new batch from its last durable result. The restart phase is derived from phase
+outputs and the unfinished item, not from a fixed recovery phase. The recovery
+batch clones frozen run rows, Apply List, current target, and the exact resume
+snapshot version; records source-batch/plan lineage; and excludes browser PIDs,
+thread turns, payload bindings, leases, and other transient ownership. Repeated
+delivery of the same recovery command returns the same recovery batch.
 
 ## Adding a New Tool
 

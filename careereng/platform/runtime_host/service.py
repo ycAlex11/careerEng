@@ -385,18 +385,57 @@ class RuntimeHostService:
         turn_id = str(payload.get("turn_id") or make_id("turn"))
         command_id = str(payload.get("command_id") or turn_id).strip()
         site_key = str(payload.get("site_key") or "").strip()
+        requested_site_key = site_key
+        source_batch_id = str(payload.get("source_batch_id") or "").strip()
         acquired = self._lock.acquire(blocking=False)
         if not acquired:
             return {"ok": False, "error": "runtime host control plane is busy"}
         try:
+            if source_batch_id:
+                source = self.loop.job_flow.job_store.load_batch(source_batch_id)
+                if not source:
+                    return {"ok": False, "error": f"source job batch not found: {source_batch_id}"}
+                if str(source.get("status") or "") not in {"completed", "partial_completed", "failed", "cancelled"}:
+                    session_id = str(source.get("session_id") or session_id)
+                else:
+                    recovered = self.loop.job_flow.create_checkpoint_recovery_batch(
+                        source_batch_id=source_batch_id,
+                        site_key=site_key,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        user_message=message,
+                        command_id=command_id,
+                    )
+                    session_id = str(recovered.get("session_id") or session_id)
             resolve_resume_site = getattr(self.loop.job_flow, "resolve_resume_site_key", None)
             if callable(resolve_resume_site):
                 site_key = str(
                     resolve_resume_site(session_id=session_id, message=message, site_key=site_key) or ""
                 ).strip()
+            if not site_key and requested_site_key and not source_batch_id:
+                find_source = getattr(self.loop.job_flow, "latest_checkpoint_recovery_source", None)
+                source = (
+                    find_source(session_id=session_id, site_key=requested_site_key)
+                    if callable(find_source)
+                    else {}
+                )
+                if isinstance(source, dict) and str(source.get("batch_id") or ""):
+                    recovered = self.loop.job_flow.create_checkpoint_recovery_batch(
+                        source_batch_id=str(source.get("batch_id") or ""),
+                        site_key=requested_site_key,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        user_message=message,
+                        command_id=command_id,
+                    )
+                    site_key = requested_site_key
+                    session_id = str(recovered.get("session_id") or session_id)
+            if not site_key:
+                return {"ok": True, "accepted": False, "reply": ""}
             backend_error = self._resume_backend_error(session_id=session_id, site_key=site_key)
             if backend_error:
                 return {"ok": False, "error": backend_error}
+            self._prepare_recovery_runtime(site_key)
             reply = self.loop.job_flow.handle_resume_message(
                 session_id=session_id,
                 message=message,
@@ -425,6 +464,24 @@ class RuntimeHostService:
         if reply is None:
             return {"ok": True, "accepted": False, "reply": ""}
         return {"ok": True, "accepted": True, "reply": reply, "turn_id": turn_id}
+
+    def _prepare_recovery_runtime(self, site_key: str) -> None:
+        """Rebuild a failed browser runtime without releasing durable work."""
+
+        if not site_key:
+            return
+        job_flow = getattr(self.loop, "job_flow", None)
+        site_store = getattr(getattr(job_flow, "site_tools", None), "site_store", None)
+        browser_runner = getattr(self.loop, "browser_runner", None)
+        if site_store is None or browser_runner is None:
+            return
+        session = site_store.load_browser_session(site_key)
+        if str(session.get("pending_action") or "") != "execution_recovery_exhausted":
+            return
+        prepare_runtime = getattr(browser_runner, "prepare_site_runtime_for_recovery", None)
+        if not callable(prepare_runtime):
+            raise RuntimeError("browser recovery preparation is unavailable")
+        prepare_runtime(site_key)
 
     def _handle_worker_command(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Queue or redirect one running worker without refreshing browser context."""
@@ -1672,6 +1729,7 @@ class RuntimeHostService:
         if site_store is None:
             return
         persisted_state = {
+            "waiting_user": "waiting_user",
             "paused": "paused",
             "pause_unconfirmed": "pause_unconfirmed",
             "released": "released",
@@ -1818,9 +1876,11 @@ class RuntimeHostService:
             **metric_details,
         )
         if status == "exhausted":
-            record_unavailable = getattr(job_flow, "record_external_execution_unavailable", None)
-            if callable(record_unavailable):
-                record_unavailable(
+            record_exhausted = getattr(job_flow, "record_external_execution_recovery_exhausted", None)
+            if not callable(record_exhausted):
+                record_exhausted = getattr(job_flow, "record_external_execution_unavailable", None)
+            if callable(record_exhausted):
+                record_exhausted(
                     site_key=record.site_key,
                     batch_id=record.batch_id,
                     phase=str(details.get("phase") or ""),

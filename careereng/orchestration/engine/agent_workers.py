@@ -547,7 +547,7 @@ class SiteAgentWorkerCoordinator:
                 if current is not None and current.work_item_id == record.work_item_id:
                     if current.turn_id and current.status in {"running", "recovering"}:
                         return current
-                    if current.status in {"unavailable", "execution_unavailable", "interrupted", "cancelled"}:
+                    if current.status in {"unavailable", "execution_unavailable", "waiting_user", "interrupted", "cancelled"}:
                         raise RuntimeError(current.last_error or f"worker resume failed with status={current.status}")
             time.sleep(0.01)
         raise RuntimeError(f"timed out waiting for resumed worker turn: site={record.site_key}")
@@ -823,15 +823,11 @@ class SiteAgentWorkerCoordinator:
                     if now - record.last_activity_monotonic < self.idle_timeout_seconds:
                         continue
                     if record.recovery_attempts >= self.max_resume_attempts:
-                        record.status = "execution_unavailable"
-                        record.last_error = "no CareerEng tool progress after configured recovery attempts"
-                        record.updated_at = now_iso()
-                        self._persist_locked(record)
-                        self._emit_recovery_locked(record, "exhausted")
-                        try:
-                            self._interrupt_locked(record, source="idle_recovery_exhausted")
-                        except RuntimeError:
-                            pass
+                        self._park_recovery_exhausted_locked(
+                            record,
+                            error="no CareerEng tool progress after configured recovery attempts",
+                            interrupt_source="idle_recovery_exhausted",
+                        )
                         continue
                     record.recovery_attempts += 1
                     recovery_command = self._enqueue_control_command_locked(
@@ -981,19 +977,11 @@ class SiteAgentWorkerCoordinator:
                         prompt=_resume_prompt(record, pending_message) if pending_message else _recovery_prompt(record),
                     )
                 except RuntimeError as exc:
-                    record.status = "execution_unavailable"
-                    record.last_error = f"{type(exc).__name__}: {exc}"
-                    self._complete_claimed_commands_locked(
+                    self._park_recovery_exhausted_locked(
                         record,
-                        status=WorkerCommandStatus.FAILED,
-                        error=record.last_error,
+                        error=f"{type(exc).__name__}: {exc}",
+                        event_thread_id=str(event.thread_id),
                     )
-                    self._persist_locked(record)
-                    self._emit_recovery_locked(record, "exhausted")
-                    self._active.pop(record.site_key, None)
-                    self._scheduler.complete(record.site_key)
-                    self._by_thread.pop(str(event.thread_id), None)
-                    self._dispatch_locked()
                     return
                 record.turn_id = _required_turn_id(result)
                 record.status = "running"
@@ -1016,15 +1004,11 @@ class SiteAgentWorkerCoordinator:
                 else:
                     record.continuation_attempts += 1
                     if record.continuation_attempts > self.max_resume_attempts:
-                        record.turn_id = ""
-                        record.status = "execution_unavailable"
-                        record.last_error = "worker turn ended repeatedly while the work item remained active"
-                        self._persist_locked(record)
-                        self._emit_recovery_locked(record, "exhausted")
-                        self._active.pop(record.site_key, None)
-                        self._scheduler.complete(record.site_key)
-                        self._by_thread.pop(str(event.thread_id), None)
-                        self._dispatch_locked()
+                        self._park_recovery_exhausted_locked(
+                            record,
+                            error="worker turn ended repeatedly while the work item remained active",
+                            event_thread_id=str(event.thread_id),
+                        )
                         return
                 record.watchdog_enabled = current_payload.watchdog_enabled
                 self._claim_pending_commands_locked(record)
@@ -1038,19 +1022,11 @@ class SiteAgentWorkerCoordinator:
                 try:
                     result = self._ensure_server_locked().start_turn(thread_id=record.thread_id, prompt=prompt)
                 except RuntimeError as exc:
-                    record.status = "execution_unavailable"
-                    record.last_error = f"{type(exc).__name__}: {exc}"
-                    self._complete_claimed_commands_locked(
+                    self._park_recovery_exhausted_locked(
                         record,
-                        status=WorkerCommandStatus.FAILED,
-                        error=record.last_error,
+                        error=f"{type(exc).__name__}: {exc}",
+                        event_thread_id=str(event.thread_id),
                     )
-                    self._persist_locked(record)
-                    self._emit_recovery_locked(record, "exhausted")
-                    self._active.pop(record.site_key, None)
-                    self._scheduler.complete(record.site_key)
-                    self._by_thread.pop(str(event.thread_id), None)
-                    self._dispatch_locked()
                     return
                 record.turn_id = _required_turn_id(result)
                 record.status = "running"
@@ -1073,6 +1049,38 @@ class SiteAgentWorkerCoordinator:
             if successor is not None:
                 self._scheduler.enqueue(SiteWorkItem(successor.site_key, successor.batch_id, successor))
             self._dispatch_locked()
+
+    def _park_recovery_exhausted_locked(
+        self,
+        record: AgentWorkerRecord,
+        *,
+        error: str,
+        interrupt_source: str = "",
+        event_thread_id: str = "",
+    ) -> None:
+        """Park a recoverable work item without retaining a scheduler slot."""
+
+        if interrupt_source and record.thread_id and record.turn_id:
+            try:
+                self._interrupt_locked(record, source=interrupt_source)
+            except RuntimeError:
+                pass
+        record.recovery_pending = False
+        record.turn_id = ""
+        record.status = "waiting_user"
+        record.last_error = str(error or "execution recovery was exhausted")
+        record.updated_at = now_iso()
+        self._complete_claimed_commands_locked(
+            record,
+            status=WorkerCommandStatus.FAILED,
+            error=record.last_error,
+        )
+        self._persist_locked(record)
+        self._emit_recovery_locked(record, "exhausted")
+        self._active.pop(record.site_key, None)
+        self._scheduler.complete(record.site_key)
+        self._by_thread.pop(str(event_thread_id or record.thread_id), None)
+        self._dispatch_locked()
 
     def _persist_locked(self, record: AgentWorkerRecord, *, bind_thread: bool = True) -> None:
         if bind_thread:

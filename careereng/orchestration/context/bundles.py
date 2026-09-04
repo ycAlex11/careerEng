@@ -64,6 +64,9 @@ def _pending_apply_rows(
                 "employment_type": str(row.get("employment_type") or ""),
                 "match_label": str(row.get("match_label") or ""),
                 "apply_state": str(row.get("apply_state") or ""),
+                "ranking_group": str(row.get("ranking_group") or ""),
+                "ranking_limit": row.get("ranking_limit"),
+                "ranking_rank": row.get("ranking_rank"),
                 "decision_status": str(row.get("decision_status") or ""),
                 "application_status": str(row.get("application_status") or ""),
                 "application_status_raw": str(row.get("application_status_raw") or ""),
@@ -223,6 +226,16 @@ class BrowserContextSession:
                 ),
             }
         )
+        if any(str(row.get("apply_state") or "").strip().lower() == "ready_to_apply" for row in pending_rows):
+            items.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "The current target is ready_to_apply: complete-set ranking is already finished. "
+                        "Do not re-score or return it to ranking_pending; continue its live application flow to a real outcome."
+                    ),
+                }
+            )
         items.append(
             {
                 "role": "user",

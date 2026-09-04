@@ -107,6 +107,45 @@ def stage_batch_resume_snapshot(
     return current
 
 
+def clone_batch_resume_snapshot(
+    *,
+    workspace: Path,
+    source: dict[str, Any],
+    target_batch_id: str,
+    site_keys: Iterable[str],
+) -> dict[str, Any]:
+    """Copy one immutable resume version into an isolated recovery batch."""
+
+    workspace = Path(workspace).resolve()
+    normalized_batch_id = _safe_scope_key(target_batch_id, field="batch_id")
+    source_path = Path(str(source.get("canonical_path") or ""))
+    expected_sha256 = str(source.get("sha256") or "").strip()
+    if not source_path.is_file() or not expected_sha256:
+        raise FileNotFoundError("source batch resume snapshot is unavailable")
+    if _sha256(source_path) != expected_sha256:
+        raise RuntimeError("source batch resume snapshot hash mismatch")
+    filename = str(source.get("filename") or source_path.name)
+    canonical_path = _copy_verified(
+        source_path,
+        workspace / "tmp" / "browser_controls" / "batches" / normalized_batch_id / filename,
+        expected_sha256=expected_sha256,
+    )
+    seed = {
+        **source,
+        "batch_id": normalized_batch_id,
+        "canonical_path": str(canonical_path),
+        "created_at": now_iso(),
+        "sites": {},
+        "recovered_from_batch_id": str(source.get("batch_id") or ""),
+    }
+    return stage_batch_resume_snapshot(
+        workspace=workspace,
+        batch_id=normalized_batch_id,
+        site_keys=site_keys,
+        existing=seed,
+    )
+
+
 def site_resume_snapshot(snapshot: dict[str, Any] | None, site_key: str) -> dict[str, Any]:
     """Return the persisted site-scoped resume artifact, if available."""
 

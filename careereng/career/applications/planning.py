@@ -10,6 +10,13 @@ from careereng.career.applications.skill_policy import load_job_skill_policies
 from careereng.career.applications.application_store import ApplicationStore
 from careereng.career.applications.planning_store import JobPlanningStore
 from careereng.career.applications.job_store import JobStore
+from careereng.career.applications.ranked_queue import (
+    DEFERRED_BY_RANK,
+    RANKING_PENDING,
+    is_ranked_review_complete,
+    is_ready_to_apply,
+    ranked_queue_updates,
+)
 
 
 HistoryNormalizationCallback = Callable[[str, str, int], dict[str, Any]]
@@ -125,13 +132,29 @@ class ApplicationPlanningService:
     def is_apply_row_terminal(cls, row: dict[str, Any]) -> bool:
         decision_status = str(row.get("decision_status") or "").strip().lower()
         application_status = cls.terminal_application_status(row)
-        return decision_status in {"filtered_out", "already_applied"} or application_status in cls.TERMINAL_APPLICATION_STATUSES
+        return (
+            decision_status in {"filtered_out", "already_applied"}
+            or application_status in cls.TERMINAL_APPLICATION_STATUSES
+            or str(row.get("apply_state") or "").strip().lower() == DEFERRED_BY_RANK
+        )
+
+    @classmethod
+    def is_apply_row_review_complete(cls, row: dict[str, Any]) -> bool:
+        return cls.is_apply_row_terminal(row) or is_ranked_review_complete(row)
+
+    @classmethod
+    def is_apply_work_item_complete(cls, row: dict[str, Any]) -> bool:
+        return cls.is_apply_row_terminal(row) or str(row.get("apply_state") or "").strip().lower() == RANKING_PENDING
 
     @classmethod
     def is_apply_row_success_terminal(cls, row: dict[str, Any]) -> bool:
         decision_status = str(row.get("decision_status") or "").strip().lower()
         application_status = cls.terminal_application_status(row)
-        return decision_status in {"filtered_out", "already_applied"} or application_status in cls.SUCCESSFUL_TERMINAL_APPLICATION_STATUSES
+        return (
+            decision_status in {"filtered_out", "already_applied"}
+            or application_status in cls.SUCCESSFUL_TERMINAL_APPLICATION_STATUSES
+            or str(row.get("apply_state") or "").strip().lower() == DEFERRED_BY_RANK
+        )
 
     def apply_counters_from_run(self, site_key: str, batch_id: str) -> dict[str, int]:
         return apply_probe_counters(self.merged_run_job_rows_for_batch(site_key, batch_id))
@@ -149,6 +172,9 @@ class ApplicationPlanningService:
             "filtered_out": int(counters.get("filtered_out") or 0),
             "failed": int(counters.get("failed") or 0),
             "blocked": int(counters.get("blocked") or 0),
+            "ranking_pending": int(counters.get("ranking_pending") or 0),
+            "ready_to_apply": int(counters.get("ready_to_apply") or 0),
+            "deferred_by_rank": int(counters.get("deferred_by_rank") or 0),
             "excluded_role_violations": int(counters.get("excluded_role_violations") or 0),
         }
 
@@ -326,7 +352,7 @@ class ApplicationPlanningService:
         return plan
 
     def pending_apply_rows(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
-        rows = [row for row in self.merged_run_job_rows_for_batch(site_key, batch_id) if not self.is_apply_row_terminal(row)]
+        rows = self.merged_run_job_rows_for_batch(site_key, batch_id)
         plan = self.planning_store.load_apply_plan(batch_id=batch_id, site_key=site_key)
         items = plan.get("plan_items") if isinstance(plan.get("plan_items"), list) else []
         actionable_ids = {
@@ -336,9 +362,41 @@ class ApplicationPlanningService:
             and str(item.get("action") or "") in self.ACTIONABLE_PLAN_ACTIONS
             and str(item.get("job_id") or "")
         }
-        if not actionable_ids:
-            return rows
-        return [row for row in rows if str(row.get("job_id") or "") in actionable_ids]
+        actionable_rows = rows if not actionable_ids else [
+            row for row in rows if str(row.get("job_id") or "") in actionable_ids
+        ]
+        review_rows = [row for row in actionable_rows if not self.is_apply_row_review_complete(row)]
+        if review_rows:
+            return review_rows
+        return [row for row in actionable_rows if is_ready_to_apply(row) and not self.is_apply_row_terminal(row)]
+
+    def prepare_ranked_submission_queue(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        session_id: str,
+        turn_id: str,
+    ) -> list[dict[str, Any]]:
+        rows = self.merged_run_job_rows_for_batch(site_key, batch_id)
+        plan = self.planning_store.load_apply_plan(batch_id=batch_id, site_key=site_key)
+        items = plan.get("plan_items") if isinstance(plan.get("plan_items"), list) else []
+        actionable_ids = {
+            str(item.get("job_id") or "")
+            for item in items
+            if isinstance(item, dict)
+            and str(item.get("action") or "") in self.ACTIONABLE_PLAN_ACTIONS
+            and str(item.get("job_id") or "")
+        }
+        actionable_rows = rows if not actionable_ids else [
+            row for row in rows if str(row.get("job_id") or "") in actionable_ids
+        ]
+        if any(not self.is_apply_row_review_complete(row) for row in actionable_rows):
+            return []
+        updates = ranked_queue_updates(actionable_rows)
+        if not updates:
+            return []
+        return self.site_store.update_run_jobs(site_key, updates, session_id, turn_id, batch_id)
 
     def seal_apply_row_terminal(
         self,

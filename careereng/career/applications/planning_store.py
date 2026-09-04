@@ -204,6 +204,31 @@ class JobPlanningStore:
             return {}
         return {**payload, "path": str(path)} if isinstance(payload, dict) else {}
 
+    def clone_apply_plan(
+        self,
+        *,
+        source_batch_id: str,
+        target_batch_id: str,
+        site_key: str,
+    ) -> dict[str, Any]:
+        """Clone an immutable Apply List into a recovery batch."""
+
+        source = self.load_apply_plan(batch_id=source_batch_id, site_key=site_key)
+        if not source.get("plan_items"):
+            return {}
+        payload = {
+            **source,
+            "plan_id": make_id("apply_plan"),
+            "batch_id": target_batch_id,
+            "generated_at": now_iso(),
+            "recovered_from_batch_id": source_batch_id,
+            "recovered_from_plan_id": str(source.get("plan_id") or ""),
+        }
+        payload.pop("path", None)
+        path = self._apply_plan_path(batch_id=target_batch_id, site_key=site_key)
+        write_json(path, payload)
+        return {**payload, "path": str(path)}
+
     @classmethod
     def terminal_update_for_plan_item(cls, item: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict):

@@ -19,6 +19,7 @@ from careereng.adapters.external_agents.contracts import (
     normalize_execution_mode,
 )
 from careereng.orchestration.engine.fresh_resume import build_fresh_snapshot_resume_plan
+from careereng.orchestration.engine.checkpoint_recovery import BatchCheckpointRecovery
 from careereng.config.schema import BrowserBudgetsConfig
 from careereng.config.execution import execution_backend_from_mode, normalize_execution_backend
 from careereng.career.applications import ApplicationPlanningService
@@ -1014,6 +1015,10 @@ class JobFlow:
         return ApplicationPlanningService.is_apply_row_terminal(row)
 
     @staticmethod
+    def _is_apply_work_item_complete(row: dict[str, Any]) -> bool:
+        return ApplicationPlanningService.is_apply_work_item_complete(row)
+
+    @staticmethod
     def _is_apply_row_success_terminal(row: dict[str, Any]) -> bool:
         return ApplicationPlanningService.is_apply_row_success_terminal(row)
 
@@ -1153,6 +1158,21 @@ class JobFlow:
 
     def _pending_apply_rows(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
         return self.applications.pending_apply_rows(site_key, batch_id)
+
+    def _prepare_ranked_submission_queue(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        session_id: str,
+        turn_id: str,
+    ) -> list[dict[str, Any]]:
+        return self.applications.prepare_ranked_submission_queue(
+            site_key=site_key,
+            batch_id=batch_id,
+            session_id=session_id,
+            turn_id=turn_id,
+        )
 
     def _seal_apply_row_terminal(
         self,
@@ -2016,7 +2036,7 @@ class JobFlow:
             "site": dict((batch.get("sites") or {}).get(site_key) or {}),
         }
 
-    def record_external_execution_unavailable(
+    def record_external_execution_recovery_exhausted(
         self,
         *,
         site_key: str,
@@ -2024,7 +2044,7 @@ class JobFlow:
         phase: str = "",
         summary: str = "",
     ) -> dict[str, Any]:
-        """Close one worker's technical execution scope without a job outcome."""
+        """Park one worker's exhausted technical recovery without a job outcome."""
 
         batch = self.job_store.load_batch(batch_id)
         sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
@@ -2035,9 +2055,9 @@ class JobFlow:
         current_url = str(browser_session.get("last_known_url") or current.get("current_url") or "")
         updated = {
             **current,
-            "status": "blocked",
-            "reason_tag": "external_agent_execution_unavailable",
-            "message": str(summary or "External worker execution is unavailable."),
+            "status": "waiting_user",
+            "reason_tag": "execution_recovery_exhausted",
+            "message": str(summary or "External worker recovery is waiting for user continuation."),
             "current_phase": str(phase or current.get("current_phase") or ""),
             "current_url": current_url,
         }
@@ -2047,8 +2067,8 @@ class JobFlow:
         self.site_tools.site_store.save_browser_session(
             site_key,
             {
-                "browser_status": "execution_unavailable",
-                "pending_action": "review_execution_failure",
+                "browser_status": "waiting_user",
+                "pending_action": "execution_recovery_exhausted",
                 "resume_phase": str(updated.get("current_phase") or ""),
                 "last_known_url": current_url,
             },
@@ -2059,6 +2079,23 @@ class JobFlow:
             "batch_status": str(batch.get("status") or ""),
             "site": dict((batch.get("sites") or {}).get(site_key) or {}),
         }
+
+    def record_external_execution_unavailable(
+        self,
+        *,
+        site_key: str,
+        batch_id: str,
+        phase: str = "",
+        summary: str = "",
+    ) -> dict[str, Any]:
+        """Compatibility alias for the nonterminal recovery-exhausted state."""
+
+        return self.record_external_execution_recovery_exhausted(
+            site_key=site_key,
+            batch_id=batch_id,
+            phase=phase,
+            summary=summary,
+        )
 
     def _continue_external_apply_target(
         self,
@@ -2071,10 +2108,11 @@ class JobFlow:
     ) -> dict[str, Any]:
         """Advance an externally completed apply item through the persisted plan.
 
-        The external agent must write the job's terminal state before reporting
-        its apply phase complete. This boundary only reads that state and
-        schedules the next persisted plan item; it does not interpret the page
-        or choose an application outcome.
+        The external agent must complete the current work item before reporting
+        its apply phase complete. A work item ends at either a real terminal
+        outcome or a valid ranking checkpoint. This boundary only reads that
+        state and schedules the next persisted plan item; it does not interpret
+        the page or choose an application outcome.
         """
 
         apply = dict(current.get("apply") or {})
@@ -2091,7 +2129,7 @@ class JobFlow:
             if isinstance(row, dict)
         }
         target_row = rows_by_job_id.get(active_job_id) or {}
-        if not self._is_apply_row_terminal(target_row):
+        if not self._is_apply_work_item_complete(target_row):
             return {
                 "handled": False,
                 "reason": "active_apply_target_not_terminal",
@@ -2138,6 +2176,12 @@ class JobFlow:
     ) -> dict[str, Any]:
         """Create one external-agent apply work order from the existing plan."""
 
+        self._prepare_ranked_submission_queue(
+            site_key=site_key,
+            batch_id=batch_id,
+            session_id=session_id,
+            turn_id=turn_id,
+        )
         pending_rows = self._pending_apply_rows(site_key, batch_id)
         if not pending_rows:
             self._promote_apply_run_to_history(
@@ -2317,12 +2361,24 @@ class JobFlow:
             return updated
 
         last_result: Any | None = None
+        self._prepare_ranked_submission_queue(
+            site_key=site_key,
+            batch_id=batch_id,
+            session_id=session_id,
+            turn_id=turn_id,
+        )
         initial_pending_rows = self._pending_apply_rows(site_key, batch_id)
         site_phase_budget_seconds = self._apply_site_phase_budget_seconds(job_count=len(initial_pending_rows))
         site_phase_deadline = time.monotonic() + float(site_phase_budget_seconds or 0)
         while True:
             if self._is_batch_cancelled(batch_id):
                 return self._cancelled_site_row(current, current_phase="apply")
+            self._prepare_ranked_submission_queue(
+                site_key=site_key,
+                batch_id=batch_id,
+                session_id=session_id,
+                turn_id=turn_id,
+            )
             pending_rows = self._pending_apply_rows(site_key, batch_id)
             if not pending_rows:
                 break
@@ -2382,7 +2438,7 @@ class JobFlow:
             latest_rows = {str(row.get("job_id") or ""): row for row in self._run_job_rows(site_key, batch_id)}
             latest_row = latest_rows.get(job_id) or {}
             self._record_run_local_proposal_validation(site_key=site_key, batch_id=batch_id, job_row=latest_row)
-            if self._is_apply_row_terminal(latest_row):
+            if self._is_apply_work_item_complete(latest_row):
                 if loop_control_from_row(latest_row):
                     loop_site_row = self._loop_control_pause_site_row(
                         site_key=site_key,
@@ -2690,6 +2746,44 @@ class JobFlow:
                     },
                 )
         return batch
+
+    def create_checkpoint_recovery_batch(
+        self,
+        *,
+        source_batch_id: str,
+        site_key: str,
+        session_id: str,
+        turn_id: str,
+        user_message: str,
+        command_id: str = "",
+    ) -> dict[str, Any]:
+        """Create one resumable batch from a terminal durable checkpoint."""
+
+        return BatchCheckpointRecovery(
+            job_store=self.job_store,
+            site_store=self.site_tools.site_store,
+        ).create(
+            source_batch_id=source_batch_id,
+            site_key=site_key,
+            session_id=session_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            command_id=command_id,
+        )
+
+    def latest_checkpoint_recovery_source(self, *, session_id: str, site_key: str) -> dict[str, Any]:
+        """Find the latest terminal batch in this session with unfinished site state."""
+
+        for batch in self.job_store.list_batches(session_id=session_id):
+            if str(batch.get("status") or "") not in TERMINAL_BATCH_STATUSES:
+                continue
+            sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+            site = sites.get(site_key)
+            if not isinstance(site, dict) or str(site.get("status") or "") == "completed":
+                continue
+            if str(site.get("current_phase") or ""):
+                return batch
+        return {}
 
     def _stage_batch_resume_snapshot(
         self,

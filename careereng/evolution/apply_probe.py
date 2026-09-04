@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from careereng.career.applications.ranked_queue import ranked_state_counts
+
 
 EXCLUDED_ROLE_RE = re.compile(
     r"\b(intern|internship|campus|student|new[\s-]*grad|new[\s-]*graduate|co[\s-]*op|coop)\b|校招|实习",
@@ -144,6 +146,7 @@ def apply_probe_counters(rows: list[dict[str, Any]]) -> dict[str, int]:
             counts["form_unsuccessful"] += 1
         if is_excluded_role_violation(row):
             counts["excluded_role_violations"] += 1
+    counts.update(ranked_state_counts(rows))
     return counts
 
 

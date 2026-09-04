@@ -7,6 +7,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from careereng.platform.cache import CacheArtifactError, CacheArtifactStore
+from careereng.career.applications.ranked_queue import (
+    DEFERRED_BY_RANK,
+    RANKING_PENDING,
+    is_ranked_review_complete,
+    validate_ranking_pending_update,
+)
 
 from careereng.orchestration.agent_protocol.state_tools import (
     PHASE_RESULT_TOOL,
@@ -339,7 +345,12 @@ def _is_apply_terminal_job_state(row: dict[str, Any] | None) -> bool:
         or application_status
         in {"already_applied", "filtered_out", "submitted", "apply_failed", "blocked", "rejected", "closed", "withdrawn"}
         or apply_state in terminal_apply_states
+        or apply_state == DEFERRED_BY_RANK
     )
+
+
+def _is_apply_review_complete_job_state(row: dict[str, Any] | None) -> bool:
+    return _is_apply_terminal_job_state(row) or is_ranked_review_complete(row)
 
 
 def _is_history_operation_success(row: dict[str, Any] | None) -> bool:
@@ -544,6 +555,29 @@ def _record_jobs_payload(*, context: PhaseStateToolContext, arguments: dict[str,
 def _update_jobs_payload(*, context: PhaseStateToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
     raw_jobs = arguments.get("jobs")
     jobs = [dict(job) for job in raw_jobs if isinstance(job, dict)] if isinstance(raw_jobs, list) else []
+    list_run_jobs = getattr(context.site_store, "list_run_jobs", None)
+    if callable(list_run_jobs):
+        existing_rows = {
+            str(row.get("job_id") or "").strip(): row
+            for row in list_run_jobs(context.site_key, context.batch_id)
+            if isinstance(row, dict) and str(row.get("job_id") or "").strip()
+        }
+    else:
+        existing_rows = {}
+    for job in jobs:
+        job_id = str(job.get("job_id") or "").strip()
+        validation_error = validate_ranking_pending_update({**dict(existing_rows.get(job_id) or {}), **job})
+        if validation_error:
+            return {
+                "isError": True,
+                "error": "invalid_ranking_pending_update",
+                "structuredContent": {
+                    "status": "validation_failed",
+                    "job_id": job_id,
+                    "reason": validation_error,
+                },
+                "content": [{"type": "text", "text": f"Job {job_id or '<unknown>'}: {validation_error}."}],
+            }
     saved_rows = context.site_store.update_run_jobs(
         context.site_key,
         jobs,
@@ -557,13 +591,30 @@ def _update_jobs_payload(*, context: PhaseStateToolContext, arguments: dict[str,
         for row in saved_rows
         if _is_apply_terminal_job_state(row) and str(row.get("job_id") or "").strip()
     ]
+    review_complete_ids = [
+        str(row.get("job_id") or "").strip()
+        for row in saved_rows
+        if _is_apply_review_complete_job_state(row) and str(row.get("job_id") or "").strip()
+    ]
+    ranking_pending_ids = [
+        str(row.get("job_id") or "").strip()
+        for row in saved_rows
+        if str(row.get("apply_state") or "").strip().lower() == RANKING_PENDING
+        and str(row.get("job_id") or "").strip()
+    ]
     return {
         "isError": False,
         "structuredContent": {
             "updated_count": len(updated_ids),
             "job_ids": updated_ids,
-            "terminal_count": len(terminal_ids),
-            "terminal_job_ids": terminal_ids,
+            "terminal_count": len(review_complete_ids),
+            "terminal_job_ids": review_complete_ids,
+            "application_terminal_count": len(terminal_ids),
+            "application_terminal_job_ids": terminal_ids,
+            "review_complete_count": len(review_complete_ids),
+            "review_complete_job_ids": review_complete_ids,
+            "ranking_pending_count": len(ranking_pending_ids),
+            "ranking_pending_job_ids": ranking_pending_ids,
         },
         "content": [{"type": "text", "text": f"Updated {len(updated_ids)} jobs in the current batch run."}],
     }

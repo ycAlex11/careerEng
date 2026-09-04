@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -197,12 +198,12 @@ class PlaywrightMCPProcess:
         return list(value)
 
     def call_tool_sync(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = self._normalize_tool_arguments(arguments or {})
+        payload = self._normalize_tool_arguments(arguments or {}, tool_name=name)
         with self._call_lock:
             value = self._submit(_RuntimeCommand(kind="call_tool", name=name, arguments=payload))
         return dict(value)
 
-    def _normalize_tool_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_tool_arguments(self, arguments: dict[str, Any], *, tool_name: str = "") -> dict[str, Any]:
         payload = dict(arguments or {})
         filename = payload.get("filename")
         if isinstance(filename, str):
@@ -211,7 +212,23 @@ class PlaywrightMCPProcess:
                 payload["filename"] = str((self.output_dir / Path(raw).name).resolve())
             else:
                 payload["filename"] = ""
+        if str(tool_name or "").strip() == "browser_file_upload":
+            raw_paths = payload.get("paths")
+            if isinstance(raw_paths, str):
+                payload["paths"] = [self._stage_upload_path(raw_paths)]
+            elif isinstance(raw_paths, list):
+                payload["paths"] = [self._stage_upload_path(path) for path in raw_paths]
         return payload
+
+    def _stage_upload_path(self, value: Any) -> str:
+        source = Path(str(value or "")).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"browser upload file is unavailable: {source}")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        target = (self.output_dir / source.name).resolve()
+        if source != target:
+            shutil.copy2(source, target)
+        return str(target)
 
     def stop(self) -> None:
         thread = self._thread
