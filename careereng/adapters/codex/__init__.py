@@ -5,7 +5,7 @@ threads.  It deliberately does not own CareerEng workflow or site policy.
 """
 
 from .app_server import CodexAppServerClient, CodexAppServerError, CodexAppServerEvent
-from .main_agent_bridge import CodexMainAgentBridge
+from .main_agent_bridge import CodexMainAgentBridge, main_agent_delivery_health
 from .worker_runner import CodexWorkerCoordinator, CodexWorkerRecord
 
 __all__ = [
@@ -13,6 +13,7 @@ __all__ = [
     "CodexAppServerError",
     "CodexAppServerEvent",
     "CodexMainAgentBridge",
+    "main_agent_delivery_health",
     "CodexWorkerCoordinator",
     "CodexWorkerRecord",
 ]

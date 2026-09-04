@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from careereng.evolution.work_items import ActionCardStore
+from careereng.evolution.artifacts import EvolutionEvidenceStore
 from careereng.evolution.reviews import build_assistant_memory_review_pack, save_review_pack
 from careereng.career.applications.job_store import JobStore
 from careereng.platform.persistence import JSONLStore
+from careereng.platform.project_state import AgentEventStore
 from careereng.utils import ensure_dir, now_iso, read_json, write_json
 
 
@@ -142,6 +144,12 @@ def evaluate_evolution_run(
         )
     write_json(run_path, run_payload)
     _update_summary(run_dir=run_dir, run_payload=run_payload, evaluation=evaluation_payload)
+    if selection["status"] == "accepted":
+        _close_validated_evolution(
+            workspace=workspace_path,
+            run_payload=run_payload,
+            selection=selection,
+        )
 
     return {
         "run_id": run_payload.get("run_id"),
@@ -152,6 +160,53 @@ def evaluate_evolution_run(
         "selection_json": selection_json,
         "summary": run_dir / "summary.md",
     }
+
+
+def _close_validated_evolution(
+    *,
+    workspace: Path,
+    run_payload: dict[str, Any],
+    selection: dict[str, Any],
+) -> None:
+    """Close linked review artifacts only after follow-up validation accepts a run."""
+
+    context = run_payload.get("context") if isinstance(run_payload.get("context"), dict) else {}
+    run_id = str(run_payload.get("run_id") or "")
+    card_id = str(context.get("action_card_id") or "")
+    if card_id:
+        try:
+            ActionCardStore(workspace).close_card(
+                card_id,
+                result_summary=f"Validated evolution {run_id}: {selection.get('reason') or 'accepted'}",
+            )
+        except Exception:
+            pass
+    evidence_id = str(context.get("evidence_id") or "")
+    if evidence_id:
+        store = EvolutionEvidenceStore(workspace)
+        rows = store.read_all()
+        for row in rows:
+            if str(row.get("evidence_id") or "") != evidence_id:
+                continue
+            row.update(
+                {
+                    "status": "resolved",
+                    "resolved_by_run_id": run_id,
+                    "resolved_at": now_iso(),
+                    "resolution": str(selection.get("reason") or "accepted follow-up validation"),
+                }
+            )
+        store.upsert_many(rows)
+    AgentEventStore(workspace).publish(
+        kind="evolution.resolved",
+        attention="notification",
+        summary=f"Evolution {run_id} passed follow-up validation.",
+        site_key=str(context.get("site_key") or ""),
+        batch_id=str(context.get("batch_id") or ""),
+        phase=str(context.get("phase") or ""),
+        details={"run_id": run_id, "action_card_id": card_id, "evidence_id": evidence_id},
+        dedupe_key=f"evolution_validated:{run_id}",
+    )
 
 
 def _evaluate_assistant_router_memory_intake(

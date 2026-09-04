@@ -365,10 +365,14 @@ waiting-user states, exhausted recovery, and terminal milestones are the
 user-facing event boundary. The registered main agent receives those events;
 site worker threads receive only scoped execution and continuation prompts.
 
-`careereng_list_agent_events` and `careereng_ack_agent_events` are polling
-tools for this inbox. `careereng_get_agent_status` is separate: it reads the
-host's current per-site worker/browser state and answers what is running now.
-It is not a batch projection and it does not replace durable events.
+`careereng_list_agent_events`, `careereng_wait_agent_events`, and
+`careereng_ack_agent_events` are the read, long-poll, and consumption tools for
+this inbox. A main agent that already owns the active Codex turn long-polls the
+queue instead of requiring a second writer to inject another turn. User input
+may interrupt that wait; the next turn resumes from the durable cursor.
+`careereng_get_agent_status` is separate: it reads the host's current per-site
+worker/browser state and answers what is running now. It is not a batch
+projection and it does not replace durable events.
 
 For immediate Codex delivery, `careereng_register_main_agent` stores the
 current App Server thread id at `workspace/agent_events/main_agent.json`. The
@@ -376,10 +380,46 @@ Codex-specific `adapters/codex/main_agent_bridge.py` subscribes to the shared
 dispatcher, then delivers durable `action_required`, `review_required`, phase
 advance, site completion, and batch completion events to that registered
 thread. Raw heartbeat and audit events are never delivered there. Delivery
-attempts are recorded separately; an App Server failure leaves the event in
-the inbox for retry after a new registration or host restart. Replacing the
-registered thread id transfers future main-agent notifications to the new
-Desktop control conversation.
+attempts are recorded separately and retried with bounded backoff. Codex
+`active writer` rejection is a normal `deferred_active` state, not an event or
+workflow failure; the active main agent consumes the same event through long
+polling. Acknowledged events are never retried. Replacing the registered thread
+id transfers future main-agent notifications to the new Desktop control
+conversation.
+
+CareerEng uses one main-agent controller per workspace and any number of
+site-scoped workers across one or more batches. Assistant intake automatically
+registers a concrete controller thread; a different thread cannot silently
+replace it. Events carry a monotonic workspace sequence and their batch, site,
+worker-thread, turn, and phase identities. Registration records an event
+watermark so reconnecting a Desktop does not replay obsolete historical
+notifications, while unresolved events created after registration remain
+retryable until acknowledged.
+
+The control boundary is task-scoped rather than global. Once CareerEng accepts
+a job-search, status-review, matching, application, recovery, or related
+evolution workflow, the main agent controls its workers only through CareerEng
+lifecycle, command, status, and event tools. It must not use Codex thread tools
+to message, interrupt, resume, or terminate those managed workers directly.
+Read-only inspection of an underlying Codex worker is allowed only while
+diagnosing CareerEng infrastructure; state changes still go through CareerEng.
+
+Evolution is side work, not a business-batch phase. A terminal site releases
+its browser worker after persisting its result even when an evolution solution
+request is created. The main agent receives durable `evolution.requested`,
+`evolution.resolved`, and `evolution.failed` events and drives the existing
+evidence/action-card/proposal/snapshot/evaluation/rollback flow. Pending
+evolution never changes an otherwise terminal batch back to `running` or
+`waiting_solution`.
+
+Exploration readiness uses version-scoped consecutive full-cycle evidence.
+Three successful exploration cycles make readiness review due; an external
+interruption is neutral, and a confirmed internal failure resets the streak.
+Ready sites create a non-blocking evolution solution request after every five
+new effective full runs. Confirmed internal defects may trigger earlier;
+external network, provider, browser-process, or service-capacity interruptions
+only enter checkpoint recovery and operational notification. Unknown-origin
+failures remain evidence until their origin is established.
 
 CLI may explicitly run the lifecycle commands:
 

@@ -20,6 +20,7 @@ from careereng.orchestration.agent_protocol.assistant_bridge import (
 )
 from .store import AssistantBridgeStore
 from .thread_state import AssistantThreadStateStore
+from careereng.platform.project_state import AgentEventStore
 from careereng.utils import make_id
 
 
@@ -175,6 +176,26 @@ def ingest_assistant_message(
         "embedding_ref": "",
         "vector_ref": "",
     }
+
+    if client_text == "codex" and thread_text != "default":
+        event_store = AgentEventStore(workspace_path)
+        try:
+            output["main_agent_registration"] = event_store.register_main_agent(
+                thread_id=thread_text,
+                consumer_id="codex_desktop",
+            )
+            inbox = event_store.list_events(consumer_id="codex_desktop", limit=20)
+            output["main_agent_inbox"] = {
+                "cursor": inbox["cursor"],
+                "next_cursor": inbox["next_cursor"],
+                "events": inbox["events"],
+                "has_attention_required": inbox["has_attention_required"],
+            }
+        except ValueError as exc:
+            output["main_agent_registration"] = {
+                "status": "conflict",
+                "error": str(exc),
+            }
 
     if not should_save:
         return output

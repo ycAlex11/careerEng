@@ -5,11 +5,13 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from careereng.evolution.artifacts import OpenEvolutionCandidateStore
 from careereng.evolution.work_items import ActionCardStore
-from careereng.evolution.work_items.schema import ACTION_CARD_MANUAL_DECISION
+from careereng.evolution.work_items.schema import ACTION_CARD_CODEX_REVIEW
+from careereng.evolution.solution_provider import create_solution_request_for_action_card
 from careereng.evolution.browser_control.lessons import BrowserControlLessonStore
 from careereng.evolution.candidate_specs import load_candidate_specs
 from careereng.evolution.memory_units import EvolutionMemoryStore
@@ -27,7 +29,8 @@ SITE_WORKFLOW_CANDIDATE_ID = "site_workflow_compaction"
 TARGET_COMPANY_CANDIDATE_ID = "target_company_intelligence_evolution"
 APPLICATION_STRATEGY_CANDIDATE_ID = "application_strategy_evolution"
 ASSISTANT_ROUTER_MEMORY_CANDIDATE_ID = "assistant_router_memory_intake"
-SITE_WORKFLOW_SCHEDULED_THRESHOLD = 10
+# Full ready-site cadence is owned by ``create_site_batch_evolution_reviews``.
+# Phase scanning remains problem-driven and does not create a second cadence.
 SITE_WORKFLOW_PROBLEM_THRESHOLD = 2
 SITE_WORKFLOW_PROBLEM_RECENT_LIMIT = 10
 APPLICATION_FEEDBACK_TOTAL_THRESHOLD = 3
@@ -157,6 +160,7 @@ def create_site_batch_evolution_reviews(
     site_run_threshold: int = 5,
     inner_attempt_limit: int = 3,
     outer_batch_limit: int = 3,
+    publish_event: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create Codex-facing review cards from terminal site-batch evidence.
 
@@ -190,7 +194,7 @@ def create_site_batch_evolution_reviews(
         effective_count = len(effective_run_ids)
         previous = previous_by_site.get(site_key) if isinstance(previous_by_site.get(site_key), dict) else {}
         last_reviewed_count = int(previous.get("last_reviewed_effective_run_count") or 0)
-        failure_triggered = _site_batch_failed(batch_status=batch_status, site=current_site)
+        failure_triggered = _confirmed_internal_site_failure(batch_status=batch_status, site=current_site)
         reasons: list[str] = []
         trigger_type = ""
         if effective_count - last_reviewed_count >= threshold:
@@ -257,6 +261,37 @@ def create_site_batch_evolution_reviews(
             site_key=site_key,
             phase="batch",
         )
+        card_id = str(candidate.get("evolution_review_card_id") or "")
+        if card_id:
+            request = create_solution_request_for_action_card(
+                project_root=root,
+                workspace=workspace_path,
+                card_id=card_id,
+                candidate_id=SITE_WORKFLOW_CANDIDATE_ID,
+                context_overrides={
+                    "site_key": site_key,
+                    "batch_id": batch_id,
+                    "phase": "batch",
+                    "trigger_type": trigger_type,
+                },
+            )
+            candidate["evolution_run_id"] = str(request.get("run_id") or "")
+            candidate["solution_request"] = str(request.get("solution_request") or "")
+            if publish_event is not None:
+                publish_event(
+                    kind="evolution.requested",
+                    attention="notification",
+                    summary=f"{site_key} reached its five-run evolution cadence.",
+                    site_key=site_key,
+                    batch_id=batch_id,
+                    phase="batch",
+                    details={
+                        "run_id": candidate["evolution_run_id"],
+                        "action_card_id": card_id,
+                        "trigger_type": trigger_type,
+                    },
+                    dedupe_key=f"evolution_requested:{candidate['evolution_run_id']}",
+                )
         OpenEvolutionCandidateStore(workspace_path).append(candidate)
         previous_by_site[site_key] = {
             "last_reviewed_effective_run_count": effective_count if trigger_type.startswith("scheduled") else last_reviewed_count,
@@ -311,12 +346,6 @@ def scan_site_workflow_triggers(
         last_handled_count = max(last_evolved_count, last_reviewed_count)
         reasons: list[str] = []
         trigger_type = ""
-        if current_count - last_handled_count >= SITE_WORKFLOW_SCHEDULED_THRESHOLD:
-            trigger_type = "scheduled"
-            reasons.append(
-                f"{site_key}:{phase} reached {current_count - last_handled_count} new terminal phase run(s) since last evolution review."
-            )
-
         problem_count = int(stats.get("recent_problem_terminal_count") or 0) + int(browser_problem_counts.get(key, 0))
         problem_key = f"{stats.get('latest_phase_at') or ''}:{problem_count}"
         if problem_count >= SITE_WORKFLOW_PROBLEM_THRESHOLD and str(previous.get("last_reviewed_problem_key") or "") != problem_key:
@@ -1275,11 +1304,11 @@ def _attach_review_card(*, project_root: Path, workspace: Path, candidate: dict[
     directions = _evolution_direction_options(project_root)
     related = _related_review_context(workspace=workspace, site_key=site_key, phase=phase)
     card = ActionCardStore(workspace).create_card(
-        card_type=ACTION_CARD_MANUAL_DECISION,
-        title=f"Choose evolution direction for {site_key}:{phase}",
+        card_type=ACTION_CARD_CODEX_REVIEW,
+        title=f"Evolve {site_key}:{phase}",
         goal=(
-            "CareerEng reached an evolution trigger. Codex should explain the trigger, list the available "
-            "evolution directions, ask the user whether to evolve now, and ask which directions to include."
+            "CareerEng reached an evolution trigger. Codex should inspect the evidence and use the existing "
+            "proposal, snapshot, validation, and rollback flow to make the smallest safe improvement."
         ),
         reason=str(candidate.get("reason") or candidate.get("summary") or "").strip(),
         source_type="evolution_trigger",
@@ -1288,27 +1317,25 @@ def _attach_review_card(*, project_root: Path, workspace: Path, candidate: dict[
         priority=str(candidate.get("priority") or "medium"),
         related_files=_review_related_files(project_root=project_root, workspace=workspace, candidate=candidate, related=related),
         suggested_actions=[
-            "Read this card and explain the trigger to the user in Codex chat.",
-            "Ask whether the user wants to evolve this site now.",
-            "If yes, ask which listed evolution directions should be included.",
-            "If the user wants cross-site lesson transfer, inspect the related lessons first and ask whether to include them in this site evolution.",
-            "After the user selects a concrete direction, run the existing evolution solution flow with the selected candidate id.",
-            "If the user says not now, cancel or close this card with the skip reason; do not create a proposal.",
+            "Read this card and inspect only the evidence needed for a concrete proposal.",
+            "Use cross-site lessons only when the evidence establishes the same reusable pattern.",
+            "Use the default site workflow candidate unless evidence proves another existing candidate is the correct boundary.",
+            "Apply only rollbackable changes and activate them for later runs.",
         ],
         safety_notes=[
             "Codex is the interaction layer; do not build a separate UI.",
             "Python lists directions and related evidence only; it must not decide which lesson transfers to this site.",
-            "Do not apply a Skill change until a concrete proposal exists and the user-selected direction is clear.",
+            "Do not apply a change until a concrete proposal and rollback path exist.",
         ],
         done_when=[
-            "The user selected one or more evolution directions and a solution request was created, or the user explicitly skipped this evolution review.",
-            "Any cross-site lesson transfer was explicitly included or rejected by the user through Codex chat.",
+            "A concrete proposal was applied and validated, or the evidence was marked keep-observing.",
         ],
         metadata={
             "task": "site_evolution_review",
             "site_key": site_key,
             "phase": phase,
             "trigger_candidate_id": str(candidate.get("candidate_id") or ""),
+            "candidate_spec_id": SITE_WORKFLOW_CANDIDATE_ID,
             "trigger_area": str(candidate.get("area") or ""),
             "trigger_type": str(candidate.get("trigger_type") or ""),
             "target_ref": str(candidate.get("target_ref") or ""),
@@ -1316,11 +1343,11 @@ def _attach_review_card(*, project_root: Path, workspace: Path, candidate: dict[
             "available_directions": directions,
             "related_review_context": related,
             "interaction_layer": "codex_chat",
-            "selection_policy": "ask_user_before_creating_solution_run",
+            "selection_policy": "automatic_safe_proposal",
         },
         semantic_tags=[
             "evolution_review",
-            "manual_decision",
+            "automatic_safe_proposal",
             "codex_interaction",
             safe_file_stem(site_key),
             safe_file_stem(phase),
@@ -1488,7 +1515,7 @@ def _review_dedupe_key(*, candidate: dict[str, Any], site_key: str, phase: str) 
         str(candidate.get("positive_progress_count") or ""),
     ]
     count_key = "-".join(part for part in count_parts if part)
-    return f"{ACTION_CARD_MANUAL_DECISION}:site_evolution_review:{_review_source_id(candidate=candidate, site_key=site_key, phase=phase)}:{count_key}"
+    return f"{ACTION_CARD_CODEX_REVIEW}:site_evolution_review:{_review_source_id(candidate=candidate, site_key=site_key, phase=phase)}:{count_key}"
 
 
 def _attach_trigger_to_run(*, run_dir: Path, trigger: dict[str, Any], site_key: str, phase: str) -> None:
@@ -1556,14 +1583,27 @@ def _effective_site_run_ids(worker_session_evidence: dict[str, Any]) -> list[str
     return run_ids
 
 
-def _site_batch_failed(*, batch_status: str, site: dict[str, Any]) -> bool:
-    if batch_status == "failed":
-        return True
-    if str(site.get("status") or "") == "failed":
-        return True
+def _confirmed_internal_site_failure(*, batch_status: str, site: dict[str, Any]) -> bool:
+    """Trigger early only from an explicit internal-origin diagnosis.
+
+    Network/provider/browser-process interruptions and unknown failures remain
+    recovery evidence; they must not make Python guess that code should change.
+    """
+
     retrieve = site.get("retrieve") if isinstance(site.get("retrieve"), dict) else {}
     apply = site.get("apply") if isinstance(site.get("apply"), dict) else {}
-    return str(retrieve.get("status") or "") == "failed" or str(apply.get("status") or "") == "failed"
+    origins = {
+        str(site.get("failure_origin") or site.get("evolution_issue_origin") or "").strip().lower(),
+        str(retrieve.get("failure_origin") or retrieve.get("evolution_issue_origin") or "").strip().lower(),
+        str(apply.get("failure_origin") or apply.get("evolution_issue_origin") or "").strip().lower(),
+    }
+    failed = (
+        batch_status == "failed"
+        or str(site.get("status") or "") == "failed"
+        or str(retrieve.get("status") or "") == "failed"
+        or str(apply.get("status") or "") == "failed"
+    )
+    return failed and "internal" in origins
 
 
 def _site_batch_evidence_refs(

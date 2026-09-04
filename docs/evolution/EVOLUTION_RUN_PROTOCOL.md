@@ -198,6 +198,20 @@ Threshold behavior:
 
 Python should enforce the loop mechanics and thresholds. The LLM/Codex should diagnose the gap and propose the smallest skill/profile/config change.
 
+Business batches do not wait for this protocol. Evolution requests are durable
+side work delivered to the registered main agent. Exploration readiness review
+becomes due after three version-scoped consecutive successful full cycles;
+ready-site scheduled evolution becomes due after five new effective full runs.
+Confirmed internal defects may enter the same flow early. External transient
+failures are recovery evidence, not evolution triggers, and unknown-origin
+failures remain observations until diagnosed.
+
+Routine rollbackable proposals may proceed without a separate user-confirmation
+step. They still require a concrete proposal, a pre-apply snapshot, focused
+validation, next-run activation, and rollback on failed validation. Login,
+CAPTCHA, final-submit safety, account data, and other irreversible boundaries
+remain human-controlled.
+
 At batch end, write a workflow evolution summary. The summary can create lesson
 candidates or follow-up candidates, but it must not auto-accept durable lessons
 from one batch alone.

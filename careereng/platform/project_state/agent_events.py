@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 from threading import RLock
+from time import monotonic, sleep
 from typing import Any
 
 from careereng.platform.persistence import JSONLStore
@@ -63,22 +64,40 @@ class AgentEventStore:
         self.dispatcher = dispatcher or AgentEventDispatcher()
         self._lock = RLock()
 
-    def register_main_agent(self, *, thread_id: str, consumer_id: str = "codex_desktop") -> dict[str, str]:
+    def register_main_agent(
+        self,
+        *,
+        thread_id: str,
+        consumer_id: str = "codex_desktop",
+        allow_takeover: bool = False,
+    ) -> dict[str, Any]:
         """Persist the one App Server thread allowed to receive main-agent events."""
 
         normalized_thread_id = str(thread_id or "").strip()
         if not normalized_thread_id:
             raise ValueError("main-agent thread_id is required")
+        existing = self.main_agent_registration()
+        existing_thread = str(existing.get("thread_id") or "")
+        if existing_thread and existing_thread != normalized_thread_id and not allow_takeover:
+            raise ValueError(f"main agent already registered: {existing_thread}")
+        latest_sequence = self._latest_sequence()
+        delivery_after_sequence = (
+            int(existing.get("delivery_after_sequence") or 0)
+            if "delivery_after_sequence" in existing
+            else latest_sequence
+        )
         registration = {
             "thread_id": normalized_thread_id,
             "consumer_id": str(consumer_id or "codex_desktop").strip() or "codex_desktop",
-            "registered_at": now_iso(),
+            "registered_at": str(existing.get("registered_at") or now_iso()),
+            "validated_at": now_iso(),
+            "delivery_after_sequence": delivery_after_sequence,
         }
         with self._lock:
             write_json(self.main_agent_path, registration)
         return registration
 
-    def main_agent_registration(self) -> dict[str, str]:
+    def main_agent_registration(self) -> dict[str, Any]:
         """Return the current workspace-scoped main-agent target, if registered."""
 
         with self._lock:
@@ -92,6 +111,8 @@ class AgentEventStore:
             "thread_id": thread_id,
             "consumer_id": str(payload.get("consumer_id") or "codex_desktop").strip() or "codex_desktop",
             "registered_at": str(payload.get("registered_at") or ""),
+            "validated_at": str(payload.get("validated_at") or ""),
+            "delivery_after_sequence": int(payload.get("delivery_after_sequence") or 0),
         }
 
     def publish(
@@ -133,9 +154,18 @@ class AgentEventStore:
                 for existing in self.events.iter_rows_reverse():
                     if str(existing.get("dedupe_key") or "") == normalized_dedupe_key:
                         return existing
+            event["sequence"] = self._latest_sequence() + 1
             self.events.append(event)
         self.dispatcher.dispatch(event)
         return event
+
+    def _latest_sequence(self) -> int:
+        for row in self.events.iter_rows_reverse():
+            try:
+                return int(row.get("sequence") or 0)
+            except (TypeError, ValueError):
+                return 0
+        return 0
 
     def list_events(
         self,
@@ -150,12 +180,19 @@ class AgentEventStore:
         requested_cursor = str(cursor or "").strip()
         with self._lock:
             cursors = self._load_cursors()
-            effective_cursor = requested_cursor or str(cursors.get(consumer) or "")
+            stored_cursor = str(cursors.get(consumer) or "")
+            effective_cursor = requested_cursor or stored_cursor
+            registration = self.main_agent_registration()
+        minimum_sequence = 0
+        if not effective_cursor and str(registration.get("consumer_id") or "") == consumer:
+            minimum_sequence = int(registration.get("delivery_after_sequence") or 0)
         filtered: list[dict[str, Any]] = []
         normalized_site = str(site_key or "").strip()
         cursor_can_advance = not normalized_site and include_notifications
         scanned_cursor = effective_cursor
         for row in self._iter_rows_after_cursor(effective_cursor):
+            if int(row.get("sequence") or 0) <= minimum_sequence:
+                continue
             scanned_cursor = str(row.get("event_id") or scanned_cursor)
             if normalized_site and str(row.get("site_key") or "") != normalized_site:
                 continue
@@ -191,7 +228,68 @@ class AgentEventStore:
             cursors = self._load_cursors()
             cursors[consumer] = acknowledged_cursor
             write_json(self.cursors_path, {"consumers": cursors, "updated_at": now_iso()})
-        return {"consumer_id": consumer, "cursor": acknowledged_cursor}
+        return {
+            "consumer_id": consumer,
+            "cursor": acknowledged_cursor,
+            "acknowledged_sequence": self.acknowledged_sequence(consumer_id=consumer),
+        }
+
+    def wait_events(
+        self,
+        *,
+        consumer_id: str = "codex_desktop",
+        cursor: str = "",
+        site_key: str = "",
+        include_notifications: bool = True,
+        limit: int = 100,
+        timeout_seconds: float = 30.0,
+        poll_interval_seconds: float = 0.25,
+    ) -> dict[str, Any]:
+        """Long-poll the durable inbox without relying on a callback write."""
+
+        timeout = min(60.0, max(0.0, float(timeout_seconds or 0.0)))
+        poll_interval = min(1.0, max(0.05, float(poll_interval_seconds or 0.25)))
+        deadline = monotonic() + timeout
+        while True:
+            result = self.list_events(
+                consumer_id=consumer_id,
+                cursor=cursor,
+                site_key=site_key,
+                include_notifications=include_notifications,
+                limit=limit,
+            )
+            if result["events"]:
+                return {**result, "timed_out": False}
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return {**result, "timed_out": True}
+            sleep(min(poll_interval, remaining))
+
+    def acknowledged_sequence(self, *, consumer_id: str = "codex_desktop") -> int:
+        """Return the monotonic sequence consumed by one inbox reader."""
+
+        consumer = str(consumer_id or "codex_desktop").strip() or "codex_desktop"
+        with self._lock:
+            cursor = str(self._load_cursors().get(consumer) or "")
+        if not cursor:
+            return 0
+        for row in self.events.iter_rows_reverse():
+            if str(row.get("event_id") or "") != cursor:
+                continue
+            try:
+                return int(row.get("sequence") or 0)
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    def is_acknowledged(self, event: dict[str, Any], *, consumer_id: str = "codex_desktop") -> bool:
+        """Report whether a durable event is behind the consumer cursor."""
+
+        try:
+            sequence = int(event.get("sequence") or 0)
+        except (TypeError, ValueError):
+            sequence = 0
+        return sequence > 0 and sequence <= self.acknowledged_sequence(consumer_id=consumer_id)
 
     def _load_cursors(self) -> dict[str, str]:
         payload = read_json(self.cursors_path)

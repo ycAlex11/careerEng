@@ -165,8 +165,8 @@ Scheduled trigger:
 
 - Count terminal phase runs for each `site_key + phase`.
 - Terminal phase runs include `done`, `blocked`, and `failed` because all three provide workflow evidence.
-- When `current_phase_run_count - last_evolved_phase_run_count >= 10`, create a `site_workflow_compaction` evolution run scoped to that site and phase.
-- Do not mix phase buckets. A site that ran status review 10 times and apply 5 times should only trigger status-review evolution.
+- When a ready site completes 5 new effective full runs since its last evolution, create one non-blocking `site_workflow_compaction` solution request.
+- Phase evidence remains scoped in the evidence pack, but phase counts do not create a second scheduled cadence.
 
 Problem-driven trigger:
 

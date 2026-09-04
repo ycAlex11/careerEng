@@ -104,11 +104,16 @@ Do not search for its socket, invent another launch command, start a second host
 5. Use site-scoped pause, stop, or cancel when changing one worker. These commands revoke that work item's execution lease and do not stop sibling sites in the batch.
 6. Treat `pause_unconfirmed` as transport uncertainty, not job failure. Resume reconstructs the worker from durable state instead of trusting the unconfirmed thread.
 7. Ordinary phase completion keeps the same site work item, Codex thread, and browser. CareerEng advances phase context synchronously and automatically continues a non-terminal item if its current turn ends.
-8. Internal heartbeat traffic is not a Desktop progress stream. The registered main agent receives only durable phase, attention, recovery, and terminal events.
+8. Internal heartbeat traffic is not a Desktop progress stream. Assistant intake automatically registers the one main-agent controller for the workspace; it receives only durable phase, attention, recovery, evolution, and terminal events.
 9. For ranking-enabled sites, `ranking_pending` completes evaluation only; CareerEng materializes `ready_to_apply` and `deferred_by_rank`, then continues selected jobs to real application outcomes.
 10. If bounded technical recovery is exhausted, report `waiting_user` rather than a job failure. A user continuation reissues the same durable work item, recreates only a dead scoped browser runtime when necessary, and resumes the current phase/item.
 11. Recovery never reruns completed phases. Retrieval continues its saved checkpoint with dedupe; apply uses the frozen Apply List and reconciles an uncertain active item from that item's Job URL before continuing.
 12. Prefer in-place continuation. When the original batch is terminal or non-reissuable and the user asks to continue rather than cancel, pass its `source_batch_id`; CareerEng creates one idempotent recovery batch whose starting phase/item is derived from that source checkpoint.
+13. Evolution is non-blocking side work. A completed site releases its browser worker and the business batch remains terminal. The main agent handles durable evolution requests through the existing proposal, snapshot, apply, evaluation, and rollback flow.
+14. External network/provider/service/browser-process interruptions enter checkpoint recovery and notification only. They do not trigger evolution unless later evidence explicitly diagnoses a CareerEng-internal defect.
+15. After CareerEng accepts a job workflow, control its Codex workers only through CareerEng. Do not use Codex thread messaging, interruption, resume, or termination tools directly. Infrastructure diagnosis may inspect an underlying worker read-only; all state changes still go through CareerEng.
+16. While the current main-agent turn is monitoring active work, call `careereng_wait_agent_events` with the last observed cursor. Handle returned events and acknowledge only the cursor actually processed. If user input interrupts the wait, read the durable inbox first on the next CareerEng turn.
+17. An App Server `active writer` response means push delivery is deferred while the main turn is active. It is not a workflow failure. The runtime retries with bounded backoff, while the active main agent consumes the same queue through long polling.
 
 For direct lifecycle commands, see `docs/assistant_bridge/COMMANDS.md`.
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from careereng.evolution.memory_units import EvolutionMemoryStore, run_local_units_for_batch_site
+from careereng.evolution.progress import EvolutionProgressStore
 from careereng.evolution.work_items import create_site_exploration_synthesis_card
 from careereng.utils import now_iso, read_json, write_json
 
@@ -48,6 +49,28 @@ class SiteRunEvolutionCoordinator:
             if not self._requires_summary(row):
                 continue
             cycle_outcome = self._cycle_outcome(row)
+            skill_path = Path(str(row.get("skill_path") or ""))
+            if not skill_path.is_absolute():
+                skill_path = Path(self.job_flow.project_root) / skill_path
+            progress = EvolutionProgressStore(self.job_store.workspace).observe_exploration_cycle(
+                site_key=str(candidate_site_key),
+                cycle_id=str(self._site_run(row, batch=batch).get("root_batch_id") or batch_id),
+                outcome="confirmed_internal_failure" if cycle_outcome == "repeated_failure_threshold" else cycle_outcome,
+                skill_path=skill_path,
+            )
+            if cycle_outcome == "successful_apply_cycle" and not bool(progress.get("readiness_due")):
+                self.job_store.append_event(
+                    "evolution.exploration_progress.recorded",
+                    {
+                        "batch_id": batch_id,
+                        "site_key": str(candidate_site_key),
+                        "consecutive_successes": int(progress.get("consecutive_successes") or 0),
+                        "required_successes": 3,
+                    },
+                )
+                continue
+            if cycle_outcome not in {"successful_apply_cycle", "repeated_failure_threshold"}:
+                continue
             summary_row = self._archive_legacy_loop_request(row) if cycle_outcome == "repeated_failure_threshold" else row
             card = create_site_exploration_synthesis_card(
                 workspace=Path(self.job_store.workspace),
@@ -78,6 +101,23 @@ class SiteRunEvolutionCoordinator:
                 cycle_outcome=cycle_outcome,
             )
             batch = self._replace_site_row(batch, str(candidate_site_key), updated)
+            publish = getattr(self.job_flow, "publish_agent_event", None)
+            if callable(publish):
+                publish(
+                    kind="evolution.requested",
+                    attention="notification",
+                    summary=f"{candidate_site_key} has a non-blocking evolution solution request.",
+                    site_key=str(candidate_site_key),
+                    batch_id=batch_id,
+                    phase="evolution_summary",
+                    details={
+                        "run_id": str(request.get("run_id") or ""),
+                        "action_card_id": str(card.get("card_id") or ""),
+                        "solution_request": str(request.get("solution_request") or ""),
+                        "cycle_outcome": cycle_outcome,
+                    },
+                    dedupe_key=f"evolution_requested:{request.get('run_id') or ''}",
+                )
             changed = True
         if changed:
             # This summary belongs to one site. Batch status remains a pure
@@ -121,6 +161,18 @@ class SiteRunEvolutionCoordinator:
         batch = self.job_store.update_site(batch, site_key, updated)
         batch["status"] = self._batch_status_after_summary(batch)
         batch = self.job_store.save_batch(batch)
+        publish = getattr(self.job_flow, "publish_agent_event", None)
+        if callable(publish):
+            publish(
+                kind="evolution.resolved",
+                attention="notification",
+                summary=f"{site_key} evolution proposal was applied and detached from its business batch.",
+                site_key=site_key,
+                batch_id=str(batch.get("batch_id") or ""),
+                phase="evolution_summary",
+                details={"run_id": run_id, "site_mode": decision},
+                dedupe_key=f"evolution_applied:{run_id}",
+            )
         return batch, decision
 
     def retain_pending_summary(self, batch: dict[str, Any]) -> dict[str, Any]:

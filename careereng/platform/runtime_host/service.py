@@ -131,7 +131,7 @@ class RuntimeHostService:
 
             bridge = CodexMainAgentBridge(project_root=self.project_root, event_store=event_store)
             bridge.attach()
-            bridge.retry_pending()
+            bridge.retry_pending(force=True)
             return bridge
         except Exception:
             # The durable inbox still works if local callback delivery is unavailable.
@@ -301,7 +301,7 @@ class RuntimeHostService:
         bridge = self._main_agent_bridge
         if bridge is None:
             return {"ok": True, "retried": 0, "bridge": "unavailable"}
-        return {"ok": True, "retried": bridge.retry_pending()}
+        return {"ok": True, "retried": bridge.retry_pending(force=True)}
 
     def _handle_start_jobs_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
         session_id = str(payload.get("session_id") or "cli:default")
@@ -353,8 +353,10 @@ class RuntimeHostService:
                 elif launch_site_keys:
                     self._enqueue_codex_workers_for_batch(batch_id, site_keys=launch_site_keys)
             except BaseException as exc:  # pragma: no cover - defensive manager boundary
-                self.loop.job_flow.fail_batch(batch_id=batch_id, error=str(exc))
-                self._maybe_create_site_run_summary(batch_id)
+                fail_batch = getattr(self.loop.job_flow, "fail_batch", None)
+                if callable(fail_batch):
+                    fail_batch(batch_id=batch_id, error=str(exc))
+                    self._maybe_create_site_run_summary(batch_id)
             finally:
                 with self._lock:
                     self._batch_workers.pop(launch_id, None)
@@ -1035,6 +1037,22 @@ class RuntimeHostService:
                 summary_created = self._maybe_create_site_run_summary(terminal_batch_id, site_key=site_key)
                 if summary_created:
                     self._activate_codex_evolution_solution(site_key=site_key, batch_id=terminal_batch_id)
+                    job_flow = getattr(self.loop, "job_flow", None)
+                    job_store = getattr(job_flow, "job_store", None)
+                    if job_store is not None:
+                        terminal_batch = job_store.load_batch(terminal_batch_id)
+                        terminal_site = (terminal_batch.get("sites") or {}).get(site_key)
+                        release = getattr(job_flow, "_release_site_if_non_resumable", None)
+                        if callable(release) and isinstance(terminal_site, dict):
+                            release(batch_id=terminal_batch_id, site_key=site_key, site=terminal_site)
+                    if self._codex_workers is not None:
+                        self._codex_workers.release(site_key=site_key)
+                else:
+                    current_flow = getattr(self.loop, "job_flow", None)
+                    current_store = getattr(current_flow, "job_store", None)
+                    terminal_batch = current_store.load_batch(terminal_batch_id) if current_store is not None else {}
+                    if self._site_uses_exploration(terminal_batch, site_key=site_key):
+                        self._record_effective_site_run(site_key=site_key, batch_id=terminal_batch_id)
             if isinstance(progression, dict) and str(progression.get("action") or "") in {
                 "advance_phase",
                 "complete_sequence",
@@ -1230,18 +1248,22 @@ class RuntimeHostService:
                 site_key=site_key,
             )
             if summary_created:
-                job_store.append_event(
-                    "evolution.site_run_summary.requested",
-                    {"batch_id": normalized_batch_id, "source": "terminal_exploration"},
-                )
+                append_event = getattr(job_store, "append_event", None)
+                if callable(append_event):
+                    append_event(
+                        "evolution.site_run_summary.requested",
+                        {"batch_id": normalized_batch_id, "source": "terminal_exploration"},
+                    )
                 if str(batch.get("execution_backend") or "") == PROVIDER_BACKEND:
                     self._consume_provider_evolution_solution(batch=updated)
                 return True
         except Exception as exc:  # pragma: no cover - terminal evidence must not fail a completed batch
-            job_store.append_event(
-                "evolution.site_run_summary.failed",
-                {"batch_id": normalized_batch_id, "error": str(exc)},
-            )
+            append_event = getattr(job_store, "append_event", None)
+            if callable(append_event):
+                append_event(
+                    "evolution.site_run_summary.failed",
+                    {"batch_id": normalized_batch_id, "error": str(exc)},
+                )
             return False
         evolution_config = getattr(self.config, "evolution", None)
         review_config = getattr(evolution_config, "batch_review", None)
@@ -1257,6 +1279,7 @@ class RuntimeHostService:
                 site_run_threshold=threshold,
                 inner_attempt_limit=int(getattr(loop_config, "inner_attempt_limit", 3) or 3),
                 outer_batch_limit=int(getattr(loop_config, "outer_batch_limit", 3) or 3),
+                publish_event=getattr(job_flow, "publish_agent_event", None),
             )
         except Exception as exc:  # pragma: no cover - never turn an execution result into a failed batch
             job_store.append_event(
@@ -1357,7 +1380,7 @@ class RuntimeHostService:
         )
 
     def resume_pending_codex_evolution_summaries(self) -> int:
-        """Rehydrate persisted summary tasks after a host restart, without a browser run."""
+        """Refresh persisted side-work payloads without restarting site workers."""
 
         if self._codex_workers is None:
             return 0
@@ -1366,9 +1389,7 @@ class RuntimeHostService:
         site_store = getattr(getattr(job_flow, "site_tools", None), "site_store", None)
         if job_store is None or site_store is None:
             return 0
-        from careereng.adapters.codex.worker_runner import worker_record_from_payload
-
-        resumed = 0
+        refreshed = 0
         for batch in job_store.list_batches(include_terminal=True):
             if str(batch.get("execution_backend") or "") != CODEX_BACKEND:
                 continue
@@ -1385,16 +1406,8 @@ class RuntimeHostService:
                     continue
                 batch = self._site_run_coordinator(job_flow).retain_pending_summary(batch)
                 self._activate_codex_evolution_solution(site_key=str(site_key), batch_id=batch_id)
-                session = site_store.load_browser_session(str(site_key))
-                payload_path = Path(str(session.get("agent_bridge_payload_path") or ""))
-                if not payload_path.is_file():
-                    continue
-                try:
-                    self._codex_workers.enqueue(worker_record_from_payload(payload_path))
-                except Exception:
-                    continue
-                resumed += 1
-        return resumed
+                refreshed += 1
+        return refreshed
 
     def _evolution_solution_batch_row(self, *, site_key: str, batch_id: str, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         """Verify that a summary run belongs to the retained terminal site batch."""

@@ -244,10 +244,8 @@ class JobFlow:
         rows = [row for row in sites.values() if isinstance(row, dict)]
         operation = self._normalize_operation(str(batch.get("operation") or ""))
         apply_requested = bool(batch.get("apply_requested"))
-        # A site summary is still work for that site, but never a batch-wide
-        # pause. Other sites keep their own scheduling slots and progression.
-        if any(self._site_summary_pending(row) for row in rows):
-            return "running"
+        # Evolution summaries are side work. They never keep a business batch
+        # running after all site execution has reached a terminal result.
         if any(str(row.get("status") or "") in {"queued", "running"} for row in rows):
             return "running"
         if any(str(row.get("status") or "") == "paused" for row in rows):
@@ -506,14 +504,6 @@ class JobFlow:
         """Release only after orchestration has persisted a terminal site outcome."""
 
         if not is_non_resumable_site_terminal(site):
-            return
-        if self._site_exploration_summary_eligible(site):
-            # A terminal exploration site has one retained Codex summary turn
-            # before it becomes fully releasable. The batch group is unrelated.
-            return
-        if self._site_summary_pending(site):
-            # The browser may be terminal, but the retained site thread still
-            # owns a summary turn. Releasing here would kill that turn.
             return
         complete_work_item = getattr(self.runtime_lifecycle, "complete_site_work_item", None)
         if callable(complete_work_item):

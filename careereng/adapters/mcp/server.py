@@ -196,7 +196,10 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             "Top-level tools are monitoring and lifecycle controls only. Browser and state "
             "execution is allowed only through careereng_work_item_* tools bound to one active "
             "worker item. Business judgment must stay in Skills, memory, evolution proposals, "
-            "and the LLM."
+            "and the LLM. Once CareerEng manages a job workflow, the main agent must use "
+            "CareerEng lifecycle and event tools instead of directly controlling its Codex "
+            "worker threads. Direct worker inspection is read-only and reserved for diagnosing "
+            "CareerEng infrastructure."
         ),
     )
 
@@ -236,6 +239,27 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         }
 
     @server.tool()
+    def careereng_wait_agent_events(
+        cursor: str = "",
+        site_key: str = "",
+        include_notifications: bool = True,
+        limit: int = 100,
+        timeout_seconds: float = 30.0,
+    ) -> dict[str, Any]:
+        """Wait for durable main-agent events while the current Codex turn owns the thread."""
+        return {
+            "ok": True,
+            **runtime.agent_events().wait_events(
+                consumer_id="codex_desktop",
+                cursor=cursor,
+                site_key=site_key,
+                include_notifications=include_notifications,
+                limit=limit,
+                timeout_seconds=timeout_seconds,
+            ),
+        }
+
+    @server.tool()
     def careereng_ack_agent_events(cursor: str) -> dict[str, Any]:
         """Acknowledge agent events through a durable Desktop cursor."""
         try:
@@ -244,10 +268,13 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             return {"ok": False, "error": str(exc)}
 
     @server.tool()
-    def careereng_register_main_agent(thread_id: str) -> dict[str, Any]:
+    def careereng_register_main_agent(thread_id: str, allow_takeover: bool = False) -> dict[str, Any]:
         """Register this Codex App Server thread as the workspace main agent."""
         try:
-            registration = runtime.agent_events().register_main_agent(thread_id=thread_id)
+            registration = runtime.agent_events().register_main_agent(
+                thread_id=thread_id,
+                allow_takeover=allow_takeover,
+            )
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
         retry: dict[str, Any] = {}
@@ -262,7 +289,14 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
     @server.tool()
     def careereng_get_main_agent_registration() -> dict[str, Any]:
         """Return the current workspace main-agent callback target."""
-        return {"ok": True, "registration": runtime.agent_events().main_agent_registration()}
+        from careereng.adapters.codex import main_agent_delivery_health
+
+        event_store = runtime.agent_events()
+        return {
+            "ok": True,
+            "registration": event_store.main_agent_registration(),
+            "delivery_health": main_agent_delivery_health(event_store),
+        }
 
     @server.tool()
     def careereng_get_agent_status(site_key: str = "") -> dict[str, Any]:
