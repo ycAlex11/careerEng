@@ -9,6 +9,37 @@ browser control, evolution, or workflow execution.
 It defines the target architecture. Existing mixed modules are compatibility
 code during migration, not a reason to extend the old boundaries.
 
+## Identity And Lifecycle Reconciliation
+
+`career/applications/identity_links.py` owns reversible, site-scoped identity
+associations under `workspace/jobs/identity_links/`. Workers decide equivalence
+from evidence through the scoped `job_identity` state tool. Python validates
+and persists the association with an existing canonical job ID; it must not
+infer equivalence from company-specific ID prefixes or titles. History reads
+may resolve an association, but original records and frozen plans are retained.
+Revocation affects future resolution, not historical evidence.
+
+`orchestration/worker_control` owns terminal-state guards and action fencing.
+Desired pause is separate from confirmed runtime suspension and browser release.
+Late pause/report messages cannot demote completed business work; terminal work
+may still require resource cleanup. Explicit resume uses the existing command
+and control-epoch path, not an automatic transition out of waiting_user.
+Metrics distinguish inherited history skips from evidence of live application work.
+Workspace file transaction exclusion is provided by `platform/persistence/mutex.py`;
+worker registries and action/command stores share locks across instances and processes.
+This protects technical updates, not site policy, and does not hold a workspace-wide
+lock while browser operations execute.
+
+Native worker state reports require `expected_control_epoch` from the current
+launch spec or control result. Validation occurs inside the registry transaction;
+stale observations cannot complete or reactivate a newer lease.
+
+Resume adapters must not reissue work-item leases before the Runtime Host has
+resolved the requested scope. The host reissues reusable items or invokes the
+existing checkpoint-recovery owner for released/terminal items, returning the
+resolved batch ID. Native actions are restricted to active items in that batch;
+an old same-site binding must not be revived by a successful recovery elsewhere.
+
 ## Two Separate Trees
 
 ```text
@@ -65,7 +96,6 @@ careereng/
       browser_phase_runtime.py  Responses API browser-tool execution adapter
     mcp/                        CareerEng MCP server transport
     cli/                        Command-line transport
-    codex/                      Codex App Server transport, thread bindings, worker lifecycle
     host/                       Deprecated compatibility exports for the runtime host
     external_agents/            Generic work-order audit/recovery and future external-agent contracts
     assistant_bridge/           Conversation ingestion and assistant-context transport
@@ -374,21 +404,24 @@ may interrupt that wait; the next turn resumes from the durable cursor.
 worker/browser state and answers what is running now. It is not a batch
 projection and it does not replace durable events.
 
-For immediate Codex delivery, `careereng_register_main_agent` stores the
-current App Server thread id at `workspace/agent_events/main_agent.json`. The
-Codex-specific `adapters/codex/main_agent_bridge.py` subscribes to the shared
-dispatcher, then delivers durable `action_required`, `review_required`, phase
-advance, site completion, and batch completion events to that registered
-thread. Raw heartbeat and audit events are never delivered there. Delivery
-attempts are recorded separately and retried with bounded backoff. Codex
-`active writer` rejection is a normal `deferred_active` state, not an event or
-workflow failure; the active main agent consumes the same event through long
-polling. Acknowledged events are never retried. Replacing the registered thread
-id transfers future main-agent notifications to the new Desktop control
-conversation.
+`careereng_register_main_agent` persists the main task identity; it does not
+start an App Server callback. The old `adapters/codex/main_agent_bridge.py`
+transport is removed. An active main task polls; a user-authorized Desktop
+heartbeat wakes an idle main task to poll. Child completion notifications are
+not a substitute for this durable inbox.
+
+`platform/project_state/notifications.py` owns a separate durable aggregation
+projection with offered notification IDs and presentation acknowledgements.
+Ordinary phase events are grouped per batch/site using
+`agent.notifications.progress_interval_seconds`; urgent attention, failures,
+and completion bypass that interval. Raw control events are never throttled.
+The Desktop heartbeat reads `poll_interval_seconds` from MCP `monitor_policy`,
+independently of progress batching and recovery timing. Urgent delivery means
+the next actual poll, not instantaneous push. Pending notification data survives
+raw event acknowledgement, restart, and a change to the configured interval.
 
 CareerEng uses one main-agent controller per workspace and any number of
-site-scoped workers across one or more batches. Assistant intake automatically
+site-scoped workers across one or more batches. The main task explicitly
 registers a concrete controller thread; a different thread cannot silently
 replace it. Events carry a monotonic workspace sequence and their batch, site,
 worker-thread, turn, and phase identities. Registration records an event
@@ -506,13 +539,11 @@ not a terminal command: the shared engine tracks any required confirmation
 progress while the active Skill remains responsible for site pagination and
 workflow policy.
 
-For `codex_app_server`, creating a work order is not sufficient to call a
-batch browser-active. The runtime host must successfully start a scoped Codex
-worker thread for every active site. A worker starts from its work-item
-directory, not the project root; on App Server startup timeout the host drops
-that transport and retries with a fresh connection before it marks the worker
-unavailable. This keeps startup bounded and prevents a stale App Server from
-blocking all sites.
+For `native_agent`, creating a work order is not sufficient to call a batch
+agent-active. CareerEng exposes durable launch specifications, and the Codex
+Desktop main Agent creates each worker through the already-running Desktop App
+Server. The main Agent is the sole worker supervisor. CareerEng never starts a
+second Codex App Server and no worker creates or controls another worker.
 
 Python provides orchestration, persistence, validation, safety, recovery
 plumbing, metrics, evidence packaging, patch application, and rollback.
@@ -564,6 +595,13 @@ The protocol layer declares tools but never implements business behavior.
 Command dispatch never invents business policy; it delegates to the owning
 module. Provider, MCP, CLI, and external-agent adapters all consume the same
 declarations and command path.
+
+State-recording tools return generic, decision-ready evidence about the data
+they persisted without choosing the next workflow action. In particular,
+`record_application_reviews` reports whether the current call matched prior
+terminal review history, observed changed statuses, or received missing status
+details. Skills and the active agent use that evidence to decide pagination;
+Python does not encode a site's stopping policy.
 
 ### 2. Raw Web Capabilities
 
@@ -618,45 +656,80 @@ recovery step.
 recovery and audit artifacts. They are not the normal, file-reading-only
 delivery mechanism for an external agent.
 
-## Codex Worker Lifecycle
+## Native Worker Lifecycle
 
-When `browser.execution_mode = "codex_app_server"`, the Codex App Server owns
-the live agent execution lifecycle:
+Desktop execution uses visible, independently openable tasks created through
+Desktop `create_thread`, not hidden `spawn_agent` children. The MCP launch spec
+declares this presentation/transport contract. The main task executes the
+returned plan and registers its visible task ID; CareerEng itself does not call
+Desktop tools. Task visibility must be verified by the main task, not inferred
+from an arbitrary registered ID. Host tool restrictions take precedence: report
+an unavailable operation instead of silently substituting another transport.
+
+Native liveness is derived from valid scoped activity, explicit heartbeats and
+bounded in-flight operations. Host execution records activity automatically
+after scope validation, and records progress separately when durable state or
+context revision advances. Activity timestamps never decide job fit, retries,
+or business outcomes. Existing browser progress guards remain responsible for
+repetitive no-progress workflow evidence.
+
+Silence beyond the recovery idle limit starts spaced read-only probes. Unserved
+probes do not consume additional failures. Only repeated acknowledged checks
+without fresh evidence can schedule recovery. Work waiting for the user, paused,
+or terminal is not treated as a running silent worker. Recovery and probe actions
+carry an activity revision as well as their existing epoch and binding fences;
+new activity invalidates stale actions. `careereng_prepare_worker_action`
+revalidates immediately before Desktop execution. The Desktop operation is an
+external side effect, so no cross-process atomicity is promised for the tiny
+post-validation interval; existing work-item leases and terminal guards remain
+mandatory. No background daemon may invent worker heartbeats.
+The host protocol revision is `2026-09-12.1`: reload MCP and Runtime Host
+together before live validation so a new monitor cannot silently use an old
+host without activity instrumentation.
+
+When `browser.execution_mode = "native_agent"`, the Codex Desktop App Server
+owns live agent execution while CareerEng owns durable orchestration state:
 
 ```text
 CareerEng batch/site work item
   -> assembled phase context + durable work-order audit artifact
-  -> orchestration binds it to its retained SiteWorkerSession
-  -> adapters/codex/ starts or resumes that session's Codex thread
-  -> Codex thread receives a work_item_id and pulls scoped MCP context
-  -> Codex thread uses CareerEng MCP/browser/state tools
-  -> Codex App Server emits turn lifecycle events
-  -> CareerEng records thread/turn linkage, updates batch evidence, and emits
-     a durable main-agent event when user attention or a completion milestone is needed
+  -> CareerEng publishes a launch specification for the main Agent
+  -> the main Agent creates a flat native worker and registers its agent_id
+  -> the worker receives a work_item_id and pulls scoped MCP context
+  -> the worker uses CareerEng MCP/browser/state tools and reports observed state
+  -> CareerEng reconciles desired and observed state into durable action plans
+  -> the main Agent executes native spawn/send/interrupt/resume/close actions
+  -> the main Agent records action receipts and consumes durable attention events
 ```
 
 One `site + batch` has one active work item at a time. A persisted
-`SiteWorkerSession` may bind consecutive effective work items for the same
-site and backend to one external-agent thread. The session is a bounded
-continuity layer, not a replacement for batches: each batch keeps independent
-history, report, metrics, and evidence. Cancellation does not consume the
-configured effective-run boundary. At that boundary CareerEng creates an
-evolution review task; it does not automatically make a business decision.
-An exploration run creates the same review task immediately after its terminal
-evidence is persisted. The applied Codex proposal decides either `ready` or a
-bounded follow-up exploration run. A follow-up requeues only that site in the
-same batch and retains its Codex thread; the batch itself is never rewritten
-to `waiting_solution` just to hold that review task.
+`SiteWorkerSession` remains the bounded business-run continuity generation,
+not a live Codex transport owner. It records the active native `agent_id` for
+that generation so consecutive batches can route new work items to the same
+flat child task. The native worker registry still owns each work-item binding
+and its desired/observed runtime state.
 
-`orchestration/engine/site_work_items.py` owns generic queue and slot
-semantics, `orchestration/engine/agent_workers.py` owns retained external-agent
-thread lifecycle, and `platform/sessions/site_workers.py` persists session and
-thread bindings. The same configuration exposes the new-site exploration loop
-limits and recurring review cadence. These are structural counts only; Codex
-and Skills decide success, continuation, cache value, and proposed evolution.
-`adapters/codex/` only translates a claimed item to Codex App Server RPC/events.
-A future Claude Code adapter supplies the same thread transport contract rather
-than another lifecycle state machine.
+Cross-batch continuity is decided mechanically from those two stores. An
+active bound child receives a durable `send` action for the new work item; a
+suspended child receives `resume` followed by `send`; a missing, terminal,
+faulted, or quarantined child produces a replacement `spawn`. The Desktop main
+Agent alone executes those actions. CareerEng never calls native task tools or
+infers whether a Codex task still exists.
+
+Each batch keeps independent history, report, metrics, evidence, and
+checkpoints even when its site work item reuses a child task. Cancellation does
+not consume the configured effective-run boundary. At that boundary the
+session becomes `review_pending`, receives no further business work, and
+CareerEng creates an evolution work item. The main Agent launches that item as
+another flat sibling worker; after review, the next site batch starts a new
+session generation and native child task. The site worker does not create its
+successor or the evolution worker.
+
+`orchestration/engine/site_work_items.py` owns generic queue and slot semantics.
+`orchestration/worker_control/` owns native worker bindings, desired/observed
+state, reconciliation, action plans, and receipts. `platform/sessions/` keeps
+durable business continuity and browser-resource records. There is no
+`adapters/codex/` transport and no CareerEng-owned Codex thread coordinator.
 
 `orchestration/worker_control/` owns backend-neutral asynchronous control
 contracts. Every executable work item carries a `control_epoch` lease and a
@@ -669,13 +742,22 @@ therefore reject stale calls instead of rebinding them to newer site state.
 Control states are monotonic, so a delayed interrupt acknowledgement cannot
 reopen a cancelled or released item.
 
-Pause is an acknowledged transition: `active -> pausing -> paused`. Transport
-activity is treated as heartbeat evidence, and the coordinator repeats the
-idempotent interrupt probe only within the configured retry bound. If no
-terminal turn event arrives, the item becomes `pause_unconfirmed`; its old
-thread is quarantined and a later resume starts from durable CareerEng state on
-a replacement thread. This recovery mechanism detects transport uncertainty;
-the epoch fence, not heartbeat timing, prevents stale side effects.
+Worker commands and worker actions are separate durable layers. A command is
+the caller's ordered intent (`guidance`, `redirect`, `resume`, `pause`,
+`cancel`, or `recovery`) and remains valid independently of Desktop transport
+availability. The command arbiter evaluates only generic lifecycle facts and
+turn-boundary safety. Its result is materialized as one or more native actions
+(`spawn`, `send`, `interrupt`, `resume`, or `close`) for the main Agent to
+execute and acknowledge. Removing an App Server adapter must never remove the
+command inbox, arbitration, continuity, or recovery contracts.
+
+Pause is an acknowledged transition: desired state changes first, the
+reconciler emits an idempotent interrupt action, the main Agent executes it,
+and the worker's observed state confirms suspension. A missing confirmation is
+represented as durable uncertainty rather than guessed completion. A later
+resume may continue the native worker when possible or launch a replacement
+from the same durable work item. The epoch fence, not heartbeat timing,
+prevents stale side effects.
 
 Ordinary Skill phases are logical state boundaries, not worker-lifecycle
 boundaries. `phase_result(done)` advances durable context synchronously; the
@@ -689,15 +771,20 @@ continuation rejects a completion after the state tool entered `transitioning`,
 the host restores the same work item to `active`; it never leaves a live target
 stranded between states.
 
-If a Codex turn nevertheless ends while its work item is still `active`, the
-coordinator starts a bounded continuation on the retained thread. Repeated
-turn endings without a context revision become an execution-recovery failure,
-not a completed site and not a permanently false `running` worker. Exhausted
-recovery parks the same durable work item in `waiting_user`, releases its
-scheduler slot, and leaves the current phase and item unchanged. A user
-continuation reissues that item with a new control epoch; a stale turn cannot
-regain access after recovery, phase refresh, pause, cancellation, or release
-because each accepted state or context change advances the site revision.
+If a native worker ends while its work item is still active, CareerEng records
+the observed mismatch and emits a recovery action instead of pretending the
+site completed. Exhausted recovery parks the same durable work item in
+`waiting_user`, releases its scheduler slot, and leaves the current phase and
+item unchanged. A user continuation reissues that item with a new control
+epoch; a stale worker cannot regain access after recovery, phase refresh,
+pause, cancellation, or release because each accepted state or context change
+advances the site revision.
+
+Main-Agent communication is pull-based and durable. Workers publish events to
+the CareerEng inbox; the main Agent consumes them through a bounded cancellable
+wait tool. A new user message may cancel the current wait without losing an
+event. CareerEng does not write directly into an active Desktop turn and does
+not depend on a callback into a separately launched App Server.
 
 Phase recovery is monotonic. Once a phase completes, its durable output is the
 frozen input for later phases in that batch and recovery never reruns it. A

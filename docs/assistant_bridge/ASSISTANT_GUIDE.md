@@ -104,7 +104,7 @@ Do not search for its socket, invent another launch command, start a second host
 5. Use site-scoped pause, stop, or cancel when changing one worker. These commands revoke that work item's execution lease and do not stop sibling sites in the batch.
 6. Treat `pause_unconfirmed` as transport uncertainty, not job failure. Resume reconstructs the worker from durable state instead of trusting the unconfirmed thread.
 7. Ordinary phase completion keeps the same site work item, Codex thread, and browser. CareerEng advances phase context synchronously and automatically continues a non-terminal item if its current turn ends.
-8. Internal heartbeat traffic is not a Desktop progress stream. Assistant intake automatically registers the one main-agent controller for the workspace; it receives only durable phase, attention, recovery, evolution, and terminal events.
+8. Internal heartbeat traffic is not a Desktop progress stream. Register the current main task and consume durable phase, attention, recovery, evolution, and terminal events through CareerEng. Registration alone does not start a push service.
 9. For ranking-enabled sites, `ranking_pending` completes evaluation only; CareerEng materializes `ready_to_apply` and `deferred_by_rank`, then continues selected jobs to real application outcomes.
 10. If bounded technical recovery is exhausted, report `waiting_user` rather than a job failure. A user continuation reissues the same durable work item, recreates only a dead scoped browser runtime when necessary, and resumes the current phase/item.
 11. Recovery never reruns completed phases. Retrieval continues its saved checkpoint with dedupe; apply uses the frozen Apply List and reconciles an uncertain active item from that item's Job URL before continuing.
@@ -113,7 +113,35 @@ Do not search for its socket, invent another launch command, start a second host
 14. External network/provider/service/browser-process interruptions enter checkpoint recovery and notification only. They do not trigger evolution unless later evidence explicitly diagnoses a CareerEng-internal defect.
 15. After CareerEng accepts a job workflow, control its Codex workers only through CareerEng. Do not use Codex thread messaging, interruption, resume, or termination tools directly. Infrastructure diagnosis may inspect an underlying worker read-only; all state changes still go through CareerEng.
 16. While the current main-agent turn is monitoring active work, call `careereng_wait_agent_events` with the last observed cursor. Handle returned events and acknowledge only the cursor actually processed. If user input interrupts the wait, read the durable inbox first on the next CareerEng turn.
-17. An App Server `active writer` response means push delivery is deferred while the main turn is active. It is not a workflow failure. The runtime retries with bounded backoff, while the active main agent consumes the same queue through long polling.
+17. CareerEng does not run the old App Server push/retry bridge. While active, the main task consumes the bounded wait interface; while idle, a user-authorized Desktop heartbeat wakes it to poll. A child's completion notification is separate and does not consume CareerEng events.
+
+### Visible Desktop Launch And Monitoring
+
+1. Check formal MCP/host reachability and current batch state. Do not use temporary Python wrappers to bypass a stale Desktop MCP connection.
+2. For a new run, call `careereng_start_jobs_batch` with the user's scope; use `separate_batch` only when a separate new batch is requested. For explicit continuation, use the resume entry instead. Never confuse a retained task with a retained Apply List.
+3. Obtain `careereng_list_worker_launch_specs`. Its `desktop_task` contract requires a visible Desktop task, not `spawn_agent`. For a new task, use Desktop `create_thread`, following its project/environment rules, with the supplied work-item prompt and a clear company title. For reuse, use the returned existing task ID; do not guess another task by site name.
+4. Register the resulting ID and current main task ID through `careereng_register_native_worker`, including session ID and control epoch, and acknowledge the actual launch action. Confirm the task is accessible; expose its returned task link. Do not claim an action succeeded merely because a plan exists.
+5. Before executing subsequent lifecycle actions, call `careereng_prepare_worker_action`. It rejects obsolete activity/epoch/binding plans. A `probe` is read-only task inspection, not interruption. Fresh tool/phase evidence can be reported through the state tool; an unchanged active label cannot be used to manufacture heartbeats. If Desktop lacks the required control operation, record a failed receipt and report it, without switching transports.
+6. Read `monitor_policy` from context, launch specs, or monitor results. While supervising, poll the durable inbox with the explicit current `batch_id` and process control actions irrespective of notification timing. Before ending the turn, create/update a user-authorized Desktop heartbeat for this main task using `poll_interval_seconds`; never hard-code the user's progress interval as the liveness interval. Re-read the policy on each wake and update that same automation when its interval changes.
+7. Render due `notifications` as compact summaries, then call `careereng_ack_notifications(delivery_id)`. Do not acknowledge before presentation. Repeated delivery is possible until acknowledged. Notification aggregation is durable and independent of the raw control-event cursor. Never summarize every raw phase event immediately, which bypasses throttling.
+8. With a site filter, retain a local cursor at the last inspected event without globally acknowledging unseen other-site events. Without a filter, acknowledge the actual processed global cursor. Retain the local cursor and pending notification receipts across heartbeat wakes.
+9. On completion, present final results, acknowledge the notification and pause the same heartbeat. Do not restart the batch, discard the reusable task, or submit again.
+
+Configuration is in the project `config.toml`:
+
+```toml
+[agent.notifications]
+progress_interval_seconds = 60
+poll_interval_seconds = 60
+```
+
+Set `progress_interval_seconds` to 300 or 600 for five- or ten-minute ordinary
+progress summaries. Quiet periods produce no notification. Attention, failures,
+and completion bypass progress batching but are delivered on the next actual
+poll, subject to Desktop scheduler/provider latency; this is not instant push.
+Keep polling frequent for controls even when progress summaries are infrequent.
+`poll_interval_seconds` is a positive whole number of minutes in seconds.
+This configuration never changes the separate `[agent.recovery]` limits.
 
 For direct lifecycle commands, see `docs/assistant_bridge/COMMANDS.md`.
 

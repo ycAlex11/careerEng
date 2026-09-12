@@ -173,6 +173,7 @@ class AgentEventStore:
         consumer_id: str = "codex_desktop",
         cursor: str = "",
         site_key: str = "",
+        batch_id: str = "",
         include_notifications: bool = True,
         limit: int = 100,
     ) -> dict[str, Any]:
@@ -188,13 +189,15 @@ class AgentEventStore:
             minimum_sequence = int(registration.get("delivery_after_sequence") or 0)
         filtered: list[dict[str, Any]] = []
         normalized_site = str(site_key or "").strip()
-        cursor_can_advance = not normalized_site and include_notifications
+        cursor_can_advance = not normalized_site and not batch_id and include_notifications
         scanned_cursor = effective_cursor
         for row in self._iter_rows_after_cursor(effective_cursor):
             if int(row.get("sequence") or 0) <= minimum_sequence:
                 continue
             scanned_cursor = str(row.get("event_id") or scanned_cursor)
             if normalized_site and str(row.get("site_key") or "") != normalized_site:
+                continue
+            if batch_id and str(row.get("batch_id") or "") != batch_id:
                 continue
             if not include_notifications and str(row.get("attention") or "") == ATTENTION_NOTIFICATION:
                 continue

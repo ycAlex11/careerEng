@@ -21,7 +21,7 @@ from careereng.platform.sessions import BrowserProfileOwnerError, BrowserRuntime
 from careereng.adapters.external_agents.browser import browser_tool_commands
 from careereng.adapters.external_agents.contracts import (
     AGENT_BRIDGE_MODE,
-    CODEX_APP_SERVER_MODE,
+    NATIVE_AGENT_MODE,
     AGENT_BRIDGE_REQUIRED_REASON,
     AGENT_BRIDGE_STATUS,
     agent_bridge_phase,
@@ -1893,7 +1893,7 @@ class BrowserAutomationService:
         timeout_ms_override: int | None = None,
         apply_resume_snapshot: dict[str, Any] | None = None,
     ) -> BrowserAutomationResult:
-        if self.execution_mode in {AGENT_BRIDGE_MODE, CODEX_APP_SERVER_MODE}:
+        if self.execution_mode in {AGENT_BRIDGE_MODE, NATIVE_AGENT_MODE}:
             return self._run_site_agent_bridge(
                 site_key=site_key,
                 site_name=site_name,

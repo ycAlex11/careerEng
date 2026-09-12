@@ -7,6 +7,7 @@ from typing import Any
 
 from careereng.orchestration.context.workflow_memory import record_interrupted_batches
 from careereng.platform.persistence import JSONLStore
+from careereng.platform.persistence.mutex import workspace_mutex
 from careereng.utils import ensure_dir, make_id, now_iso, read_json, write_json
 
 
@@ -65,7 +66,11 @@ class JobStore:
         return payload
 
     def load_batch(self, batch_id: str) -> dict[str, Any]:
-        return read_json(self._batch_path(batch_id))
+        with self.batch_transaction(batch_id):
+            return read_json(self._batch_path(batch_id))
+
+    def batch_transaction(self, batch_id: str):
+        return workspace_mutex(self._batch_path(batch_id))
 
     def save_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):
@@ -73,10 +78,20 @@ class JobStore:
         batch_id = str(payload.get("batch_id") or "")
         if not batch_id:
             return {}
-        payload = dict(payload)
-        payload["updated_at"] = now_iso()
-        write_json(self._batch_path(batch_id), payload)
-        return payload
+        with self.batch_transaction(batch_id):
+            payload = dict(payload)
+            current = read_json(self._batch_path(batch_id))
+            if current.get("status") in {"completed", "cancelled"} and payload.get("status") == "paused":
+                payload["status"] = current["status"]
+            sites = dict(payload.get("sites") or {})
+            for key, previous in (current.get("sites") or {}).items():
+                incoming = sites.get(key)
+                if isinstance(incoming, dict) and previous.get("status") in {"done", "completed", "cancelled"} and incoming.get("status") == "paused":
+                    sites[key] = previous
+            payload["sites"] = sites
+            payload["updated_at"] = now_iso()
+            write_json(self._batch_path(batch_id), payload)
+            return payload
 
     def append_sites(self, *, batch_id: str, sites: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
         """Append new site rows to one unfinished batch in caller order.

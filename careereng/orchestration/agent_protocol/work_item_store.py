@@ -239,6 +239,21 @@ class WorkItemStore:
             "site_revision": int(record.get("site_revision") or 0),
         }
 
+    def list_records(self, *, batch_id: str = "", states: set[str] | None = None) -> list[dict[str, Any]]:
+        """Return durable work-item metadata without loading executable payloads."""
+
+        index = read_json(self.index_path)
+        records = index.get("records") if isinstance(index.get("records"), dict) else {}
+        requested_states = {str(value) for value in states} if states is not None else None
+        rows = [
+            dict(record)
+            for record in records.values()
+            if isinstance(record, dict)
+            and (not batch_id or str(record.get("batch_id") or "") == str(batch_id))
+            and (requested_states is None or str(record.get("state") or "") in requested_states)
+        ]
+        return sorted(rows, key=lambda row: (str(row.get("site_key") or ""), str(row.get("created_at") or "")))
+
     def release_scope(self, *, site_key: str, batch_id: str = "", event: str = "released") -> int:
         """Close indexed work items for an explicitly released execution scope."""
 

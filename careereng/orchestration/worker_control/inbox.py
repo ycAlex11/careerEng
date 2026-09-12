@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-import threading
+from careereng.platform.persistence.mutex import workspace_mutex
 
 from careereng.utils import ensure_dir, now_iso, read_json, write_json
 
@@ -15,7 +15,7 @@ class WorkerCommandInbox:
     def __init__(self, workspace: Path | str):
         self.root = ensure_dir(Path(workspace) / "sessions" / "worker_commands")
         self.path = self.root / "commands.json"
-        self._lock = threading.RLock()
+        self._lock = workspace_mutex(self.path)
 
     def enqueue(self, command: WorkerCommand) -> WorkerCommand:
         with self._lock:
@@ -47,6 +47,19 @@ class WorkerCommandInbox:
             return persisted
 
     def pending(self, *, site_key: str, work_item_id: str) -> list[WorkerCommand]:
+        return self.list(
+            site_key=site_key,
+            work_item_id=work_item_id,
+            statuses={WorkerCommandStatus.PENDING},
+        )
+
+    def list(
+        self,
+        *,
+        site_key: str,
+        work_item_id: str,
+        statuses: set[WorkerCommandStatus] | None = None,
+    ) -> list[WorkerCommand]:
         with self._lock:
             data = self._load_locked()
             rows = [
@@ -54,7 +67,10 @@ class WorkerCommandInbox:
                 for row in data["commands"]
                 if str(row.get("site_key") or "") == str(site_key or "")
                 and str(row.get("work_item_id") or "") == str(work_item_id or "")
-                and str(row.get("status") or "") == WorkerCommandStatus.PENDING.value
+                and (
+                    statuses is None
+                    or WorkerCommandStatus(str(row.get("status") or WorkerCommandStatus.PENDING.value)) in statuses
+                )
             ]
             return sorted(rows, key=lambda row: row.sequence)
 
@@ -83,6 +99,7 @@ class WorkerCommandInbox:
                 WorkerCommandStatus.CLAIMED: {
                     WorkerCommandStatus.APPLIED,
                     WorkerCommandStatus.FAILED,
+                    WorkerCommandStatus.SUPERSEDED,
                 },
             }
             if normalized not in allowed.get(current, set()):
@@ -92,6 +109,13 @@ class WorkerCommandInbox:
             row["error"] = str(error or "")
             self._save_locked(data)
             return WorkerCommand.from_dict(row)
+
+    def get(self, command_id: str) -> WorkerCommand:
+        with self._lock:
+            row = self._find(self._load_locked(), command_id)
+        if row is None:
+            raise KeyError(f"worker command not found: {command_id}")
+        return WorkerCommand.from_dict(row)
 
     def latest_pending(self, *, site_key: str, work_item_id: str) -> WorkerCommand | None:
         rows = self.pending(site_key=site_key, work_item_id=work_item_id)

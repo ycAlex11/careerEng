@@ -18,9 +18,7 @@ def normalize_execution_backend(value: object) -> str:
         return PROVIDER_BACKEND
     if normalized in {
         "codex",
-        "codex_app_server",
-        "codex_appserver",
-        "codex_workers",
+        "native_agent",
         "agent_bridge",
         "codex_handoff",
     }:
@@ -29,9 +27,9 @@ def normalize_execution_backend(value: object) -> str:
 
 
 def execution_backend_from_mode(execution_mode: object) -> str:
-    """Map the legacy browser mode to its owning execution backend."""
+    """Map the configured browser mode to its owning execution backend."""
 
-    return normalize_execution_backend(execution_mode) or PROVIDER_BACKEND
+    return normalize_execution_backend(execution_mode)
 
 
 def resolve_execution_backend(
@@ -58,9 +56,11 @@ def resolve_execution_backend(
         return "", f"unsupported configured execution backend: {selected_raw}"
     if not selected:
         browser = getattr(config, "browser", None)
-        selected = execution_backend_from_mode(
-            getattr(browser, "execution_mode", "") or runtime_execution_mode
-        )
+        configured_mode = getattr(browser, "execution_mode", "") or runtime_execution_mode
+        selected = execution_backend_from_mode(configured_mode)
+        if configured_mode and not selected:
+            return "", f"unsupported configured execution mode: {configured_mode}"
+        selected = selected or PROVIDER_BACKEND
 
     if requested and requested != selected:
         return "", (

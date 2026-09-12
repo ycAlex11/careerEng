@@ -101,7 +101,7 @@ def build_loop(*, project_root: Path, workspace: Path | None = None) -> tuple[Ag
         browser_execution_mode = (
             configured_mode
             if execution_backend_from_mode(configured_mode) == CODEX_BACKEND
-            else "codex_app_server"
+            else "native_agent"
         )
     else:
         browser_execution_mode = "provider"

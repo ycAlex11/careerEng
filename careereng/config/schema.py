@@ -14,6 +14,30 @@ class AgentRecoveryConfig:
     max_resume_attempts: int = 2
     interrupt_ack_timeout_seconds: int = 15
     max_interrupt_attempts: int = 2
+    probe_interval_seconds: int = 30
+    failure_threshold: int = 3
+    inflight_timeout_seconds: int = 300
+
+    def __post_init__(self) -> None:
+        for name in ("idle_timeout_seconds", "probe_interval_seconds", "inflight_timeout_seconds", "failure_threshold"):
+            value = getattr(self, name)
+            minimum = 2 if name == "failure_threshold" else 1
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"agent.recovery.{name} must be an integer >= {minimum}")
+
+
+@dataclass
+class AgentNotificationsConfig:
+    progress_interval_seconds: int = 60
+    poll_interval_seconds: int = 60
+
+    def __post_init__(self) -> None:
+        for name in ("progress_interval_seconds", "poll_interval_seconds"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"agent.notifications.{name} must be a positive integer")
+        if self.poll_interval_seconds < 60 or self.poll_interval_seconds % 60:
+            raise ValueError("agent.notifications.poll_interval_seconds must be a multiple of 60")
 
 
 @dataclass
@@ -28,6 +52,7 @@ class AgentConfig:
     router_log_enabled: bool = True
     search_company_top_k: int = 10
     recovery: AgentRecoveryConfig = field(default_factory=AgentRecoveryConfig)
+    notifications: AgentNotificationsConfig = field(default_factory=AgentNotificationsConfig)
 
 
 @dataclass

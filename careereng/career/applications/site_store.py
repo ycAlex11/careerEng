@@ -24,6 +24,7 @@ from careereng.career.applications.skill_policy import (
 from careereng.career.applications.skill_policy.schema import file_hash
 from careereng.career.applications.job_identity import infer_site_job_id_from_url, normalize_identity_url
 from careereng.career.applications.history_view import BatchHistoryView
+from careereng.career.applications.identity_links import JobIdentityLinks
 from careereng.career.applications.site_modes import SITE_MODE_DRAFT, normalize_site_mode
 from careereng.platform.observability import PerformanceRecorder
 from careereng.platform.persistence import JSONLStore
@@ -56,6 +57,12 @@ class SiteStore:
         "already_applied",
         "filtered_out",
         "submitted",
+        "rejected",
+        "closed",
+        "withdrawn",
+    }
+    TERMINAL_APPLICATION_REVIEW_STATUSES = {
+        "inactive",
         "rejected",
         "closed",
         "withdrawn",
@@ -103,6 +110,7 @@ class SiteStore:
     )
 
     RUN_JOB_STRING_FIELDS = (
+        "application_evidence_source",
         "batch_id",
         "session_id",
         "turn_id",
@@ -827,6 +835,17 @@ class SiteStore:
         ):
             return "submitted"
         return ""
+
+    @classmethod
+    def _review_history_is_terminal(cls, *, status: object, raw: object, stage: object) -> bool:
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status in cls.TERMINAL_APPLICATION_REVIEW_STATUSES:
+            return True
+        return cls._application_status_from_review(status=status, raw=raw, stage=stage) in {
+            "rejected",
+            "closed",
+            "withdrawn",
+        }
 
     @classmethod
     def _row_text(cls, row: dict[str, Any], fields: tuple[str, ...]) -> str:
@@ -2277,6 +2296,43 @@ class SiteStore:
         rest = [key for key in keys if not key.startswith(strong_prefixes)]
         return strong + rest
 
+    def job_identity(self, site_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        links = JobIdentityLinks(self.workspace, site_id)
+        snapshot = links.snapshot()
+        rows = self.list_jobs(site_id)
+        action = str(arguments.get("action") or "inspect")
+        if action == "inspect":
+            offset = max(0, int(arguments.get("offset") or 0))
+            fields = ("job_id", "canonical_job_id", "site_job_id", "title", "location", "url",
+                      "application_status", "application_review_status", "application_review_status_raw")
+            return {"revision": snapshot["revision"], "associations": snapshot["associations"],
+                    "jobs": [{key: row.get(key, "") for key in fields} for row in rows[offset:offset + 50]],
+                    "total": len(rows), "next_offset": offset + 50 if offset + 50 < len(rows) else None}
+        observations = list(arguments.get("jobs") or [])
+        canonical_job_id = ""
+        keys: list[str] = []
+        if action == "confirm":
+            target = next((row for row in rows if row.get("job_id") == arguments.get("target_job_id")), None)
+            if not target or not target.get("canonical_job_id"):
+                raise ValueError("target_job_id must identify an existing same-site history record")
+            canonical_job_id = str(target["canonical_job_id"])
+            if not observations or not all(isinstance(row, dict) for row in observations):
+                raise ValueError("confirmation requires source observations")
+            observations = [{key: target.get(key, "") for key in
+                             ("job_id", "canonical_job_id", "site_job_id", "url", "title", "location")}, *observations]
+            for row in observations:
+                strong = [key for key in self.job_identity_keys(site_id, row) if not key.startswith("fallback|")]
+                if not strong:
+                    raise ValueError("each observation requires a source ID or URL; title alone is insufficient")
+                keys.extend(strong)
+        return links.record(
+            operation_id=str(arguments.get("operation_id") or ""),
+            expected_revision=int(arguments.get("expected_revision", -1)), action=action,
+            evidence=str(arguments.get("evidence") or ""), canonical_job_id=canonical_job_id,
+            keys=keys, observations=observations,
+            association_id=str(arguments.get("association_id") or ""),
+        )
+
     def _history_identity_seed(self, site_id: str, row: dict[str, Any]) -> str:
         keys = self._history_match_keys(site_id, row)
         if keys:
@@ -2600,6 +2656,7 @@ class SiteStore:
         # Application review itself establishes the latest canonical state;
         # the shared batch view is created/refreshed immediately afterwards.
         history_rows = self._history_rows_for_batch(site_id, batch_id)
+        identity_snapshot = JobIdentityLinks(self.workspace, site_id).snapshot()
         by_job_id, by_canonical_job_id, by_match_key = self._history_indexes_for_batch(
             site_id,
             history_rows,
@@ -2624,6 +2681,9 @@ class SiteStore:
                 by_match_key=by_match_key,
                 history_rows=history_rows,
             )
+            linked = JobIdentityLinks.resolve(self.job_identity_keys(site_id, job), identity_snapshot)
+            if linked in by_canonical_job_id:
+                match_idx = by_canonical_job_id[linked]
             if match_idx is None:
                 classifications.append(
                     {
@@ -2723,6 +2783,7 @@ class SiteStore:
         rows = self._history_rows_for_batch(site_id, batch_id)
         by_job_id, by_canonical_job_id, by_match_key = self._history_indexes_for_batch(site_id, rows, batch_id)
         matches: list[dict[str, Any] | None] = []
+        identity_snapshot = JobIdentityLinks(self.workspace, site_id).snapshot()
         for job in jobs:
             match_idx = self._resolve_history_row_index(
                 site_id,
@@ -2732,6 +2793,9 @@ class SiteStore:
                 by_match_key=by_match_key,
                 history_rows=rows,
             )
+            linked = JobIdentityLinks.resolve(self.job_identity_keys(site_id, job), identity_snapshot)
+            if linked in by_canonical_job_id:
+                match_idx = by_canonical_job_id[linked]
             if match_idx is None:
                 matches.append(None)
                 continue
@@ -3628,7 +3692,11 @@ class SiteStore:
         matched_count = 0
         unmatched_count = 0
         created_history_count = 0
+        matched_prior_terminal_count = 0
+        changed_status_count = 0
+        missing_status_count = 0
         matched_job_ids: list[str] = []
+        matched_prior_terminal_job_ids: list[str] = []
         changed = False
 
         for raw in reviews:
@@ -3654,6 +3722,9 @@ class SiteStore:
                 status = "resumable"
             if not title and not url and not site_job_id:
                 continue
+            status_missing = not status or (status == "unknown" and not review_application_status)
+            if status_missing:
+                missing_status_count += 1
 
             review_row = {
                 "ts": checked_at,
@@ -3676,6 +3747,7 @@ class SiteStore:
                 by_match_key=by_match_key,
                 history_rows=history_rows,
             )
+            matched_existing_history = match_idx is not None
             matched_job_id = ""
             if match_idx is None:
                 created = self._build_application_review_history_row(
@@ -3700,6 +3772,11 @@ class SiteStore:
                 previous_status = str(current.get("application_review_status") or "").strip().lower()
                 previous_raw = re.sub(r"\s+", " ", str(current.get("application_review_status_raw") or "").strip())
                 previous_stage = self._normalize_review_stage(current.get("application_review_stage"))
+                matched_prior_terminal = matched_existing_history and self._review_history_is_terminal(
+                    status=previous_status,
+                    raw=previous_raw,
+                    stage=previous_stage,
+                )
                 status_changed = bool(
                     (previous_status and status and previous_status != status)
                     or (
@@ -3713,6 +3790,8 @@ class SiteStore:
                 review_row["previous_application_review_status_raw"] = previous_raw
                 review_row["previous_application_review_stage"] = previous_stage
                 review_row["application_review_status_changed"] = status_changed
+                review_row["matched_prior_terminal_history"] = matched_prior_terminal
+                review_row["application_review_status_missing"] = status_missing
                 if site_job_id:
                     current["site_job_id"] = site_job_id
                 current["application_review_status"] = status
@@ -3746,6 +3825,12 @@ class SiteStore:
                 if url:
                     current["application_review_url"] = url
                 matched_count += 1
+                if matched_prior_terminal:
+                    matched_prior_terminal_count += 1
+                    if matched_job_id:
+                        matched_prior_terminal_job_ids.append(matched_job_id)
+                if status_changed:
+                    changed_status_count += 1
                 if matched_job_id:
                     matched_job_ids.append(matched_job_id)
                 changed = True
@@ -3767,6 +3852,17 @@ class SiteStore:
             "unmatched_count": unmatched_count,
             "created_history_count": created_history_count,
             "matched_job_ids": matched_job_ids,
+            "matched_prior_terminal_count": matched_prior_terminal_count,
+            "matched_prior_terminal_job_ids": matched_prior_terminal_job_ids,
+            "changed_status_count": changed_status_count,
+            "missing_status_count": missing_status_count,
+            "all_rows_match_prior_terminal_history": bool(
+                recorded_count
+                and matched_prior_terminal_count == recorded_count
+                and not unmatched_count
+                and not changed_status_count
+                and not missing_status_count
+            ),
         }
 
     def append_job_features(self, site_id: str, features: list[dict[str, Any]], session_id: str, turn_id: str) -> None:

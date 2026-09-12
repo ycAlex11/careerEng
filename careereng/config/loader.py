@@ -9,6 +9,7 @@ from pathlib import Path
 from careereng.config.schema import (
     AgentConfig,
     AgentRecoveryConfig,
+    AgentNotificationsConfig,
     AppConfig,
     AuthConfig,
     BrowserConfig,
@@ -58,12 +59,18 @@ idle_timeout_seconds = 180
 max_resume_attempts = 2
 interrupt_ack_timeout_seconds = 15
 max_interrupt_attempts = 2
+probe_interval_seconds = 30
+failure_threshold = 3
+inflight_timeout_seconds = 300
+
+[agent.notifications]
+progress_interval_seconds = 60
+poll_interval_seconds = 60
 
 [browser]
 # provider: use the configured browser LLM API.
 # agent_bridge: keep CareerEng's Playwright MCP runtime and let an external agent such as Codex drive it.
-# codex_handoff is kept as a legacy alias for agent_bridge.
-# codex_app_server creates a Codex worker thread per active site work item.
+# native_agent prepares scoped work items for flat workers created by the Codex Desktop main Agent.
 execution_mode = "provider"
 headless = false
 keep_open = false
@@ -76,7 +83,7 @@ executable_path = ""
 mcp_port_start = 8931
 
 [execution]
-# Both transports may be available, but every runtime host selects exactly one.
+# Both execution paths may be available, but every runtime host selects exactly one.
 # CareerEng never changes this choice because a provider call fails or a Codex
 # worker is unavailable. Existing config files without this section continue to
 # derive the choice from browser.execution_mode.
@@ -363,10 +370,10 @@ def load_config(project_root: Path) -> AppConfig:
         agent = loaded.get("agent")
         if isinstance(agent, dict):
             for key, value in agent.items():
-                if key == "recovery" and isinstance(value, dict):
+                if key in {"recovery", "notifications"} and isinstance(value, dict):
                     for recovery_key, recovery_value in value.items():
-                        if recovery_key in payload["agent"]["recovery"]:
-                            payload["agent"]["recovery"][recovery_key] = recovery_value
+                        if recovery_key in payload["agent"][key]:
+                            payload["agent"][key][recovery_key] = recovery_value
                     continue
                 if key in payload["agent"]:
                     payload["agent"][key] = value
@@ -554,6 +561,7 @@ def load_config(project_root: Path) -> AppConfig:
             **{
                 **payload["agent"],
                 "recovery": AgentRecoveryConfig(**dict(payload["agent"].get("recovery") or {})),
+                "notifications": AgentNotificationsConfig(**dict(payload["agent"].get("notifications") or {})),
             }
         ),
         browser=BrowserConfig(

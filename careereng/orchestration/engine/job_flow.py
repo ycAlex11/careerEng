@@ -7,6 +7,7 @@ import json
 import re
 import threading
 import time
+from careereng.orchestration.worker_control.lifecycle import is_terminal_work
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ from careereng.evolution.work_items import ActionCardStore
 from careereng.evolution.work_items.schema import ACTION_CARD_CODEX_REVIEW
 from careereng.adapters.external_agents.contracts import (
     AGENT_BRIDGE_MODE,
-    CODEX_APP_SERVER_MODE,
+    NATIVE_AGENT_MODE,
     is_agent_bridge_reason,
     normalize_execution_mode,
 )
@@ -238,8 +239,6 @@ class JobFlow:
     def _compute_batch_status(self, batch: dict[str, Any]) -> str:
         if str(batch.get("status") or "") == "cancelled":
             return "cancelled"
-        if str(batch.get("status") or "") == "paused":
-            return "paused"
         sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
         rows = [row for row in sites.values() if isinstance(row, dict)]
         operation = self._normalize_operation(str(batch.get("operation") or ""))
@@ -920,7 +919,7 @@ class JobFlow:
         if continuation_context:
             intent_only = set(continuation_context) == {"run_intent"}
             execution_mode = normalize_execution_mode(str(getattr(self.browser_runner, "execution_mode", "") or ""))
-            if not intent_only or execution_mode in {AGENT_BRIDGE_MODE, CODEX_APP_SERVER_MODE}:
+            if not intent_only or execution_mode in {AGENT_BRIDGE_MODE, NATIVE_AGENT_MODE}:
                 run_kwargs["continuation_context"] = continuation_context
         result = self.browser_runner.run_site(**run_kwargs)
         if not self._phase_requires_auth_recovery(result):
@@ -969,7 +968,7 @@ class JobFlow:
         if continuation_context:
             intent_only = set(continuation_context) == {"run_intent"}
             execution_mode = normalize_execution_mode(str(getattr(self.browser_runner, "execution_mode", "") or ""))
-            if not intent_only or execution_mode in {AGENT_BRIDGE_MODE, CODEX_APP_SERVER_MODE}:
+            if not intent_only or execution_mode in {AGENT_BRIDGE_MODE, NATIVE_AGENT_MODE}:
                 recovery_kwargs["continuation_context"] = continuation_context
         return self.browser_runner.run_site(**recovery_kwargs)
 
@@ -3059,6 +3058,10 @@ class JobFlow:
         return self.run_batch(str(batch.get("batch_id") or ""))
 
     def pause_batch(self, *, batch_id: str, site_key: str = "") -> dict[str, Any]:
+        with self.job_store.batch_transaction(batch_id):
+            return self._pause_batch(batch_id=batch_id, site_key=site_key)
+
+    def _pause_batch(self, *, batch_id: str, site_key: str = "") -> dict[str, Any]:
         """Persist a user pause without turning it into a business outcome."""
 
         batch = self.job_store.load_batch(str(batch_id or ""))
@@ -3067,10 +3070,16 @@ class JobFlow:
         sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
         requested_site = str(site_key or "").strip()
         updated_sites: dict[str, dict[str, Any]] = {}
+        if requested_site and requested_site not in sites:
+            raise ValueError(f"site is not in batch: {requested_site}")
+        if is_terminal_work(str(batch.get("status") or "")):
+            return batch
         for key, row in sites.items():
             if not isinstance(row, dict):
                 continue
             if requested_site and key != requested_site:
+                continue
+            if is_terminal_work(str(row.get("status") or "")) or row.get("status") == "paused":
                 continue
             session = self.site_tools.site_store.load_browser_session(key)
             phase = str(row.get("current_phase") or session.get("agent_bridge_current_phase") or session.get("resume_phase") or "")
@@ -3103,15 +3112,12 @@ class JobFlow:
                     "last_known_url": current_url,
                 },
             )
-        if requested_site and not updated_sites:
-            raise ValueError(f"site is not in batch: {requested_site}")
         if not updated_sites:
-            raise ValueError("batch has no resumable sites")
+            return batch
         sites.update(updated_sites)
         batch["sites"] = sites
-        batch["status"] = "paused" if not requested_site else "running"
-        if requested_site:
-            batch["status"] = self._compute_batch_status(batch)
+        batch["status"] = "running"
+        batch["status"] = self._compute_batch_status(batch)
         saved = self.job_store.save_batch(batch)
         self.job_store.append_event(
             "batch.paused",

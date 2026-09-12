@@ -239,6 +239,7 @@ class JobPlanningStore:
             return {}
         if action == "skip_already_applied":
             return {
+                "application_evidence_source": "history_skip",
                 "job_id": job_id,
                 "application_status": "already_applied",
                 "apply_state": "terminal_already_applied",
@@ -246,6 +247,7 @@ class JobPlanningStore:
             }
         if action == "skip_submitted":
             return {
+                "application_evidence_source": "history_skip",
                 "job_id": job_id,
                 "application_status": "already_applied",
                 "apply_state": "terminal_already_applied",
@@ -448,6 +450,7 @@ class JobPlanningStore:
             "action": action,
             "reason": reason,
             "history_job_id": str(history.get("job_id") or ""),
+            "history_canonical_job_id": str(history.get("canonical_job_id") or ""),
             "history_application_status": application_status,
             "history_decision_status": decision_status,
             "history_apply_state": apply_state,

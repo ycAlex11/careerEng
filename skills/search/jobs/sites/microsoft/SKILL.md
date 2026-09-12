@@ -16,8 +16,8 @@ apply_enabled: true
 
 - Retrieve Microsoft roles from the current live Microsoft results page before any stop decision.
 - Microsoft often removes jobs that are no longer open, so keep the jobs returned by the current live listing for later filtering and decision-making.
-- Do not use time-based early-stop logic on Microsoft search results unless the active site skill is explicitly changed.
-- Move through visible Microsoft pagination sequentially and record each reachable page.
+- Inherit the project-level retrieval stop policy: after recording the full current page, stop when either the confirmed newest-first 30-day boundary is reached or two consecutive pages satisfy history coverage.
+- Move through visible Microsoft pagination sequentially only while no project-level stop condition has been met.
 
 ### Application Review Policy
 
@@ -223,10 +223,10 @@ apply_enabled: true
 - Do not let the previous page's selected detail panel, PID, or title stand in for the current page after pagination.
 - Do not leave the current Microsoft results page before that page has been recorded.
 - Do not move to the next Microsoft results page while the current visible page still has roles with missing concrete role links.
-- Continue through the Microsoft results pagination until the final reachable results page has been recorded.
+- Continue through Microsoft results pagination until the final reachable page or a project-level retrieval stop condition has been reached.
 - For Microsoft, move through the visible results pagination sequentially. Do not jump ahead by guessing page URLs, offsets, or hidden pagination targets from the total jobs count.
-- On Microsoft, do not declare the current results page finished just because a next-page control is not immediately visible after scrolling. If the live page still shows more jobs than the current recorded page could contain, re-check the real pagination region, results footer, or page label and continue until the final page is explicitly confirmed.
-- Do not use time-based early-stop logic on Microsoft search results.
+- On Microsoft, when no project-level stop condition has been met, do not declare the current results page finished just because a next-page control is not immediately visible after scrolling. If the live page still shows more jobs than the current recorded page could contain, re-check the real pagination region, results footer, or page label.
+- Apply the project-level 30-day and consecutive-history-page stopping rules after the full current Microsoft page has been recorded.
 - Microsoft often removes jobs that are no longer open, so keep the jobs returned by the current live Microsoft listing for later filtering and decision-making.
 
 ## Apply

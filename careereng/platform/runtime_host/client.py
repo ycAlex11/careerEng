@@ -116,11 +116,6 @@ class RuntimeHostClient:
 
         return self.request("agent_status", {"site_key": str(site_key or "")}, timeout=3.0)
 
-    def main_agent_registration_updated(self) -> dict[str, Any]:
-        """Ask a running host bridge to retry any durable pending attention events."""
-
-        return self.request("main_agent_registration_updated", timeout=3.0)
-
     @staticmethod
     def _validate_response(response: dict[str, Any]) -> None:
         remote_version = protocol_version_from(response)

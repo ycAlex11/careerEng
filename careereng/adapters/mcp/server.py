@@ -6,6 +6,7 @@ manager and phase-runtime capabilities without adding workflow strategy.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -22,6 +23,22 @@ from careereng.career.applications.site_modes import SITE_MODES
 from careereng.career.applications.site_store import SiteStore
 from careereng.platform.runtime_host import RUNTIME_HOST_PROTOCOL_VERSION, runtime_host_client, runtime_host_status
 from careereng.platform.project_state import AgentEventStore
+from careereng.platform.project_state.notifications import AgentNotificationStore
+from careereng.platform.sessions import SiteWorkerSessionStore
+from careereng.config.loader import load_config
+from careereng.orchestration.worker_control import (
+    BrowserResourcePolicy,
+    NativeWorkerControlSupervisor,
+    NativeWorkerRegistry,
+    WorkerActionStore,
+    WorkerActionKind,
+    WorkerCommandKind,
+    WorkerDesiredState,
+    WorkerLifecycleReconciler,
+    create_worker_action,
+    create_worker_command,
+    plan_worker_continuity,
+)
 from careereng.utils import make_id
 
 
@@ -48,6 +65,32 @@ class CareerEngMCPRuntime:
 
     def agent_events(self) -> AgentEventStore:
         return AgentEventStore(self.workspace)
+
+    def native_workers(self) -> NativeWorkerRegistry:
+        return NativeWorkerRegistry(self.workspace)
+
+    def worker_actions(self) -> WorkerActionStore:
+        return WorkerActionStore(self.workspace)
+
+    def worker_control(self) -> NativeWorkerControlSupervisor:
+        return NativeWorkerControlSupervisor(self.workspace)
+
+    def site_worker_sessions(self) -> SiteWorkerSessionStore:
+        return SiteWorkerSessionStore(self.workspace)
+
+    def site_run_threshold(self) -> int:
+        return max(1, int(load_config(self.project_root).evolution.batch_review.site_run_threshold or 5))
+
+    def monitor_policy(self) -> dict[str, Any]:
+        config = load_config(self.project_root).agent.notifications
+        return {
+            "progress_interval_seconds": config.progress_interval_seconds,
+            "poll_interval_seconds": config.poll_interval_seconds,
+            "urgent_bypass_progress_interval": True,
+            "delivery_mode": "desktop_poll",
+            "idle_wakeup_owner": "codex_desktop_heartbeat",
+            "worker_task_mode": "visible_desktop_task",
+        }
 
     def host_client(self):
         # The desktop adapter must never create a browser-owning process inside
@@ -196,12 +239,99 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             "Top-level tools are monitoring and lifecycle controls only. Browser and state "
             "execution is allowed only through careereng_work_item_* tools bound to one active "
             "worker item. Business judgment must stay in Skills, memory, evolution proposals, "
-            "and the LLM. Once CareerEng manages a job workflow, the main agent must use "
-            "CareerEng lifecycle and event tools instead of directly controlling its Codex "
-            "worker threads. Direct worker inspection is read-only and reserved for diagnosing "
-            "CareerEng infrastructure."
+            "and the LLM. The Codex Desktop main Agent is the only native worker supervisor: "
+            "it creates flat workers, executes CareerEng action plans with native Agent tools, "
+            "and writes receipts back to CareerEng. Workers never create or control other workers."
         ),
     )
+
+    def plan_worker_state(*, worker: dict[str, Any], desired_state: str, browser_policy: str) -> list[dict[str, Any]]:
+        normalized = WorkerDesiredState(str(desired_state))
+        updated = runtime.native_workers().update(
+            worker["work_item_id"],
+            desired_state=normalized.value,
+            browser_policy=BrowserResourcePolicy(str(browser_policy)).value,
+        )
+        command_kind = {
+            WorkerDesiredState.RUNNING: WorkerCommandKind.RESUME,
+            WorkerDesiredState.PAUSED: WorkerCommandKind.PAUSE,
+            WorkerDesiredState.CANCELLED: WorkerCommandKind.CANCEL,
+        }.get(normalized)
+        if command_kind is None:
+            actions = WorkerLifecycleReconciler().plan(updated, resource_policy=browser_policy)
+            return [runtime.worker_actions().enqueue(action).as_dict() for action in actions]
+        command = create_worker_command(
+            command_id=(
+                f"worker_command:{updated['work_item_id']}:{updated.get('control_epoch', 0)}:"
+                f"{normalized.value}:{browser_policy}"
+            ),
+            site_key=str(updated.get("site_key") or ""),
+            batch_id=str(updated.get("batch_id") or ""),
+            work_item_id=str(updated.get("work_item_id") or ""),
+            kind=command_kind,
+            expected_control_epoch=int(updated.get("control_epoch") or 0),
+        )
+        _, actions = runtime.worker_control().enqueue(command)
+        return [action.as_dict() for action in actions]
+
+    def workers_for_scope(*, batch_id: str, site_key: str = "") -> list[dict[str, Any]]:
+        records = {
+            str(row.get("work_item_id") or ""): row
+            for row in WorkItemStore(runtime.workspace).list_records(batch_id=batch_id)
+        }
+        workers = []
+        for row in runtime.native_workers().list(batch_id=batch_id):
+            if site_key and str(row.get("site_key") or "") != site_key:
+                continue
+            agent_id = str(row.get("agent_id") or "")
+            latest = runtime.native_workers().get(agent_id=agent_id) if agent_id else row
+            if latest.get("work_item_id") != row.get("work_item_id"):
+                continue
+            if row.get("work_state") in {"completed", "cancelled", "failed"} and row.get("runtime_state") in {"terminal", "detached"}:
+                continue
+            durable = records.get(str(row.get("work_item_id") or ""), {})
+            if durable:
+                terminal_state = str(durable.get("state") or "")
+                row = runtime.native_workers().update(
+                    str(row.get("work_item_id") or ""),
+                    control_epoch=int(durable.get("control_epoch") or 0),
+                    **({"work_state": terminal_state} if terminal_state in {"completed", "cancelled"} else {}),
+                )
+            workers.append(row)
+        return workers
+
+    def reconcile_worker_liveness() -> list[dict[str, Any]]:
+        recovery = load_config(runtime.project_root).agent.recovery
+        results = runtime.worker_control().reconcile_liveness(
+            idle_timeout_seconds=int(recovery.idle_timeout_seconds),
+            max_resume_attempts=int(recovery.max_resume_attempts),
+            interrupt_ack_timeout_seconds=int(recovery.interrupt_ack_timeout_seconds),
+            max_interrupt_attempts=int(recovery.max_interrupt_attempts),
+            probe_interval_seconds=int(recovery.probe_interval_seconds),
+            failure_threshold=int(recovery.failure_threshold),
+            inflight_timeout_seconds=int(recovery.inflight_timeout_seconds),
+        )
+        serialized = []
+        for result in results:
+            worker = dict(result.get("worker") or {})
+            actions = [row.as_dict() for row in result.get("actions") or []]
+            kind = str(result.get("kind") or "worker_liveness")
+            attention = "action_required" if kind in {"interrupt_unconfirmed", "recovery_exhausted"} else "notification"
+            event = runtime.agent_events().publish(
+                kind=f"worker.{kind}",
+                attention=attention,
+                summary=f"Worker liveness reconciliation reported {kind} for {worker.get('site_key') or worker.get('work_item_id')}.",
+                site_key=str(worker.get("site_key") or ""),
+                batch_id=str(worker.get("batch_id") or ""),
+                details={
+                    "work_item_id": str(worker.get("work_item_id") or ""),
+                    "agent_id": str(worker.get("agent_id") or ""),
+                    "action_ids": [row["action_id"] for row in actions],
+                },
+                dedupe_key=f"worker_liveness:{kind}:{worker.get('work_item_id')}:{worker.get('revision')}",
+            )
+            serialized.append({"kind": kind, "worker": worker, "actions": actions, "event": event})
+        return serialized
 
     @server.tool()
     def careereng_ping() -> dict[str, Any]:
@@ -223,6 +353,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
     def careereng_list_agent_events(
         cursor: str = "",
         site_key: str = "",
+        batch_id: str = "",
         include_notifications: bool = True,
         limit: int = 100,
     ) -> dict[str, Any]:
@@ -233,37 +364,331 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 consumer_id="codex_desktop",
                 cursor=cursor,
                 site_key=site_key,
+                batch_id=batch_id,
                 include_notifications=include_notifications,
                 limit=limit,
             ),
         }
 
     @server.tool()
-    def careereng_wait_agent_events(
+    async def careereng_wait_agent_events(
         cursor: str = "",
         site_key: str = "",
+        batch_id: str = "",
         include_notifications: bool = True,
         limit: int = 100,
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = 5.0,
     ) -> dict[str, Any]:
-        """Wait for durable main-agent events while the current Codex turn owns the thread."""
-        return {
-            "ok": True,
-            **runtime.agent_events().wait_events(
+        """Cancellably wait for durable events while the current main-Agent turn is active."""
+        reconcile_worker_liveness()
+        bounded_timeout = min(5.0, max(0.0, float(timeout_seconds or 0.0)))
+        event_store = runtime.agent_events()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + bounded_timeout
+        while True:
+            policy = runtime.monitor_policy()
+            notifications = AgentNotificationStore(runtime.workspace).plan(
+                progress_interval_seconds=policy["progress_interval_seconds"], site_key=site_key, batch_id=batch_id,
+            )
+            listed = event_store.list_events(
                 consumer_id="codex_desktop",
                 cursor=cursor,
                 site_key=site_key,
+                batch_id=batch_id,
                 include_notifications=include_notifications,
                 limit=limit,
-                timeout_seconds=timeout_seconds,
-            ),
+            )
+            if listed["events"] or notifications:
+                return {"ok": True, "max_wait_seconds": 5.0, "timed_out": False, **listed,
+                        "notifications": notifications, "monitor_policy": policy}
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return {"ok": True, "max_wait_seconds": 5.0, "timed_out": True, **listed,
+                        "notifications": [], "monitor_policy": policy}
+            await asyncio.sleep(min(0.25, remaining))
+
+    @server.tool()
+    async def careereng_monitor_agent_events(
+        cursor: str = "",
+        site_key: str = "",
+        batch_id: str = "",
+        include_notifications: bool = True,
+        limit: int = 100,
+        timeout_seconds: float = 5.0,
+    ) -> dict[str, Any]:
+        """Stable bounded monitor alias for Desktop supervisors."""
+        return await careereng_wait_agent_events(
+            cursor=cursor,
+            site_key=site_key,
+            batch_id=batch_id,
+            include_notifications=include_notifications,
+            limit=limit,
+            timeout_seconds=timeout_seconds,
+        )
+
+    @server.tool()
+    def careereng_list_worker_launch_specs(batch_id: str) -> dict[str, Any]:
+        """Return ordered actions for active work items and bounded child-task continuity."""
+        records = WorkItemStore(runtime.workspace).list_records(batch_id=batch_id, states={"active"})
+        specs = []
+        actions = []
+        for record in records:
+            work_item_id = str(record.get("work_item_id") or "")
+            existing = runtime.native_workers().get(work_item_id=work_item_id)
+            if not work_item_id or str(existing.get("agent_id") or ""):
+                continue
+            payload = _active_work_item_payload(runtime, work_item_id)
+            context = build_work_item_context(payload)
+            scope = context.get("scope") if isinstance(context.get("scope"), dict) else {}
+            worker_kind = "evolution" if str(scope.get("evolution_run_id") or "") else "site"
+            session_binding = None
+            continuity = None
+            previous_worker: dict[str, Any] = {}
+            if worker_kind == "site":
+                session_binding = runtime.site_worker_sessions().bind_batch(
+                    site_key=str(record.get("site_key") or ""),
+                    backend="native_agent",
+                    batch_id=str(record.get("batch_id") or ""),
+                    max_effective_batches=runtime.site_run_threshold(),
+                )
+                previous_worker = runtime.native_workers().latest_for_session(session_binding.worker_session_id)
+                continuity = plan_worker_continuity(
+                    bound_agent_id=session_binding.thread_id,
+                    previous_worker=previous_worker,
+                )
+                if continuity.replacement_reason and session_binding.thread_id:
+                    runtime.site_worker_sessions().quarantine_thread(
+                        worker_session_id=session_binding.worker_session_id,
+                        thread_id=session_binding.thread_id,
+                        reason=continuity.replacement_reason,
+                    )
+            spec = {
+                "work_item_id": work_item_id,
+                "site_key": str(record.get("site_key") or ""),
+                "batch_id": str(record.get("batch_id") or ""),
+                "worker_kind": worker_kind,
+                "worker_session_id": session_binding.worker_session_id if session_binding else "",
+                "continuity_mode": continuity.mode.value if continuity else "spawn",
+                "control_epoch": int(record.get("control_epoch") or 0),
+                "desktop_task": {"creation_tool": "create_thread", "visible": True,
+                                 "title": f"CareerEng {str(record.get('site_key') or '').title()} Worker",
+                                 "reuse_tool": "send_message_to_thread", "forbidden_tool": "spawn_agent"},
+                "prompt": (
+                    "You are a flat CareerEng worker owned by the Codex Desktop main Agent. "
+                    f"Call careereng_get_work_item_context with work_item_id={work_item_id}, "
+                    "follow its scoped capabilities and Skills, report every durable phase result through CareerEng, "
+                    "and report native state using only the declared enum values. While a turn is executing use "
+                    "runtime_state=running; after this work item finishes but this task remains reusable use "
+                    "runtime_state=suspended and work_state=completed; reserve runtime_state=terminal for an "
+                    "inaccessible or permanently closed task. "
+                    "and do not create or manage other agents."
+                ),
+            }
+            specs.append(spec)
+            worker = runtime.native_workers().plan(
+                work_item_id=work_item_id,
+                site_key=spec["site_key"],
+                batch_id=spec["batch_id"],
+                worker_kind=worker_kind,
+                control_epoch=spec["control_epoch"],
+                worker_session_id=spec["worker_session_id"],
+                agent_id=continuity.agent_id if continuity else "",
+                runtime_state=(
+                    str(previous_worker.get("runtime_state") or "running")
+                    if continuity and continuity.agent_id
+                    else "detached"
+                ),
+            )
+            planned_kinds = continuity.action_kinds if continuity else (WorkerActionKind.SPAWN,)
+            prerequisite_action_id = ""
+            for kind in planned_kinds:
+                action_payload = {
+                    "desktop_task": spec["desktop_task"],
+                    "worker_kind": worker_kind,
+                    "worker_session_id": spec["worker_session_id"],
+                    "worker_revision": worker["revision"],
+                }
+                if kind == WorkerActionKind.SPAWN:
+                    action_payload["prompt"] = spec["prompt"]
+                elif kind == WorkerActionKind.SEND:
+                    action_payload["message"] = spec["prompt"]
+                    if prerequisite_action_id:
+                        action_payload["depends_on_action_id"] = prerequisite_action_id
+                else:
+                    action_payload["reason"] = "cross_batch_continuity"
+                persisted = runtime.worker_actions().enqueue(
+                    create_worker_action(
+                        kind=kind,
+                        agent_id=str(worker.get("agent_id") or ""),
+                        work_item_id=work_item_id,
+                        site_key=spec["site_key"],
+                        batch_id=spec["batch_id"],
+                        control_epoch=spec["control_epoch"],
+                        payload=action_payload,
+                    )
+                )
+                prerequisite_action_id = persisted.action_id
+        actions = [row.as_dict() for row in runtime.worker_actions().pending(batch_id=batch_id)]
+        return {"ok": True, "batch_id": batch_id, "launch_specs": specs, "actions": actions,
+                "monitor_policy": runtime.monitor_policy()}
+
+    @server.tool()
+    def careereng_register_native_worker(
+        agent_id: str,
+        work_item_id: str,
+        batch_id: str,
+        site_key: str = "",
+        worker_kind: str = "site",
+        parent_agent_id: str = "",
+        control_epoch: int = 0,
+        worker_session_id: str = "",
+    ) -> dict[str, Any]:
+        """Bind one Desktop-native flat worker to its durable CareerEng work item."""
+        record = WorkItemStore(runtime.workspace).list_records(batch_id=batch_id)
+        scope = next((row for row in record if str(row.get("work_item_id") or "") == work_item_id), None)
+        if scope is None:
+            return {"ok": False, "error": "work item does not belong to the requested batch"}
+        resolved_site = str(scope.get("site_key") or "")
+        if site_key and site_key != resolved_site:
+            return {"ok": False, "error": "site key does not match the durable work item"}
+        try:
+            planned = runtime.native_workers().get(work_item_id=work_item_id)
+            resolved_session_id = str(worker_session_id or planned.get("worker_session_id") or "")
+            if worker_kind == "site" and not resolved_session_id:
+                resolved_session_id = runtime.site_worker_sessions().bind_batch(
+                    site_key=resolved_site,
+                    backend="native_agent",
+                    batch_id=batch_id,
+                    max_effective_batches=runtime.site_run_threshold(),
+                ).worker_session_id
+            worker = runtime.native_workers().register(
+                agent_id=agent_id, work_item_id=work_item_id, site_key=resolved_site,
+                batch_id=batch_id, worker_kind=worker_kind, parent_agent_id=parent_agent_id,
+                control_epoch=control_epoch or int(scope.get("control_epoch") or 0),
+                worker_session_id=resolved_session_id,
+            )
+            if worker_kind == "site" and resolved_session_id:
+                runtime.site_worker_sessions().bind_thread(
+                    worker_session_id=resolved_session_id,
+                    thread_id=agent_id,
+                    reason="native_agent_registered",
+                )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "worker": worker}
+
+    @server.tool()
+    def careereng_report_native_worker_state(
+        work_item_id: str,
+        runtime_state: Literal["detached", "starting", "running", "quiescing", "suspended", "terminal", "faulted"],
+        work_state: Literal["queued", "running", "waiting_user", "paused", "completed", "failed", "cancelled"],
+        expected_control_epoch: int,
+        browser_state: Literal["absent", "starting", "ready", "retained", "releasing", "lost"] | None = None,
+        error: str = "",
+        heartbeat: bool = True,
+    ) -> dict[str, Any]:
+        """Record observed worker state without interpreting site behavior."""
+        changes: dict[str, Any] = {
+            "runtime_state": runtime_state, "work_state": work_state,
+            "last_error": str(error or ""), "heartbeat": bool(heartbeat),
         }
+        changes["expected_control_epoch"] = expected_control_epoch
+        if heartbeat and runtime_state == "running":
+            changes["recovery_attempts"] = 0
+        if runtime_state in {"suspended", "terminal", "faulted"}:
+            changes["interrupt_ack_started_at"] = ""
+            changes["control_state"] = (
+                "waiting_user"
+                if work_state == "waiting_user"
+                else "paused"
+                if runtime_state == "suspended"
+                else "stopped"
+            )
+        if browser_state is not None:
+            changes["browser_state"] = browser_state
+        try:
+            worker = runtime.native_workers().update(work_item_id, **changes)
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        policy = str(worker.get("browser_policy") or BrowserResourcePolicy.UNCHANGED.value)
+        work_state = str(worker.get("work_state") or work_state)
+        actions = [
+            runtime.worker_actions().enqueue(action).as_dict()
+            for action in WorkerLifecycleReconciler().plan(worker, resource_policy=policy)
+        ]
+        actions.extend(action.as_dict() for action in runtime.worker_control().reconcile(work_item_id))
+        attention = "action_required" if work_state == "waiting_user" else "notification"
+        event = runtime.agent_events().publish(
+            kind=f"worker.{work_state}", attention=attention,
+            summary=f"{worker.get('site_key') or worker.get('worker_kind')} worker is {work_state}.",
+            site_key=str(worker.get("site_key") or ""), batch_id=str(worker.get("batch_id") or ""),
+            details={"work_item_id": work_item_id, "agent_id": str(worker.get("agent_id") or ""), "error": error},
+            dedupe_key=f"native-worker:{work_item_id}:{worker.get('revision')}:{work_state}",
+        )
+        return {"ok": True, "worker": worker, "event": event, "actions": actions}
+
+    @server.tool()
+    def careereng_set_worker_desired_state(
+        work_item_id: str,
+        desired_state: Literal["running", "paused", "cancelled", "completed"] | str,
+        browser_policy: Literal["unchanged", "retain", "release", "restore"] | str = "unchanged",
+    ) -> dict[str, Any]:
+        """Set desired lifecycle state and materialize supervisor-executable actions."""
+        try:
+            normalized = WorkerDesiredState(str(desired_state))
+            policy = BrowserResourcePolicy(str(browser_policy))
+            worker = runtime.native_workers().get(work_item_id=work_item_id)
+            if not worker:
+                raise KeyError(f"native worker not found: {work_item_id}")
+            persisted = plan_worker_state(
+                worker=worker,
+                desired_state=normalized.value,
+                browser_policy=policy.value,
+            )
+            worker = runtime.native_workers().get(work_item_id=work_item_id)
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "worker": worker, "actions": persisted}
+
+    @server.tool()
+    def careereng_list_worker_actions(batch_id: str = "", site_key: str = "") -> dict[str, Any]:
+        """List pending native actions for execution by the main-Agent supervisor."""
+        return {"ok": True, "actions": [row.as_dict() for row in runtime.worker_actions().pending(batch_id=batch_id, site_key=site_key)]}
+
+    @server.tool()
+    def careereng_ack_worker_action(action_id: str, applied: bool, error: str = "") -> dict[str, Any]:
+        """Persist the receipt for one native action executed by the main Agent."""
+        try:
+            action, command = runtime.worker_control().acknowledge(action_id, applied=applied, error=error)
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "action": action.as_dict(), "command": command.as_dict() if command else {}}
+
+    @server.tool()
+    def careereng_prepare_worker_action(action_id: str) -> dict[str, Any]:
+        """Revalidate and claim an action immediately before Desktop execution."""
+        try:
+            action = runtime.worker_control().prepare_action(action_id)
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "action": action.as_dict()}
 
     @server.tool()
     def careereng_ack_agent_events(cursor: str) -> dict[str, Any]:
         """Acknowledge agent events through a durable Desktop cursor."""
         try:
+            AgentNotificationStore(runtime.workspace).plan(
+                progress_interval_seconds=runtime.monitor_policy()["progress_interval_seconds"],
+            )
             return {"ok": True, **runtime.agent_events().acknowledge(consumer_id="codex_desktop", cursor=cursor)}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @server.tool()
+    def careereng_ack_notifications(delivery_id: str) -> dict[str, Any]:
+        """Acknowledge a notification only after presenting it to the user."""
+        try:
+            return {"ok": True, **AgentNotificationStore(runtime.workspace).acknowledge(delivery_id)}
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -277,25 +702,24 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             )
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
-        retry: dict[str, Any] = {}
-        try:
-            retry = runtime.host_client().main_agent_registration_updated()
-        except Exception:
-            # The registration is durable. A future host start retries pending
-            # events even when the current host is intentionally offline.
-            retry = {"deferred": True}
-        return {"ok": True, **registration, "delivery_retry": retry}
+        return {"ok": True, **registration}
 
     @server.tool()
     def careereng_get_main_agent_registration() -> dict[str, Any]:
         """Return the current workspace main-agent callback target."""
-        from careereng.adapters.codex import main_agent_delivery_health
-
         event_store = runtime.agent_events()
+        pending = event_store.list_events(
+            consumer_id=str(event_store.main_agent_registration().get("consumer_id") or "codex_desktop"),
+            limit=100,
+        )
         return {
             "ok": True,
             "registration": event_store.main_agent_registration(),
-            "delivery_health": main_agent_delivery_health(event_store),
+            "inbox_health": {
+                "pending_count": len(pending.get("events") or []),
+                "has_attention_required": bool(pending.get("has_attention_required")),
+                "next_cursor": str(pending.get("next_cursor") or ""),
+            },
         }
 
     @server.tool()
@@ -333,6 +757,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             "session_id": session_id,
             "batch": _compact_batch(batch, site_store=site_store),
             "active_sites": compact_sites,
+            "monitor_policy": runtime.monitor_policy(),
         }
 
     @server.tool()
@@ -459,7 +884,14 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         )
         if not bool(result.get("accepted")):
             return result
-        return result
+        return {
+            **result,
+            "supervisor_next": {
+                "monitor_tool": "careereng_monitor_agent_events",
+                "launch_tool": "careereng_list_worker_launch_specs",
+                "batch_id": str(result.get("batch_id") or ""),
+            },
+        }
 
     @server.tool()
     def careereng_resume_after_user_action(
@@ -472,7 +904,8 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         """Continue in place, or recover from a terminal batch checkpoint."""
         resume_message = str(message or "").strip() or f"{site_key} done"
         effective_command_id = str(command_id or make_id("worker_command"))
-        return runtime.host_client().request(
+        work_items = WorkItemStore(runtime.workspace)
+        result = runtime.host_client().request(
             "fresh_snapshot_resume",
             {
                 "session_id": session_id,
@@ -483,6 +916,31 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 "source_batch_id": str(source_batch_id or ""),
             },
         )
+        if not bool(result.get("accepted")):
+            return result
+        actions = []
+        resolved_batch_id = str(result.get("batch_id") or "")
+        active_records = {
+            str(record.get("work_item_id") or ""): record
+            for record in work_items.list_records(batch_id=resolved_batch_id, states={"active"})
+        } if resolved_batch_id else {}
+        for worker in runtime.native_workers().list(batch_id=resolved_batch_id, active_only=True):
+            if str(worker.get("site_key") or "") != site_key:
+                continue
+            record = active_records.get(str(worker.get("work_item_id") or ""))
+            if not record:
+                continue
+            worker = runtime.native_workers().update(
+                worker["work_item_id"], control_epoch=int(record.get("control_epoch") or 0),
+            )
+            actions.extend(
+                plan_worker_state(
+                    worker=worker,
+                    desired_state="running",
+                    browser_policy="restore",
+                )
+            )
+        return {**result, "actions": actions, "launch_required": not bool(actions)}
 
     @server.tool()
     def careereng_send_worker_command(
@@ -491,44 +949,69 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         interrupt_current_turn: bool = False,
         command_id: str = "",
     ) -> dict[str, Any]:
-        """Send guidance to a running worker, optionally redirecting it after interrupt acknowledgement."""
-
-        effective_command_id = str(command_id or make_id("worker_command"))
-        return runtime.host_client().request(
-            "worker_command",
-            {
-                "site_key": site_key,
-                "message": message,
-                "kind": "redirect" if interrupt_current_turn else "guidance",
-                "command_id": effective_command_id,
-            },
+        """Persist ordered worker intent and materialize it at a safe boundary."""
+        workers = [row for row in runtime.native_workers().list(active_only=True) if row.get("site_key") == site_key]
+        if not workers:
+            return {"ok": False, "error": f"no active native worker for site={site_key}"}
+        worker = workers[-1]
+        command = create_worker_command(
+            command_id=str(command_id or make_id("worker_command")),
+            site_key=site_key,
+            batch_id=str(worker.get("batch_id") or ""),
+            work_item_id=str(worker.get("work_item_id") or ""),
+            kind=WorkerCommandKind.REDIRECT if interrupt_current_turn else WorkerCommandKind.GUIDANCE,
+            message=message,
+            expected_control_epoch=int(worker.get("control_epoch") or 0),
         )
+        persisted, actions = runtime.worker_control().enqueue(command)
+        return {
+            "ok": True,
+            "command": persisted.as_dict(),
+            "actions": [row.as_dict() for row in actions],
+            "action": actions[0].as_dict() if actions else {},
+        }
 
     @server.tool()
     def careereng_pause_jobs_batch(batch_id: str, site_key: str = "") -> dict[str, Any]:
         """Pause a batch without converting its current site state into a blocker."""
-        return runtime.host_client().request(
+        result = runtime.host_client().request(
             "pause_jobs_batch",
             {"batch_id": batch_id, "site_key": site_key},
         )
+        if not result.get("ok"):
+            return result
+        actions = []
+        for worker in workers_for_scope(batch_id=batch_id, site_key=site_key):
+            actions.extend(plan_worker_state(worker=worker, desired_state="paused", browser_policy="retain"))
+        return {**result, "actions": actions}
 
     @server.tool()
     def careereng_pause_site(batch_id: str, site_key: str) -> dict[str, Any]:
         """Pause one site worker while retaining its browser runtime."""
-        return runtime.host_client().request("pause_site", {"batch_id": batch_id, "site_key": site_key})
+        return careereng_pause_jobs_batch(batch_id=batch_id, site_key=site_key)
 
     @server.tool()
     def careereng_stop_site(batch_id: str, site_key: str) -> dict[str, Any]:
         """Pause one site worker and release only its browser runtime."""
-        return runtime.host_client().request("stop_site", {"batch_id": batch_id, "site_key": site_key})
+        result = runtime.host_client().request("stop_site", {"batch_id": batch_id, "site_key": site_key})
+        if not result.get("ok"):
+            return result
+        actions = []
+        for worker in workers_for_scope(batch_id=batch_id, site_key=site_key):
+            actions.extend(plan_worker_state(worker=worker, desired_state="paused", browser_policy="release"))
+        return {**result, "actions": actions}
 
     @server.tool()
     def careereng_cancel_site(batch_id: str, site_key: str, reason: str = "user_requested_cancel") -> dict[str, Any]:
         """Cancel one site without cancelling other sites in the batch."""
-        return runtime.host_client().request(
+        result = runtime.host_client().request(
             "cancel_site",
             {"batch_id": batch_id, "site_key": site_key, "reason": reason},
         )
+        actions = []
+        for worker in workers_for_scope(batch_id=batch_id, site_key=site_key):
+            actions.extend(plan_worker_state(worker=worker, desired_state="cancelled", browser_policy="release"))
+        return {**result, "actions": actions}
 
     @server.tool()
     def careereng_set_site_mode(
@@ -564,10 +1047,15 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
     @server.tool()
     def careereng_cancel_jobs_batch(batch_id: str, reason: str = "user_requested_cancel") -> dict[str, Any]:
         """Cancel exactly one active batch and release only its site runtimes."""
-        return runtime.host_client().request(
+        workers = workers_for_scope(batch_id=batch_id)
+        result = runtime.host_client().request(
             "cancel_jobs_batch",
             {"batch_id": batch_id, "reason": reason},
         )
+        actions = []
+        for worker in workers:
+            actions.extend(plan_worker_state(worker=worker, desired_state="cancelled", browser_policy="release"))
+        return {**result, "actions": actions}
 
     @server.tool()
     def careereng_release_site(site_key: str) -> dict[str, Any]:

@@ -24,8 +24,10 @@ CACHE_READ_TOOL = "cache_read"
 CACHE_PROPOSE_TOOL = "cache_propose"
 CACHE_VALIDATE_TOOL = "cache_validate"
 RECORD_EVOLUTION_SIGNAL_TOOL = "record_evolution_signal"
+JOB_IDENTITY_TOOL = "job_identity"
 
 STATE_TOOL_NAMES = {
+    JOB_IDENTITY_TOOL,
     PHASE_RESULT_TOOL,
     RECORD_JOBS_TOOL,
     UPDATE_JOBS_TOOL,
@@ -38,6 +40,30 @@ STATE_TOOL_NAMES = {
     CACHE_VALIDATE_TOOL,
     RECORD_EVOLUTION_SIGNAL_TOOL,
 }
+
+
+def job_identity_tool_schema() -> dict[str, Any]:
+    return {
+        "type": "function", "name": JOB_IDENTITY_TOOL,
+        "description": "Inspect same-site history and reversible identity associations. Confirm equivalence only with evidence, or revoke an incorrect association. Does not change source records or frozen plans.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["inspect", "confirm", "revoke"]},
+                "offset": {"type": "integer", "minimum": 0},
+                "operation_id": {"type": "string"},
+                "expected_revision": {"type": "integer", "minimum": 0},
+                "target_job_id": {"type": "string"},
+                "association_id": {"type": "string"},
+                "evidence": {"type": "string"},
+                "jobs": {"type": "array", "items": {
+                    "type": "object", "properties": {field: {"type": "string"} for field in
+                        ("site_job_id", "url", "title", "location")}, "additionalProperties": False,
+                }},
+            },
+            "required": ["action"], "additionalProperties": False,
+        },
+    }
 
 
 def record_evolution_signal_tool_schema() -> dict[str, Any]:
@@ -456,6 +482,8 @@ class StateToolRegistry:
 DEFAULT_STATE_TOOL_REGISTRY = StateToolRegistry(
     (
         StateToolSpec(PHASE_RESULT_TOOL, phase_result_tool_schema),
+        StateToolSpec(JOB_IDENTITY_TOOL, job_identity_tool_schema,
+                      frozenset({"application_status_review", "job_retrieval", "apply"})),
         StateToolSpec(UPDATE_PHASE_MEMORY_TOOL, update_phase_memory_tool_schema, always_available=True),
         StateToolSpec(RECORD_EVOLUTION_SIGNAL_TOOL, record_evolution_signal_tool_schema, always_available=True),
         StateToolSpec(CACHE_LOOKUP_TOOL, cache_lookup_tool_schema, CACHE_TOOL_PHASES),

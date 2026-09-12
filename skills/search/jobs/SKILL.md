@@ -30,7 +30,7 @@ apply_candidate_policy:
 - When a site exposes relative posting age such as `Posted 13 Days Ago`, record the exact visible label and treat it as an observation made at the current run time; future runs should recompute the current posting age from the observation time instead of assuming the old label is still current.
 - When a site exposes an absolute posting date, record the absolute date and still preserve the visible label when available.
 - Treat `Posted 30+ Days Ago` or similar `+` labels as lower-bound ages, not exact dates.
-- Treat posted-date / posted-age rules as apply-candidate eligibility first unless the active site skill defines a stronger newest-first stop rule.
+- Treat posted-date / posted-age rules as both apply-candidate eligibility and a pagination stop when newest-first order is confirmed. If the fully recorded current page contains any role aged `30 days`, `30+ days`, or older, stop after recording that entire page.
 - Combine project retrieval stop conditions and site retrieval stop conditions with OR: stop retrieval when any safe stop condition is met.
 - If a page contains existing history matches, still preserve any new or incomplete-history jobs from that page before stopping.
 
@@ -38,6 +38,14 @@ apply_candidate_policy:
 
 - Exclude `intern`, `internship`, `campus`, `student`, `graduate`, `new-grad`, `new graduate`, `co-op`, `校招`, and `实习`.
 - Exclude remote-only roles when the site exposes a reliable work-site or remote filter.
+
+### Cross-phase Job Identity
+
+- Exact source identities are reused automatically. If review and retrieval IDs differ but evidence suggests the same requisition, inspect `job_identity` history before finalizing retrieval. Compare title, location, source URL and visible identifiers; title or a shared numeric prefix alone is not proof.
+- Use `job_identity` confirm with the inspected revision, a stable operation_id, the existing target_job_id, source observations and supporting evidence. Prefer the history record carrying the confirmed application outcome. Keep uncertain records distinct; do not invent an association or return to earlier phases to investigate it.
+- If an apply-list URL reveals an already submitted application under another identity, persist that association and update this job's live outcome. Do not rebuild or extend the frozen apply list. Future history reads reuse the association.
+- Revoke incorrect associations with evidence before correcting them. Associations do not overwrite original submitted/rejected history.
+- Report historical skips, live already-applied confirmations and actual form attempts separately; a skipped row is not a form attempt.
 
 ## Matching Policy
 
@@ -203,8 +211,10 @@ Realtime areas are the live source of current applications. Inspect and record e
 Historical areas may stop early using retrieval-like coverage:
 - Always inspect the current historical page before clicking `Next`, a page number, `Show more`, `Load more`, or any equivalent pagination control.
 - Record the current visible page before deciding whether to continue.
+- Treat the first recorded historical page as the baseline page. History coverage alone must not stop on that first page when a real second page is available; inspect the second page as the minimum confirmation page.
 - If the current historical page produces unmatched rows, changed statuses, missing status details, or rows that are not covered by local terminal history, continue to the next historical page when a real pagination control is available.
-- If the current historical page is mostly or entirely already matched to local terminal history, has no unmatched rows, and has no visible status changes, then treat later pages as already covered and stop that historical area.
+- Starting with the second recorded historical page, if every visible row is matched to local terminal history, no row is unmatched, no status is missing, and no status changed, treat later pages as already covered and stop that historical area immediately.
+- If the second page does not satisfy that confirmation rule, continue page by page and stop on the first later recorded page that does. Never continue past a qualifying confirmation page.
 - "Covered" does not mean merely retrieved before. It means the local history/review data already has the same application or site job with a terminal/no-longer-current status such as `inactive`, `rejected`, `closed`, or `withdrawn`, or the just-recorded review matched existing terminal history without changes.
 - If the page order is not clearly newest-first, or the meaning of the visible date is unreliable, do not use date or coverage to stop early. Continue until pagination is exhausted or the site skill gives a safer stop rule.
 
@@ -414,7 +424,9 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - Treat `existing_needs_enrichment` as feedback only in retrieval. Do not open job detail pages just to enrich JD text, decide fit, or compensate for incomplete history.
 - If the current list page exposes missing lightweight fields such as a visible job id, location, or posted label, include them in `record_jobs`; otherwise continue retrieval with the stable URL and title.
 - JD/description enrichment, fit scoring, and application decisions belong to `apply`, not `job_retrieval`.
-- If `record_jobs` returns `stop_recommended = true`, finish retrieval after updating phase memory unless the current site skill has a stricter still-unmet stop condition.
+- Treat `stop_recommended = true` as one history-coverage confirmation page, not as permission to stop by itself.
+- For history-match stopping, require two consecutively recorded pages whose `record_jobs` results both return `stop_recommended = true`. The first qualifying page starts the confirmation streak; record the next real page before deciding to stop.
+- After the second consecutive qualifying page has been recorded and phase memory updated, finish retrieval. Reset the confirmation streak whenever a recorded page returns `stop_recommended = false`.
 - If `record_jobs` returns `stop_recommended = false`, continue or stop only according to the active site/project retrieval stop conditions.
 
 ### Carry-Forward Usage
@@ -446,7 +458,7 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 ### Pagination
 
 - After recording the current page, check the current site-specific stop condition.
-- Also check the project history match stop condition from the `record_jobs` result: if the current page reaches the configured operation-success history threshold, stop pagination after the required confirmation behavior.
+- Also check the project history-match stop condition from consecutive `record_jobs` results: stop only after two adjacent recorded pages both reach the configured operation-success history threshold.
 - If the current site skill defines a date, page, posted-age, or other retrieval stop condition, combine it with the project history match stop condition using OR: stop when any one stop condition is satisfied.
 - If no stop condition is triggered and a real next-page / next-results / load-more action is available, continue to the next results page and repeat.
 - Use only a real visible pagination control, next-page control, or load-more action from the live page. Do not guess or synthesize pagination URLs.

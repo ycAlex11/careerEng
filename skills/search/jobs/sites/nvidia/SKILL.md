@@ -27,8 +27,8 @@ apply_candidate_policy:
 
 - NVIDIA roles should be retrieved from the current filtered Workday listing before any stop decision.
 - NVIDIA's preferred apply-candidate window is roles posted within the last 30 days, interpreted as posted age `0-29`.
-- Treat the 30-day posted-age rule as apply-candidate eligibility, not as an immediate pagination stop.
-- Stop retrieval only after the current page has been recorded and a safe newest-first, no-next-page, or no-results stop condition is met.
+- Inherit the project-level retrieval stop policy: after recording the full current page, stop when either the confirmed newest-first 30-day boundary is reached or two consecutive pages satisfy history coverage.
+- Continue pagination only while no project-level stop condition has been met and a real next-page action remains available.
 
 ### Application Review Policy
 
@@ -99,7 +99,8 @@ apply_candidate_policy:
 - If the current page contains any row before `2026-04-10`, the current area is complete after any in-window rows on that page have been recorded. Do not paginate that area.
 - If all visible rows on the current page are on or after `2026-04-10`, the current page has been recorded, and a `Next` control is available for the current area, use `Next` once to inspect the next page.
 - When `Active` is complete, click `Inactive` exactly once.
-- Treat NVIDIA `Inactive` as a historical area: after recording a visible Inactive page, stop paging Inactive when the page is already covered by matched terminal local history, has no unmatched rows, and shows no status changes.
+- Treat NVIDIA `Inactive` as the project-level historical area. Record page one as the baseline, inspect page two as the minimum confirmation page, and from page two onward stop immediately on the first page whose rows are all matched to terminal local history with no unmatched rows, missing statuses, or status changes.
+- Do not continue to a third or later Inactive page after the current recorded page satisfies the project-level history confirmation rule.
 - When `Inactive` is complete, immediately finish `Application Status Review` with `phase_result done`.
 - An empty NVIDIA tab, such as `Active (0)` or `Inactive (0)`, counts as complete.
 - For each recorded NVIDIA row, include the job title, the best available job or application URL, the visible Workday requisition/job id such as `JR...` as `site_job_id`, and the normalized `application_review_status`.
@@ -173,14 +174,11 @@ apply_candidate_policy:
 - Do not open a single NVIDIA job detail before the current NVIDIA results page has been recorded.
 - Retrieve NVIDIA jobs from the current live listing and keep the retrieved results for later filtering and decision-making.
 - For NVIDIA, only keep roles posted within the last 30 days for application consideration, interpreted as posted age `0-29`.
-- Treat the 30-day posted-age rule as apply-candidate eligibility, not as an immediate pagination stop.
-- If a visible NVIDIA role is marked 30 days old, `30+ Days Ago`, or older, record it when it is part of the current visible page, but do not keep it as an apply candidate.
-- Do not stop retrieval only because one or a few visible roles on the current page are older than 30 days.
+- If a visible NVIDIA role is marked 30 days old, `30+ Days Ago`, or older, record the full current page, exclude that old role from apply candidates, and stop pagination when newest-first order is confirmed.
 - If the live NVIDIA page still shows result signals such as page labels, visible job cards, or pagination but the current attempt returns zero jobs, capture a fresh snapshot and retry the same current results page once before stopping or paginating.
 - Treat `Posted 30 Days Ago`, `Posted 30+ Days Ago`, or any larger age signal as an old-role signal.
-- After `record_jobs` succeeds for the current NVIDIA page, continue to the next page when the current page contains any role within the last 30 days or any `new` history match and a real next-page control is available.
-- Stop NVIDIA retrieval only after the current page has been recorded and one of these is true: the current visible page has no roles within the last 30 days on a clearly newest-first listing, or there is no real next-page / load-more control.
-- If the current page mixes within-window and older roles, record the full page and then continue pagination when a real next-page control is available.
+- After `record_jobs` succeeds for the current NVIDIA page, apply the project-level OR stop conditions before using a real next-page control.
+- If the current page mixes within-window and older roles on a confirmed newest-first listing, record the full page and then stop; do not paginate beyond the 30-day boundary.
 
 ## Apply
 
@@ -198,8 +196,10 @@ apply_candidate_policy:
 
 ### Form Filling
 
-- For every NVIDIA job in the current batch, if the live `Start Your Application` dialog offers `Use My Last Application`, select that path. This applies to the first NVIDIA apply target too.
-- Do not select `Autofill with Resume` or `Apply Manually` while `Use My Last Application` is visible and enabled. Use `Autofill with Resume` only when `Use My Last Application` is absent or unavailable.
+- When current batch context, phase memory, or durable NVIDIA application evidence confirms that the staged resume version has not changed since the most recent successful NVIDIA application, always select `Use My Last Application`. This applies to every NVIDIA apply target, including the first target in a batch.
+- Do not choose `Autofill with Resume` or upload the staged PDF when unchanged-resume evidence is available and `Use My Last Application` is offered.
+- When the staged resume version changed, or unchanged status cannot be confirmed, use `Autofill with Resume` and the current batch's staged PDF instead of `Use My Last Application`.
+- Do not infer that the resume is unchanged merely because `Use My Last Application` is visible. Resume-version evidence must come from CareerEng context or a previously confirmed NVIDIA resume filename/version.
 - After choosing `Use My Last Application`, inspect `My Experience`, `Resume/CV`, or the visible resume summary before continuing past that section.
 - Do not click the `Resume/CV` dropzone, upload area, or `Select files` control just to inspect the current resume. On Workday, those controls may immediately open a file chooser and cause an unnecessary upload.
 - Compare the visible resume file name on the live page with the staged resume basename from the current apply context.

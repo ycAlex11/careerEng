@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -67,6 +68,14 @@ class PhaseStateToolContext:
 def execute_state_tool(tool_name: str, arguments: dict[str, Any] | None, context: PhaseStateToolContext) -> dict[str, Any]:
     normalized = normalize_tool_name(tool_name)
     args = arguments if isinstance(arguments, dict) else {}
+    if normalized == "job_identity":
+        try:
+            result = context.site_store.job_identity(context.site_key, args)
+            return {"isError": False, "structuredContent": result,
+                    "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
+        except (ValueError, TypeError) as exc:
+            return {"isError": True, "error": str(exc),
+                    "content": [{"type": "text", "text": str(exc)}]}
     if normalized == PHASE_RESULT_TOOL:
         payload = phase_result_payload(args)
         structured = payload.get("structuredContent") if isinstance(payload.get("structuredContent"), dict) else {}
@@ -566,6 +575,8 @@ def _update_jobs_payload(*, context: PhaseStateToolContext, arguments: dict[str,
         existing_rows = {}
     for job in jobs:
         job_id = str(job.get("job_id") or "").strip()
+        if str(job.get("application_status") or "") in {"submitted", "already_applied", "apply_failed", "blocked"}:
+            job["application_evidence_source"] = "live_worker"
         validation_error = validate_ranking_pending_update({**dict(existing_rows.get(job_id) or {}), **job})
         if validation_error:
             return {
@@ -631,12 +642,26 @@ def _record_application_reviews_payload(*, context: PhaseStateToolContext, argum
     matched_count = int(summary.get("matched_count") or 0) if isinstance(summary, dict) else 0
     unmatched_count = int(summary.get("unmatched_count") or 0) if isinstance(summary, dict) else 0
     created_history_count = int(summary.get("created_history_count") or 0) if isinstance(summary, dict) else 0
+    matched_prior_terminal_count = (
+        int(summary.get("matched_prior_terminal_count") or 0) if isinstance(summary, dict) else 0
+    )
+    changed_status_count = int(summary.get("changed_status_count") or 0) if isinstance(summary, dict) else 0
+    missing_status_count = int(summary.get("missing_status_count") or 0) if isinstance(summary, dict) else 0
     matched_job_ids = summary.get("matched_job_ids") if isinstance(summary, dict) else []
+    matched_prior_terminal_job_ids = (
+        summary.get("matched_prior_terminal_job_ids") if isinstance(summary, dict) else []
+    )
     if not isinstance(matched_job_ids, list):
         matched_job_ids = []
+    if not isinstance(matched_prior_terminal_job_ids, list):
+        matched_prior_terminal_job_ids = []
     text = f"Recorded {recorded_count} application reviews ({matched_count} matched history, {unmatched_count} unmatched)."
     if created_history_count:
         text += f" Created {created_history_count} minimal history row(s)."
+    text += (
+        f" Prior terminal coverage: {matched_prior_terminal_count}; "
+        f"changed statuses: {changed_status_count}; missing statuses: {missing_status_count}."
+    )
     return {
         "isError": False,
         "structuredContent": {
@@ -645,6 +670,15 @@ def _record_application_reviews_payload(*, context: PhaseStateToolContext, argum
             "unmatched_count": unmatched_count,
             "created_history_count": created_history_count,
             "matched_job_ids": [str(job_id) for job_id in matched_job_ids if str(job_id).strip()],
+            "matched_prior_terminal_count": matched_prior_terminal_count,
+            "matched_prior_terminal_job_ids": [
+                str(job_id) for job_id in matched_prior_terminal_job_ids if str(job_id).strip()
+            ],
+            "changed_status_count": changed_status_count,
+            "missing_status_count": missing_status_count,
+            "all_rows_match_prior_terminal_history": bool(
+                summary.get("all_rows_match_prior_terminal_history") if isinstance(summary, dict) else False
+            ),
         },
         "content": [{"type": "text", "text": text}],
     }

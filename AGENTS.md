@@ -126,6 +126,15 @@ python -m careereng taskboard archive
 
 ## Assistant Bridge
 
+### Codex Desktop Worker Contract
+
+- User-authorized site runs use visible, independently openable Codex Desktop tasks, like `CareerEng Microsoft Worker`. Obtain CareerEng launch specifications first, then use Desktop `create_thread` for a new task or the specified existing task for continuity. Do not substitute `spawn_agent`, hidden subagents, another App Server, or a temporary MCP bridge. If host/tool policy prevents visible task creation, report the limitation instead of substituting silently.
+- Register the returned task ID, parent task ID, work item, worker session, and control epoch through CareerEng. Execute only current CareerEng actions, revalidate with `careereng_prepare_worker_action` immediately before execution, and record receipts. If a lifecycle operation is unavailable in Desktop, report that limitation rather than claiming it was executed.
+- New run and continuation are different user intents. A new run preserves historical dedupe but never restores the previous Apply List. Reusing a visible task is not restoring its previous batch.
+- Before ending a supervising turn, ensure a user-authorized Desktop heartbeat monitors the current batch in the main task. Read `monitor_policy` from CareerEng, reuse/update the existing monitor, and persist the local read cursor. No new monitor is needed for an already completed batch. Do not promise automatic push from CareerEng or rely on a child's final notification as the event inbox.
+- Consume control events independently of user notification cadence. Present only due `notifications`, then acknowledge their `delivery_id`; raw event acknowledgements do not mean the user was notified. Never advance a shared cursor over unseen other-site events.
+- During a read-only liveness probe, inspect current execution evidence. A task labelled active or a healthy Runtime Host is not proof that its worker is progressing. Do not repeatedly refresh a heartbeat from the same observation. Do not interrupt a demonstrably active workflow merely because a probe was requested.
+
 Use the assistant bridge before guessing commands:
 
 ```bash

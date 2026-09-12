@@ -356,13 +356,8 @@ def activate_browser_agent_evolution_solution(
     proposal_output_path: str,
     evidence_pack: str = "",
     solution_status: str = "waiting_solution",
-) -> None:
-    """Make an already-created evolution request the next turn of one worker.
-
-    The browser work item keeps its stable identity and retained Codex thread.
-    This only refreshes its context so the generic worker coordinator starts a
-    follow-up turn after the current browser turn completes.
-    """
+) -> str:
+    """Create a sibling evolution work item for the Desktop supervisor."""
 
     payload = read_json(Path(payload_path))
     session_payload = read_json(Path(phase_session_path))
@@ -377,10 +372,32 @@ def activate_browser_agent_evolution_solution(
     }
     if not request["run_id"] or not request["solution_request"] or not request["proposal_output_path"]:
         raise ValueError("evolution solution handoff requires run_id and artifact paths")
+    previous_work_item_id = str(payload.get("work_order_id") or payload.get("handoff_id") or "").strip()
+    target_payload_path = Path(payload_path)
+    target_session_path = Path(phase_session_path)
+    if workspace is not None:
+        site_key = str(payload.get("site_key") or "").strip()
+        if not site_key:
+            raise ValueError("evolution solution handoff requires site_key")
+        evolution_root = ensure_dir(Path(workspace) / "agent_bridge" / "evolution" / site_key / request["run_id"])
+        target_payload_path = evolution_root / "payload.json"
+        target_session_path = evolution_root / "phase_session.json"
+        existing = read_json(target_payload_path)
+        existing_request = existing.get("evolution_solution") if isinstance(existing.get("evolution_solution"), dict) else {}
+        existing_work_item_id = str(existing.get("work_order_id") or existing.get("handoff_id") or "").strip()
+        if existing_work_item_id and str(existing_request.get("run_id") or "") == request["run_id"]:
+            WorkItemStore(workspace).register(target_payload_path, event="evolution_solution_refreshed")
+            return existing_work_item_id
+    evolution_work_item_id = make_id("agent_bridge")
     now = now_iso()
-    for row in (payload, session_payload):
+    evolution_payload = dict(payload)
+    evolution_session = dict(session_payload)
+    for row in (evolution_payload, evolution_session):
         row.update(
             {
+                "work_order_id": evolution_work_item_id,
+                "handoff_id": evolution_work_item_id,
+                "previous_work_item_id": previous_work_item_id,
                 "updated_at": now,
                 "context_revision": int(row.get("context_revision") or 0) + 1,
                 "worker_state": "active",
@@ -391,10 +408,23 @@ def activate_browser_agent_evolution_solution(
                 "evolution_solution": request,
             }
         )
-    write_json(Path(payload_path), payload)
-    write_json(Path(phase_session_path), session_payload)
+    write_json(target_payload_path, evolution_payload)
+    write_json(target_session_path, evolution_session)
     if workspace is not None:
-        WorkItemStore(workspace).register(payload_path, event="evolution_solution_activated")
+        if previous_work_item_id:
+            try:
+                WorkItemStore(workspace).transition(
+                    previous_work_item_id,
+                    state="completed",
+                    event="evolution_worker_succeeded",
+                )
+            except ValueError:
+                pass
+        WorkItemStore(workspace).register(target_payload_path, event="evolution_solution_activated")
+    else:
+        write_json(Path(payload_path), evolution_payload)
+        write_json(Path(phase_session_path), evolution_session)
+    return evolution_work_item_id
 
 
 def persist_browser_agent_phase_memory(

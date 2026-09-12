@@ -113,6 +113,9 @@ def apply_probe_counters(rows: list[dict[str, Any]]) -> dict[str, int]:
         "form_successful": 0,
         "form_unsuccessful": 0,
         "apply_path_attempted": 0,
+        "history_skipped": 0,
+        "live_already_applied": 0,
+        "already_applied_unattributed": 0,
         "submitted": 0,
         "already_applied": 0,
         "filtered_out": 0,
@@ -125,11 +128,19 @@ def apply_probe_counters(rows: list[dict[str, Any]]) -> dict[str, int]:
             continue
         decision_status = _normalized(row.get("decision_status"))
         application_status = _normalized(row.get("application_status"))
+        source = _normalized(row.get("application_evidence_source"))
+        if source == "history_skip":
+            counts["history_skipped"] += 1
         if decision_status == "filtered_out" or application_status == "filtered_out":
             counts["filtered_out"] += 1
         if application_status == "already_applied":
             counts["already_applied"] += 1
-        if application_status in {"submitted", "apply_failed", "blocked", "already_applied"}:
+            if source == "live_worker":
+                counts["live_already_applied"] += 1
+            elif source != "history_skip":
+                counts["already_applied_unattributed"] += 1
+        if source != "history_skip" and (application_status in {"submitted", "apply_failed", "blocked"}
+                                        or (application_status == "already_applied" and source == "live_worker")):
             counts["apply_path_attempted"] += 1
         if application_status == "submitted":
             counts["submitted"] += 1

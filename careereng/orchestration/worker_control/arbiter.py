@@ -41,12 +41,17 @@ class WorkerCommandArbiter:
                 WorkerCommandAction.INTERRUPT if has_turn else WorkerCommandAction.TERMINATE,
                 "pause waits for the current turn boundary",
             )
-        if turn_start_inflight or worker_status in {"starting", "pausing"}:
+        if turn_start_inflight or worker_status in {"starting", "quiescing"}:
             return WorkerCommandDecision(WorkerCommandAction.QUEUE, "worker control transition is in flight")
         if recovery_pending and command.kind != WorkerCommandKind.RECOVERY:
             return WorkerCommandDecision(WorkerCommandAction.QUEUE, "user command owns the pending recovery boundary")
         if command.kind == WorkerCommandKind.RECOVERY and recovery_pending:
             return WorkerCommandDecision(WorkerCommandAction.QUEUE, "recovery is already pending")
+        if command.kind == WorkerCommandKind.RECOVERY:
+            return WorkerCommandDecision(
+                WorkerCommandAction.INTERRUPT if has_turn else WorkerCommandAction.START,
+                "recovery replaces an unresponsive turn from durable state",
+            )
         if command.kind == WorkerCommandKind.REDIRECT:
             return WorkerCommandDecision(
                 WorkerCommandAction.INTERRUPT if has_turn else WorkerCommandAction.START,
