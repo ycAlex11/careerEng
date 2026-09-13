@@ -11,6 +11,7 @@ from careereng.utils import ensure_dir, make_id, now_iso, read_json, write_json
 from .registry import NativeWorkerRegistry
 from .lifecycle import is_terminal_work
 from .liveness import obsolete_recovery
+from .scheduling import execution_admitted
 from careereng.platform.persistence.mutex import workspace_mutex
 
 
@@ -143,6 +144,8 @@ class WorkerActionStore:
             if statuses[row.action_id] == WorkerActionStatus.PENDING
             and (not batch_id or row.batch_id == batch_id)
             and (not site_key or row.site_key == site_key)
+            and (row.kind not in {WorkerActionKind.SPAWN, WorkerActionKind.SEND, WorkerActionKind.RESUME}
+                 or execution_admitted(registry.get(work_item_id=row.work_item_id)))
             and (
                 not str(row.payload.get("depends_on_action_id") or "")
                 or statuses.get(str(row.payload.get("depends_on_action_id") or "")) == WorkerActionStatus.APPLIED

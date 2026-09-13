@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 
-RUNTIME_HOST_PROTOCOL_VERSION = "2026-09-12.1"
+RUNTIME_HOST_PROTOCOL_VERSION = "2026-09-13.1"
 RUNTIME_HOST_PROTOCOL_FIELD = "runtime_host_protocol_version"
 RUNTIME_HOST_NAME = "careereng_runtime_host"
 

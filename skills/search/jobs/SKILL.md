@@ -19,6 +19,40 @@ apply_candidate_policy:
 
 # Search Jobs Skill
 
+## Waiting And Capacity Policy
+
+The site worker, not the main Agent, judges whether its own wait should retain
+or release execution capacity. Use these defaults with live evidence; they are
+guidance rather than rigid classifications:
+
+| Situation | Default recommendation |
+| --- | --- |
+| User login, verification code, or missing information; work can continue once supplied | Notify the user; retain the concurrency slot and browser. |
+| Persistent network or external-service failure with uncertain recovery time | Report the blocker; release the slot and preserve the recovery checkpoint. |
+| Brief loading or an occasional failure | Retry within existing limits; do not immediately request user assistance. |
+| Unknown cause or repeated unsuccessful recovery | Report evidence and uncertainty, request help, and explicitly recommend whether to retain or release the slot. |
+
+- Save current progress in phase memory, then record `phase_result` as
+  `waiting_user` for resumable waits. A wait must not complete or restart a phase.
+- For a native Desktop worker, follow that phase report with
+  `careereng_report_native_worker_state`: `work_state=waiting_user`, current
+  `expected_control_epoch`, and `wait_decision` containing four nonempty strings:
+  `slot_policy` (`retain` or `release`), `reason`, `evidence`, `resume_condition`.
+  Explain any deviation from the defaults in `reason`; do not guess another
+  site's priority or choose which worker runs next.
+- Before reporting release, finish outstanding browser/state calls and cease
+  business execution; report `runtime_state=suspended`. Releasing a slot does
+  not cancel the work item, erase its Apply List, or close its browser. Browser
+  retention/release is a separate resource operation; do not claim it closed
+  without confirmation.
+- Send the urgent notification through the existing CareerEng relay. Never
+  treat ordinary polling cadence as a reason to delay asking for user input.
+- After user assistance, use CareerEng's resume flow. If the slot was released,
+  wait for admission instead of running immediately. Resume the saved current
+  phase/item; do not return to completed phases or rebuild the frozen Apply List.
+- Reuse existing retry/recovery limits and phase memory. This policy introduces
+  no new timer or loop-detection mechanism; ordinary user waits are not failures.
+
 ## Site Policy
 
 ### Retrieval Policy

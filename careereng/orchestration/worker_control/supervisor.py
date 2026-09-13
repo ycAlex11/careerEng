@@ -12,6 +12,7 @@ from .inbox import WorkerCommandInbox
 from .registry import NativeWorkerRegistry
 from .lifecycle import is_terminal_work
 from .liveness import has_recent_activity, obsolete_recovery
+from .scheduling import execution_admitted
 from careereng.platform.persistence.mutex import workspace_mutex
 from careereng.utils import now_iso
 
@@ -245,6 +246,9 @@ class NativeWorkerControlSupervisor:
         with workspace_mutex(self.registry.path):
             pending = {row.action_id: row for row in self.actions.pending()}
             existing = self.actions.get(action_id)
+            worker = self.registry.get(work_item_id=existing.work_item_id)
+            if existing.kind in {WorkerActionKind.SPAWN, WorkerActionKind.SEND, WorkerActionKind.RESUME} and not execution_admitted(worker):
+                raise ValueError("worker is waiting or queued for execution capacity")
             if existing.status == WorkerActionStatus.CLAIMED:
                 return existing
             if action_id not in pending:

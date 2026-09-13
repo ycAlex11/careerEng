@@ -24,8 +24,10 @@ from careereng.career.applications.site_store import SiteStore
 from careereng.platform.runtime_host import RUNTIME_HOST_PROTOCOL_VERSION, runtime_host_client, runtime_host_status
 from careereng.platform.project_state import AgentEventStore
 from careereng.platform.project_state.notifications import AgentNotificationStore
+from careereng.platform.project_state.urgent_relay import UrgentNotificationRelay
 from careereng.platform.sessions import SiteWorkerSessionStore
 from careereng.config.loader import load_config
+from careereng.orchestration.worker_control.scheduling import SiteCapacityScheduler, execution_admitted
 from careereng.orchestration.worker_control import (
     BrowserResourcePolicy,
     NativeWorkerControlSupervisor,
@@ -75,6 +77,9 @@ class CareerEngMCPRuntime:
     def worker_control(self) -> NativeWorkerControlSupervisor:
         return NativeWorkerControlSupervisor(self.workspace)
 
+    def site_scheduler(self) -> SiteCapacityScheduler:
+        return SiteCapacityScheduler(self.workspace, limit=load_config(self.project_root).agent.site_parallelism)
+
     def site_worker_sessions(self) -> SiteWorkerSessionStore:
         return SiteWorkerSessionStore(self.workspace)
 
@@ -87,7 +92,9 @@ class CareerEngMCPRuntime:
             "progress_interval_seconds": config.progress_interval_seconds,
             "poll_interval_seconds": config.poll_interval_seconds,
             "urgent_bypass_progress_interval": True,
-            "delivery_mode": "desktop_poll",
+            "delivery_mode": "worker_relay_with_polling_fallback",
+            "urgent_relay_tool": "careereng_claim_urgent_notification",
+            "urgent_transport_tool": "send_message_to_thread",
             "idle_wakeup_owner": "codex_desktop_heartbeat",
             "worker_task_mode": "visible_desktop_task",
         }
@@ -252,6 +259,9 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             desired_state=normalized.value,
             browser_policy=BrowserResourcePolicy(str(browser_policy)).value,
         )
+        if normalized == WorkerDesiredState.RUNNING:
+            updated = runtime.site_scheduler().resume(worker["work_item_id"])
+        runtime.site_scheduler().reconcile()
         command_kind = {
             WorkerDesiredState.RUNNING: WorkerCommandKind.RESUME,
             WorkerDesiredState.PAUSED: WorkerCommandKind.PAUSE,
@@ -270,6 +280,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             work_item_id=str(updated.get("work_item_id") or ""),
             kind=command_kind,
             expected_control_epoch=int(updated.get("control_epoch") or 0),
+            message=str((updated.get("launch_spec") or {}).get("prompt") or "") if command_kind == WorkerCommandKind.RESUME else "",
         )
         _, actions = runtime.worker_control().enqueue(command)
         return [action.as_dict() for action in actions]
@@ -301,6 +312,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         return workers
 
     def reconcile_worker_liveness() -> list[dict[str, Any]]:
+        runtime.site_scheduler().reconcile()
         recovery = load_config(runtime.project_root).agent.recovery
         results = runtime.worker_control().reconcile_liveness(
             idle_timeout_seconds=int(recovery.idle_timeout_seconds),
@@ -435,6 +447,10 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         for record in records:
             work_item_id = str(record.get("work_item_id") or "")
             existing = runtime.native_workers().get(work_item_id=work_item_id)
+            if existing.get("launch_spec"):
+                if not existing.get("agent_id"):
+                    specs.append(existing["launch_spec"])
+                continue
             if not work_item_id or str(existing.get("agent_id") or ""):
                 continue
             payload = _active_work_item_payload(runtime, work_item_id)
@@ -481,7 +497,17 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                     "runtime_state=running; after this work item finishes but this task remains reusable use "
                     "runtime_state=suspended and work_state=completed; reserve runtime_state=terminal for an "
                     "inaccessible or permanently closed task. "
-                    "and do not create or manage other agents."
+                    "Follow the shared jobs Skill's Waiting And Capacity Policy. After recording a waiting phase, "
+                    "report native waiting_user state with wait_decision containing slot_policy (retain/release), "
+                    "reason, evidence and resume_condition. Release only after finishing browser operations; "
+                    "report runtime_state=suspended. Waiting does not implicitly release capacity. "
+                    "Do not create or manage other agents. After reporting waiting_user, failure, "
+                    "or completion, call careereng_claim_urgent_notification with this work item "
+                    "and its current control epoch. If send_required, call Desktop "
+                    "send_message_to_thread with the returned target/message, then record the "
+                    "transport result using careereng_record_urgent_notification_send. "
+                    "Do not acknowledge user presentation yourself or bypass CareerEng. "
+                    "If unavailable or failed, leave events pending for polling; do not busy-loop."
                 ),
             }
             specs.append(spec)
@@ -499,6 +525,8 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                     else "detached"
                 ),
             )
+            worker = runtime.site_scheduler().enroll(work_item_id)
+            runtime.native_workers().update(work_item_id, launch_spec=spec)
             planned_kinds = continuity.action_kinds if continuity else (WorkerActionKind.SPAWN,)
             prerequisite_action_id = ""
             for kind in planned_kinds:
@@ -528,8 +556,11 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                     )
                 )
                 prerequisite_action_id = persisted.action_id
+        scheduling = runtime.site_scheduler().reconcile()
+        specs = [spec for spec in specs if execution_admitted(runtime.native_workers().get(work_item_id=spec["work_item_id"]))]
         actions = [row.as_dict() for row in runtime.worker_actions().pending(batch_id=batch_id)]
         return {"ok": True, "batch_id": batch_id, "launch_specs": specs, "actions": actions,
+                "scheduling": scheduling,
                 "monitor_policy": runtime.monitor_policy()}
 
     @server.tool()
@@ -553,6 +584,12 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             return {"ok": False, "error": "site key does not match the durable work item"}
         try:
             planned = runtime.native_workers().get(work_item_id=work_item_id)
+            if not planned or planned.get("worker_kind") != worker_kind:
+                raise ValueError("worker kind must match the CareerEng launch plan")
+            if worker_kind == "site" and not planned.get("slot_state"):
+                raise ValueError("obtain admitted worker launch specs before registration")
+            if not execution_admitted(planned):
+                raise ValueError("worker has not been admitted by the capacity scheduler")
             resolved_session_id = str(worker_session_id or planned.get("worker_session_id") or "")
             if worker_kind == "site" and not resolved_session_id:
                 resolved_session_id = runtime.site_worker_sessions().bind_batch(
@@ -586,6 +623,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         browser_state: Literal["absent", "starting", "ready", "retained", "releasing", "lost"] | None = None,
         error: str = "",
         heartbeat: bool = True,
+        wait_decision: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Record observed worker state without interpreting site behavior."""
         changes: dict[str, Any] = {
@@ -607,7 +645,9 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         if browser_state is not None:
             changes["browser_state"] = browser_state
         try:
-            worker = runtime.native_workers().update(work_item_id, **changes)
+            worker = runtime.site_scheduler().report(work_item_id, changes=changes, decision=wait_decision)
+            scheduling = runtime.site_scheduler().reconcile()
+            worker = runtime.native_workers().get(work_item_id=work_item_id)
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
         policy = str(worker.get("browser_policy") or BrowserResourcePolicy.UNCHANGED.value)
@@ -622,10 +662,41 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             kind=f"worker.{work_state}", attention=attention,
             summary=f"{worker.get('site_key') or worker.get('worker_kind')} worker is {work_state}.",
             site_key=str(worker.get("site_key") or ""), batch_id=str(worker.get("batch_id") or ""),
-            details={"work_item_id": work_item_id, "agent_id": str(worker.get("agent_id") or ""), "error": error},
+            details={"work_item_id": work_item_id, "agent_id": str(worker.get("agent_id") or ""), "error": error,
+                     "wait_decision": dict(worker.get("wait_decision") or {})},
             dedupe_key=f"native-worker:{work_item_id}:{worker.get('revision')}:{work_state}",
         )
-        return {"ok": True, "worker": worker, "event": event, "actions": actions}
+        return {"ok": True, "worker": worker, "event": event, "actions": actions,
+                "scheduling": scheduling,
+                "notification_policy": runtime.monitor_policy()}
+
+    @server.tool()
+    def careereng_claim_urgent_notification(work_item_id: str, expected_control_epoch: int) -> dict[str, Any]:
+        """Claim a durable urgent signal; the worker sends it with Desktop send_message_to_thread."""
+        registry = runtime.native_workers()
+        try:
+            with registry._lock:
+                worker = registry.get(work_item_id=work_item_id)
+                if not worker:
+                    raise ValueError("worker binding required")
+                return {"ok": True, **UrgentNotificationRelay(runtime.workspace).claim(
+                    worker=worker, expected_control_epoch=expected_control_epoch,
+                    progress_interval_seconds=runtime.monitor_policy()["progress_interval_seconds"],
+                )}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @server.tool()
+    def careereng_record_urgent_notification_send(
+        work_item_id: str, attempt_id: str, accepted: bool, error: str = "",
+    ) -> dict[str, Any]:
+        """Record transport acceptance or failure, never user presentation or worker liveness."""
+        try:
+            return {"ok": True, **UrgentNotificationRelay(runtime.workspace).receipt(
+                work_item_id=work_item_id, attempt_id=attempt_id, accepted=accepted, error=error,
+            )}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
 
     @server.tool()
     def careereng_set_worker_desired_state(
@@ -640,6 +711,8 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             worker = runtime.native_workers().get(work_item_id=work_item_id)
             if not worker:
                 raise KeyError(f"native worker not found: {work_item_id}")
+            if normalized == WorkerDesiredState.RUNNING and worker.get("slot_state") and worker.get("work_state") in {"waiting_user", "paused"}:
+                raise ValueError("use careereng_resume_after_user_action to resume with a new work-item lease")
             persisted = plan_worker_state(
                 worker=worker,
                 desired_state=normalized.value,
@@ -653,7 +726,8 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
     @server.tool()
     def careereng_list_worker_actions(batch_id: str = "", site_key: str = "") -> dict[str, Any]:
         """List pending native actions for execution by the main-Agent supervisor."""
-        return {"ok": True, "actions": [row.as_dict() for row in runtime.worker_actions().pending(batch_id=batch_id, site_key=site_key)]}
+        scheduling = runtime.site_scheduler().reconcile()
+        return {"ok": True, "scheduling": scheduling, "actions": [row.as_dict() for row in runtime.worker_actions().pending(batch_id=batch_id, site_key=site_key)]}
 
     @server.tool()
     def careereng_ack_worker_action(action_id: str, applied: bool, error: str = "") -> dict[str, Any]:
@@ -668,6 +742,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
     def careereng_prepare_worker_action(action_id: str) -> dict[str, Any]:
         """Revalidate and claim an action immediately before Desktop execution."""
         try:
+            runtime.site_scheduler().reconcile()
             action = runtime.worker_control().prepare_action(action_id)
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
@@ -779,7 +854,11 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             status="ok",
             context_catalog_size=len(context.get("context_catalog") or []),
         )
-        return {"ok": True, **context}
+        worker = runtime.native_workers().get(work_item_id=work_item_id)
+        return {"ok": True, **context, "notification_policy": runtime.monitor_policy(),
+                "scheduling": {"slot_state": worker.get("slot_state", ""),
+                               "execution_admitted": execution_admitted(worker),
+                               "wait_decision": worker.get("wait_decision", {})}}
 
     @server.tool()
     def careereng_read_work_item_resource(
@@ -940,7 +1019,10 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                     browser_policy="restore",
                 )
             )
-        return {**result, "actions": actions, "launch_required": not bool(actions)}
+        scheduling = runtime.site_scheduler().reconcile()
+        return {**result, "actions": actions, "scheduling": scheduling,
+                "launch_required": not any(runtime.native_workers().get(work_item_id=work_id)
+                                           for work_id in active_records)}
 
     @server.tool()
     def careereng_send_worker_command(
@@ -1191,13 +1273,14 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         apply_target_job_id: str = "",
     ) -> dict[str, Any]:
         """Write the terminal result of exactly one active worker phase."""
-        return careereng_work_item_call_state_tool(
+        result = careereng_work_item_call_state_tool(
             work_item_id=work_item_id,
             context_revision=context_revision,
             tool_name="phase_result",
             arguments={"status": status, "summary": summary},
             apply_target_job_id=apply_target_job_id,
         )
+        return {**result, "notification_policy": runtime.monitor_policy()}
 
     @server.tool()
     def careereng_complete_evolution_solution(work_item_id: str, run_id: str) -> dict[str, Any]:

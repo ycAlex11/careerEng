@@ -98,7 +98,7 @@ cd /Users/alexlee/Desktop/gh/careerEng
 Do not search for its socket, invent another launch command, start a second host, directly launch another browser runtime, or switch to a provider backend when host access fails. If `careereng_runtime_host_status` reports a permission error, report that error; it does not prove the host is stopped.
 
 1. Use `careereng_get_context` to inspect the active batch and target site before changing its execution state.
-2. Multiple sites may run concurrently up to `agent.site_parallelism`. A paused, login-required, or CAPTCHA-required site does not block the other sites.
+2. Multiple sites may run concurrently up to `agent.site_parallelism`. Native launch and resume share CareerEng's durable capacity queue. A user-waiting site retains its reserved slot unless its worker explicitly reports a release decision; siblings may use other available slots.
 3. When the user completes a browser-only step, continue the same target site from its retained page and durable state. Do not restart unrelated sites or create another host.
 4. The configured execution backend is fixed for a running host. Do not switch between provider and Codex execution during a run.
 5. Use site-scoped pause, stop, or cancel when changing one worker. These commands revoke that work item's execution lease and do not stop sibling sites in the batch.
@@ -113,7 +113,7 @@ Do not search for its socket, invent another launch command, start a second host
 14. External network/provider/service/browser-process interruptions enter checkpoint recovery and notification only. They do not trigger evolution unless later evidence explicitly diagnoses a CareerEng-internal defect.
 15. After CareerEng accepts a job workflow, control its Codex workers only through CareerEng. Do not use Codex thread messaging, interruption, resume, or termination tools directly. Infrastructure diagnosis may inspect an underlying worker read-only; all state changes still go through CareerEng.
 16. While the current main-agent turn is monitoring active work, call `careereng_wait_agent_events` with the last observed cursor. Handle returned events and acknowledge only the cursor actually processed. If user input interrupts the wait, read the durable inbox first on the next CareerEng turn.
-17. CareerEng does not run the old App Server push/retry bridge. While active, the main task consumes the bounded wait interface; while idle, a user-authorized Desktop heartbeat wakes it to poll. A child's completion notification is separate and does not consume CareerEng events.
+17. CareerEng does not run the old App Server push/retry bridge. Urgent notifications use the worker-mediated relay described below; periodic Desktop heartbeat polling remains the fallback. A child's completion notification is separate and does not consume CareerEng events.
 
 ### Visible Desktop Launch And Monitoring
 
@@ -122,6 +122,13 @@ Do not search for its socket, invent another launch command, start a second host
 3. Obtain `careereng_list_worker_launch_specs`. Its `desktop_task` contract requires a visible Desktop task, not `spawn_agent`. For a new task, use Desktop `create_thread`, following its project/environment rules, with the supplied work-item prompt and a clear company title. For reuse, use the returned existing task ID; do not guess another task by site name.
 4. Register the resulting ID and current main task ID through `careereng_register_native_worker`, including session ID and control epoch, and acknowledge the actual launch action. Confirm the task is accessible; expose its returned task link. Do not claim an action succeeded merely because a plan exists.
 5. Before executing subsequent lifecycle actions, call `careereng_prepare_worker_action`. It rejects obsolete activity/epoch/binding plans. A `probe` is read-only task inspection, not interruption. Fresh tool/phase evidence can be reported through the state tool; an unchanged active label cannot be used to manufacture heartbeats. If Desktop lacks the required control operation, record a failed receipt and report it, without switching transports.
+   Launch specs expose only admitted work; `scheduling.queued` is not permission
+   to start a task. Re-read launch specs/actions when capacity changes. Do not
+   manually free a login-waiting site's slot. The shared jobs Skill guides the
+   child to report `wait_decision` (slot_policy, reason, evidence, resume_condition)
+   through its native state report. Released work remains resumable and rejoins
+   the FIFO queue through the explicit batch/site resume entry. Browser resources
+   and slot ownership are separate; retaining a page does not authorize execution.
 6. Read `monitor_policy` from context, launch specs, or monitor results. While supervising, poll the durable inbox with the explicit current `batch_id` and process control actions irrespective of notification timing. Before ending the turn, create/update a user-authorized Desktop heartbeat for this main task using `poll_interval_seconds`; never hard-code the user's progress interval as the liveness interval. Re-read the policy on each wake and update that same automation when its interval changes.
 7. Render due `notifications` as compact summaries, then call `careereng_ack_notifications(delivery_id)`. Do not acknowledge before presentation. Repeated delivery is possible until acknowledged. Notification aggregation is durable and independent of the raw control-event cursor. Never summarize every raw phase event immediately, which bypasses throttling.
 8. With a site filter, retain a local cursor at the last inspected event without globally acknowledging unseen other-site events. Without a filter, acknowledge the actual processed global cursor. Retain the local cursor and pending notification receipts across heartbeat wakes.
@@ -137,11 +144,36 @@ poll_interval_seconds = 60
 
 Set `progress_interval_seconds` to 300 or 600 for five- or ten-minute ordinary
 progress summaries. Quiet periods produce no notification. Attention, failures,
-and completion bypass progress batching but are delivered on the next actual
-poll, subject to Desktop scheduler/provider latency; this is not instant push.
-Keep polling frequent for controls even when progress summaries are infrequent.
+and completion bypass progress batching and can use the urgent worker relay.
+When that transport is unavailable, they remain pending until an actual poll.
+Polling follows the configured cadence, not a hard-coded one-minute wakeup.
 `poll_interval_seconds` is a positive whole number of minutes in seconds.
 This configuration never changes the separate `[agent.recovery]` limits.
+
+### Urgent Worker Relay
+
+Register the actual parent task for every worker, including reused tasks. After
+persisting a waiting-user, failure, or completion result, the worker calls
+`careereng_claim_urgent_notification(work_item_id, expected_control_epoch)`.
+For `send_required`, use Desktop `send_message_to_thread` with the returned
+target/message, then call `careereng_record_urgent_notification_send` with the
+attempt ID and actual transport outcome. Do not call the presentation ACK from
+the worker. Never use an unsupported/private Desktop transport as a substitute.
+
+Claims are leased for 120 seconds. Failed sends become retryable after 30 seconds;
+accepted but unacknowledged sends after 300 seconds. A pending event set permits
+at most three attempts; a new urgent event permits a fresh attempt. These are
+transport retry bounds, not the user's polling cadence. Respect returned retry
+times, never busy-loop, and allow periodic polling to drain outstanding events
+when the child cannot continue. There is no independent background push daemon.
+
+The main task consumes a signal by reading the indicated batch/site inbox,
+presenting pending notifications, and acknowledging their delivery IDs. A signal
+does not authorize resume or application operations. Transport acceptance does
+not prove execution, user visibility, or durable Desktop queueing while busy.
+Busy/idle behavior of the Desktop tool is a live-validation requirement, not an
+assumption. The existing local polling interval is configured to 300 seconds;
+do not hard-code that value or reactivate a paused monitor during development.
 
 For direct lifecycle commands, see `docs/assistant_bridge/COMMANDS.md`.
 

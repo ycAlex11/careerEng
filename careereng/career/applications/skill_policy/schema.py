@@ -13,6 +13,7 @@ SITE_POLICY_SECTION = "Site Policy"
 MATCHING_POLICY_SECTION = "Matching Policy"
 
 GLOBAL_SECTION_INJECTIONS: dict[str, set[str]] = {
+    "Waiting And Capacity Policy": {"*"},
     SITE_POLICY_SECTION: {"job_filtering", "job_retrieval", "apply", "application_status_review"},
     MATCHING_POLICY_SECTION: {"job_filtering", "apply"},
 }

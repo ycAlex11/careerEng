@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from careereng.orchestration.worker_control.scheduling import execution_admitted
+
 import hashlib
 import json
 import os
@@ -276,6 +278,8 @@ class RuntimeHostService:
                     "phase": str(browser.get("agent_bridge_current_phase") or browser.get("resume_phase") or ""),
                     "worker_status": worker_status,
                     "scheduler_state": str(worker.get("runtime_state") or ""),
+                    "slot_state": str(worker.get("slot_state") or ""),
+                    "wait_decision": dict(worker.get("wait_decision") or {}),
                     "thread_id": str(worker.get("agent_id") or ""),
                     "turn_id": "",
                     "batch_id": str(worker.get("batch_id") or ""),
@@ -881,6 +885,13 @@ class RuntimeHostService:
                 terminal_batch_id = batch_id
                 phase_result_status = phase_status
                 phase_result_batch_id = batch_id
+                if phase_status in {"waiting_user", "blocked"} and not tool_payload.get("isError"):
+                    registry = NativeWorkerRegistry(self.workspace)
+                    native_id = str(work_item_record.get("work_item_id") or "")
+                    native = registry.get(work_item_id=native_id)
+                    if native.get("slot_state"):
+                        registry.update(native_id, expected_control_epoch=int(work_item_record.get("control_epoch") or 0),
+                                        work_state="waiting_user")
                 record_progress = getattr(getattr(self.loop, "job_flow", None), "record_external_phase_progress", None)
                 if batch_id and phase_status and callable(record_progress):
                     result = {
@@ -1061,6 +1072,9 @@ class RuntimeHostService:
         if not all((fence.work_item_id, fence.site_key, fence.batch_id, fence.control_epoch, fence.site_revision)):
             raise ValueError("agent bridge request has incomplete work-item fencing")
         record = WorkItemStore(self.workspace).validate_fence(fence)
+        worker = NativeWorkerRegistry(self.workspace).get(work_item_id=fence.work_item_id)
+        if not execution_admitted(worker):
+            raise ValueError("native worker is waiting or queued for execution capacity")
         if "context_revision" in payload:
             expected_context_revision = int(payload.get("context_revision") or 0)
             if expected_context_revision <= 0:
@@ -1663,7 +1677,7 @@ class RuntimeHostService:
         )
 
     def _retract_effective_site_run(self, *, site_key: str, batch_id: str) -> None:
-        """Retract a counted site run after orchestration cancels its batch."""
+        """Retract unfinished site runs without undoing completed siblings."""
 
         normalized_site = str(site_key or "").strip()
         normalized_batch = str(batch_id or "").strip()
@@ -1674,6 +1688,11 @@ class RuntimeHostService:
         if job_store is None:
             return
         batch = job_store.load_batch(normalized_batch)
+        sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
+        site = sites.get(normalized_site) if isinstance(sites.get(normalized_site), dict) else {}
+        apply = site.get("apply") if isinstance(site.get("apply"), dict) else {}
+        if str(site.get("status") or "") == "completed" and str(apply.get("status") or "") not in {"blocked", "failed"}:
+            return
         run_id = self._effective_site_run_id(batch, site_key=normalized_site, batch_id=normalized_batch)
         evidence = self._site_worker_sessions.site_evidence(normalized_site)
         for session in evidence.get("sessions", []):

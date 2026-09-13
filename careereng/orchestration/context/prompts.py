@@ -109,7 +109,7 @@ def extract_phase_sections(markdown: str) -> dict[str, str]:
 def _global_section_texts(sections: dict[str, str], slug: str) -> list[str]:
     parts: list[str] = []
     for title, target_slugs in GLOBAL_SECTION_INJECTIONS.items():
-        if slug not in target_slugs:
+        if "*" not in target_slugs and slug not in target_slugs:
             continue
         text = str(sections.get(title) or "").strip()
         if text:

@@ -11,6 +11,21 @@ code during migration, not a reason to extend the old boundaries.
 
 ## Identity And Lifecycle Reconciliation
 
+`orchestration/worker_control/scheduling.py` owns native site execution capacity.
+Waiting state is independent from slot ownership and retained browser resources.
+The shared jobs Skill guides workers to report a reason, evidence, retain/release
+decision and resume condition; Python validates the contract, not the reason's
+business meaning. The Skill section is globally injected into every business
+phase, including session preparation, through the shared prompt composition
+schema; it is not an executable phase itself. Slot reservations and FIFO queue order live in the existing
+native worker registry, under its cross-process lock. Launch and resume share
+the configured workspace-wide `agent.site_parallelism` limit; admission reuses
+`SiteWorkItemScheduler` for FIFO and same-site exclusion. Released waits
+retain their work item/checkpoint and only rejoin the queue on explicit resume.
+Action preparation and host execution enforce admission; listing a task is not
+permission to execute it. Missing decisions never implicitly release capacity.
+No new no-progress or loop-detection policy is introduced by this change.
+
 `career/applications/identity_links.py` owns reversible, site-scoped identity
 associations under `workspace/jobs/identity_links/`. Workers decide equivalence
 from evidence through the scoped `job_identity` state tool. Python validates
@@ -372,8 +387,8 @@ or site failure.
 
 ## Main-Agent Events And Live Status
 
-Concurrent site workers never write directly into the Codex Desktop
-conversation. They report lifecycle facts through CareerEng. The shared event
+Concurrent site workers report lifecycle facts through CareerEng before sending
+a claimed urgent relay signal to the registered main Desktop task. The shared event
 store persists a compact, append-only main-agent inbox at
 `workspace/agent_events/events.jsonl`; Desktop maintains its own acknowledgement
 cursor there. This persistence is authoritative, so a Desktop restart or a
@@ -407,8 +422,20 @@ projection and it does not replace durable events.
 `careereng_register_main_agent` persists the main task identity; it does not
 start an App Server callback. The old `adapters/codex/main_agent_bridge.py`
 transport is removed. An active main task polls; a user-authorized Desktop
-heartbeat wakes an idle main task to poll. Child completion notifications are
+heartbeat wakes an idle main task to poll. A claimed urgent worker relay may
+additionally notify the main task through Desktop tools. Child completion notifications are
 not a substitute for this durable inbox.
+
+Urgent worker-to-main delivery uses a worker-mediated Desktop relay. CareerEng
+offers a bounded, leased notification with an opaque attempt ID and the registered
+parent task. The worker calls the existing Desktop `send_message_to_thread` tool;
+CareerEng never connects to private Desktop pipes or starts another App Server.
+Transport acceptance is not presentation acknowledgement. Failed or expired
+attempts leave notifications pending for bounded retry and periodic polling.
+Only the main task presents and acknowledges notification delivery IDs. Busy/idle
+Desktop delivery semantics require live validation; the relay does not promise
+instant execution or infer receipt from a successful transport call.
+This notification path never changes site scheduling or concurrency ownership.
 
 `platform/project_state/notifications.py` owns a separate durable aggregation
 projection with offered notification IDs and presentation acknowledgements.
@@ -416,8 +443,8 @@ Ordinary phase events are grouped per batch/site using
 `agent.notifications.progress_interval_seconds`; urgent attention, failures,
 and completion bypass that interval. Raw control events are never throttled.
 The Desktop heartbeat reads `poll_interval_seconds` from MCP `monitor_policy`,
-independently of progress batching and recovery timing. Urgent delivery means
-the next actual poll, not instantaneous push. Pending notification data survives
+independently of progress batching and recovery timing. Failed or unavailable
+worker relays fall back to the next actual poll, not instantaneous push. Pending notification data survives
 raw event acknowledgement, restart, and a change to the configured interval.
 
 CareerEng uses one main-agent controller per workspace and any number of
@@ -774,8 +801,10 @@ stranded between states.
 If a native worker ends while its work item is still active, CareerEng records
 the observed mismatch and emits a recovery action instead of pretending the
 site completed. Exhausted recovery parks the same durable work item in
-`waiting_user`, releases its scheduler slot, and leaves the current phase and
-item unchanged. A user continuation reissues that item with a new control
+`waiting_user` and leaves the current phase and item unchanged. Waiting alone
+does not release its reserved slot: an explicit worker decision does, or a
+confirmed pause/cancellation/terminal result settles ownership. A user
+continuation reissues that item with a new control
 epoch; a stale worker cannot regain access after recovery, phase refresh,
 pause, cancellation, or release because each accepted state or context change
 advances the site revision.

@@ -64,6 +64,10 @@ class NativeWorkerRegistry:
             existing = next((row for row in data["workers"] if row.get("work_item_id") == work_item_id), None)
             now = now_iso()
             if existing is not None and str(existing.get("agent_id") or "") == str(agent_id):
+                if control_epoch and int(existing.get("control_epoch") or 0) != int(control_epoch):
+                    raise ValueError("obsolete control epoch")
+                if parent_agent_id:
+                    existing["parent_agent_id"] = str(parent_agent_id)
                 existing["updated_at"] = now
                 existing["last_heartbeat_at"] = now
                 write_json(self.path, data)
@@ -81,6 +85,10 @@ class NativeWorkerRegistry:
                 "registered_at": str(existing.get("registered_at") or now) if existing else now,
                 "updated_at": now, "last_heartbeat_at": now,
             }
+            if existing:
+                for key in ("slot_state", "queue_sequence", "wait_decision", "launch_spec", "browser_policy"):
+                    if key in existing:
+                        payload[key] = existing[key]
             if existing is None:
                 data["workers"].append(payload)
             else:
@@ -140,7 +148,7 @@ class NativeWorkerRegistry:
             row = next((item for item in data["workers"] if item.get("work_item_id") == work_item_id), None)
             if not row or int(row.get("control_epoch") or 0) != expected_control_epoch:
                 return ""
-            if row.get("desired_state") != "running" or row.get("work_state") not in {"running", "queued"}:
+            if row.get("desired_state") != "running" or (not completed and row.get("work_state") not in {"running", "queued"}):
                 return ""
             operations = dict(row.get("inflight_operations") or {})
             if completed and operation_id not in operations:
