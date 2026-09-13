@@ -9,12 +9,14 @@ from typing import Any
 
 from careereng.career.profile.store import ProfileStore
 from careereng.career.resume.store import CVStore
+from careereng.career.resume.selection import read_snapshot_markdown
 from careereng.utils import parse_front_matter, read_json
 
 
 class BrowserContextRegistry:
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, resume_snapshot: dict[str, Any] | None = None):
         self.workspace = Path(workspace)
+        self.resume_snapshot = dict(resume_snapshot or {})
         self.profile_store = ProfileStore(self.workspace)
         self.cv_store = CVStore(self.workspace)
         self.persona_doc: dict[str, Any] = {}
@@ -81,6 +83,8 @@ class BrowserContextRegistry:
         """Return a content version for a lazily served context resource."""
 
         normalized = str(resource_id or "").strip().lower()
+        if normalized == "full_cv" and self.resume_snapshot.get("markdown_sha256"):
+            return str(self.resume_snapshot["markdown_sha256"])
         if normalized == "apply_facts":
             payload = json.dumps(self.apply_facts, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -90,6 +94,8 @@ class BrowserContextRegistry:
         return ""
 
     def _load_cv_text(self) -> str:
+        if self.resume_snapshot.get("markdown_path"):
+            return read_snapshot_markdown(self.resume_snapshot)
         if self._cv_loaded:
             return self.cv_text
         try:
@@ -101,6 +107,8 @@ class BrowserContextRegistry:
         return self.cv_text
 
     def _has_current_cv(self) -> bool:
+        if self.resume_snapshot.get("markdown_path"):
+            return True
         try:
             return bool(self.cv_store.has_current_text())
         except Exception:

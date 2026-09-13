@@ -115,7 +115,7 @@ def build_work_item_context(payload: dict[str, Any]) -> dict[str, Any]:
     if staged_resume:
         scope["resume_snapshot"] = {
             key: staged_resume.get(key)
-            for key in ("filename", "path", "sha256", "version")
+            for key in ("filename", "path", "sha256", "version", "variant", "markdown_path", "markdown_sha256")
             if staged_resume.get(key)
         }
     return {

@@ -14,6 +14,26 @@ from careereng.platform.runtime_host import runtime_host_client, runtime_host_so
 runtime_host_app = typer.Typer(help="User-owned local browser/runtime host commands")
 
 
+@runtime_host_app.command("recover-failed-worker")
+def recover_failed_worker(work_item_id: str):
+    """Requeue a failed worker after an explicit durable resume has succeeded."""
+    from careereng.orchestration.agent_protocol.work_item_store import WorkItemStore
+    from careereng.orchestration.worker_control import NativeWorkerRegistry, NativeWorkerControlSupervisor
+
+    workspace = _workspace_path(_project_root())
+    record = next((row for row in WorkItemStore(workspace).list_records()
+                   if row.get("work_item_id") == work_item_id), None)
+    if not record or record.get("state") != "active":
+        raise typer.BadParameter("an active, explicitly resumed work item is required")
+    try:
+        worker = NativeWorkerRegistry(workspace).recover_failed(
+            work_item_id, control_epoch=int(record.get("control_epoch") or 0))
+        NativeWorkerControlSupervisor(workspace).reconcile(work_item_id)
+    except (ValueError, StopIteration) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps(worker, ensure_ascii=False))
+
+
 def _project_root() -> Path:
     cwd = Path.cwd()
     if (cwd / "pyproject.toml").exists() and (cwd / "careereng").exists():

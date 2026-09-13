@@ -9,6 +9,8 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from careereng.career.applications.skill_policy import normalize_posted_window_policy
+from careereng.career.applications.skill_policy import context_hash
+from careereng.career.resume.selection import batch_job_resume, resume_context_versions
 from careereng.career.applications.job_identity import infer_site_job_id_from_url, primary_job_identity_key
 from careereng.career.applications.posted_time import current_posted_age_observation, normalize_posted_fields
 from careereng.utils import ensure_dir, make_id, now_iso, safe_file_stem, write_json
@@ -160,14 +162,19 @@ class JobPlanningStore:
             if not isinstance(row, dict):
                 continue
             history = history_matches[idx] if idx < len(history_matches) else None
+            resume = batch_job_resume(self.workspace, batch_id, site_key, row)
+            row_versions = resume_context_versions(current_context_versions, resume)
             item = self._plan_item(
                 site_key=site_key,
                 row=row,
                 history=history if isinstance(history, dict) else None,
-                decision_context_hash=decision_context_hash,
-                context_versions=current_context_versions,
+                decision_context_hash=context_hash(row_versions) if resume.get("matching_hash") else decision_context_hash,
+                context_versions=row_versions,
                 apply_candidate_policy=apply_candidate_policy,
             )
+            if resume:
+                item["resume_variant"] = resume.get("variant", "default")
+                item["resume_version"] = resume.get("version", "")
             items.append(item)
             action = str(item.get("action") or "unknown")
             counts[action] = int(counts.get(action) or 0) + 1

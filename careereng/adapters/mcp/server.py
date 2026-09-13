@@ -760,10 +760,14 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             return {"ok": False, "error": str(exc)}
 
     @server.tool()
-    def careereng_ack_notifications(delivery_id: str) -> dict[str, Any]:
-        """Acknowledge a notification only after presenting it to the user."""
+    def careereng_ack_notifications(delivery_id: str, final_response_text: str = "",
+                                    presentation_channel: str = "") -> dict[str, Any]:
+        """Confirm a previously rendered final reply, not commentary or transport receipt."""
         try:
-            return {"ok": True, **AgentNotificationStore(runtime.workspace).acknowledge(delivery_id)}
+            if presentation_channel != "final" or not final_response_text.strip():
+                raise ValueError("render a non-empty final reply first; acknowledge it on the next turn with its text and presentation_channel=final")
+            return {"ok": True, **AgentNotificationStore(runtime.workspace).acknowledge(
+                delivery_id, final_response_text=final_response_text)}
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -861,6 +865,23 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                                "wait_decision": worker.get("wait_decision", {})}}
 
     @server.tool()
+    def careereng_ack_worker_guidance(work_item_id: str, expected_control_epoch: int,
+                                     command_id: str, status: Literal["received", "applied", "failed"],
+                                     summary: str) -> dict[str, Any]:
+        """Record worker receipt/adoption of guidance without changing job scope or execution permissions."""
+        from careereng.orchestration.worker_control.boundary import WorkerCommandBoundary
+
+        try:
+            payload = _active_work_item_payload(runtime, work_item_id)
+            if int(payload.get("control_epoch") or 0) != expected_control_epoch:
+                raise ValueError("obsolete work-item control epoch")
+            receipt = WorkerCommandBoundary(runtime.workspace).acknowledge(
+                work_item_id, expected_control_epoch, command_id, status, summary)
+            return {"ok": True, "receipt": receipt}
+        except (ValueError, KeyError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @server.tool()
     def careereng_read_work_item_resource(
         work_item_id: str,
         resource_id: str,
@@ -947,8 +968,15 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         session_id: str = DEFAULT_SESSION_ID,
         backend: Literal["provider", "codex"] | str = "",
         separate_batch: bool = False,
+        resume_selection: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Start a jobs batch on the explicitly selected configured backend."""
+        """Start a jobs batch on the explicitly selected configured backend.
+
+        Optional resume_selection has default (variant name), sites (site key to
+        variant), and jobs (site key to exact job ID/URL to variant). Omission
+        uses the default exports. Explicit references are validated and frozen;
+        existing batch selections cannot be replaced. See workspace/cv/README.md.
+        """
         result = runtime.host_client().request(
             "start_jobs_batch",
             {
@@ -958,6 +986,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 "apply_requested": bool(apply_requested),
                 "backend": str(backend or ""),
                 "separate_batch": bool(separate_batch),
+                "resume_selection": resume_selection,
             },
             timeout=10.0,
         )
@@ -1023,6 +1052,19 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         return {**result, "actions": actions, "scheduling": scheduling,
                 "launch_required": not any(runtime.native_workers().get(work_item_id=work_id)
                                            for work_id in active_records)}
+
+    @server.tool()
+    def careereng_get_worker_command(command_id: str) -> dict[str, Any]:
+        """Read durable command intent and worker receipt separately from transport acceptance."""
+        from careereng.orchestration.worker_control.boundary import WorkerCommandBoundary
+
+        try:
+            boundary = WorkerCommandBoundary(runtime.workspace)
+            command = boundary.inbox.get(command_id)
+            return {"ok": True, "command": command.as_dict(), "receipt": boundary.receipt(command_id),
+                    "transport_actions": [action.as_dict() for action in boundary.actions.for_command(command_id)]}
+        except KeyError as exc:
+            return {"ok": False, "error": str(exc)}
 
     @server.tool()
     def careereng_send_worker_command(

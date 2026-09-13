@@ -117,6 +117,16 @@ Do not search for its socket, invent another launch command, start a second host
 
 ### Visible Desktop Launch And Monitoring
 
+For existing resume variants, read `workspace/cv/README.md` and pass explicit
+`resume_selection` to `careereng_start_jobs_batch`. Omission keeps the default
+English export. Example shape (site keys and job references must be real):
+`{"default":"default","sites":{"site-key":"chinese_cv"},"jobs":{"site-key":{"exact-job-id-or-url":"default"}}}`.
+Selection is job > site > default. Job overrides are declared before starting;
+this is not an automatic JD-driven CV rewrite or an in-flight file switch.
+Use exactly one PDF per variant's exports directory and its matching `cv.md`.
+The batch freezes those artifacts; recovery and appended work retain them.
+An explicit missing/ambiguous variant is an error, not permission to fall back.
+
 1. Check formal MCP/host reachability and current batch state. Do not use temporary Python wrappers to bypass a stale Desktop MCP connection.
 2. For a new run, call `careereng_start_jobs_batch` with the user's scope; use `separate_batch` only when a separate new batch is requested. For explicit continuation, use the resume entry instead. Never confuse a retained task with a retained Apply List.
 3. Obtain `careereng_list_worker_launch_specs`. Its `desktop_task` contract requires a visible Desktop task, not `spawn_agent`. For a new task, use Desktop `create_thread`, following its project/environment rules, with the supplied work-item prompt and a clear company title. For reuse, use the returned existing task ID; do not guess another task by site name.
@@ -130,9 +140,20 @@ Do not search for its socket, invent another launch command, start a second host
    the FIFO queue through the explicit batch/site resume entry. Browser resources
    and slot ownership are separate; retaining a page does not authorize execution.
 6. Read `monitor_policy` from context, launch specs, or monitor results. While supervising, poll the durable inbox with the explicit current `batch_id` and process control actions irrespective of notification timing. Before ending the turn, create/update a user-authorized Desktop heartbeat for this main task using `poll_interval_seconds`; never hard-code the user's progress interval as the liveness interval. Re-read the policy on each wake and update that same automation when its interval changes.
-7. Render due `notifications` as compact summaries, then call `careereng_ack_notifications(delivery_id)`. Do not acknowledge before presentation. Repeated delivery is possible until acknowledged. Notification aggregation is durable and independent of the raw control-event cursor. Never summarize every raw phase event immediately, which bypasses throttling.
+7. The main Agent summarizes due `notifications` in a non-empty **final reply**, including the site, verified result/blocker and any required user action. Commentary or transport acceptance alone is not presentation. On the next supervising turn, first acknowledge the previously rendered reply using `careereng_ack_notifications(delivery_id, final_response_text, presentation_channel="final")`. Retain the delivery IDs and exact final text across turns; never fabricate presentation evidence. Repeated delivery remains possible until acknowledged. Empty polls and duplicate signals with nothing pending stay silent; never summarize raw phase events merely to fill an empty reply. This receipt is an Agent assertion, not Desktop rendering telemetry.
 8. With a site filter, retain a local cursor at the last inspected event without globally acknowledging unseen other-site events. Without a filter, acknowledge the actual processed global cursor. Retain the local cursor and pending notification receipts across heartbeat wakes.
-9. On completion, present final results, acknowledge the notification and pause the same heartbeat. Do not restart the batch, discard the reusable task, or submit again.
+9. On completion, present final results; keep the same heartbeat for one receipt-only wake, acknowledge the previous final reply, then pause it. Do not restart the batch, discard the reusable task, or submit again.
+
+### Guidance Delivery
+
+Use `careereng_send_worker_command` for ordinary in-flight guidance. A returned
+command is queued intent, not proof the child adopted it. Running workers receive
+it at their next scoped tool boundary; idle workers use the existing Desktop
+action path. Use `careereng_get_worker_command` to distinguish pending/claimed,
+worker `received`, and worker `applied`/`failed` receipts. Desktop send acceptance
+alone never means adoption. The shared Worker Guidance section defines the
+child's response. Already admitted operations may finish; no immediate token-level
+interruption is promised and no site strategy is implemented by this mechanism.
 
 Configuration is in the project `config.toml`:
 

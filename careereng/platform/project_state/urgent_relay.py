@@ -56,8 +56,11 @@ class UrgentNotificationRelay:
                 "message": (
                     f"CareerEng urgent event signal {attempt_id}. "
                     f"Read careereng_monitor_agent_events with batch_id={worker['batch_id']} "
-                    f"and site_key={worker['site_key']}. Present currently pending notifications, "
-                    "then acknowledge their delivery_id with careereng_ack_notifications. "
+                    f"and site_key={worker['site_key']}. First acknowledge any final reply already rendered "
+                    "on a previous turn using careereng_ack_notifications with its delivery_id, "
+                    "final_response_text and presentation_channel=final. Summarize remaining pending "
+                    "notifications in a non-empty final reply, not commentary alone; retain its text "
+                    "and delivery IDs to acknowledge on the next turn. "
                     "If already acknowledged, do not repeat the notification. "
                     "This signal does not authorize restarting or controlling any workflow."
                 ),

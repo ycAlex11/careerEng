@@ -2,11 +2,11 @@
 id: site-sap
 name: sap Site Skill
 version: v1
-updated_at: '2026-04-03'
+updated_at: '2026-09-13'
 scope: site
 site_key: sap
-status: draft
-apply_enabled: false
+status: exploration
+apply_enabled: true
 ---
 # Site Skill
 

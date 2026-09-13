@@ -19,6 +19,42 @@ apply_candidate_policy:
 
 # Search Jobs Skill
 
+## Worker Guidance
+
+- Ordinary user guidance is delivered through CareerEng's durable inbox before the next scoped browser/state operation; it does not require interrupting the whole Codex turn.
+- On `worker_guidance_pending`, the requested operation was not executed. Read the returned command and call `careereng_ack_worker_guidance` with its command ID, work item and current control epoch, first `received`, then `applied` with a concise explanation of the adopted change. Only then continue with an operation consistent with the new instruction; never blindly retry the old call.
+- `applied` means the instruction was adopted, not that applications or other requested outcomes have completed. Report actual outcomes through the normal state tools. If adoption is impossible or conflicts with current permissions/contracts, acknowledge `failed` with evidence and report the blocker rather than continuing the old strategy silently.
+- The same command may also arrive through Desktop messaging. Use its command ID to acknowledge it once; an acknowledgement returning an existing terminal receipt means it was already handled. Never execute it twice.
+- A guidance receipt does not resume a paused worker, grant a slot, change the Apply List, or bypass a state safety gate. Process commands in order using the current epoch; stale commands require refreshed context, not repeated retries.
+- Keep explicit browser sequences bounded to one coherent operation. An operation already admitted may finish; guidance gates the next scoped call, not every browser substep or token of reasoning.
+
+## Resume Selection
+
+- Read `workspace/cv/README.md` before choosing a non-default resume. It is a
+  human-maintained index of existing files, languages and emphasis, not permission
+  to invent experience or rewrite a CV.
+- Unless instructed otherwise, keep the existing default: `cv/current/cv.md`
+  and the single PDF in `cv/exports/`. Named versions use
+  `cv/variants/<name>/cv.md` and the single PDF in that version's `exports/`.
+- The main agent supplies `resume_selection` when creating the batch:
+  `{"default":"default","sites":{"site-key":"variant-name"},
+  "jobs":{"site-key":{"exact-job-id-or-url":"variant-name"}}}`.
+  Job references may be internal job IDs, visible site job IDs or exact job URLs.
+  Explicit job selection overrides site selection, which overrides the default.
+  Do not infer resume language solely from company nationality.
+- Selection is frozen at batch creation. The current work item supplies the
+  selected artifact for its job; `full_cv` reads that artifact's matching Markdown.
+  Do not replace it with the latest export or a different file during execution
+  or checkpoint recovery. An invalid explicit selection must be reported, never
+  silently replaced with the default.
+- Compare JD against the selected CV, not another version's remembered contents.
+  Before using a saved/last application, establish that its resume matches this
+  selected version. A prior submission, identical filename, or previous-job
+  carry-forward alone does not establish that; inspect the page and update the
+  resume when needed. This requirement applies to all sites.
+- New variants require only their Markdown/PDF files and an index entry. No
+  automatic rewriting or additional selection/locking workflow is introduced.
+
 ## Waiting And Capacity Policy
 
 The site worker, not the main Agent, judges whether its own wait should retain
@@ -420,7 +456,18 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 
 ### Recording Rules
 
-- Record the full current visible jobs page before deciding whether to stop or paginate.
+- Enforce a project-level cap of 100 recorded jobs per retrieval run. If the
+  reachable result set exceeds 100 jobs, record only the first 100 jobs in the
+  current visible ordering and stop retrieval immediately; do not paginate or
+  load more results after the cap is reached.
+- When the current page crosses the cap, pass only the remaining records needed
+  to reach 100 to `record_jobs`, preserve their visible order, then finish the
+  retrieval phase. Do not record a partial page beyond the cap.
+- Treat the 100-job cap as a retrieval-run limit, separate from site-specific
+  date/page rules and the history-match confirmation rule. The cap takes
+  precedence once 100 jobs have been recorded successfully.
+- Record the full current visible jobs page before deciding whether to stop or paginate,
+  unless doing so would exceed the 100-job retrieval-run cap.
 - Start from the attached current live snapshot for the current results page.
 - If the current visible jobs are already readable there, form the current-page records directly from that current page.
 - If the snapshot is not yet enough, stay on the same current results page and use the official browser tools to read that same page. Do not leave the current results page before it is recorded.
@@ -428,7 +475,8 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 - After `{title, url}` is already available for the current visible jobs, you may do at most one more same-page read to fill lightweight optional list fields that are clearly visible on the current page.
 - Those optional fields are best-effort only. Do not keep observing the same page just to perfect location, posted label, employment type, match label, apply state, or posted_at.
 - After that optional same-page pass, or immediately if it is not needed, call `record_jobs`.
-- Do not paginate or finish while the current visible page is still unrecorded.
+- Do not paginate or finish while the current visible page is still unrecorded,
+  unless the 100-job cap has already been reached.
 - The current results-page address is not a per-job link. Do not reuse the same results page address as the job link for multiple visible roles.
 - Do not leave the current results page to open a separate job detail page before the current visible results page has been recorded.
 - If one attempt already produced the current page jobs, call `record_jobs` before any more observation or pagination.
@@ -492,6 +540,9 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 ### Pagination
 
 - After recording the current page, check the current site-specific stop condition.
+- Also stop immediately after `record_jobs` confirms that this retrieval run has
+  reached 100 recorded jobs. Do not inspect or open the next page after this
+  limit, even if the site reports more results.
 - Also check the project history-match stop condition from consecutive `record_jobs` results: stop only after two adjacent recorded pages both reach the configured operation-success history threshold.
 - If the current site skill defines a date, page, posted-age, or other retrieval stop condition, combine it with the project history match stop condition using OR: stop when any one stop condition is satisfied.
 - If no stop condition is triggered and a real next-page / next-results / load-more action is available, continue to the next results page and repeat.
@@ -505,7 +556,8 @@ Record the reachable jobs from the current narrowed jobs surface so later decisi
 
 - Return `done` only after the current page has already been recorded and either the final page has been reached or the site-specific retrieval stop condition has been triggered.
 - Do not treat the current page as final when the live page still indicates a larger total results set or additional numbered pages that have not yet been confirmed and recorded.
-- Never stop before recording the full current visible page.
+- Never stop before recording the full current visible page unless the 100-job cap
+  requires recording only the remaining records needed to reach the cap.
 
 ## Apply
 
@@ -644,7 +696,7 @@ Loop-control continuation semantics:
 
 - The resume source for apply is the run-local staged PDF path provided in the current apply context.
 - When the site asks for a resume upload, use that provided run-local PDF path.
-- The apply context also provides the staged resume basename. If the current live page already shows that same file name as the selected or active resume for this apply page, treat the resume step as already satisfied and do not upload again.
+- The apply context provides the staged basename and version. Skip re-upload only when the live selection is established to be this version; a matching basename alone is insufficient across resume variants.
 - A successful file-upload tool call only means the local file was attached to the page control. It does not by itself prove the site accepted the resume.
 - If the current live page already confirms that same staged PDF is uploaded or selected for this apply page, do not upload it again on that same page.
 - If a stale file chooser reappears on an unchanged apply page after an upload attempt, return to the live page state first instead of blindly uploading again.

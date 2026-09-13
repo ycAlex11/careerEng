@@ -11,6 +11,32 @@ code during migration, not a reason to extend the old boundaries.
 
 ## Identity And Lifecycle Reconciliation
 
+### Communication Delivery Boundaries
+
+`orchestration/worker_control/boundary.py` delivers ordinary guidance from the
+existing inbox before the next scoped browser/state operation. It preserves
+control-epoch fencing and records worker receipt and adoption separately from
+Desktop transport acceptance. An already admitted operation or explicit browser
+sequence finishes normally; pending guidance prevents the next operation until
+the worker acknowledges adoption or failure. Python never interprets its business
+content or changes job selection on behalf of the worker.
+
+`careereng_ack_worker_guidance` records worker receipt/adoption; the read-only
+`careereng_get_worker_command` exposes that receipt separately from Desktop
+transport actions. Receipts live alongside the existing command inbox under
+`sessions/worker_commands/receipts.json`, protected by the inbox lock. Pending
+Desktop sends are superseded after boundary receipt; already claimed sends may
+finish but cannot erase that receipt. A persisted terminal receipt is reconciled
+back into the command after an interrupted write. No separate command queue or
+site-policy engine is introduced.
+
+The main Agent owns user-facing summaries. Notification acknowledgement requires
+non-empty final-response text and preserves it with the delivery receipt. This is
+an Agent assertion, not proof of Desktop rendering or that the user read it.
+The main Agent must render a non-empty final reply before acknowledging on a
+subsequent turn; idle polls with no due notifications remain silent. CareerEng
+cannot suppress Desktop's own empty activity indicators.
+
 `orchestration/worker_control/scheduling.py` owns native site execution capacity.
 Waiting state is independent from slot ownership and retained browser resources.
 The shared jobs Skill guides workers to report a reason, evidence, retain/release
@@ -211,12 +237,23 @@ recovery, exploration, or a proposal.
 
 ## Batch Resume Snapshot Boundary
 
-An apply-enabled batch locks the current exported resume before any site worker
-starts. The resume capability creates one immutable batch artifact plus one
-site-isolated upload copy under `workspace/tmp/browser_controls/`, records the
+Resume selection belongs to `career/resume/`: Skills and the user choose an
+existing variant; Python resolves explicit job > site > default references,
+freezes the matching Markdown and PDF, and validates scoped uploads. The default
+keeps `cv/current/cv.md` and `cv/exports/`; named variants live under
+`cv/variants/<name>/` with `cv.md` and `exports/`. A Markdown index describes
+variants to the LLM; it is not a Python business-policy registry. Recovery keeps
+the original selection and snapshots. Resume-dependent matching reuse must use
+the selected content, while submitted/rejected deduplication remains unchanged.
+No CV rewriting or separate select/lock workflow is introduced.
+
+An apply-enabled batch freezes explicitly selected resumes before any site worker
+starts. The resume capability creates immutable Markdown/PDF artifacts plus
+site-isolated upload copies under `workspace/tmp/browser_controls/`, records the
 filename, content hash, version, and scoped paths in the batch, and carries the
-site copy into every work item from its first phase. A reused unfinished batch
-keeps its original resume version when another site is appended.
+site default into preparation work items and the resolved job override into apply
+work items. A reused unfinished batch keeps its original selection and artifacts
+when another site is appended; conflicting overrides require a new batch.
 
 Workers may upload only the staged path declared by their current work item.
 The runtime host validates `browser_file_upload` calls before browser side

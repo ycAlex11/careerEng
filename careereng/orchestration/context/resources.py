@@ -32,6 +32,9 @@ def build_apply_initial_facts(
             "path": staged_path,
             "filename": Path(staged_path).name,
         }
+        selected = getattr(registry, "resume_snapshot", {})
+        if selected.get("path") == staged_path:
+            facts["staged_resume"].update(selected)
     normalized_targets = [str(item or "").strip() for item in (target_job_ids or ()) if str(item or "").strip()]
     if normalized_targets:
         facts["apply_target_job_ids"] = normalized_targets
@@ -67,6 +70,9 @@ class ContextResourceResolver:
         registry: BrowserContextRegistry | None = None,
         apply_initial_facts: dict[str, Any] | None = None,
     ) -> "ContextResourceResolver":
+        selected = (apply_initial_facts or {}).get("staged_resume", {})
+        if selected.get("markdown_path"):
+            registry = BrowserContextRegistry(Path(workspace), resume_snapshot=selected)
         return cls(
             workspace=Path(workspace),
             site_store=site_store,

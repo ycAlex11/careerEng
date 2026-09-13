@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
+from careereng.career.resume.selection import batch_job_resume, resume_context_versions
+
 from careereng.career.applications.skill_policy import (
     MATCHING_POLICY_SECTION,
     SITE_POLICY_SECTION,
@@ -147,6 +149,8 @@ class SiteStore:
         "fit_source",
         "application_status",
         "application_status_raw",
+        "application_resume_version",
+        "application_resume_variant",
         "last_apply_error",
         "decision_reason_type",
         "decision_context_hash",
@@ -184,6 +188,8 @@ class SiteStore:
         "current_posted_age_is_lower_bound",
     )
     HISTORY_DECISION_FIELDS = {
+        "application_resume_version",
+        "application_resume_variant",
         "apply_state",
         "decision_status",
         "decision_rule_source",
@@ -2534,6 +2540,10 @@ class SiteStore:
     ) -> dict[str, Any]:
         incoming = dict(incoming)
         site_key = str(incoming.get("site_id") or root.name)
+        selected_resume = batch_job_resume(self.workspace, batch_id, site_key, {**base, **incoming, "job_id": job_id})
+        if selected_resume and incoming.get("application_status") == "submitted" and incoming.get("application_evidence_source") == "live_worker":
+            incoming["application_resume_version"] = selected_resume.get("version", "")
+            incoming["application_resume_variant"] = selected_resume.get("variant", "default")
         skill_policies = load_job_skill_policies(self.project_root, site_key)
         apply_candidate_policy = skill_policies.get("apply_candidate_policy", {})
         if not str(incoming.get("site_job_id") or "").strip():
@@ -2550,14 +2560,14 @@ class SiteStore:
             (incoming_application_status == "filtered_out" or incoming_decision_status == "filtered_out")
             and not str(incoming.get("decision_context_hash") or "").strip()
         ):
-            context_versions = self.decision_context_versions(site_key)
+            context_versions = resume_context_versions(self.decision_context_versions(site_key), selected_resume)
             incoming["context_versions"] = context_versions
             incoming["decision_context_hash"] = context_hash(context_versions)
         elif (
             (incoming_application_status == "filtered_out" or incoming_decision_status == "filtered_out")
             and not isinstance(incoming.get("context_versions"), dict)
         ):
-            incoming["context_versions"] = self.decision_context_versions(str(incoming.get("site_id") or root.name))
+            incoming["context_versions"] = resume_context_versions(self.decision_context_versions(str(incoming.get("site_id") or root.name)), selected_resume)
 
         merged = dict(base)
         merged["job_id"] = job_id
@@ -3033,11 +3043,13 @@ class SiteStore:
                 reason = f"retry previous {application_status}"
             elif application_status == "filtered_out" or decision_status == "filtered_out":
                 reason_type = self._normalize_decision_reason_type(row.get("decision_reason_type")) or "unknown"
+                resume = batch_job_resume(self.workspace, batch_id, site_id, row)
+                row_versions = resume_context_versions(current_context_versions, resume)
                 include = self._context_changed_for_decision_reason(
                     reason_type=reason_type,
-                    current_context_versions=current_context_versions,
+                    current_context_versions=row_versions,
                     history_context_versions=row.get("context_versions") if isinstance(row.get("context_versions"), dict) else {},
-                    current_decision_context_hash=current_decision_context_hash,
+                    current_decision_context_hash=context_hash(row_versions) if resume.get("matching_hash") else current_decision_context_hash,
                     history_decision_context_hash=str(row.get("decision_context_hash") or ""),
                 )
                 if include:

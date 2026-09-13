@@ -41,6 +41,7 @@ from careereng.career.applications.application_store import ApplicationStore
 from careereng.career.applications.job_store import JobStore, TERMINAL_BATCH_STATUSES
 from careereng.career.applications.site_tools import SiteTools
 from careereng.career.resume.batch_snapshot import site_resume_snapshot, stage_batch_resume_snapshot
+from careereng.career.resume.selection import normalize_selection, validate_selection_sources
 from careereng.platform.project_state import AgentEventStore
 
 
@@ -897,10 +898,17 @@ class JobFlow:
         timeout_ms_override: int | None = None,
     ) -> Any:
         batch = self.job_store.load_batch(batch_id) if batch_id else {}
+        target_rows = [
+            row for row in self.site_tools.site_store.list_run_jobs(site_key, batch_id)
+            if str(row.get("job_id") or "") in set(apply_target_job_ids or ())
+        ] if apply_target_job_ids else []
         apply_resume_snapshot = site_resume_snapshot(
             batch.get("resume_snapshot") if isinstance(batch, dict) else {},
             site_key,
+            target_rows[0] if target_rows else None,
         )
+        if any(site_resume_snapshot(batch.get("resume_snapshot"), site_key, row).get("version") != apply_resume_snapshot.get("version") for row in target_rows):
+            raise ValueError("apply targets with different resumes must execute separately")
         run_kwargs = {
             "site_key": site_key,
             "site_name": site_name,
@@ -2624,6 +2632,7 @@ class JobFlow:
         operation: str = OPERATION_JOB_SEARCH,
         execution_backend: str = "",
         separate_batch: bool = False,
+        resume_selection: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         selected_backend = normalize_execution_backend(execution_backend) or self.execution_backend
         if selected_backend != self.execution_backend:
@@ -2691,6 +2700,8 @@ class JobFlow:
             else None
         )
         if reusable_batch is not None:
+            if resume_selection is not None and normalize_selection(resume_selection) != reusable_batch.get("resume_snapshot", {}).get("selection"):
+                raise ValueError("cannot change resume selection on an existing batch; create a new batch")
             batch, appended_site_keys = self.job_store.append_sites(
                 batch_id=str(reusable_batch.get("batch_id") or ""),
                 sites=site_rows,
@@ -2700,6 +2711,12 @@ class JobFlow:
             batch["_runtime_reused_batch"] = True
             batch["_runtime_site_keys"] = appended_site_keys
         else:
+            if resume_selection is not None:
+                choices = normalize_selection(resume_selection)
+                unknown_sites = (set(choices["sites"]) | set(choices["jobs"])) - {str(row.get("site_key")) for row in site_rows}
+                if unknown_sites:
+                    raise ValueError(f"resume selection references unknown sites: {sorted(unknown_sites)}")
+                validate_selection_sources(self.job_store.workspace, choices)
             batch = self.job_store.create_batch(
                 session_id=session_id,
                 turn_id=turn_id,
@@ -2709,6 +2726,8 @@ class JobFlow:
                 sites=site_rows,
                 execution_backend=selected_backend,
             )
+            if resume_selection is not None:
+                batch["resume_selection"] = choices
             batch = self._stage_batch_resume_snapshot(batch)
             batch = dict(batch)
             batch["_runtime_reused_batch"] = False
@@ -2803,6 +2822,7 @@ class JobFlow:
             batch_id=str(batch.get("batch_id") or ""),
             site_keys=apply_sites,
             existing=existing,
+            selection=batch.get("resume_selection"),
         )
         updated = dict(batch)
         updated["resume_snapshot"] = snapshot

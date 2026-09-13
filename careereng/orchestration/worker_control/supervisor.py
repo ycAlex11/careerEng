@@ -19,12 +19,17 @@ from careereng.utils import now_iso
 
 class NativeWorkerControlSupervisor:
     def __init__(self, workspace: Path | str):
+        self.workspace = Path(workspace)
         self.registry = NativeWorkerRegistry(workspace)
         self.inbox = WorkerCommandInbox(workspace)
         self.actions = WorkerActionStore(workspace)
         self.arbiter = WorkerCommandArbiter()
 
     def enqueue(self, command: WorkerCommand) -> tuple[WorkerCommand, list[WorkerAction]]:
+        with self.registry._lock, self.inbox._lock:
+            return self._enqueue(command)
+
+    def _enqueue(self, command: WorkerCommand) -> tuple[WorkerCommand, list[WorkerAction]]:
         persisted = self.inbox.enqueue(command)
         worker = self.registry.get(work_item_id=persisted.work_item_id)
         if worker:
@@ -51,6 +56,10 @@ class NativeWorkerControlSupervisor:
         return persisted, self._executable_for_command(persisted.command_id)
 
     def reconcile(self, work_item_id: str) -> list[WorkerAction]:
+        with self.registry._lock, self.inbox._lock:
+            return self._reconcile(work_item_id)
+
+    def _reconcile(self, work_item_id: str) -> list[WorkerAction]:
         worker = self.registry.get(work_item_id=work_item_id)
         if not worker:
             return []
@@ -87,6 +96,10 @@ class NativeWorkerControlSupervisor:
                                       error="obsolete control epoch or terminal work item")
 
     def acknowledge(self, action_id: str, *, applied: bool, error: str = "") -> tuple[WorkerAction, WorkerCommand | None]:
+        with self.registry._lock, self.inbox._lock:
+            return self._acknowledge(action_id, applied=applied, error=error)
+
+    def _acknowledge(self, action_id: str, *, applied: bool, error: str = "") -> tuple[WorkerAction, WorkerCommand | None]:
         self.actions.pending()
         existing = self.actions.get(action_id)
         if existing.status == WorkerActionStatus.SUPERSEDED:
@@ -110,12 +123,17 @@ class NativeWorkerControlSupervisor:
         command = self.inbox.get(command_id)
         if not applied:
             self.actions.supersede_dependents(action.action_id, error=error)
-            if command.status == WorkerCommandStatus.CLAIMED:
+            from .boundary import WorkerCommandBoundary
+
+            received = command.kind == WorkerCommandKind.GUIDANCE and bool(
+                WorkerCommandBoundary(self.workspace).receipt(command_id)
+            )
+            if command.status == WorkerCommandStatus.CLAIMED and not received:
                 command = self.inbox.transition(command_id, status=WorkerCommandStatus.FAILED, error=error)
             return action, command
         command_actions = self.actions.for_command(command_id)
         if command_actions and all(row.status == WorkerActionStatus.APPLIED for row in command_actions):
-            if command.status == WorkerCommandStatus.CLAIMED:
+            if command.status == WorkerCommandStatus.CLAIMED and command.kind != WorkerCommandKind.GUIDANCE:
                 command = self.inbox.transition(command_id, status=WorkerCommandStatus.APPLIED)
         return action, command
 
@@ -256,6 +274,12 @@ class NativeWorkerControlSupervisor:
             return self.actions.transition(action_id, status=WorkerActionStatus.CLAIMED)
 
     def _materialize(self, command: WorkerCommand, worker: dict) -> list[WorkerAction]:
+        if command.kind == WorkerCommandKind.GUIDANCE and any(
+            earlier.sequence < command.sequence
+            for earlier in self.inbox.list(work_item_id=command.work_item_id, site_key=command.site_key,
+                                           statuses={WorkerCommandStatus.CLAIMED})
+        ):
+            return []
         obsolete = command.expected_control_epoch != int(worker.get("control_epoch") or 0)
         terminal_action = is_terminal_work(str(worker.get("work_state") or "")) and command.kind not in {
             WorkerCommandKind.PAUSE, WorkerCommandKind.CANCEL,
@@ -308,6 +332,14 @@ class NativeWorkerControlSupervisor:
             "worker_revision": int(worker.get("revision") or 0),
             "resource_policy": str(worker.get("browser_policy") or "unchanged"),
         }
+        message = command.message
+        if command.kind == WorkerCommandKind.GUIDANCE:
+            message = (
+                f"CareerEng guidance {command.command_id}; work_item_id={command.work_item_id}; "
+                f"expected_control_epoch={command.expected_control_epoch}. "
+                "Acknowledge received then applied or failed with careereng_ack_worker_guidance; "
+                "do not execute an already acknowledged command twice.\n\n" + message
+            )
         if command.kind == WorkerCommandKind.RECOVERY:
             base_payload["expected_activity_revision"] = int(worker.get("activity_revision") or 0)
         planned: list[WorkerAction] = []
@@ -332,7 +364,7 @@ class NativeWorkerControlSupervisor:
             planned.append(
                 create_worker_action(
                     kind=WorkerActionKind.SPAWN,
-                    payload={**base_payload, "prompt": command.message},
+                    payload={**base_payload, "prompt": message},
                     **common,
                 )
             )
@@ -345,7 +377,7 @@ class NativeWorkerControlSupervisor:
                         kind=WorkerActionKind.SEND,
                         payload={
                             **base_payload,
-                            "message": command.message,
+                            "message": message,
                             "depends_on_action_id": resume.action_id,
                         },
                         **common,
@@ -355,7 +387,7 @@ class NativeWorkerControlSupervisor:
             planned.append(
                 create_worker_action(
                     kind=WorkerActionKind.SEND,
-                    payload={**base_payload, "message": command.message},
+                    payload={**base_payload, "message": message},
                     **common,
                 )
             )

@@ -140,7 +140,17 @@ class RuntimeHostService:
         registry = NativeWorkerRegistry(self.workspace)
         work_item_id = str(before["work_item_id"])
         epoch = int(before.get("control_epoch") or 0)
-        token = registry.record_activity(work_item_id, expected_control_epoch=epoch)
+        from careereng.orchestration.worker_control.boundary import WorkerCommandBoundary
+
+        try:
+            with registry._lock:
+                guidance = WorkerCommandBoundary(self.workspace).pending(work_item_id, epoch)
+                if guidance:
+                    return {"ok": False, "error": "worker_guidance_pending", "executed": False,
+                            "guidance": guidance}
+                token = registry.record_activity(work_item_id, expected_control_epoch=epoch)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "executed": False}
         result: dict[str, Any] = {}
         try:
             result = self._handle_request(payload)
@@ -316,6 +326,7 @@ class RuntimeHostService:
                 operation=operation,
                 execution_backend=execution_backend,
                 separate_batch=bool(payload.get("separate_batch")),
+                **({"resume_selection": payload["resume_selection"]} if payload.get("resume_selection") is not None else {}),
             )
             if not batch:
                 return {"ok": True, "accepted": False, "reply": "当前没有已注册的 active sites。请先完成公司注册。"}

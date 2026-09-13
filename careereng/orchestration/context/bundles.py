@@ -154,6 +154,11 @@ class BrowserContextSession:
         phase_memory: BrowserPhaseMemory | None = None,
         continuation_context: dict[str, Any] | None = None,
     ) -> "BrowserContextSession":
+        from careereng.career.resume.selection import snapshot_for_upload_path
+
+        selected = snapshot_for_upload_path(workspace, batch_id, site_key, staged_resume_pdf_path)
+        if selected.get("markdown_path"):
+            registry = BrowserContextRegistry(workspace, resume_snapshot=selected)
         available_bundle_names = registry.available_bundles()
         # All profile data stays lazy. The agent requests it only when the live
         # form needs it, so a resumed run cannot keep stale user facts.
@@ -256,7 +261,7 @@ class BrowserContextSession:
                     ),
                 }
             )
-        nvidia_batch_fact = _nvidia_apply_batch_fact(
+        nvidia_batch_fact = "" if selected else _nvidia_apply_batch_fact(
             site_store=site_store,
             site_key=site_key,
             batch_id=batch_id,

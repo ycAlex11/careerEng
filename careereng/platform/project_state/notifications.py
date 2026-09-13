@@ -52,11 +52,14 @@ class AgentNotificationStore:
                 ids = sorted(event["event_id"] for event in events)
                 delivery_id = "notification_" + sha256("|".join(ids).encode()).hexdigest()[:20]
                 offered[delivery_id] = {"event_ids": ids, "group": group}
-                notifications.append({"delivery_id": delivery_id, "urgent": urgent, "events": events})
+                notifications.append({"delivery_id": delivery_id, "urgent": urgent, "events": events,
+                                      "presentation": {"owner": "main_agent", "channel": "final",
+                                                       "acknowledge": "after_final_on_next_turn",
+                                                       "instruction": "Summarize current verified facts in a non-empty final reply. Never use commentary alone; no notifications means silence."}})
             write_json(self.path, state)
             return notifications
 
-    def acknowledge(self, delivery_id: str, *, observed_at: str = "") -> dict:
+    def acknowledge(self, delivery_id: str, *, observed_at: str = "", final_response_text: str = "") -> dict:
         with self.lock:
             state = read_json(self.path) or {}
             offered = state.get("offered", {})
@@ -70,5 +73,8 @@ class AgentNotificationStore:
                 state.get("pending", {}).pop(event_id, None)
             state.setdefault("last_sent", {})[delivery["group"]] = stamp
             delivery["acknowledged_at"] = stamp
+            if final_response_text.strip():
+                delivery["final_response_text"] = final_response_text.strip()
+                delivery["presentation_channel"] = "final"
             write_json(self.path, state)
             return dict(delivery)

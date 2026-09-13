@@ -140,6 +140,23 @@ class NativeWorkerRegistry:
             write_json(self.path, data)
             return dict(row)
 
+    def recover_failed(self, work_item_id: str, *, control_epoch: int) -> dict[str, Any]:
+        with self._lock:
+            data = self._load()
+            row = next(item for item in data["workers"] if item.get("work_item_id") == work_item_id)
+            if row.get("work_state") != "failed":
+                raise ValueError("only a failed worker can be recovered")
+            if control_epoch <= int(row.get("control_epoch") or 0):
+                raise ValueError("recovery requires a newer control epoch")
+            row.update(control_epoch=control_epoch, desired_state="running", runtime_state="suspended",
+                       work_state="queued", slot_state="queued", browser_policy="restore",
+                       queue_sequence=max((int(item.get("queue_sequence") or 0) for item in data["workers"]), default=0) + 1,
+                       inflight_operations={}, wait_decision={}, control_state="", last_error="",
+                       interrupt_ack_started_at="", suspect_checks=0, last_probe_at="",
+                       revision=int(row.get("revision") or 0) + 1, updated_at=now_iso())
+            write_json(self.path, data)
+            return dict(row)
+
     def record_activity(self, work_item_id: str, *, expected_control_epoch: int,
                         operation_id: str = "", completed: bool = False,
                         progress: bool = False) -> str:
