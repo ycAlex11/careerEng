@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from contextlib import ExitStack
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -318,6 +319,12 @@ class RuntimeHostService:
         if not acquired:
             return {"ok": False, "error": "runtime host control plane is busy"}
         try:
+            from careereng.orchestration.worker_control.batch_retirement import archive_previous_batches
+
+            if self._batch_workers:
+                return {"ok": False, "accepted": False, "error": "batch startup is still in flight; retry after it settles"}
+            archive_previous_batches(self.loop.job_flow, self.workspace, session_id,
+                                     retire=self._retire_previous_batch)
             batch = self.loop.job_flow.create_batch(
                 session_id=session_id,
                 turn_id=turn_id,
@@ -325,12 +332,14 @@ class RuntimeHostService:
                 apply_requested=apply_requested,
                 operation=operation,
                 execution_backend=execution_backend,
-                separate_batch=bool(payload.get("separate_batch")),
+                separate_batch=True,
                 **({"resume_selection": payload["resume_selection"]} if payload.get("resume_selection") is not None else {}),
             )
             if not batch:
                 return {"ok": True, "accepted": False, "reply": "当前没有已注册的 active sites。请先完成公司注册。"}
             batch_id = str(batch.get("batch_id") or "")
+            batch["parent_agent_id"] = str(payload.get("parent_agent_id") or "")
+            self.loop.job_flow.job_store.save_batch(batch)
             self._managed_batch_seen = True
             reused_batch = bool(batch.get("_runtime_reused_batch"))
             launch_site_keys = [str(site_key) for site_key in batch.get("_runtime_site_keys") or [] if str(site_key)]
@@ -380,6 +389,23 @@ class RuntimeHostService:
             "reply": f"batch={batch_id} status=running",
         }
 
+    def _retire_previous_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        with ExitStack() as stack:
+            for site_key in sorted(batch.get("sites", {})):
+                with self._site_locks_guard:
+                    lock = self._site_locks.setdefault(site_key, threading.Lock())
+                stack.enter_context(lock)
+            closed = self.loop.job_flow.cancel_batch(
+                batch_id=batch["batch_id"], reason="superseded_by_new_batch")
+            for site_key in closed.get("sites", {}):
+                runner = getattr(self.loop, "browser_runner", None)
+                is_active = getattr(runner, "batch_site_is_active", None)
+                if callable(is_active) and is_active(site_key, batch_id=batch["batch_id"]):
+                    raise RuntimeError(f"old batch runtime has not been released: {site_key}")
+                WorkItemStore(self.workspace).release_scope(site_key=site_key, batch_id=batch["batch_id"])
+                self._record_site_worker_batch_outcome(site_key=site_key, batch_id=batch["batch_id"])
+            return closed
+
     def _handle_fresh_snapshot_resume(self, payload: dict[str, Any]) -> dict[str, Any]:
         session_id = str(payload.get("session_id") or "cli:default")
         message = str(payload.get("message") or "")
@@ -396,6 +422,8 @@ class RuntimeHostService:
                 source = self.loop.job_flow.job_store.load_batch(source_batch_id)
                 if not source:
                     return {"ok": False, "error": f"source job batch not found: {source_batch_id}"}
+                if source.get("archived_at") or source.get("resume_allowed") is False:
+                    return {"ok": False, "error": "archived batch cannot be resumed"}
                 if str(source.get("status") or "") not in {"completed", "partial_completed", "failed", "cancelled"}:
                     session_id = str(source.get("session_id") or session_id)
                     latest = self.loop.job_flow.job_store.latest_open_batch(session_id) or {}

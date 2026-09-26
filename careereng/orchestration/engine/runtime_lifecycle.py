@@ -22,8 +22,13 @@ class SiteRuntimeLifecycle:
         result = complete_work_item(normalized_site_key)
         return result is not False
 
-    def release_site(self, site_key: str) -> bool:
+    def release_site(self, site_key: str, *, batch_id: str = "") -> bool:
         normalized_site_key = release_site_payload(site_key=site_key)["site_key"]
+        if batch_id:
+            scoped_finish = getattr(self.browser_runner, "finish_batch_site", None)
+            if not callable(scoped_finish):
+                return False
+            return scoped_finish(normalized_site_key, batch_id=batch_id) is not False
         finish_site = getattr(self.browser_runner, "finish_site", None)
         if not callable(finish_site):
             return False

@@ -938,3 +938,20 @@ default.
 If a change alters a boundary, dependency direction, tool contract, or
 workspace ownership rule, update this document and the active taskboard before
 implementing it.
+# New Batch Supersession
+
+An explicit new jobs batch retires prior batches in the same session before
+admission. Archived batches cannot be resumed or cloned into recovery batches.
+Each site retains its own completed/incomplete outcome and historical dedupe;
+archival does not count incomplete execution or retract completed site counts.
+Visible task continuity remains independent from batch execution continuity.
+
+Runtime release from terminal batch cleanup must validate batch ownership.
+Worker scheduling reconciles all work items belonging to a retired batch,
+including older bindings of reused Desktop tasks. Native cancellation fences
+future operations; it must not be presented as a Desktop interrupt receipt.
+
+New batch records carry the main task ID; launch plans inherit that owner for
+urgent delivery. The Desktop supervisor registers itself before launch and
+installs or updates its configured heartbeat before ending supervision. Python
+does not simulate Desktop message delivery or user presentation acknowledgements.

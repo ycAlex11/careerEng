@@ -119,6 +119,8 @@ def _compact_batch(batch: dict[str, Any] | None, *, site_store: SiteStore | None
         "status": str(batch.get("status") or ""),
         "created_at": str(batch.get("created_at") or ""),
         "updated_at": str(batch.get("updated_at") or ""),
+        "archived_at": str(batch.get("archived_at") or ""),
+        "resume_allowed": not batch.get("archived_at") and batch.get("resume_allowed") is not False,
         "site_count": len(sites),
         "sites": {
             str(site_key): _compact_batch_site(
@@ -139,6 +141,7 @@ def _compact_batch_site(site: dict[str, Any], *, browser_session: dict[str, Any]
         "site_key": str(site.get("site_key") or ""),
         "site_name": str(site.get("site_name") or ""),
         "status": str(site.get("status") or ""),
+        "execution_outcome": str(site.get("execution_outcome") or ""),
         "reason_tag": str(site.get("reason_tag") or ""),
         "current_phase": str(site.get("current_phase") or ""),
         "current_url": str(site.get("current_url") or ""),
@@ -584,6 +587,12 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             return {"ok": False, "error": "site key does not match the durable work item"}
         try:
             planned = runtime.native_workers().get(work_item_id=work_item_id)
+            owner = runtime.job_store().load_batch(batch_id).get("parent_agent_id")
+            if owner and parent_agent_id and owner != parent_agent_id:
+                raise ValueError("parent task does not match the batch owner")
+            parent_agent_id = str(owner or parent_agent_id or runtime.agent_events().main_agent_registration().get("thread_id") or "")
+            if not parent_agent_id or parent_agent_id == agent_id:
+                raise ValueError("register the main agent before binding a worker")
             if not planned or planned.get("worker_kind") != worker_kind:
                 raise ValueError("worker kind must match the CareerEng launch plan")
             if worker_kind == "site" and not planned.get("slot_state"):
@@ -744,6 +753,37 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         try:
             runtime.site_scheduler().reconcile()
             action = runtime.worker_control().prepare_action(action_id)
+            worker = runtime.native_workers().get(work_item_id=action.work_item_id)
+            launching = action.kind in {WorkerActionKind.SPAWN, WorkerActionKind.RESUME} or (
+                action.kind == WorkerActionKind.SEND and action.payload.get("reason") == "cross_batch_continuity")
+            if worker.get("worker_kind") == "site" and launching:
+                scope = _active_work_item_scope(runtime, action.work_item_id)
+                readiness = {}
+                for attempt in range(2):
+                    try:
+                        readiness = runtime.host_client().request(
+                            "agent_bridge_browser_list_tools",
+                            {"site_key": scope["site_key"], **_work_item_fence_payload(scope)},
+                        )
+                    except Exception as exc:
+                        readiness = {"ok": False, "error": str(exc)}
+                    if readiness.get("ok"):
+                        break
+                if not readiness.get("ok"):
+                    error = str(readiness.get("error") or "browser runtime is not ready")
+                    runtime.native_workers().update(action.work_item_id, expected_control_epoch=action.control_epoch,
+                                                    runtime_state="faulted",
+                                                    work_state="failed", browser_state="lost",
+                                                    slot_state="released", last_error=error)
+                    runtime.agent_events().publish(
+                        kind="worker.start_failed", attention="action_required", summary=error,
+                        site_key=worker["site_key"], batch_id=worker["batch_id"],
+                        details={"work_item_id": action.work_item_id},
+                    )
+                    runtime.site_scheduler().reconcile()
+                    return {"ok": False, "error": error, "failure_kind": "runtime_start_failed"}
+                runtime.native_workers().update(action.work_item_id, expected_control_epoch=action.control_epoch,
+                                                browser_state="ready")
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "action": action.as_dict()}
@@ -977,9 +1017,13 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         uses the default exports. Explicit references are validated and frozen;
         existing batch selections cannot be replaced. See workspace/cv/README.md.
         """
+        parent = str(runtime.agent_events().main_agent_registration().get("thread_id") or "")
+        if backend == "codex" and not parent:
+            return {"ok": False, "accepted": False, "error": "register the main agent before starting a Codex batch"}
         result = runtime.host_client().request(
             "start_jobs_batch",
             {
+                "parent_agent_id": parent,
                 "session_id": session_id,
                 "message": message,
                 "operation": operation,

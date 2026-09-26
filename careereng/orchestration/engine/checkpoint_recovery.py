@@ -27,6 +27,9 @@ class BatchCheckpointRecovery:
         user_message: str,
         command_id: str = "",
     ) -> dict[str, Any]:
+        source = self.job_store.load_batch(source_batch_id)
+        if source.get("resume_allowed") is False or source.get("archived_at"):
+            raise ValueError("archived batch cannot be resumed; start a new run")
         existing = self._existing_recovery(
             source_batch_id=source_batch_id,
             site_key=site_key,

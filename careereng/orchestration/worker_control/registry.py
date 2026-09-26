@@ -15,6 +15,7 @@ from careereng.platform.persistence.mutex import workspace_mutex
 class NativeWorkerRegistry:
     def __init__(self, workspace: Path | str):
         self.path = ensure_dir(Path(workspace) / "sessions" / "native_workers") / "workers.json"
+        self.workspace = Path(workspace)
         self._lock = workspace_mutex(self.path)
 
     def plan(self, *, work_item_id: str, site_key: str, batch_id: str,
@@ -38,7 +39,7 @@ class NativeWorkerRegistry:
                 "site_key": str(site_key or ""),
                 "batch_id": str(batch_id),
                 "worker_kind": str(worker_kind or "site"),
-                "parent_agent_id": "",
+                "parent_agent_id": self._batch_parent(batch_id),
                 "desired_state": "running",
                 "runtime_state": AgentRuntimeState(str(runtime_state or "detached")).value,
                 "work_state": "queued",
@@ -57,6 +58,7 @@ class NativeWorkerRegistry:
     def register(self, *, agent_id: str, work_item_id: str, site_key: str, batch_id: str,
                  worker_kind: str = "site", parent_agent_id: str = "",
                  control_epoch: int = 0, worker_session_id: str = "") -> dict[str, Any]:
+        parent_agent_id = parent_agent_id or self._batch_parent(batch_id)
         if not all(str(value or "").strip() for value in (agent_id, work_item_id, batch_id)):
             raise ValueError("native worker requires agent_id, work_item_id, and batch_id")
         with self._lock:
@@ -86,7 +88,7 @@ class NativeWorkerRegistry:
                 "updated_at": now, "last_heartbeat_at": now,
             }
             if existing:
-                for key in ("slot_state", "queue_sequence", "wait_decision", "launch_spec", "browser_policy"):
+                for key in ("slot_state", "queue_sequence", "wait_decision", "launch_spec", "browser_policy", "browser_state"):
                     if key in existing:
                         payload[key] = existing[key]
             if existing is None:
@@ -95,6 +97,11 @@ class NativeWorkerRegistry:
                 existing.clear(); existing.update(payload)
             write_json(self.path, data)
             return dict(payload)
+
+    def _batch_parent(self, batch_id: str) -> str:
+        from careereng.career.applications.job_store import JobStore
+
+        return str(JobStore(self.workspace).load_batch(batch_id).get("parent_agent_id") or "")
 
     def update(self, work_item_id: str, **changes: Any) -> dict[str, Any]:
         with self._lock:

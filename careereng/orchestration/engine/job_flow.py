@@ -489,7 +489,7 @@ class JobFlow:
             if not isinstance(site, dict) or not is_non_resumable_site_terminal(site):
                 continue
             try:
-                self.runtime_lifecycle.release_site(str(site_key or ""))
+                self.runtime_lifecycle.release_site(str(site_key or ""), batch_id=str(batch.get("batch_id") or ""))
             except Exception as exc:
                 self.job_store.append_event(
                     "browser.runtime_release.failed",
@@ -515,7 +515,7 @@ class JobFlow:
                     {"batch_id": batch_id, "site_key": site_key, "error": str(exc)},
                 )
         try:
-            released = self.runtime_lifecycle.release_site(site_key)
+            released = self.runtime_lifecycle.release_site(site_key, batch_id=batch_id)
         except Exception as exc:
             self.job_store.append_event(
                 "browser.runtime_release.failed",
@@ -2783,6 +2783,8 @@ class JobFlow:
         """Find the latest terminal batch in this session with unfinished site state."""
 
         for batch in self.job_store.list_batches(session_id=session_id):
+            if batch.get("archived_at") or batch.get("resume_allowed") is False:
+                continue
             if str(batch.get("status") or "") not in TERMINAL_BATCH_STATUSES:
                 continue
             sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}

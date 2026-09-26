@@ -302,6 +302,7 @@ class BrowserAutomationService:
             site_key,
             {
                 "browser_status": AGENT_BRIDGE_STATUS,
+                "runtime_batch_id": batch_id,
                 "last_browser_pid": active.runtime.pid(),
                 "last_browser_opened_at": now_iso(),
                 "active_run_id": turn_id,
@@ -1443,6 +1444,7 @@ class BrowserAutomationService:
             site_key,
             {
                 "browser_status": "running",
+                "runtime_batch_id": batch_id,
                 "last_browser_pid": active.runtime.pid(),
                 "last_browser_opened_at": now_iso(),
                 "active_run_id": turn_id,
@@ -1952,6 +1954,22 @@ class BrowserAutomationService:
                 reason_tag="browser_runtime_failed",
                 message=message[:4000],
             )
+
+    def finish_batch_site(self, site_key: str, *, batch_id: str) -> bool:
+        session = self.site_store.load_browser_session(site_key)
+        if str(session.get("runtime_batch_id") or session.get("agent_bridge_batch_id") or "") != batch_id:
+            return False
+        return self.finish_site(site_key)
+
+    def batch_site_is_active(self, site_key: str, *, batch_id: str) -> bool:
+        session = self.site_store.load_browser_session(site_key)
+        if str(session.get("runtime_batch_id") or session.get("agent_bridge_batch_id") or "") != batch_id:
+            return False
+        try:
+            self._runtime_registry.active(site_key)
+        except RuntimeError:
+            return False
+        return True
 
     def finish_site(self, site_key: str) -> bool:
         released = self._release_runtime(site_key)

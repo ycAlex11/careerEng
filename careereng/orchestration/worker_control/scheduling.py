@@ -99,10 +99,17 @@ class SiteCapacityScheduler:
         with self.registry._lock:
             durable = {row["work_item_id"]: row for row in WorkItemStore(self.workspace).list_records()}
             workers = self.registry.list()
+            from careereng.career.applications.job_store import JobStore
+
+            batches = {row["batch_id"]: row for row in JobStore(self.workspace).list_batches()}
             for worker in workers:
                 if not worker.get("slot_state"):
                     continue
                 record = durable.get(worker["work_item_id"], {})
+                batch = batches.get(worker.get("batch_id"), {})
+                if batch.get("status") == "cancelled" or batch.get("archived_at"):
+                    worker = self.registry.update(worker["work_item_id"], desired_state="cancelled",
+                                                  work_state="cancelled", slot_state="released")
                 if record.get("state") in {"completed", "cancelled"}:
                     worker = self.registry.update(worker["work_item_id"], work_state=record["state"],
                                                   control_epoch=max(int(worker.get("control_epoch") or 0), int(record.get("control_epoch") or 0)))
