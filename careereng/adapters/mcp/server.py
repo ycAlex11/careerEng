@@ -187,6 +187,7 @@ def _active_work_item_scope(
     *,
     expected_context_revision: int | None = None,
     expected_apply_target_job_id: str = "",
+    require_binding: bool = True,
 ) -> dict[str, Any]:
     """Resolve the immutable execution scope for one active worker item."""
 
@@ -216,6 +217,11 @@ def _active_work_item_scope(
     expected_target = str(expected_apply_target_job_id or "").strip()
     if expected_target and expected_target not in apply_target_job_ids:
         raise ValueError("apply target fence does not match the active work item target")
+    if require_binding:
+        runtime.native_workers().require_binding(
+            work_item_id, batch_id=batch_id, site_key=site_key,
+            control_epoch=int(payload.get("control_epoch") or 0),
+        )
     return {
         "work_item_id": str(context.get("work_item_id") or ""),
         "site_key": site_key,
@@ -654,6 +660,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         if browser_state is not None:
             changes["browser_state"] = browser_state
         try:
+            runtime.native_workers().require_binding(work_item_id, control_epoch=expected_control_epoch)
             worker = runtime.site_scheduler().report(work_item_id, changes=changes, decision=wait_decision)
             scheduling = runtime.site_scheduler().reconcile()
             worker = runtime.native_workers().get(work_item_id=work_item_id)
@@ -757,7 +764,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             launching = action.kind in {WorkerActionKind.SPAWN, WorkerActionKind.RESUME} or (
                 action.kind == WorkerActionKind.SEND and action.payload.get("reason") == "cross_batch_continuity")
             if worker.get("worker_kind") == "site" and launching:
-                scope = _active_work_item_scope(runtime, action.work_item_id)
+                scope = _active_work_item_scope(runtime, action.work_item_id, require_binding=False)
                 readiness = {}
                 for attempt in range(2):
                     try:
@@ -899,9 +906,19 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             context_catalog_size=len(context.get("context_catalog") or []),
         )
         worker = runtime.native_workers().get(work_item_id=work_item_id)
+        binding_error = ""
+        try:
+            runtime.native_workers().require_binding(
+                work_item_id, batch_id=str(context.get("scope", {}).get("batch_id") or ""),
+                site_key=str(context.get("scope", {}).get("site_key") or ""),
+                control_epoch=int(payload.get("control_epoch") or 0),
+            )
+        except ValueError as exc:
+            binding_error = str(exc)
         return {"ok": True, **context, "notification_policy": runtime.monitor_policy(),
                 "scheduling": {"slot_state": worker.get("slot_state", ""),
-                               "execution_admitted": execution_admitted(worker),
+                               "execution_admitted": not binding_error and execution_admitted(worker),
+                               "binding_error": binding_error,
                                "wait_decision": worker.get("wait_decision", {})}}
 
     @server.tool()
@@ -941,7 +958,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             if requested not in catalog_ids:
                 raise ValueError(f"work-item resource is not available: {requested or '<missing>'}")
             if requested == "execution_diagnostics":
-                scope = _active_work_item_scope(runtime, work_item_id)
+                scope = _active_work_item_scope(runtime, work_item_id, require_binding=False)
                 from careereng.platform.observability import ExecutionDiagnosticStore
 
                 resource = {

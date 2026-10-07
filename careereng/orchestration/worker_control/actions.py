@@ -223,6 +223,11 @@ class WorkerActionStore:
 
         target = WorkerActionStatus.APPLIED if applied else WorkerActionStatus.FAILED
         current = self.get(action_id)
+        if applied and current.kind in {WorkerActionKind.SPAWN, WorkerActionKind.RESUME, WorkerActionKind.SEND}:
+            NativeWorkerRegistry(self.workspace).require_binding(
+                current.work_item_id, batch_id=current.batch_id, site_key=current.site_key,
+                control_epoch=current.control_epoch, agent_id=current.agent_id,
+            )
         if current.status == target:
             return current
         if current.status == WorkerActionStatus.PENDING:

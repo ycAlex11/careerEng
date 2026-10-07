@@ -11,6 +11,12 @@ code during migration, not a reason to extend the old boundaries.
 
 ## Identity And Lifecycle Reconciliation
 
+Native capacity admission may precede Desktop task registration. Business
+execution and successful spawn/resume/send receipts require a registered child
+task and parent binding matching the work item, site, batch and control epoch.
+Missing binding returns a registration-required error without side effects;
+resume preserves identity and cannot substitute capacity admission for binding.
+
 ### Communication Delivery Boundaries
 
 `orchestration/worker_control/boundary.py` delivers ordinary guidance from the

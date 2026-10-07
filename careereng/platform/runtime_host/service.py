@@ -799,7 +799,7 @@ class RuntimeHostService:
     def _handle_agent_bridge_browser_list_tools(self, payload: dict[str, Any]) -> dict[str, Any]:
         site_key = str(payload.get("site_key") or "").strip()
         try:
-            self._validate_work_item_fence(payload)
+            self._validate_work_item_fence(payload, require_binding=False)
             def _list() -> list[dict[str, Any]]:
                 browser_runner = getattr(self.loop, "browser_runner", None)
                 list_tools = getattr(browser_runner, "list_active_browser_tools", None)
@@ -1092,7 +1092,7 @@ class RuntimeHostService:
             worker_state="active",
         )
 
-    def _validate_work_item_fence(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _validate_work_item_fence(self, payload: dict[str, Any], *, require_binding: bool = True) -> dict[str, Any]:
         """Reject stale or revoked external-agent tool calls before side effects."""
 
         has_fence = any(
@@ -1111,7 +1111,13 @@ class RuntimeHostService:
         if not all((fence.work_item_id, fence.site_key, fence.batch_id, fence.control_epoch, fence.site_revision)):
             raise ValueError("agent bridge request has incomplete work-item fencing")
         record = WorkItemStore(self.workspace).validate_fence(fence)
-        worker = NativeWorkerRegistry(self.workspace).get(work_item_id=fence.work_item_id)
+        registry = NativeWorkerRegistry(self.workspace)
+        worker = registry.get(work_item_id=fence.work_item_id)
+        if require_binding:
+            worker = registry.require_binding(
+                fence.work_item_id, batch_id=fence.batch_id, site_key=fence.site_key,
+                control_epoch=fence.control_epoch,
+            )
         if not execution_admitted(worker):
             raise ValueError("native worker is waiting or queued for execution capacity")
         if "context_revision" in payload:

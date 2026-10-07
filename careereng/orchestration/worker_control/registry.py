@@ -65,6 +65,23 @@ class NativeWorkerRegistry:
             data = self._load()
             existing = next((row for row in data["workers"] if row.get("work_item_id") == work_item_id), None)
             now = now_iso()
+            if existing is not None:
+                if any(existing.get(key) != value for key, value in
+                       (("batch_id", batch_id), ("site_key", site_key), ("worker_kind", worker_kind))):
+                    raise ValueError("worker binding does not match the launch scope")
+                if control_epoch != int(existing.get("control_epoch") or 0):
+                    raise ValueError("obsolete control epoch")
+                if worker_session_id and existing.get("worker_session_id") not in {"", worker_session_id}:
+                    raise ValueError("worker session does not match the launch scope")
+                if existing.get("parent_agent_id") and parent_agent_id != existing["parent_agent_id"]:
+                    raise ValueError("parent task does not match the launch scope")
+                if existing.get("agent_id") and existing["agent_id"] != agent_id and existing.get("runtime_state") not in {"detached", "terminal", "faulted"}:
+                    raise ValueError("worker already bound to another live task")
+            if parent_agent_id and parent_agent_id == agent_id:
+                raise ValueError("worker cannot be its own parent task")
+            if any(row.get("agent_id") == agent_id and row.get("work_item_id") != work_item_id
+                   and not is_terminal_work(str(row.get("work_state") or "")) for row in data["workers"]):
+                raise ValueError("task already bound to another active work item")
             if existing is not None and str(existing.get("agent_id") or "") == str(agent_id):
                 if control_epoch and int(existing.get("control_epoch") or 0) != int(control_epoch):
                     raise ValueError("obsolete control epoch")
@@ -102,6 +119,21 @@ class NativeWorkerRegistry:
         from careereng.career.applications.job_store import JobStore
 
         return str(JobStore(self.workspace).load_batch(batch_id).get("parent_agent_id") or "")
+
+    def require_binding(self, work_item_id: str, *, batch_id: str = "", site_key: str = "",
+                        control_epoch: int | None = None, agent_id: str = "") -> dict[str, Any]:
+        worker = self.get(work_item_id=work_item_id)
+        if not all(str(worker.get(key) or "").strip() for key in
+                   ("agent_id", "parent_agent_id", "registered_at", "batch_id", "site_key")):
+            raise ValueError("worker_registration_required: register the visible task with careereng_register_native_worker")
+        if worker["agent_id"] == worker["parent_agent_id"]:
+            raise ValueError("invalid worker parent binding")
+        for key, expected in (("batch_id", batch_id), ("site_key", site_key), ("agent_id", agent_id)):
+            if expected and worker.get(key) != expected:
+                raise ValueError(f"worker binding does not match {key}")
+        if control_epoch is not None and int(worker.get("control_epoch") or 0) != control_epoch:
+            raise ValueError("obsolete control epoch")
+        return worker
 
     def update(self, work_item_id: str, **changes: Any) -> dict[str, Any]:
         with self._lock:

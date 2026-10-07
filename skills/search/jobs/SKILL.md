@@ -33,7 +33,12 @@ apply_candidate_policy:
 - Read `workspace/cv/README.md` before choosing a non-default resume. It is a
   human-maintained index of existing files, languages and emphasis, not permission
   to invent experience or rewrite a CV.
-- Unless instructed otherwise, keep the existing default: `cv/current/cv.md`
+- Before creating a batch, the main agent selects `chinese_cv` for Chinese
+  companies and `default` (English) for non-Chinese companies unless the user
+  explicitly requests another resume. Use the company's identity, not the job
+  location or website language; ask when the company identity is unclear.
+  This policy applies to exploration and ready runs alike; site mode does not
+  choose the resume. The default English files remain `cv/current/cv.md`
   and the single PDF in `cv/exports/`. Named versions use
   `cv/variants/<name>/cv.md` and the single PDF in that version's `exports/`.
 - The main agent supplies `resume_selection` when creating the batch:
@@ -41,7 +46,10 @@ apply_candidate_policy:
   "jobs":{"site-key":{"exact-job-id-or-url":"variant-name"}}}`.
   Job references may be internal job IDs, visible site job IDs or exact job URLs.
   Explicit job selection overrides site selection, which overrides the default.
-  Do not infer resume language solely from company nationality.
+  Populate site selections from the language policy above before starting;
+  omission uses English and does not perform automatic language selection.
+  If the required Chinese variant is unavailable, report it before starting
+  rather than silently substituting English.
 - Selection is frozen at batch creation. The current work item supplies the
   selected artifact for its job; `full_cv` reads that artifact's matching Markdown.
   Do not replace it with the latest export or a different file during execution
