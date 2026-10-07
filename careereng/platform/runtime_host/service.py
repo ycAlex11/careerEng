@@ -298,7 +298,7 @@ class RuntimeHostService:
                     "browser_status": browser_status,
                     "pending_action": pending_action,
                     "current_url": str(browser.get("last_known_url") or ""),
-                    "last_activity_at": str(worker.get("updated_at") or browser.get("updated_at") or ""),
+                    "last_activity_at": str(worker.get("last_activity_at") or worker.get("last_heartbeat_at") or browser.get("updated_at") or ""),
                     "last_error": str(worker.get("last_error") or ""),
                 }
             )
@@ -491,7 +491,7 @@ class RuntimeHostService:
         if reply is None:
             return {"ok": True, "accepted": False, "reply": ""}
         return {"ok": True, "accepted": True, "reply": reply, "turn_id": turn_id,
-                "batch_id": resolved_batch_id}
+                "batch_id": resolved_batch_id, "affected_sites": [site_key]}
 
     def _prepare_resume_work_item(self, *, session_id: str, site_key: str,
                                   turn_id: str, message: str, command_id: str) -> str:
@@ -632,6 +632,8 @@ class RuntimeHostService:
             job_store = getattr(job_flow, "job_store", None)
             current = job_store.load_batch(batch_id) if job_store is not None else {}
             current_sites = current.get("sites") if isinstance(current.get("sites"), dict) else {}
+            if current.get("archived_at") or current.get("resume_allowed") is False or current.get("status") == "cancelled":
+                raise ValueError("cancelled or archived execution cannot be paused or resumed")
             revoked: list[dict[str, Any]] = []
             if site_key:
                 def _pause_site() -> dict[str, Any]:
@@ -643,7 +645,14 @@ class RuntimeHostService:
                             event="pause_requested",
                         )
                     )
-                    return self.loop.job_flow.pause_batch(batch_id=batch_id, site_key=site_key)
+                    batch = self.loop.job_flow.pause_batch(batch_id=batch_id, site_key=site_key)
+                    registry = NativeWorkerRegistry(self.workspace)
+                    for worker in registry.list(batch_id=batch_id):
+                        if worker.get("site_key") == site_key and worker.get("work_state") not in {"completed", "cancelled", "failed"}:
+                            epoch = max([int(worker.get("control_epoch") or 0)] +
+                                        [int(row.get("control_epoch") or 0) for row in revoked if row.get("work_item_id") == worker["work_item_id"]])
+                            registry.update(worker["work_item_id"], desired_state="paused", work_state="paused", control_epoch=epoch)
+                    return batch
 
                 batch = self._run_site_operation(site_key, _pause_site)
             else:
@@ -655,7 +664,8 @@ class RuntimeHostService:
                 batch = job_store.load_batch(batch_id)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "accepted": True, "batch": batch, "revoked_work_items": len(revoked)}
+        return {"ok": True, "accepted": True, "batch": batch, "revoked_work_items": len(revoked),
+                "affected_sites": [site_key] if site_key else list(current_sites)}
 
     def _handle_pause_site(self, payload: dict[str, Any]) -> dict[str, Any]:
         site_key = str(payload.get("site_key") or "").strip()
@@ -673,7 +683,7 @@ class RuntimeHostService:
         if not paused.get("ok"):
             return paused
         try:
-            released = self._release_site_runtime(site_key=site_key, dispatch=True)
+            released = self._release_site_runtime(site_key=site_key, dispatch=True, batch_id=batch_id)
             WorkItemStore(self.workspace).release_scope(site_key=site_key, batch_id=batch_id, event="site_stopped")
         except Exception as exc:
             return {"ok": False, "error": str(exc), "batch": paused.get("batch")}
@@ -691,22 +701,20 @@ class RuntimeHostService:
                 raise RuntimeError("site cancellation is unavailable")
 
             def _cancel_site() -> dict[str, Any]:
-                WorkItemStore(self.workspace).revoke_scope(
-                    site_key=site_key,
-                    batch_id=batch_id,
-                    state="cancelling",
-                    event="site_cancel_requested",
-                )
+                from careereng.orchestration.worker_control.batch_retirement import retire_site_workers
+
+                retire_site_workers(self.workspace, batch_id, site_key)
                 return cancel_site(batch_id=batch_id, site_key=site_key, reason=reason)
 
             batch = self._run_site_operation(site_key, _cancel_site)
-            released = self._release_site_runtime(site_key=site_key, dispatch=True)
+            released = self._release_site_runtime(site_key=site_key, dispatch=True, batch_id=batch_id)
             WorkItemStore(self.workspace).release_scope(site_key=site_key, batch_id=batch_id, event="site_cancelled")
             self._record_site_worker_batch_outcome(site_key=site_key, batch_id=batch_id)
-            self._retract_effective_site_run(site_key=site_key, batch_id=batch_id)
+            if (batch.get("sites", {}).get(site_key) or {}).get("status") == "cancelled":
+                self._retract_effective_site_run(site_key=site_key, batch_id=batch_id)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "accepted": True, "released": released, "batch": batch}
+        return {"ok": True, "accepted": True, "released": released, "batch": batch, "affected_sites": [site_key]}
 
     def _handle_cancel_jobs_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
         batch_id = str(payload.get("batch_id") or "").strip()
@@ -721,13 +729,10 @@ class RuntimeHostService:
             job_store = getattr(job_flow, "job_store", None)
             current = job_store.load_batch(batch_id) if job_store is not None else {}
             current_sites = current.get("sites") if isinstance(current.get("sites"), dict) else {}
+            from careereng.orchestration.worker_control.batch_retirement import retire_site_workers
+
             for target in current_sites:
-                WorkItemStore(self.workspace).revoke_scope(
-                    site_key=str(target),
-                    batch_id=batch_id,
-                    state="cancelling",
-                    event="batch_cancel_requested",
-                )
+                retire_site_workers(self.workspace, batch_id, str(target))
             batch = cancel_batch(batch_id=batch_id, reason=reason)
             self._managed_batch_seen = True
             sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
@@ -739,7 +744,7 @@ class RuntimeHostService:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         self._shutdown_if_idle()
-        return {"ok": True, "accepted": True, "batch": batch}
+        return {"ok": True, "accepted": True, "batch": batch, "affected_sites": list(current_sites)}
 
     def _handle_release_site(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Release one retained site runtime without interpreting workflow state."""
@@ -757,19 +762,21 @@ class RuntimeHostService:
                     event="runtime_release_requested",
                 ),
             )
-            released = self._release_site_runtime(site_key=request["site_key"], dispatch=True)
-            WorkItemStore(self.workspace).release_scope(site_key=request["site_key"])
+            batch_id = str(payload.get("batch_id") or "")
+            released = self._release_site_runtime(site_key=request["site_key"], dispatch=True, batch_id=batch_id)
+            if released:
+                WorkItemStore(self.workspace).release_scope(site_key=request["site_key"], batch_id=batch_id)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "released": bool(released), **request}
 
-    def _release_site_runtime(self, *, site_key: str, dispatch: bool) -> bool:
+    def _release_site_runtime(self, *, site_key: str, dispatch: bool, batch_id: str = "") -> bool:
         def _release() -> bool:
             browser_runner = getattr(self.loop, "browser_runner", None)
-            finish_site = getattr(browser_runner, "finish_site", None)
+            finish_site = getattr(browser_runner, "finish_batch_site" if batch_id else "finish_site", None)
             if not callable(finish_site):
                 raise RuntimeError("site runtime release is unavailable")
-            outcome = finish_site(site_key)
+            outcome = finish_site(site_key, batch_id=batch_id) if batch_id else finish_site(site_key)
             return True if outcome is None else bool(outcome)
 
         released = self._run_site_operation(site_key, _release)
@@ -791,6 +798,18 @@ class RuntimeHostService:
             return
         if unfinished:
             return
+        if (self.workspace / "sessions" / "native_workers" / "workers.json").is_file():
+            registry = NativeWorkerRegistry(self.workspace)
+            for worker in registry.list():
+                if worker.get("agent_id") and registry.get(agent_id=worker["agent_id"]).get("work_item_id") != worker.get("work_item_id"):
+                    continue
+                if worker.get("runtime_state") in {"starting", "running", "quiescing"}:
+                    return
+                if worker.get("browser_policy") == "release" and worker.get("browser_state") != "absent":
+                    return
+        if (self.workspace / "sessions" / "worker_actions" / "actions.json").is_file():
+            if WorkerActionStore(self.workspace).outstanding():
+                return
         callback = self._idle_shutdown_callback
         if callback is not None:
             self._idle_shutdown_callback = None
@@ -1117,7 +1136,12 @@ class RuntimeHostService:
             worker = registry.require_binding(
                 fence.work_item_id, batch_id=fence.batch_id, site_key=fence.site_key,
                 control_epoch=fence.control_epoch,
+                agent_id=str(payload.get("caller_thread_id") or ""),
             )
+        elif payload.get("caller_thread_id"):
+            caller = str(payload["caller_thread_id"])
+            if caller not in {worker.get("agent_id"), worker.get("parent_agent_id")}:
+                raise ValueError("caller task does not own this worker preflight")
         if not execution_admitted(worker):
             raise ValueError("native worker is waiting or queued for execution capacity")
         if "context_revision" in payload:

@@ -13,6 +13,7 @@ from .registry import NativeWorkerRegistry
 from .lifecycle import is_terminal_work
 from .liveness import has_recent_activity, obsolete_recovery
 from .scheduling import execution_admitted
+from .reconciler import WorkerLifecycleReconciler
 from careereng.platform.persistence.mutex import workspace_mutex
 from careereng.utils import now_iso
 
@@ -95,14 +96,160 @@ class NativeWorkerControlSupervisor:
                 self.inbox.transition(command.command_id, status=WorkerCommandStatus.SUPERSEDED,
                                       error="obsolete control epoch or terminal work item")
 
-    def acknowledge(self, action_id: str, *, applied: bool, error: str = "") -> tuple[WorkerAction, WorkerCommand | None]:
+    def acknowledge(self, action_id: str, *, applied: bool, error: str = "", observation: dict | None = None) -> tuple[WorkerAction, WorkerCommand | None]:
         with self.registry._lock, self.inbox._lock:
+            if observation:
+                self._record_observation(action_id, observation)
             return self._acknowledge(action_id, applied=applied, error=error)
+
+    def _record_observation(self, action_id: str, observation: dict) -> None:
+        action = self.actions.get(action_id)
+        if action.status not in {WorkerActionStatus.CLAIMED, WorkerActionStatus.APPLIED}:
+            raise ValueError("prepare the action before recording an observation")
+        if action.kind not in {WorkerActionKind.PROBE, WorkerActionKind.CLOSE, WorkerActionKind.INTERRUPT}:
+            raise ValueError("only probe and shutdown actions accept runtime observations")
+        worker = self.registry.require_binding(action.work_item_id, batch_id=action.batch_id,
+                                              agent_id=action.agent_id, control_epoch=action.control_epoch)
+        if self.registry.get(agent_id=action.agent_id).get("work_item_id") != action.work_item_id:
+            raise ValueError("observation refers to a replaced task binding")
+        if action.status == WorkerActionStatus.APPLIED and worker.get("observed_runtime_evidence") == observation:
+            return
+        if observation.get("agent_id") != action.agent_id or observation.get("control_epoch") != action.control_epoch:
+            raise ValueError("observation does not match the prepared task and epoch")
+        if observation.get("worker_revision") != worker.get("revision"):
+            raise ValueError("observation is stale; inspect the task again")
+        if not str(observation.get("summary") or "").strip():
+            raise ValueError("runtime observation requires Desktop evidence")
+        state = str(observation.get("runtime_state") or "")
+        if state not in {"running", "suspended", "terminal", "faulted"}:
+            raise ValueError("unsupported observed runtime state")
+        self.registry.update(action.work_item_id, expected_control_epoch=action.control_epoch,
+                             runtime_state=state, observed_runtime_evidence=dict(observation),
+                             observed_runtime_activity_revision=int(worker.get("activity_revision") or 0),
+                             observed_runtime_action_id=action_id,
+                             control_state=("stopped" if state == "terminal" else
+                                            "paused" if state == "suspended" and worker.get("desired_state") == "paused" else
+                                            "idle_confirmed" if state == "suspended" else worker.get("control_state", "")),
+                             interrupt_ack_started_at="" if state != "running" else worker.get("interrupt_ack_started_at", ""))
+
+    def reconcile_actions(self, *, batch_id: str = "", site_key: str = "",
+                          receipt_timeout_seconds: int = 30, max_probe_attempts: int = 2,
+                          max_continuation_attempts: int = 2,
+                          observed_at: str | None = None) -> dict:
+        now = datetime.fromisoformat(observed_at or now_iso())
+        unresolved = []
+        settled = []
+        cleanup_pending = []
+        continuations = []
+        with self.registry._lock, self.inbox._lock:
+            workers = self.registry.list(batch_id=batch_id)
+            latest_bindings = {str(worker["agent_id"]): worker["work_item_id"]
+                               for worker in self.registry.list() if worker.get("agent_id")}
+            outstanding_by_worker = {}
+            for action in self.actions.outstanding(batch_id=batch_id, site_key=site_key):
+                outstanding_by_worker.setdefault(action.work_item_id, []).append(action)
+            for worker in workers:
+                if site_key and worker.get("site_key") != site_key:
+                    continue
+                work_item_id = str(worker["work_item_id"])
+                if worker.get("agent_id") and latest_bindings.get(str(worker["agent_id"])) != work_item_id:
+                    continue
+                cleanup = worker.get("desired_state") in {"paused", "cancelled"} or worker.get("work_state") in {"cancelled", "failed"}
+                cleanup = cleanup or (is_terminal_work(str(worker.get("work_state") or "")) and worker.get("browser_policy") == "release")
+                quiet = worker.get("runtime_state") in {"suspended", "terminal", "detached"}
+                released = worker.get("browser_state") == "absent"
+                needs_release = worker.get("browser_policy") == "release" or worker.get("desired_state") == "cancelled"
+                complete = cleanup and quiet and (released or not needs_release)
+                for action in outstanding_by_worker.get(work_item_id, []):
+                    redundant = action.kind == WorkerActionKind.INTERRUPT and cleanup and quiet
+                    redundant = redundant or (action.kind == WorkerActionKind.CLOSE and complete)
+                    redundant = redundant or (action.kind == WorkerActionKind.PROBE and complete)
+                    if redundant:
+                        settled.append(self.actions.transition(action.action_id, status=WorkerActionStatus.SUPERSEDED,
+                                                               error="observed lifecycle target reached; no delivery receipt inferred").as_dict())
+                        self.actions.supersede_dependents(action.action_id, error="observed lifecycle target reached")
+                        continue
+                    age = (now - datetime.fromisoformat(action.updated_at or action.created_at)).total_seconds()
+                    if action.status == WorkerActionStatus.CLAIMED and age >= max(1, receipt_timeout_seconds):
+                        unresolved.append({"action_id": action.action_id, "work_item_id": work_item_id,
+                                           "kind": action.kind.value, "status": action.status.value,
+                                           "reason": "action receipt or lifecycle observation missing"})
+                if not cleanup or complete:
+                    evidence = worker.get("observed_runtime_evidence") or {}
+                    activity_revision = int(worker.get("activity_revision") or 0)
+                    resumable = (worker.get("desired_state") == "running" and worker.get("work_state") in {"queued", "running"}
+                                 and worker.get("runtime_state") == "suspended" and evidence.get("runtime_state") == "suspended"
+                                 and worker.get("observed_runtime_activity_revision") == activity_revision
+                                 and worker.get("observed_runtime_action_id")
+                                 and worker.get("continuation_observation_id") != worker.get("observed_runtime_action_id")
+                                 and worker.get("registered_at") and execution_admitted(worker)
+                                 and not worker.get("inflight_operations") and not self.actions.unsettled(work_item_id))
+                    if resumable:
+                        attempts = int(worker.get("continuation_attempts") or 0) if worker.get("continuation_activity_revision") == activity_revision else 0
+                        if attempts >= max(0, max_continuation_attempts):
+                            self.registry.update(work_item_id, work_state="waiting_user", control_state="continuation_exhausted",
+                                                 last_error="unfinished work repeatedly ended without new execution progress")
+                            continuations.append({"kind": "continuation_exhausted", "work_item_id": work_item_id})
+                        else:
+                            self.registry.update(work_item_id, continuation_observation_id=worker.get("observed_runtime_action_id"),
+                                                 continuation_activity_revision=activity_revision,
+                                                 continuation_attempts=attempts + 1)
+                            command = create_worker_command(
+                                command_id=f"worker_continuation:{work_item_id}:{worker.get('control_epoch')}:{activity_revision}:{attempts + 1}",
+                                work_item_id=work_item_id, site_key=str(worker.get("site_key") or ""),
+                                batch_id=str(worker.get("batch_id") or ""), kind=WorkerCommandKind.RESUME,
+                                expected_control_epoch=int(worker.get("control_epoch") or 0),
+                                message="Continue this unfinished work item from its current durable phase and remaining Apply Plan. A Desktop turn ending is not business completion; do not restart finished phases or return only a progress summary.",
+                            )
+                            self.enqueue(command)
+                            continuations.append({"kind": "continuation_requested", "work_item_id": work_item_id})
+                    continue
+                cleanup_pending.append(work_item_id)
+                outstanding = self.actions.unsettled(work_item_id)
+                history = [action for action in self.actions.history(work_item_id)
+                           if action.control_epoch == int(worker.get("control_epoch") or 0)]
+                probes = [action for action in history if action.payload.get("cleanup_probe")]
+                overdue = any(action.status in {WorkerActionStatus.CLAIMED, WorkerActionStatus.APPLIED}
+                              and (now - datetime.fromisoformat(action.updated_at or action.created_at)).total_seconds()
+                              >= max(1, receipt_timeout_seconds) for action in history)
+                if overdue:
+                    unresolved.append({"action_id": f"cleanup:{work_item_id}:{worker.get('control_epoch')}",
+                                       "work_item_id": work_item_id, "kind": "cleanup", "status": "unconfirmed",
+                                       "reason": "runtime or browser release is unconfirmed",
+                                       "runtime_state": worker.get("runtime_state"), "browser_state": worker.get("browser_state"),
+                                       "probe_attempts": len(probes)})
+                for probe in probes:
+                    age = (now - datetime.fromisoformat(probe.updated_at or probe.created_at)).total_seconds()
+                    if probe.status in {WorkerActionStatus.PENDING, WorkerActionStatus.CLAIMED} and age >= max(1, receipt_timeout_seconds):
+                        self.actions.transition(probe.action_id, status=WorkerActionStatus.SUPERSEDED,
+                                                error="read-only cleanup probe timed out")
+                outstanding = self.actions.unsettled(work_item_id)
+                if not quiet and not any(action.kind == WorkerActionKind.PROBE for action in outstanding):
+                    if len(probes) < max(0, max_probe_attempts):
+                        self.actions.enqueue(create_worker_action(
+                            kind=WorkerActionKind.PROBE, agent_id=str(worker.get("agent_id") or ""),
+                            work_item_id=work_item_id, site_key=str(worker.get("site_key") or ""),
+                            batch_id=str(worker.get("batch_id") or ""), control_epoch=int(worker.get("control_epoch") or 0),
+                            action_id=f"cleanup_probe:{work_item_id}:{worker.get('control_epoch')}:{len(probes) + 1}",
+                            payload={"cleanup_probe": True, "cleanup_key": f"cleanup:{work_item_id}:{worker.get('control_epoch')}",
+                                     "worker_revision": worker.get("revision"), "reason": "Inspect the original Desktop task; report actual runtime state with evidence, never infer it from cancellation."},
+                        ))
+                if not outstanding and not any(action.kind in {WorkerActionKind.CLOSE, WorkerActionKind.INTERRUPT} for action in history):
+                    for action in WorkerLifecycleReconciler().plan(worker, resource_policy=str(worker.get("browser_policy") or "unchanged")):
+                        self.actions.enqueue(action)
+            outstanding = self.actions.outstanding(batch_id=batch_id, site_key=site_key)
+        return {"settled": settled, "outstanding": [action.as_dict() for action in outstanding],
+                "unresolved": unresolved, "cleanup_pending": cleanup_pending,
+                "continuations": continuations,
+                "cleanup_complete": not outstanding and not cleanup_pending}
 
     def _acknowledge(self, action_id: str, *, applied: bool, error: str = "") -> tuple[WorkerAction, WorkerCommand | None]:
         self.actions.pending()
         existing = self.actions.get(action_id)
         if existing.status == WorkerActionStatus.SUPERSEDED:
+            command_id = str(existing.payload.get("command_id") or "")
+            return existing, self.inbox.get(command_id) if command_id else None
+        if existing.status == (WorkerActionStatus.APPLIED if applied else WorkerActionStatus.FAILED):
             command_id = str(existing.payload.get("command_id") or "")
             return existing, self.inbox.get(command_id) if command_id else None
         action = self.actions.acknowledge(action_id, applied=applied, error=error)
@@ -168,7 +315,7 @@ class NativeWorkerControlSupervisor:
         now = datetime.fromisoformat(observed_at) if observed_at else datetime.fromisoformat(now_iso())
         results: list[dict] = []
         for worker in self.registry.list(active_only=True):
-            if worker.get("desired_state") != "running" or worker.get("work_state") != "running":
+            if worker.get("desired_state") != "running" or worker.get("work_state") not in {"running", "queued"}:
                 if str(worker.get("control_state") or "") != "transitioning":
                     continue
             interrupt_started = str(worker.get("interrupt_ack_started_at") or "")
@@ -205,7 +352,9 @@ class NativeWorkerControlSupervisor:
                 )
                 results.append({"kind": "interrupt_retry", "worker": worker, "actions": [retry]})
                 continue
-            if str(worker.get("runtime_state") or "") != "running" or str(worker.get("work_state") or "") != "running":
+            if str(worker.get("runtime_state") or "") not in {"running", "suspended"} or str(worker.get("work_state") or "") not in {"running", "queued"}:
+                continue
+            if worker.get("slot_state") and not execution_admitted(worker):
                 continue
             if has_recent_activity(worker, now, max(1, idle_timeout_seconds), max(1, inflight_timeout_seconds)):
                 if worker.get("suspect_checks"):

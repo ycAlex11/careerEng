@@ -31,6 +31,11 @@ class NativeWorkerRegistry:
             existing = next((row for row in data["workers"] if row.get("work_item_id") == work_item_id), None)
             if existing is not None:
                 return dict(existing)
+            if agent_id:
+                previous = next((row for row in reversed(data["workers"]) if row.get("agent_id") == agent_id), None)
+                if previous and (not is_terminal_work(str(previous.get("work_state") or ""))
+                                 or previous.get("runtime_state") in {"starting", "running", "quiescing"}):
+                    raise ValueError("task_reuse_requires_quiescence: reconcile the previous worker before reusing its task")
             now = now_iso()
             payload = {
                 "agent_id": str(agent_id or ""),
@@ -47,7 +52,7 @@ class NativeWorkerRegistry:
                 "browser_policy": "unchanged",
                 "control_epoch": max(0, int(control_epoch or 0)),
                 "revision": 1,
-                "registered_at": now if agent_id else "",
+                "registered_at": "",
                 "updated_at": now,
                 "last_heartbeat_at": "",
             }
@@ -79,8 +84,10 @@ class NativeWorkerRegistry:
                     raise ValueError("worker already bound to another live task")
             if parent_agent_id and parent_agent_id == agent_id:
                 raise ValueError("worker cannot be its own parent task")
-            if any(row.get("agent_id") == agent_id and row.get("work_item_id") != work_item_id
-                   and not is_terminal_work(str(row.get("work_state") or "")) for row in data["workers"]):
+            previous = next((row for row in reversed(data["workers"])
+                             if row.get("agent_id") == agent_id and row.get("work_item_id") != work_item_id), {})
+            if previous and (not is_terminal_work(str(previous.get("work_state") or ""))
+                             or previous.get("runtime_state") in {"starting", "running", "quiescing"}):
                 raise ValueError("task already bound to another active work item")
             if existing is not None and str(existing.get("agent_id") or "") == str(agent_id):
                 if control_epoch and int(existing.get("control_epoch") or 0) != int(control_epoch):
@@ -88,6 +95,7 @@ class NativeWorkerRegistry:
                 if parent_agent_id:
                     existing["parent_agent_id"] = str(parent_agent_id)
                 existing["updated_at"] = now
+                existing["registered_at"] = str(existing.get("registered_at") or now)
                 existing["last_heartbeat_at"] = now
                 write_json(self.path, data)
                 return dict(existing)
@@ -144,6 +152,9 @@ class NativeWorkerRegistry:
             expected_epoch = changes.pop("expected_control_epoch", None)
             if expected_epoch is not None and int(expected_epoch) != int(row.get("control_epoch") or 0):
                 raise ValueError("obsolete control epoch")
+            expected_agent = changes.pop("expected_agent_id", None)
+            if expected_agent is not None and row.get("agent_id") != expected_agent:
+                raise ValueError("caller task does not own this worker")
             if "control_epoch" in changes and int(changes["control_epoch"]) < int(row.get("control_epoch") or 0):
                 raise ValueError("control epoch cannot move backwards")
             immutable = {"agent_id", "work_item_id", "worker_session_id", "site_key", "batch_id", "worker_kind", "parent_agent_id", "registered_at"}
@@ -215,6 +226,7 @@ class NativeWorkerRegistry:
                 operations.pop(token)
             else:
                 operations[token] = stamp
+                row.update(runtime_state="running", work_state="running")
             row.update(inflight_operations=operations, last_activity_at=stamp,
                        activity_revision=int(row.get("activity_revision") or 0) + 1,
                        revision=int(row.get("revision") or 0) + 1,
@@ -231,6 +243,12 @@ class NativeWorkerRegistry:
             rows = self._load()["workers"]
         row = next((item for item in reversed(rows) if (work_item_id and item.get("work_item_id") == work_item_id)
                     or (agent_id and item.get("agent_id") == agent_id)), None)
+        return dict(row) if row else {}
+
+    def previous_binding(self, agent_id: str, *, excluding: str = "") -> dict[str, Any]:
+        with self._lock:
+            row = next((item for item in reversed(self._load()["workers"])
+                        if item.get("agent_id") == agent_id and item.get("work_item_id") != excluding), None)
         return dict(row) if row else {}
 
     def latest_for_session(self, worker_session_id: str) -> dict[str, Any]:

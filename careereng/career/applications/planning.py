@@ -9,6 +9,7 @@ from careereng.evolution.apply_probe import apply_probe_counters
 from careereng.career.applications.skill_policy import load_job_skill_policies
 from careereng.career.applications.application_store import ApplicationStore
 from careereng.career.applications.planning_store import JobPlanningStore
+from careereng.utils import now_iso
 from careereng.career.applications.job_store import JobStore
 from careereng.career.applications.ranked_queue import (
     DEFERRED_BY_RANK,
@@ -353,6 +354,23 @@ class ApplicationPlanningService:
         if terminal_updates:
             self.site_store.update_run_jobs(site_key, terminal_updates, session_id, turn_id, batch_id)
         return plan
+
+    def progress_snapshot(self, site_key: str, batch_id: str) -> dict[str, Any]:
+        plan = self.planning_store.load_apply_plan(batch_id=batch_id, site_key=site_key)
+        if not plan:
+            return {"available": False}
+        rows = {str(row.get("job_id") or ""): row for row in self.merged_run_job_rows_for_batch(site_key, batch_id)}
+        items = [item for item in plan.get("plan_items", []) if isinstance(item, dict)]
+        terminal = 0
+        submitted = 0
+        for item in items:
+            row = rows.get(str(item.get("job_id") or "")) or self.planning_store.terminal_update_for_plan_item(item)
+            terminal += int(self.is_apply_row_terminal(row))
+            submitted += int(row.get("application_status") == "submitted" and row.get("application_evidence_source") != "history_skip"
+                             and item.get("action") not in {"skip_submitted", "skip_already_applied"})
+        return {"available": True, "plan_id": plan.get("plan_id"), "observed_at": now_iso(),
+                "total": len(items), "handled": terminal, "remaining": len(items) - terminal,
+                "submitted": submitted}
 
     def pending_apply_rows(self, site_key: str, batch_id: str) -> list[dict[str, Any]]:
         rows = self.merged_run_job_rows_for_batch(site_key, batch_id)

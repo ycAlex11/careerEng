@@ -44,6 +44,8 @@ class BatchCheckpointRecovery:
         source_site = source_sites.get(site_key)
         if not isinstance(source_site, dict):
             raise ValueError(f"site is not in source batch: {site_key}")
+        if source.get("status") == "cancelled" or source_site.get("status") == "cancelled" or source_site.get("resume_allowed") is False:
+            raise ValueError("cancelled site cannot be recovered; start a fresh run")
         phase = self._restart_phase(source=source, site=source_site)
         if not phase:
             raise ValueError("source batch has no unfinished durable checkpoint")

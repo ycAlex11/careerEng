@@ -68,6 +68,52 @@ python -m careereng assistant ingest --client codex --thread <thread_id> -m "@ca
 
 ## Execution Rule
 
+### Desktop Identity And Cleanup
+
+Pause retains the selected site's frozen plan and resumes only on user intent.
+Cancel archives that site's execution, fences its leases/actions and prohibits
+checkpoint recovery; a new run starts fresh while retaining application dedupe.
+Cancellation receipts may still expose real runtime cleanup, but obsolete
+history must not block a new task. Use batch-scoped browser release when handling
+old cleanup; never release a replacement browser using only a stale site name.
+
+Use `careereng_get_batch_progress` to answer user progress questions read-only;
+do not send a guidance query that makes a worker switch to replying. Due ordinary
+notifications include bounded `summary_context` snapshots. Let the LLM combine
+them into a natural summary with reliable counts, meaningful changes and user
+actions, rather than translating raw phase events. Preserve configurable cadence,
+urgent delivery and final presentation receipts; unknown quantities are not zero.
+
+If Desktop reports a completed/idle turn but the site remains unfinished,
+prepare a read-only probe and record actual task/epoch/revision-fenced evidence.
+The existing supervisor can plan a bounded continuation from the current work
+item; consume those actions independently of notification cadence. Do not infer
+idle from a registry label or resume user-paused/waiting/cancelled work. Do not
+reset the phase or Apply Plan or send duplicate pending continuation commands.
+
+CareerEng reads the actual caller task from Desktop MCP request metadata.
+Register the calling main task before launching work; only it may control workers
+and acknowledge Desktop action receipts. Register reused child tasks again for
+their new work item. Children may read and execute only their assigned scope;
+they report login completion but must not call the supervisor resume tool.
+
+Business completion/cancellation and lifecycle cleanup are separate. Read
+`reconciliation` from monitoring, batch status or action listing even after the
+batch becomes terminal. Keep receipt-only monitoring until `cleanup_complete`,
+or report the explicit unresolved actions when Desktop cannot perform them.
+Do not automatically resume cancelled business work to finish cleanup.
+
+Prepare every probe/interrupt/close action before using Desktop tools. To record
+actual task state, pass `observation` to `careereng_ack_worker_action` with the
+returned `observation_fence` fields (`agent_id`, `control_epoch`,
+`worker_revision`), a supported `runtime_state` and a non-empty evidence
+`summary`. Refresh a rejected stale observation rather than changing the fence
+to match blindly. A transport receipt alone never proves that a task stopped.
+Browser release is confirmed independently by CareerEng's runtime owner.
+If launch specs return `blocked_workers`, handle their read-only `probe_action`
+before requesting launch specs again. Probe and cleanup actions never authorize
+new applications or restoration of an archived Apply List.
+
 The bridge returns structured JSON with:
 
 - `data_category`

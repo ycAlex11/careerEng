@@ -122,6 +122,12 @@ class WorkerActionStore:
         for row in rows:
             if row.status not in {WorkerActionStatus.PENDING, WorkerActionStatus.CLAIMED}:
                 continue
+            prerequisite = str(row.payload.get("depends_on_action_id") or "")
+            if prerequisite and statuses.get(prerequisite) in {WorkerActionStatus.FAILED, WorkerActionStatus.SUPERSEDED}:
+                self.transition(row.action_id, status=WorkerActionStatus.SUPERSEDED, error="prerequisite did not succeed")
+                self.supersede_dependents(row.action_id, error="prerequisite did not succeed")
+                statuses[row.action_id] = WorkerActionStatus.SUPERSEDED
+                continue
             worker = registry.get(work_item_id=row.work_item_id)
             if not worker:
                 continue
@@ -167,6 +173,19 @@ class WorkerActionStore:
                     if row.get("work_item_id") == work_item_id
                     and row.get("status") in {"pending", "claimed"}]
 
+    def outstanding(self, *, batch_id: str = "", site_key: str = "") -> list[WorkerAction]:
+        self.pending()
+        with self._lock:
+            return [WorkerAction.from_dict(row) for row in self._load()["actions"]
+                    if row.get("status") in {"pending", "claimed"}
+                    and (not batch_id or row.get("batch_id") == batch_id)
+                    and (not site_key or row.get("site_key") == site_key)]
+
+    def history(self, work_item_id: str) -> list[WorkerAction]:
+        with self._lock:
+            return [WorkerAction.from_dict(row) for row in self._load()["actions"]
+                    if row.get("work_item_id") == work_item_id]
+
     def supersede_dependents(self, action_id: str, *, error: str = "") -> list[WorkerAction]:
         normalized = str(action_id or "").strip()
         if not normalized:
@@ -186,6 +205,7 @@ class WorkerActionStore:
                         error=error or "prerequisite action failed",
                     )
                 )
+                updated.extend(self.supersede_dependents(row.action_id, error=error))
         return updated
 
     def transition(self, action_id: str, *, status: WorkerActionStatus | str, error: str = "") -> WorkerAction:
@@ -236,7 +256,10 @@ class WorkerActionStore:
             raise ValueError(
                 f"worker action cannot be acknowledged from {current.status.value}"
             )
-        return self.transition(action_id, status=target, error=error)
+        result = self.transition(action_id, status=target, error=error)
+        if not applied:
+            self.supersede_dependents(action_id, error=error or "prerequisite failed")
+        return result
 
     def _load(self) -> dict[str, list[dict[str, Any]]]:
         payload = read_json(self.path)

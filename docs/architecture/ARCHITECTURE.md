@@ -11,11 +11,55 @@ code during migration, not a reason to extend the old boundaries.
 
 ## Identity And Lifecycle Reconciliation
 
+Pause and cancel have different durable meanings. Pause retains the site work
+item and frozen Apply Plan and resumes only on explicit user intent. Cancellation
+archives that site's execution, fences its leases and commands, and forbids
+checkpoint recovery; historical applications remain available for deduplication.
+Completed sibling sites keep their outcomes. Browser cleanup is scoped by both
+site and batch so late cleanup cannot release a newer runtime. Task reuse checks
+only its latest effective previous binding; retired running tasks are quarantined
+and replaced through existing visible-task continuity, never presumed stopped.
+
+Receipt time starts on a prepared action's claim; pending dispatch, queued work
+and blocked prerequisites do not produce missing-receipt alarms. Failed dependencies settle
+their descendants. A confirmed idle Desktop turn may need a bounded continuation
+of unfinished business work, but user-paused, waiting-user and cancelled work
+must never be automatically restarted. Read-only supervisor progress snapshots
+do not enqueue worker guidance or change work-item leases. The LLM summarizes
+verified snapshots and due events at the existing configured notification cadence.
+Cancellation archival and resource cleanup are separate: a sealed batch can
+retain `runtime_cleanup_pending` until a scoped release is verified, so a failed
+release remains retryable before replacement startup. The Runtime Host contract
+is versioned as `2026-10-07.1` to reject old unscoped cleanup implementations.
+
 Native capacity admission may precede Desktop task registration. Business
 execution and successful spawn/resume/send receipts require a registered child
 task and parent binding matching the work item, site, batch and control epoch.
 Missing binding returns a registration-required error without side effects;
 resume preserves identity and cannot substitute capacity admission for binding.
+
+The MCP request boundary reads Desktop-supplied `threadId` metadata, never a
+tool argument, to authorize calls. The registered main task owns batch controls
+and Desktop action receipts. Registered children execute and report only their
+own work items; the main task can read their scoped context for diagnosis but
+cannot execute browser or business-state tools on their behalf. Unknown tools
+and missing caller identity fail closed. This boundary trusts the local Desktop
+transport, not arbitrary local processes with filesystem access.
+
+Lifecycle reconciliation reuses the action store and supervisor. Transport
+acceptance does not set observed runtime state. Pending and claimed actions stay
+visible after business termination; confirmed redundant cleanup is superseded
+with evidence rather than acknowledged as a delivery that never happened.
+Timeouts produce bounded read-only probes or explicit unresolved cleanup; they
+never automatically replay an uncertain spawn or message send. Only confirmed
+browser release and observed runtime suspension/termination settle cleanup.
+`careereng_prepare_worker_action` supplies an observation fence (task, epoch and
+registry revision). The supervisor may attach Desktop runtime evidence to a
+probe/interrupt/close receipt; mismatched or stale observations cannot update the
+registry. Browser release evidence is recorded by the browser runtime owner,
+independently of Desktop task state. Reused task plans require explicit
+registration and a quiescent previous binding; an active previous task is probed
+before reuse. The Runtime Host does not shut down while cleanup is unresolved.
 
 ### Communication Delivery Boundaries
 

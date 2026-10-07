@@ -34,6 +34,18 @@ class AgentNotificationStore:
                 if urgent or kind in {"site.phase_advanced", "evolution.requested"}:
                     pending[event["event_id"]] = {**event, "urgent": urgent}
             state["cursor"] = listed["next_cursor"]
+            from careereng.orchestration.worker_control.actions import WorkerActionStore
+
+            actions = WorkerActionStore(self.path.parent.parent)
+            for event_id, event in list(pending.items()):
+                if event.get("kind") != "worker.action_unconfirmed":
+                    continue
+                try:
+                    action = actions.get(str((event.get("details") or {}).get("action_id") or ""))
+                except KeyError:
+                    continue
+                if action.status.value in {"applied", "failed", "superseded"}:
+                    pending.pop(event_id, None)
             groups: dict[str, list[dict]] = {}
             for event in pending.values():
                 if site_key and event.get("site_key") != site_key:
@@ -55,7 +67,8 @@ class AgentNotificationStore:
                 notifications.append({"delivery_id": delivery_id, "urgent": urgent, "events": events,
                                       "presentation": {"owner": "main_agent", "channel": "final",
                                                        "acknowledge": "after_final_on_next_turn",
-                                                       "instruction": "Summarize current verified facts in a non-empty final reply. Never use commentary alone; no notifications means silence."}})
+                                                       "progress_tool": "careereng_get_batch_progress",
+                                                       "instruction": "Use the LLM to combine due events and current verified site progress into a concise update in the user's language. Describe what is being processed, waiting or finished; include reliable counts when available, never invent them. Do not translate internal phase events one by one. Render a non-empty final reply; no due notifications or no meaningful change means silence."}})
             write_json(self.path, state)
             return notifications
 

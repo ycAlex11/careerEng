@@ -11,6 +11,7 @@ from careereng.orchestration.worker_control.lifecycle import is_terminal_work
 from pathlib import Path
 from typing import Any
 
+from careereng.utils import now_iso
 from careereng.evolution.work_items import ActionCardStore
 from careereng.evolution.work_items.schema import ACTION_CARD_CODEX_REVIEW
 from careereng.adapters.external_agents.contracts import (
@@ -2789,7 +2790,7 @@ class JobFlow:
                 continue
             sites = batch.get("sites") if isinstance(batch.get("sites"), dict) else {}
             site = sites.get(site_key)
-            if not isinstance(site, dict) or str(site.get("status") or "") == "completed":
+            if not isinstance(site, dict) or str(site.get("status") or "") in {"completed", "cancelled"} or site.get("resume_allowed") is False:
                 continue
             if str(site.get("current_phase") or ""):
                 return batch
@@ -3172,8 +3173,12 @@ class JobFlow:
         current = sites.get(normalized_site)
         if not isinstance(current, dict):
             raise ValueError(f"site is not in batch: {normalized_site}")
+        if current.get("status") == "completed" and is_non_resumable_site_terminal(current):
+            return batch
         updated = self._cancelled_site_row(current, current_phase=str(current.get("current_phase") or ""))
         updated["message"] = f"Site cancelled: {str(reason or 'user_requested_cancel')}"
+        updated["archived_at"] = now_iso()
+        updated["resume_allowed"] = False
         sites[normalized_site] = updated
         batch["sites"] = sites
         batch["status"] = "running"
@@ -3238,6 +3243,8 @@ class JobFlow:
         current = sites.get(site_key)
         if not isinstance(current, dict):
             return None
+        if current.get("status") == "cancelled" or current.get("resume_allowed") is False or batch.get("resume_allowed") is False:
+            raise ValueError("cancelled execution cannot be resumed; start a fresh run")
         if not self.browser_runner:
             replacement = self._disabled_site_row(
                 site_key=site_key,

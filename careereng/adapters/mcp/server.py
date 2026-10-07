@@ -11,7 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+
+from .access import DesktopMCPServer, current_caller
 
 from careereng.adapters.bootstrap import project_root_from_cwd, workspace_path as resolve_workspace_path
 from careereng.orchestration.agent_protocol.work_items import build_work_item_context, read_work_item_resource, work_item_id_from_payload
@@ -141,6 +143,8 @@ def _compact_batch_site(site: dict[str, Any], *, browser_session: dict[str, Any]
         "site_key": str(site.get("site_key") or ""),
         "site_name": str(site.get("site_name") or ""),
         "status": str(site.get("status") or ""),
+        "resume_allowed": site.get("status") != "cancelled" and site.get("resume_allowed") is not False,
+        "execution_archived_at": str(site.get("archived_at") or ""),
         "execution_outcome": str(site.get("execution_outcome") or ""),
         "reason_tag": str(site.get("reason_tag") or ""),
         "current_phase": str(site.get("current_phase") or ""),
@@ -218,9 +222,12 @@ def _active_work_item_scope(
     if expected_target and expected_target not in apply_target_job_ids:
         raise ValueError("apply target fence does not match the active work item target")
     if require_binding:
+        caller = current_caller.get()
+        main = str(runtime.agent_events().main_agent_registration().get("thread_id") or "")
         runtime.native_workers().require_binding(
             work_item_id, batch_id=batch_id, site_key=site_key,
             control_epoch=int(payload.get("control_epoch") or 0),
+            agent_id=caller if caller != main else "",
         )
     return {
         "work_item_id": str(context.get("work_item_id") or ""),
@@ -243,13 +250,15 @@ def _work_item_fence_payload(scope: dict[str, Any]) -> dict[str, Any]:
         "context_revision": scope["context_revision"],
         "control_epoch": scope["control_epoch"],
         "site_revision": scope["site_revision"],
+        "caller_thread_id": current_caller.get(),
     }
 
 
 def create_mcp_server(*, project_root: Path | None = None, workspace: Path | None = None) -> FastMCP:
     runtime = CareerEngMCPRuntime.from_paths(project_root=project_root, workspace=workspace)
-    server = FastMCP(
+    server = DesktopMCPServer(
         "careereng",
+        workspace=runtime.workspace,
         instructions=(
             "CareerEng MCP tools expose local CareerEng workflow capabilities to Codex. "
             "Top-level tools are monitoring and lifecycle controls only. Browser and state "
@@ -354,15 +363,56 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             serialized.append({"kind": kind, "worker": worker, "actions": actions, "event": event})
         return serialized
 
+    def reconcile_worker_actions(*, batch_id: str = "", site_key: str = "") -> dict[str, Any]:
+        runtime.site_scheduler().reconcile()
+        recovery = load_config(runtime.project_root).agent.recovery
+        result = runtime.worker_control().reconcile_actions(
+            batch_id=batch_id, site_key=site_key,
+            receipt_timeout_seconds=int(recovery.probe_interval_seconds),
+            max_probe_attempts=int(recovery.max_interrupt_attempts),
+            max_continuation_attempts=int(recovery.max_resume_attempts),
+        )
+        for continuation in result["continuations"]:
+            if continuation["kind"] != "continuation_exhausted":
+                continue
+            worker = runtime.native_workers().get(work_item_id=continuation["work_item_id"])
+            runtime.agent_events().publish(
+                kind="worker.continuation_exhausted", attention="action_required",
+                summary="Unfinished worker repeatedly ended without progress; user assistance is required.",
+                site_key=str(worker.get("site_key") or ""), batch_id=str(worker.get("batch_id") or ""),
+                details=continuation, dedupe_key=f"continuation_exhausted:{worker.get('work_item_id')}:{worker.get('control_epoch')}:{worker.get('activity_revision')}",
+            )
+        for missing in result["unresolved"]:
+            worker = runtime.native_workers().get(work_item_id=missing["work_item_id"])
+            runtime.agent_events().publish(
+                kind="worker.action_unconfirmed", attention="action_required",
+                summary=f"{worker.get('site_key')} {missing['kind']} remains unconfirmed; inspect the original task before retrying.",
+                site_key=str(worker.get("site_key") or ""), batch_id=str(worker.get("batch_id") or ""),
+                details=missing, dedupe_key=f"action_unconfirmed:{missing['action_id']}:{worker.get('control_epoch')}",
+            )
+        return result
+
     @server.tool()
-    def careereng_ping() -> dict[str, Any]:
+    def careereng_ping(ctx: Context) -> dict[str, Any]:
         """Check that the CareerEng MCP server is reachable."""
+        try:
+            metadata = ctx.request_context.meta
+        except ValueError:
+            metadata = None
+        values = metadata.model_dump(by_alias=True) if metadata is not None else {}
         return {
             "ok": True,
             "bridge_protocol_version": AGENT_BRIDGE_PROTOCOL_VERSION,
             "runtime_host_protocol_version": RUNTIME_HOST_PROTOCOL_VERSION,
             "project_root": str(runtime.project_root),
             "workspace": str(runtime.workspace),
+            "caller_diagnostics": {
+                "metadata_keys": sorted(values),
+                "thread_id": values.get("threadId"),
+                "turn_id": values.get("turnId"),
+                "call_id": values.get("callId"),
+            },
+            "caller_access_enforced": True,
         }
 
     @server.tool()
@@ -402,6 +452,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
     ) -> dict[str, Any]:
         """Cancellably wait for durable events while the current main-Agent turn is active."""
         reconcile_worker_liveness()
+        reconciliation = reconcile_worker_actions(batch_id=batch_id, site_key=site_key)
         bounded_timeout = min(5.0, max(0.0, float(timeout_seconds or 0.0)))
         event_store = runtime.agent_events()
         loop = asyncio.get_running_loop()
@@ -421,11 +472,15 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             )
             if listed["events"] or notifications:
                 return {"ok": True, "max_wait_seconds": 5.0, "timed_out": False, **listed,
-                        "notifications": notifications, "monitor_policy": policy}
+                        "notifications": notifications, "monitor_policy": policy, "reconciliation": reconciliation,
+                        "summary_context": [careereng_get_batch_progress(batch_id=key) for key in sorted({
+                            str(event.get("batch_id") or "") for notification in notifications
+                            for event in notification.get("events", []) if event.get("batch_id")
+                        })]}
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return {"ok": True, "max_wait_seconds": 5.0, "timed_out": True, **listed,
-                        "notifications": [], "monitor_policy": policy}
+                        "notifications": [], "monitor_policy": policy, "reconciliation": reconciliation}
             await asyncio.sleep(min(0.25, remaining))
 
     @server.tool()
@@ -453,11 +508,12 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         records = WorkItemStore(runtime.workspace).list_records(batch_id=batch_id, states={"active"})
         specs = []
         actions = []
+        blocked_workers = []
         for record in records:
             work_item_id = str(record.get("work_item_id") or "")
             existing = runtime.native_workers().get(work_item_id=work_item_id)
             if existing.get("launch_spec"):
-                if not existing.get("agent_id"):
+                if not existing.get("registered_at"):
                     specs.append(existing["launch_spec"])
                 continue
             if not work_item_id or str(existing.get("agent_id") or ""):
@@ -477,6 +533,17 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                     max_effective_batches=runtime.site_run_threshold(),
                 )
                 previous_worker = runtime.native_workers().latest_for_session(session_binding.worker_session_id)
+                if previous_worker.get("agent_id") and not previous_worker.get("execution_retired") and previous_worker.get("runtime_state") in {"starting", "running", "quiescing"}:
+                    probe = runtime.worker_actions().enqueue(create_worker_action(
+                        kind=WorkerActionKind.PROBE, agent_id=str(previous_worker["agent_id"]),
+                        work_item_id=str(previous_worker["work_item_id"]), site_key=str(previous_worker["site_key"]),
+                        batch_id=str(previous_worker["batch_id"]), control_epoch=int(previous_worker.get("control_epoch") or 0),
+                        action_id=f"task_reuse_probe:{previous_worker['work_item_id']}:{previous_worker.get('control_epoch')}",
+                        payload={"reason": "Verify the previous Desktop task has stopped before explicitly rebinding it."},
+                    ))
+                    blocked_workers.append({"work_item_id": work_item_id, "reason": "task_reuse_requires_quiescence",
+                                            "probe_action": probe.as_dict()})
+                    continue
                 continuity = plan_worker_continuity(
                     bound_agent_id=session_binding.thread_id,
                     previous_worker=previous_worker,
@@ -510,7 +577,9 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                     "report native waiting_user state with wait_decision containing slot_policy (retain/release), "
                     "reason, evidence and resume_condition. Release only after finishing browser operations; "
                     "report runtime_state=suspended. Waiting does not implicitly release capacity. "
-                    "Do not create or manage other agents. After reporting waiting_user, failure, "
+                    "Do not create or manage other agents. After every individual job's phase_result, fetch the same work item context again and keep processing its remaining plan. "
+                    "A progress query is not a pause; one job completing is not the site completing. "
+                    "Return a final summary only when the site is terminal or genuinely blocked. After reporting waiting_user, failure, "
                     "or completion, call careereng_claim_urgent_notification with this work item "
                     "and its current control epoch. If send_required, call Desktop "
                     "send_message_to_thread with the returned target/message, then record the "
@@ -569,6 +638,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         specs = [spec for spec in specs if execution_admitted(runtime.native_workers().get(work_item_id=spec["work_item_id"]))]
         actions = [row.as_dict() for row in runtime.worker_actions().pending(batch_id=batch_id)]
         return {"ok": True, "batch_id": batch_id, "launch_specs": specs, "actions": actions,
+                "blocked_workers": blocked_workers,
                 "scheduling": scheduling,
                 "monitor_policy": runtime.monitor_policy()}
 
@@ -646,6 +716,8 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             "last_error": str(error or ""), "heartbeat": bool(heartbeat),
         }
         changes["expected_control_epoch"] = expected_control_epoch
+        if current_caller.get():
+            changes["expected_agent_id"] = current_caller.get()
         if heartbeat and runtime_state == "running":
             changes["recovery_attempts"] = 0
         if runtime_state in {"suspended", "terminal", "faulted"}:
@@ -660,7 +732,8 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         if browser_state is not None:
             changes["browser_state"] = browser_state
         try:
-            runtime.native_workers().require_binding(work_item_id, control_epoch=expected_control_epoch)
+            runtime.native_workers().require_binding(work_item_id, control_epoch=expected_control_epoch,
+                                                     agent_id=current_caller.get())
             worker = runtime.site_scheduler().report(work_item_id, changes=changes, decision=wait_decision)
             scheduling = runtime.site_scheduler().reconcile()
             worker = runtime.native_workers().get(work_item_id=work_item_id)
@@ -695,6 +768,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                 worker = registry.get(work_item_id=work_item_id)
                 if not worker:
                     raise ValueError("worker binding required")
+                registry.require_binding(work_item_id, control_epoch=expected_control_epoch, agent_id=current_caller.get())
                 return {"ok": True, **UrgentNotificationRelay(runtime.workspace).claim(
                     worker=worker, expected_control_epoch=expected_control_epoch,
                     progress_interval_seconds=runtime.monitor_policy()["progress_interval_seconds"],
@@ -727,6 +801,8 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             worker = runtime.native_workers().get(work_item_id=work_item_id)
             if not worker:
                 raise KeyError(f"native worker not found: {work_item_id}")
+            if normalized == WorkerDesiredState.RUNNING and worker.get("execution_retired"):
+                raise ValueError("cancelled execution cannot be resumed; start a fresh run")
             if normalized == WorkerDesiredState.RUNNING and worker.get("slot_state") and worker.get("work_state") in {"waiting_user", "paused"}:
                 raise ValueError("use careereng_resume_after_user_action to resume with a new work-item lease")
             persisted = plan_worker_state(
@@ -737,22 +813,35 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             worker = runtime.native_workers().get(work_item_id=work_item_id)
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "worker": worker, "actions": persisted}
+        return {"ok": True, "worker": worker, "actions": persisted, "affected_sites": [worker["site_key"]]}
 
     @server.tool()
     def careereng_list_worker_actions(batch_id: str = "", site_key: str = "") -> dict[str, Any]:
         """List pending native actions for execution by the main-Agent supervisor."""
+        reconciliation = reconcile_worker_actions(batch_id=batch_id, site_key=site_key)
         scheduling = runtime.site_scheduler().reconcile()
-        return {"ok": True, "scheduling": scheduling, "actions": [row.as_dict() for row in runtime.worker_actions().pending(batch_id=batch_id, site_key=site_key)]}
+        return {"ok": True, "scheduling": scheduling, "reconciliation": reconciliation,
+                "actions": [row.as_dict() for row in runtime.worker_actions().pending(batch_id=batch_id, site_key=site_key)]}
 
     @server.tool()
-    def careereng_ack_worker_action(action_id: str, applied: bool, error: str = "") -> dict[str, Any]:
+    def careereng_ack_worker_action(action_id: str, applied: bool, error: str = "",
+                                  observation: dict[str, Any] | None = None) -> dict[str, Any]:
         """Persist the receipt for one native action executed by the main Agent."""
         try:
-            action, command = runtime.worker_control().acknowledge(action_id, applied=applied, error=error)
+            action, command = runtime.worker_control().acknowledge(action_id, applied=applied, error=error,
+                                                                  observation=observation)
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "action": action.as_dict(), "command": command.as_dict() if command else {}}
+        if action.status.value == "failed":
+            runtime.agent_events().publish(
+                kind="worker.action_failed", attention="action_required",
+                summary=f"{action.site_key} {action.kind.value} failed: {action.error or error}",
+                site_key=action.site_key, batch_id=action.batch_id,
+                details={"action_id": action.action_id, "error": action.error or error},
+                dedupe_key=f"action_failed:{action.action_id}",
+            )
+        return {"ok": True, "action": action.as_dict(), "command": command.as_dict() if command else {},
+                "reconciliation": reconcile_worker_actions(batch_id=action.batch_id)}
 
     @server.tool()
     def careereng_prepare_worker_action(action_id: str) -> dict[str, Any]:
@@ -793,7 +882,9 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
                                                 browser_state="ready")
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "action": action.as_dict()}
+        return {"ok": True, "action": action.as_dict(),
+                "observation_fence": {"agent_id": worker.get("agent_id"), "control_epoch": worker.get("control_epoch"),
+                                      "worker_revision": worker.get("revision")}}
 
     @server.tool()
     def careereng_ack_agent_events(cursor: str) -> dict[str, Any]:
@@ -1009,13 +1100,35 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         return {"ok": True, **resource}
 
     @server.tool()
+    def careereng_get_batch_progress(batch_id: str, site_key: str = "") -> dict[str, Any]:
+        """Read authoritative site progress without dispatching a worker or changing leases."""
+        from careereng.career.applications import ApplicationPlanningService
+        from careereng.career.applications.application_store import ApplicationStore
+
+        batch = runtime.job_store().load_batch(batch_id)
+        if not batch:
+            return {"ok": False, "error": "batch not found"}
+        planning = ApplicationPlanningService(project_root=runtime.project_root, job_store=runtime.job_store(),
+                                             application_store=ApplicationStore(runtime.workspace), site_store=runtime.site_store())
+        sites = batch.get("sites") or {}
+        if site_key and site_key not in sites:
+            return {"ok": False, "error": "site does not belong to batch"}
+        return {"ok": True, "batch_id": batch_id, "status": batch.get("status"), "sites": [
+            {"site_key": key, "status": site.get("status"), "phase": site.get("current_phase"),
+             "current_url": site.get("current_url"), "progress": planning.progress_snapshot(key, batch_id)}
+            for key, site in sites.items() if not site_key or key == site_key
+        ]}
+
+    @server.tool()
     def careereng_get_batch_status(
         batch_id: str = "latest",
         session_id: str = DEFAULT_SESSION_ID,
     ) -> dict[str, Any]:
         """Return compact status for one batch, or the latest open batch by default."""
         batch = _latest_batch(runtime.job_store(), session_id=session_id, batch_id=batch_id)
-        return {"ok": True, "batch": _compact_batch(batch, site_store=runtime.site_store())}
+        resolved_batch_id = str((batch or {}).get("batch_id") or "")
+        return {"ok": True, "batch": _compact_batch(batch, site_store=runtime.site_store()),
+                "reconciliation": reconcile_worker_actions(batch_id=resolved_batch_id) if resolved_batch_id else {}}
 
     @server.tool()
     def careereng_start_jobs_batch(
@@ -1152,6 +1265,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         return {
             "ok": True,
             "command": persisted.as_dict(),
+            "affected_sites": [site_key],
             "actions": [row.as_dict() for row in actions],
             "action": actions[0].as_dict() if actions else {},
         }
@@ -1193,6 +1307,8 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             "cancel_site",
             {"batch_id": batch_id, "site_key": site_key, "reason": reason},
         )
+        if not result.get("ok"):
+            return result
         actions = []
         for worker in workers_for_scope(batch_id=batch_id, site_key=site_key):
             actions.extend(plan_worker_state(worker=worker, desired_state="cancelled", browser_policy="release"))
@@ -1237,16 +1353,20 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             "cancel_jobs_batch",
             {"batch_id": batch_id, "reason": reason},
         )
+        if not result.get("ok"):
+            return result
         actions = []
         for worker in workers:
             actions.extend(plan_worker_state(worker=worker, desired_state="cancelled", browser_policy="release"))
-        return {**result, "actions": actions}
+        return {**result, "actions": actions, "reconciliation": reconcile_worker_actions(batch_id=batch_id)}
 
     @server.tool()
-    def careereng_release_site(site_key: str) -> dict[str, Any]:
+    def careereng_release_site(site_key: str, batch_id: str = "") -> dict[str, Any]:
         """Release one retained site browser/runtime without changing CareerEng workflow state."""
 
         request = release_site_payload(site_key=site_key)
+        if batch_id:
+            return runtime.host_client().request("release_site", {**request, "batch_id": batch_id})
         return runtime.host_client().release_site(site_key=request["site_key"])
 
     @server.tool()

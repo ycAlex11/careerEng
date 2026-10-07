@@ -1415,11 +1415,21 @@ class BrowserAutomationService:
         )
 
     def _release_runtime(self, site_key: str) -> bool:
+        session = self.site_store.load_browser_session(site_key)
+        batch_id = str(session.get("runtime_batch_id") or session.get("agent_bridge_batch_id") or "")
         released = self._runtime_registry.release_or_reclaim(
             site_key=site_key,
             profile_dir=self.site_store.browser_profile_dir(site_key),
         )
         self.site_store.save_browser_session(site_key, {"browser_status": "stopped", "active_run_id": ""})
+        if released and batch_id:
+            from careereng.orchestration.worker_control.registry import NativeWorkerRegistry
+
+            registry = NativeWorkerRegistry(self.site_store.workspace)
+            for worker in registry.list(batch_id=batch_id):
+                if worker.get("site_key") == site_key:
+                    registry.update(worker["work_item_id"], expected_control_epoch=int(worker.get("control_epoch") or 0),
+                                    browser_state="absent", browser_release_confirmed_at=now_iso())
         return released
 
     async def _run_site_async(

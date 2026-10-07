@@ -43,6 +43,8 @@ def plan_worker_continuity(*, bound_agent_id: str, previous_worker: dict[str, An
             replacement_reason="bound_agent_not_registered",
         )
     runtime_state = str(previous.get("runtime_state") or "detached")
+    if previous.get("execution_retired") and runtime_state in {"running", "starting", "quiescing"}:
+        return WorkerContinuityPlan(WorkerContinuityMode.SPAWN, replacement_reason="retired_task_not_quiescent")
     if runtime_state in {"running", "starting", "quiescing"}:
         return WorkerContinuityPlan(WorkerContinuityMode.SEND, agent_id=agent_id)
     if runtime_state == "suspended":

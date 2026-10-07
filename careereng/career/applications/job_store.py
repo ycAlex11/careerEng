@@ -210,11 +210,19 @@ class JobStore:
         payload = self.load_batch(str(batch_id or ""))
         if not payload:
             raise FileNotFoundError(f"job batch not found: {batch_id}")
-        if str(payload.get("status") or "") in TERMINAL_BATCH_STATUSES:
+        if str(payload.get("status") or "") == "completed" or payload.get("archived_at"):
+            if not payload.get("archived_at"):
+                payload["archived_at"] = now_iso()
+                payload["resume_allowed"] = False
+                payload["runtime_cleanup_pending"] = True
+                return self.save_batch(payload)
             return payload
         payload = dict(payload)
         payload["status"] = "cancelled"
         payload["closed_at"] = now_iso()
+        payload["archived_at"] = payload["closed_at"]
+        payload["resume_allowed"] = False
+        payload["runtime_cleanup_pending"] = True
         payload = self._mark_running_site_state_cancelled(payload, status="cancelled")
         sites = payload.get("sites") if isinstance(payload.get("sites"), dict) else {}
         for site_key, site in sites.items():
