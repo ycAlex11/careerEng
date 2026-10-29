@@ -23,7 +23,7 @@ class ProfileProcessCleanup:
 _CHROME_PROFILE_LOCK_NAMES = ("SingletonLock", "SingletonSocket", "SingletonCookie")
 
 
-def _profile_process_ids(profile_dir: Path) -> tuple[int, ...]:
+def _profile_process_ids(profile_dir: Path, *, strict: bool = False) -> tuple[int, ...]:
     """Find only processes whose command line names this exact profile path."""
 
     try:
@@ -35,8 +35,12 @@ def _profile_process_ids(profile_dir: Path) -> tuple[int, ...]:
             timeout=5.0,
         )
     except (OSError, subprocess.SubprocessError):
+        if strict:
+            raise RuntimeError("profile process inspection failed")
         return ()
     if result.returncode != 0:
+        if strict:
+            raise RuntimeError("profile process inspection failed")
         return ()
 
     expected = str(profile_dir.resolve())
@@ -53,6 +57,15 @@ def _profile_process_ids(profile_dir: Path) -> tuple[int, ...]:
         if pid > 0 and pid != current_pid:
             matched.append(pid)
     return tuple(sorted(set(matched), reverse=True))
+
+
+def profile_resources_absent(profile_dir: Path) -> bool:
+    try:
+        if _profile_process_ids(profile_dir, strict=True):
+            return False
+    except RuntimeError:
+        return False
+    return not any(os.path.lexists(profile_dir / name) for name in _CHROME_PROFILE_LOCK_NAMES)
 
 
 def _is_alive(pid: int) -> bool:

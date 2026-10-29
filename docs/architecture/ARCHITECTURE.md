@@ -11,6 +11,23 @@ code during migration, not a reason to extend the old boundaries.
 
 ## Identity And Lifecycle Reconciliation
 
+Explicit continuation retains batch, work-item identity, frozen outputs and
+completed progress regardless of elapsed time. Browser recreation and login
+restore access, not business identity. Resolve retained work from the durable
+index before refreshing its existing work order; scoped reads and phase writes
+must use the same payload. Missing or ambiguous retained context fails visibly
+rather than silently creating a second work item.
+
+The LLM selects explicit continuation versus a new application request. New
+requests retire prior execution before starting a fresh batch/list, preserving
+historical deduplication. Closure verifies task quiescence, resources and capacity;
+the Desktop supervisor closes the associated heartbeat. No new intent heuristics
+or site-specific workflow policy belong in Python.
+
+Repeated resource cleanup may confirm an already absent runtime. It must verify
+profile process enumeration and absence of ownership/singleton locks; enumeration
+failure is not absence. This confirmation changes resource state, not job results.
+
 Pause and cancel have different durable meanings. Pause retains the site work
 item and frozen Apply Plan and resumes only on explicit user intent. Cancellation
 archives that site's execution, fences its leases and commands, and forbids
@@ -30,7 +47,8 @@ verified snapshots and due events at the existing configured notification cadenc
 Cancellation archival and resource cleanup are separate: a sealed batch can
 retain `runtime_cleanup_pending` until a scoped release is verified, so a failed
 release remains retryable before replacement startup. The Runtime Host contract
-is versioned as `2026-10-07.1` to reject old unscoped cleanup implementations.
+is versioned as `2026-10-28.1` to reject old unscoped cleanup and
+release-as-business-termination implementations.
 
 Native capacity admission may precede Desktop task registration. Business
 execution and successful spawn/resume/send receipts require a registered child
@@ -126,10 +144,14 @@ launch spec or control result. Validation occurs inside the registry transaction
 stale observations cannot complete or reactivate a newer lease.
 
 Resume adapters must not reissue work-item leases before the Runtime Host has
-resolved the requested scope. The host reissues reusable items or invokes the
-existing checkpoint-recovery owner for released/terminal items, returning the
-resolved batch ID. Native actions are restricted to active items in that batch;
-an old same-site binding must not be revived by a successful recovery elsewhere.
+resolved the requested scope. Browser release fences execution but retains the
+durable work item. Explicit resume of unfinished work reissues its lease in the
+same batch, including an already released resource lease; completed or cancelled
+business work cannot be resumed this way. Resource state alone never creates a
+recovery batch. The ordinary resume entry never clones a source batch. Native actions are restricted
+to active items in the resolved batch; a failed worker can rejoin scheduling only
+after explicit resume issues a newer epoch. Registration is still required before
+execution. LLM/Skills decide whether and when to attempt recovery.
 
 ## Two Separate Trees
 
@@ -940,18 +962,17 @@ A browser process is replaceable infrastructure, not durable workflow state.
 When recovery is exhausted because the scoped browser is dead, the runtime host
 may discard and recreate only that site's browser process/profile lease while
 retaining its payload, phase session, Skill snapshot, Apply List, active target,
-work-item identity, and batch. Normal `release_site` remains terminal for that
-execution scope and is never used as a recovery shortcut.
+work-item identity, and batch. Normal `release_site` revokes the execution lease;
+it does not erase the retained business progress or create another batch.
 
-User continuation follows a resume-or-recover rule. If the original batch and
-work item remain resumable, the host reissues them in place. If the source batch
-is terminal or otherwise cannot be reissued, `checkpoint_recovery` creates one
-new batch from its last durable result. The restart phase is derived from phase
-outputs and the unfinished item, not from a fixed recovery phase. The recovery
-batch clones frozen run rows, Apply List, current target, and the exact resume
-snapshot version; records source-batch/plan lineage; and excludes browser PIDs,
-thread turns, payload bindings, leases, and other transient ownership. Repeated
-delivery of the same recovery command returns the same recovery batch.
+User continuation reissues the original unfinished work in place, including a
+failed attempt in a non-archived batch. The restart phase is derived from retained
+phase outputs and the unfinished item, not from a fixed login/recovery phase.
+Missing or ambiguous context is reported, never replaced by an implicit new
+batch. Completed/cancelled/archived execution cannot be resumed. The existing
+checkpoint-cloning utility is not a fallback of the ordinary resume entry.
+New-run intent instead retires old execution and creates a fresh batch/list,
+retaining application history for deduplication rather than cloning old progress.
 
 ## Adding a New Tool
 

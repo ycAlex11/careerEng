@@ -7,6 +7,9 @@ config.toml
 # Runtime workspace data
 workspace/
 
+# Local Skills
+/skills/
+
 # Python environment and build artifacts
 .venv/
 venv/
@@ -35,6 +38,3 @@ resume.txt
 # Temporary choice for initial push
 tests/
 teststh.py
-skills/search/jobs/sites/apple/SKILL.md
-skills/search/jobs/sites/arm/SKILL.md
-skills/search/jobs/sites/minimax/SKILL.md

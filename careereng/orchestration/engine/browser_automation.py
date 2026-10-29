@@ -38,6 +38,7 @@ from careereng.adapters.external_agents.work_orders import (
 )
 from careereng.orchestration.context.prompts import build_phase_prompts, load_text
 from careereng.orchestration.agent_protocol.browser_phase import BrowserPhaseResult
+from careereng.orchestration.agent_protocol.work_item_store import WorkItemStore
 from careereng.orchestration.agent_protocol.state_tools import state_tool_schemas_for_phase
 from careereng.orchestration.agent_protocol.browser_sequence import (
     BROWSER_SEQUENCE_PHASES,
@@ -296,8 +297,20 @@ class BrowserAutomationService:
         continuation_context: dict[str, Any] | None = None,
         apply_resume_snapshot: dict[str, Any] | None = None,
     ) -> BrowserAutomationResult:
+        retained = WorkItemStore(self.workspace).retained_browser_work_item(site_key=site_key, batch_id=batch_id)
+        existing_payload = retained.get("payload") or {}
+        existing_payload_path = Path(retained.get("payload_path") or "")
+        existing_phase_session_path = Path(str(existing_payload.get("phase_session_path") or ""))
+        if retained:
+            if retained.get("state") in {"completed", "cancelled", "released"}:
+                raise ValueError("retained work item must be explicitly resumed before browser execution")
+            if not existing_phase_session_path.is_absolute():
+                existing_phase_session_path = self.workspace / existing_phase_session_path
+            if not existing_payload.get("phase_session_path") or not existing_phase_session_path.is_file():
+                raise ValueError("retained browser phase session is unavailable")
+            session_id = str(existing_payload.get("session_id") or session_id)
+            turn_id = str(existing_payload.get("turn_id") or turn_id)
         active, reused_runtime = self._reserve_runtime(site_key, entry_url)
-        prior_session = self.site_store.load_browser_session(site_key)
         self.site_store.save_browser_session(
             site_key,
             {
@@ -335,10 +348,6 @@ class BrowserAutomationService:
                 "reused_runtime": bool(reused_runtime),
             },
         )
-        existing_payload_path = Path(str(prior_session.get("agent_bridge_payload_path") or ""))
-        existing_phase_session_path = Path(str(prior_session.get("phase_session_path") or ""))
-        same_batch = str(prior_session.get("agent_bridge_batch_id") or "") == str(batch_id or "")
-        existing_payload = read_json(existing_payload_path) if same_batch and existing_payload_path.is_file() else {}
         pinned_snapshot = existing_payload.get("skill_snapshot") if isinstance(existing_payload.get("skill_snapshot"), dict) else {}
         if pinned_snapshot:
             skill_snapshot = dict(pinned_snapshot)
@@ -420,12 +429,21 @@ class BrowserAutomationService:
             "apply_initial_facts": apply_initial_facts,
             "skill_snapshot": skill_snapshot,
         }
-        if same_batch and existing_payload_path.is_file() and existing_phase_session_path.is_file():
+        if retained:
             work_order = refresh_browser_agent_work_order(
                 payload_path=existing_payload_path,
                 phase_session_path=existing_phase_session_path,
+                preserve_phase_memory=resume,
                 **common_kwargs,
             )
+            self.site_store.save_browser_session(site_key, {
+                "phase_session_path": str(existing_phase_session_path),
+                "agent_bridge_payload_path": str(work_order.payload_path),
+                "agent_bridge_work_order_path": str(work_order.markdown_path),
+                "codex_handoff_path": str(work_order.payload_path),
+                "codex_handoff_markdown_path": str(work_order.markdown_path),
+                "agent_bridge_current_phase": work_order.current_phase,
+            })
         else:
             work_order = create_browser_agent_work_order(
                 site_store=self.site_store,
@@ -729,6 +747,22 @@ class BrowserAutomationService:
             )
 
         return anyio.run(_runner)
+
+    def validate_work_item_context(self, record: dict[str, Any]) -> None:
+        """Require scoped calls and browser execution to use the same context."""
+
+        payload_path = Path(str(record.get("payload_path") or "")).resolve()
+        payload = read_json(payload_path)
+        context = self._agent_bridge_session_context(str(record.get("site_key") or ""))
+        phase_path = Path(str(payload.get("phase_session_path") or ""))
+        if not phase_path.is_absolute():
+            phase_path = self.workspace / phase_path
+        if (not payload_path.is_file() or not phase_path.is_file()
+                or Path(context["payload_path"]).resolve() != payload_path
+                or Path(context["phase_session_path"]).resolve() != phase_path.resolve()
+                or context["batch_id"] != record.get("batch_id")
+                or context["phase"] != payload.get("current_phase")):
+            raise ValueError("browser execution context does not match the retained work item")
 
     def _agent_bridge_session_context(self, site_key: str, *, phase: str = "") -> dict[str, Any]:
         normalized_site = str(site_key or "").strip()

@@ -412,7 +412,6 @@ class RuntimeHostService:
         turn_id = str(payload.get("turn_id") or make_id("turn"))
         command_id = str(payload.get("command_id") or turn_id).strip()
         site_key = str(payload.get("site_key") or "").strip()
-        requested_site_key = site_key
         source_batch_id = str(payload.get("source_batch_id") or "").strip()
         acquired = self._lock.acquire(blocking=False)
         if not acquired:
@@ -424,48 +423,17 @@ class RuntimeHostService:
                     return {"ok": False, "error": f"source job batch not found: {source_batch_id}"}
                 if source.get("archived_at") or source.get("resume_allowed") is False:
                     return {"ok": False, "error": "archived batch cannot be resumed"}
-                if str(source.get("status") or "") not in {"completed", "partial_completed", "failed", "cancelled"}:
-                    session_id = str(source.get("session_id") or session_id)
-                    latest = self.loop.job_flow.job_store.latest_open_batch(session_id) or {}
-                    recovery = latest.get("recovery") or {}
-                    if latest.get("batch_id") != source_batch_id and not (
-                        recovery.get("source_batch_id") == source_batch_id
-                        and recovery.get("command_id") == command_id
-                    ):
-                        return {"ok": False, "error": "requested source is not the current resumable batch"}
-                else:
-                    recovered = self.loop.job_flow.create_checkpoint_recovery_batch(
-                        source_batch_id=source_batch_id,
-                        site_key=site_key,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        user_message=message,
-                        command_id=command_id,
-                    )
-                    session_id = str(recovered.get("session_id") or session_id)
+                if source.get("status") in {"completed", "cancelled"}:
+                    return {"ok": False, "error": "finished batch cannot be resumed; start a fresh run"}
+                session_id = str(source.get("session_id") or session_id)
+                latest = self.loop.job_flow.job_store.latest_open_batch(session_id) or {}
+                if latest.get("batch_id") != source_batch_id:
+                    return {"ok": False, "error": "requested source is not the current resumable batch"}
             resolve_resume_site = getattr(self.loop.job_flow, "resolve_resume_site_key", None)
             if callable(resolve_resume_site):
                 site_key = str(
                     resolve_resume_site(session_id=session_id, message=message, site_key=site_key) or ""
                 ).strip()
-            if not site_key and requested_site_key and not source_batch_id:
-                find_source = getattr(self.loop.job_flow, "latest_checkpoint_recovery_source", None)
-                source = (
-                    find_source(session_id=session_id, site_key=requested_site_key)
-                    if callable(find_source)
-                    else {}
-                )
-                if isinstance(source, dict) and str(source.get("batch_id") or ""):
-                    recovered = self.loop.job_flow.create_checkpoint_recovery_batch(
-                        source_batch_id=str(source.get("batch_id") or ""),
-                        site_key=requested_site_key,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        user_message=message,
-                        command_id=command_id,
-                    )
-                    site_key = requested_site_key
-                    session_id = str(recovered.get("session_id") or session_id)
             if not site_key:
                 return {"ok": True, "accepted": False, "reply": ""}
             backend_error = self._resume_backend_error(session_id=session_id, site_key=site_key)
@@ -503,19 +471,17 @@ class RuntimeHostService:
         if not isinstance(batch, dict):
             return ""
         batch_id = str(batch.get("batch_id") or "")
+        site = (batch.get("sites") or {}).get(site_key) or {}
+        if (not site or batch.get("archived_at") or batch.get("resume_allowed") is False
+                or site.get("resume_allowed") is False
+                or site.get("status") in {"completed", "cancelled"}):
+            raise ValueError("site execution cannot be resumed")
         work_items = WorkItemStore(self.workspace)
-        records = [record for record in work_items.list_records(batch_id=batch_id)
-                   if record.get("site_key") == site_key]
-        if not records:
+        record = work_items.retained_browser_work_item(site_key=site_key, batch_id=batch_id)
+        if not record:
             return batch_id
-        record = max(records, key=lambda row: (str(row.get("created_at") or ""), str(row.get("updated_at") or "")))
-        if record.get("state") in {"completed", "cancelled", "released"}:
-            recovered = job_flow.create_checkpoint_recovery_batch(
-                source_batch_id=batch_id, site_key=site_key, session_id=session_id,
-                turn_id=turn_id, user_message=message, command_id=command_id,
-            )
-            return str(recovered.get("batch_id") or "")
-        work_items.reissue(str(record["work_item_id"]), event="user_resumed", command_id=command_id)
+        work_items.reissue(str(record["work_item_id"]), event="user_resumed",
+                           command_id=command_id, resume_released=True)
         return batch_id
 
     def _prepare_recovery_runtime(self, site_key: str) -> None:
@@ -529,7 +495,8 @@ class RuntimeHostService:
         if site_store is None or browser_runner is None:
             return
         session = site_store.load_browser_session(site_key)
-        if str(session.get("pending_action") or "") != "execution_recovery_exhausted":
+        if (str(session.get("pending_action") or "") != "execution_recovery_exhausted"
+                and session.get("browser_status") not in {"stopped", "lost"}):
             return
         prepare_runtime = getattr(browser_runner, "prepare_site_runtime_for_recovery", None)
         if not callable(prepare_runtime):
@@ -754,18 +721,18 @@ class RuntimeHostService:
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
         try:
-            self._run_site_operation(
-                request["site_key"],
-                lambda: WorkItemStore(self.workspace).revoke_scope(
-                    site_key=request["site_key"],
-                    state="stopping",
-                    event="runtime_release_requested",
-                ),
-            )
             batch_id = str(payload.get("batch_id") or "")
-            released = self._release_site_runtime(site_key=request["site_key"], dispatch=True, batch_id=batch_id)
-            if released:
-                WorkItemStore(self.workspace).release_scope(site_key=request["site_key"], batch_id=batch_id)
+            with self._lock:
+                self._run_site_operation(
+                    request["site_key"],
+                    lambda: WorkItemStore(self.workspace).revoke_scope(
+                        site_key=request["site_key"],
+                        batch_id=batch_id,
+                        state="stopping",
+                        event="runtime_release_requested",
+                    ),
+                )
+                released = self._release_site_runtime(site_key=request["site_key"], dispatch=True, batch_id=batch_id)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "released": bool(released), **request}
@@ -1160,6 +1127,9 @@ class RuntimeHostService:
             }
             if expected_target not in active_targets:
                 raise ValueError("apply target fence does not match the active work item target")
+        validate_context = getattr(getattr(self.loop, "browser_runner", None), "validate_work_item_context", None)
+        if require_binding and callable(validate_context):
+            validate_context(record)
         return record
 
     def _validate_work_item_resume_upload(

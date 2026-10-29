@@ -88,6 +88,8 @@ class BatchCheckpointRecovery:
             site_key=site_key,
         )
         batch = self.job_store.load_batch(batch_id)
+        if source.get("parent_agent_id"):
+            batch["parent_agent_id"] = source["parent_agent_id"]
         batch["sites"][site_key] = recovered_site
         batch["status"] = "waiting_user"
         batch["recovery"] = {

@@ -1183,7 +1183,7 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
         command_id: str = "",
         source_batch_id: str = "",
     ) -> dict[str, Any]:
-        """Continue in place, or recover from a terminal batch checkpoint."""
+        """Continue unfinished work in its original batch; never create a new batch."""
         resume_message = str(message or "").strip() or f"{site_key} done"
         effective_command_id = str(command_id or make_id("worker_command"))
         work_items = WorkItemStore(runtime.workspace)
@@ -1206,12 +1206,18 @@ def create_mcp_server(*, project_root: Path | None = None, workspace: Path | Non
             str(record.get("work_item_id") or ""): record
             for record in work_items.list_records(batch_id=resolved_batch_id, states={"active"})
         } if resolved_batch_id else {}
-        for worker in runtime.native_workers().list(batch_id=resolved_batch_id, active_only=True):
+        for worker in runtime.native_workers().list(batch_id=resolved_batch_id):
             if str(worker.get("site_key") or "") != site_key:
                 continue
             record = active_records.get(str(worker.get("work_item_id") or ""))
             if not record:
                 continue
+            if worker.get("work_state") in {"completed", "cancelled"}:
+                continue
+            if worker.get("work_state") == "failed":
+                worker = runtime.native_workers().recover_failed(
+                    worker["work_item_id"], control_epoch=int(record.get("control_epoch") or 0),
+                )
             worker = runtime.native_workers().update(
                 worker["work_item_id"], control_epoch=int(record.get("control_epoch") or 0),
             )

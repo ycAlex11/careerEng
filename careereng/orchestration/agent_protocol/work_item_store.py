@@ -164,6 +164,7 @@ class WorkItemStore:
         *,
         event: str = "reissued",
         command_id: str = "",
+        resume_released: bool = False,
     ) -> dict[str, Any]:
         """Issue a fresh executable lease for one retained work item."""
 
@@ -176,7 +177,8 @@ class WorkItemStore:
             normalized_command_id = str(command_id or "").strip()
             if normalized_command_id and str(record.get("last_reissue_command_id") or "") == normalized_command_id:
                 return dict(record)
-            if str(record.get("state") or "") in {"completed", "cancelled", "released"}:
+            if (str(record.get("state") or "") in {"completed", "cancelled"}
+                    or (record.get("state") == "released" and not resume_released)):
                 raise ValueError("terminal work item cannot be reissued")
             payload, _ = self._load_payload(record.get("payload_path"))
             if work_item_id_from_payload(payload) != str(work_item_id or ""):
@@ -253,6 +255,25 @@ class WorkItemStore:
             and (requested_states is None or str(record.get("state") or "") in requested_states)
         ]
         return sorted(rows, key=lambda row: (str(row.get("site_key") or ""), str(row.get("created_at") or "")))
+
+    def retained_browser_work_item(self, *, site_key: str, batch_id: str) -> dict[str, Any]:
+        """Resolve retained execution independently of mutable browser pointers."""
+
+        candidates = []
+        for record in self.list_records(batch_id=batch_id):
+            if record.get("site_key") != site_key:
+                continue
+            payload, path = self._load_payload(record["payload_path"])
+            if payload.get("evolution_solution"):
+                continue
+            if (work_item_id_from_payload(payload) != record["work_item_id"]
+                    or payload.get("batch_id") != batch_id
+                    or payload.get("site_key") != site_key):
+                raise ValueError("retained work item scope does not match its index")
+            candidates.append({**record, "payload": payload, "payload_path": str(path)})
+        if len(candidates) > 1:
+            raise ValueError("multiple retained browser work items for the same batch and site")
+        return candidates[0] if candidates else {}
 
     def release_scope(self, *, site_key: str, batch_id: str = "", event: str = "released") -> int:
         """Close indexed work items for an explicitly released execution scope."""

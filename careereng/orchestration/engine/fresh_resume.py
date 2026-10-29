@@ -108,6 +108,8 @@ def build_fresh_snapshot_resume_plan(
     run_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
     batch_id = str(batch.get("batch_id") or "")
+    if browser_session.get("agent_bridge_batch_id") not in {None, "", batch_id}:
+        browser_session = {}
     browser_resume_phase = str(browser_session.get("resume_phase") or "").strip()
     current_phase = str(current.get("current_phase") or browser_resume_phase or "").strip()
     if current_phase == "idle":

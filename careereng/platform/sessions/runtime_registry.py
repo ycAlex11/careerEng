@@ -7,6 +7,7 @@ from pathlib import Path
 import threading
 
 from careereng.platform.web_control import PlaywrightMCPProcess, launch_playwright_mcp, reclaim_profile_processes
+from careereng.platform.web_control.profile_cleanup import profile_resources_absent
 from careereng.utils import now_iso
 
 from .browser_profile_owner import BrowserProfileOwnerError, BrowserProfileOwnerRegistry
@@ -152,13 +153,14 @@ class BrowserRuntimeRegistry:
 
         lease = self.release(site_key)
         if lease is not None:
-            return True
+            resolved_profile = Path(lease.runtime.profile_dir).resolve()
+            return not self.profile_lock_path(resolved_profile).exists() and profile_resources_absent(resolved_profile)
         resolved_profile = Path(profile_dir).resolve()
         if not self.profile_owners.can_reclaim(profile_dir=resolved_profile):
             return False
-        cleanup = reclaim_profile_processes(resolved_profile)
-        lock_released = self.profile_owners.release_if_reclaimable(profile_dir=resolved_profile)
-        return bool(cleanup.terminated_pids or getattr(cleanup, "removed_lock_paths", ()) or lock_released)
+        reclaim_profile_processes(resolved_profile)
+        self.profile_owners.release_if_reclaimable(profile_dir=resolved_profile)
+        return not self.profile_lock_path(resolved_profile).exists() and profile_resources_absent(resolved_profile)
 
     def release_all(self) -> list[BrowserRuntimeLease]:
         with self._lock:

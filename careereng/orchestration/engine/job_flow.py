@@ -3226,7 +3226,7 @@ class JobFlow:
         if not isinstance(current, dict):
             return ""
         if (
-            str(current.get("status") or "") not in {"blocked_login", "blocked", "waiting_user", "paused"}
+            str(current.get("status") or "") not in {"blocked_login", "blocked", "waiting_user", "paused", "failed"}
             and not is_agent_bridge_reason(str(current.get("reason_tag") or ""))
         ):
             return ""

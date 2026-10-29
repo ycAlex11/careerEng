@@ -214,6 +214,7 @@ def refresh_browser_agent_work_order(
     cache_dependency_versions: dict[str, Any] | None = None,
     apply_initial_facts: dict[str, Any] | None = None,
     skill_snapshot: dict[str, Any] | None = None,
+    preserve_phase_memory: bool = False,
 ) -> AgentBridgeWorkOrder:
     """Reuse a site-batch work item for the next declared browser sequence."""
 
@@ -230,7 +231,12 @@ def refresh_browser_agent_work_order(
     if not current_phase or current_phase_row is None:
         raise ValueError("refreshed agent bridge work order requires a declared first phase")
     versions = dict(cache_dependency_versions or payload.get("cache_dependency_versions") or {})
-    phase_memory = BrowserPhaseMemory()
+    phase_memory = (
+        BrowserPhaseMemory.from_payload(session_payload.get("phase_memory"))
+        if (preserve_phase_memory and current_phase == payload.get("current_phase")
+            and list(apply_target_job_ids or ()) == list(payload.get("apply_target_job_ids") or ()))
+        else BrowserPhaseMemory()
+    )
     phase_context = build_phase_context(
         current_phase_row,
         phase_memory=phase_memory,
